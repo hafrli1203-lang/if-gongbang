@@ -65,10 +65,20 @@ old/new_string boundary cannot dodge detection. A malformed/unparseable stdin pa
 (fail-closed). The whole analysis is wrapped in try/except: any unexpected error while
 deciding gate status results in a deny, never a silent allow.
 
-Known, accepted limits (see README.md "알려진 한계"): this is not a full POSIX shell parser.
-Deeply nested pipelines/subshells beyond one level of "sh -c", and command substitution
-($(...) / `...`) are not unwrapped. These degrade towards MORE false positives/negatives in
+Known, accepted limits (see README.md "이 장치가 맡는 범위"): this is not a full POSIX shell
+parser. Deeply nested pipelines/subshells beyond one level of "sh -c" are not unwrapped.
+Command substitution ($(...) / `...`), eval, sourcing and heredocs ARE handled, but only as a
+flat text-level backstop: if one of those constructs appears anywhere in the command together
+with an already-gated keyword (OPAQUE_GATE_KEYWORDS, drawn from the gate reasons implemented
+above), the whole command is gated ("모르면 막는다") even though the substitution itself is
+never actually unwrapped and evaluated - a command with neither signal is left alone (no new
+over-blocking of plain "echo $(date)"). These degrade towards MORE false positives/negatives in
 unusual shapes, not towards trusting a forged approval record.
+
+An approval name that matches one of cfg["apps_root"]'s own project-folder names
+(case-insensitive) is project-scoped: it only grants gated actions whose target path/cwd
+resolves inside that one project folder (see _task_grants below and
+docs/approval-gate.md "프로젝트 범위"). Any other approval name stays session-wide, as before.
 """
 import json
 import os
@@ -353,8 +363,49 @@ def _path_token_hits(tokens: list[str]) -> set[str]:
     return hits
 
 
+# ---------------------------------------------------------------------------
+# Opaque constructs (command substitution, eval, sourcing, heredocs, ...): this hook does not
+# structurally unwrap these (see docs/command-parsing.md). Rather than silently letting a
+# substituted gated command through, "모르면 막는다" - when one of these constructs appears
+# ANYWHERE in the command text together with an already-gated keyword (drawn from the program
+# names / git subcommands / text patterns already checked above, as a flat constant), the whole
+# command is treated as gated. Without an accompanying gate keyword this adds no hit at all, so
+# ordinary substitution-free-of-danger commands ("echo $(date)", "ls $(pwd)") are not
+# over-blocked.
+# ---------------------------------------------------------------------------
+
+OPAQUE_CONSTRUCT_RE = re.compile(
+    r"\$\(|`|\beval\b|\bsource\s+\S|(?:^|[;&|]\s*)\.\s+\S|<<[A-Za-z'\"_-]|\bsh\s+-c\s+\"\$"
+)
+
+# Flat constant pulled from the gate reasons already implemented above (git subcommands, rm,
+# SIMPLE_PROGRAM_GATES program names, TEXT_PATTERNS keywords) - not a newly invented list.
+OPAQUE_GATE_KEYWORDS = {
+    "push", "reset", "clean", "branch", "checkout",
+    "rm",
+    "systemctl", "tailscale",
+    "npm", "pnpm", "yarn", "pip", "pip3", "uv", "apt", "apt-get", "snap",
+    "sudo", "kill", "pkill", "killall", "crontab", "find", "mv",
+    "drop", "truncate", "delete",
+}
+_OPAQUE_KEYWORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in OPAQUE_GATE_KEYWORDS) + r")\b", re.I
+)
+
+
+def _opaque_construct_hit(command: str) -> str | None:
+    if not command or not OPAQUE_CONSTRUCT_RE.search(command):
+        return None
+    if not _OPAQUE_KEYWORD_RE.search(command):
+        return None
+    return "명령 치환·eval 등 해석 불가 + 관문 대상 낱말 포함"
+
+
 def command_hits(command: str) -> set[str]:
     hits: set[str] = set()
+    opaque = _opaque_construct_hit(command)
+    if opaque:
+        hits.add(opaque)
     tokens = _tokenize(command)
     if tokens is None:
         # Malformed quoting: fall back to a coarse text-level backstop so broken shell syntax
@@ -568,6 +619,42 @@ def bash_work_queue_hit(cmd: str, cfg: dict) -> bool:
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Project-scoped approval: an approval name that happens to match one of cfg["apps_root"]'s own
+# project-folder names (case-insensitive) only opens the gate for a tool call whose target path
+# or cwd resolves INSIDE that one project folder - see docs/approval-gate.md "프로젝트 범위".
+# Any other approval name keeps the old, session-wide behavior (opens every gated action in
+# this session, regardless of what the label says) - splitting that apart for every possible
+# label would need a much bigger redesign (README "이 장치가 맡는 범위").
+# ---------------------------------------------------------------------------
+
+def _project_dir_for(task: str, cfg: dict) -> str | None:
+    """Returns the real project folder path under cfg["apps_root"] whose basename matches
+    `task` case-insensitively, or None if `task` is not a project-folder name at all (an
+    ordinary human-chosen label, handled as session-wide)."""
+    apps_root = cfg.get("apps_root") or ""
+    try:
+        entries = os.listdir(apps_root)
+    except Exception:
+        return None
+    for name in entries:
+        if name.lower() == task.lower():
+            candidate = os.path.join(apps_root, name)
+            if os.path.isdir(candidate):
+                return candidate
+    return None
+
+
+def _task_grants(task: str, cfg: dict, path: str, cwd: str) -> bool:
+    project_dir = _project_dir_for(task, cfg)
+    if project_dir is None:
+        return True  # not a project-folder name -> ordinary session-wide approval
+    target = path or cwd
+    if not target:
+        return False  # project-scoped approval, but nothing to scope the action against -> deny
+    return _under(target, project_dir)
+
+
 def deny(reason: str) -> int:
     out = {
         "hookSpecificOutput": {
@@ -608,14 +695,21 @@ def _run(data: dict, cfg: dict) -> int:
 
     ok, open_tasks = fence_parse.compute_open_tasks(session_id, cfg)
     if ok and open_tasks:
-        label = ", ".join(sorted(open_tasks))
-        print(f"승인 관문 열림({label}) — 허용: {', '.join(sorted(hits))}", file=sys.stderr)
-        return 0
+        granting = {t for t in open_tasks if _task_grants(t, cfg, path, cwd)}
+        if granting:
+            label = ", ".join(sorted(granting))
+            print(f"승인 관문 열림({label}) — 허용: {', '.join(sorted(hits))}", file=sys.stderr)
+            return 0
 
     if not session_id:
         reason_suffix = " (session_id 없음 — 세션 대화 기록을 확인할 수 없어 차단)"
     elif not ok:
         reason_suffix = " (이 세션의 대화 기록을 찾거나 읽지 못해 차단)"
+    elif open_tasks:
+        reason_suffix = (
+            " (승인은 있으나 이 행동엔 적용되지 않음: "
+            + ", ".join(sorted(open_tasks)) + " — 프로젝트 폴더 이름과 같은 승인은 그 폴더 안에만 적용됨)"
+        )
     else:
         reason_suffix = ""
     return deny(

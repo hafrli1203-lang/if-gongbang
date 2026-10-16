@@ -506,3 +506,118 @@ def test_bash_perl_separate_dash_i_x_mark_blocked_without_approval(fence_home, t
     fence_home.write_transcript(sid, [])
     r = fence_home.bash(f"perl -i -pe 's/\\[ \\] TASK1/[x] TASK1/' {wq}", sid)
     assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+# --- opaque constructs (command substitution / eval / backticks) + gate keyword ------------
+
+def test_command_substitution_with_gate_keyword_denied(fence_home):
+    sid = "sid-opaque"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("git $(echo push)", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_eval_with_gate_keyword_denied(fence_home):
+    sid = "sid-opaque"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash('eval "git push"', sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_backtick_command_name_with_gate_keyword_denied(fence_home):
+    sid = "sid-opaque"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("`echo rm` -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_command_substitution_without_gate_keyword_allowed(fence_home):
+    sid = "sid-opaque"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("echo $(date)", sid, now=_now())
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+def test_command_substitution_in_pwd_without_gate_keyword_allowed(fence_home):
+    sid = "sid-opaque"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("ls $(pwd)", sid, now=_now())
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+def test_command_substitution_gate_keyword_allowed_with_matching_approval(fence_home):
+    sid = "sid-opaque-ok"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 G1")])
+    r = fence_home.bash("git $(echo push)", sid, now=now)
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+# --- project-scoped approval -----------------------------------------------------------------
+
+def _make_project(fence_home, name: str) -> str:
+    apps_root = os.path.join(fence_home.home, "apps")
+    project_dir = os.path.join(apps_root, name)
+    os.makedirs(project_dir, exist_ok=True)
+    return project_dir
+
+
+def test_project_name_approval_allows_inside_that_project(fence_home):
+    project_dir = _make_project(fence_home, "myproj")
+    sid = "sid-scope-ok"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 myproj")])
+    r = fence_home.bash("git push origin main", sid, now=now, cwd=project_dir)
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+def test_project_name_approval_case_insensitive(fence_home):
+    project_dir = _make_project(fence_home, "MyProj")
+    sid = "sid-scope-case"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 myproj")])
+    r = fence_home.bash("git push origin main", sid, now=now, cwd=project_dir)
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+def test_project_name_approval_denies_other_project(fence_home):
+    _make_project(fence_home, "myproj")
+    other_dir = _make_project(fence_home, "otherproj")
+    sid = "sid-scope-deny"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 myproj")])
+    r = fence_home.bash("git push origin main", sid, now=now, cwd=other_dir)
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_project_name_approval_denies_when_no_cwd(fence_home):
+    _make_project(fence_home, "myproj")
+    sid = "sid-scope-nocwd"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 myproj")])
+    r = fence_home.bash("git push origin main", sid, now=now, cwd="")
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_project_name_approval_allows_edit_path_inside_project(fence_home):
+    project_dir = _make_project(fence_home, "myproj")
+    settings_path = os.path.join(project_dir, ".env")
+    sid = "sid-scope-edit"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 myproj")])
+    r = fence_home.run(
+        SCOPE_GUARD_SCRIPT,
+        {"tool_name": "Edit", "tool_input": {"file_path": settings_path}, "session_id": sid},
+        now=now,
+    )
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
+def test_generic_name_approval_stays_session_wide(fence_home):
+    _make_project(fence_home, "myproj")
+    other_dir = _make_project(fence_home, "otherproj")
+    sid = "sid-scope-generic"
+    now = _now()
+    fence_home.write_transcript(sid, [fence_home.human_line(now - 60, "승인 G1")])
+    r = fence_home.bash("git push origin main", sid, now=now, cwd=other_dir)
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
