@@ -1,0 +1,16 @@
+{
+  "apps_root": "~/apps",
+  "exempt_apps": ["_control"],
+  "installed_hooks_dir": "~/.claude/hooks",
+  "legacy_gate_dir": "~/.claude/gate",
+  "approval_window_seconds": 14400,
+  "extra_protected_hook_names": [],
+  "work_queue_path": "~/.gongbang/WORK_QUEUE.md",
+  "alerts_path": "~/.gongbang/ALERTS.md",
+  "lessons_dir": "~/.gongbang/lessons",
+  "library_root": "~/.gongbang/library",
+  "transcripts_root": "~/.claude/projects",
+  "log_dir": "~/.gongbang/logs",
+  "preflight_mode": "warn",
+  "library_tool_name": "library_search"
+}

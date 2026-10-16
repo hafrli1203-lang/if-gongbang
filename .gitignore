@@ -1,0 +1,10 @@
+gongbang.config.json
+tests/public_ready.local.txt
+.gongbang/
+*.log
+*.jsonl
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

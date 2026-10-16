@@ -1,0 +1,46 @@
+{
+  "_comment": "참고용 예시다. 경로는 자신의 설치 위치로 바꾼다. hooks 배열 순서가 실행 순서다.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/approve_gate.py" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/lesson_capture.py" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/library_nudge.py" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/block_dangerous.py" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/scope_guard.py" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/preflight_gate.py" }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/scope_guard.py" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/preflight_gate.py" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/verify_claims.py" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash /absolute/path/to/hooks/next_task.sh" },
+          { "type": "command", "command": "python3 /absolute/path/to/hooks/lesson_start.py" }
+        ]
+      }
+    ]
+  }
+}

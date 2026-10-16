@@ -1,0 +1,17 @@
+# Example only - every word below is a made-up placeholder, safe to commit.
+#
+# Copy this file to tests/public_ready.local.txt (gitignored, never committed) and replace
+# the placeholders with the REAL sensitive identifiers for your environment: a company/brand
+# name, a borrowed service/brand name you must not re-publish, a person's chat handle, a real
+# server account name, an internal project codename, anything that would identify a specific
+# person, company or server if it showed up in this public repo. One regex per line (plain
+# words work fine as a regex), '#'-prefixed lines are comments. Case-insensitive.
+#
+# tests/test_public_ready.py reads this file (or the path in GONGBANG_PUBLIC_READY_EXTRA) if
+# present, and fails the build if any pattern in it is found anywhere in the repo. It is
+# skipped entirely on a fresh clone with no local list.
+
+맞춤가상회사
+ExamplePlaceholderBrand
+example-internal-codename
+alice-example-handle

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><title>IF 공방 안내서</title>
+<style>
+:root{--bg:#f4f2ee;--ink:#1e2a33;--sub:#56616b;--line:#cfd3d6;--teal:#0f7a6c;--tealb:#e6efec;--blue:#2f55a4;--blueb:#e8ecf6;--brown:#b8651b;--brownb:#f6eadf;--plum:#7b3fa0;--plumb:#f1e9f6;--red:#b42318;--redb:#fbeae8}
+*{box-sizing:border-box}body{margin:0;background:#ddd;font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;color:var(--ink)}
+.slide{width:1600px;height:1200px;background:var(--bg);position:relative;padding:56px 56px 40px;overflow:hidden;margin:0}
+.kick{width:52px;height:6px;background:var(--teal);border-radius:3px}
+.series{color:var(--teal);font-size:22px;margin-top:14px}
+.no{position:absolute;right:64px;top:62px;color:var(--teal);font-size:34px}
+h1{font-size:58px;margin:10px 0 8px;font-weight:700;letter-spacing:-1px}
+.sub{color:var(--sub);font-size:25px;margin:0 0 36px}
+.foot{position:absolute;left:56px;right:56px;bottom:30px;border-top:1px solid var(--line);padding-top:12px;color:var(--sub);font-size:16px}
+.card{background:#fff;border-radius:14px;padding:20px 24px;border-left:6px solid var(--teal)}
+.card h3{margin:0 0 10px;font-size:28px}.card p{margin:0;font-size:21px;line-height:1.55}
+.t h3{color:var(--teal)}.t{border-color:var(--teal)}.b{border-color:var(--blue)}.b h3{color:var(--blue)}.o{border-color:var(--brown)}.o h3{color:var(--brown)}
+.v{border-color:var(--plum)}.v h3{color:var(--plum)}.r{border-color:var(--red)}.r h3{color:var(--red)}
+.col{border-radius:18px;padding:24px}.colT{background:var(--tealb)}.colB{background:var(--blueb)}.colO{background:var(--brownb)}
+.col h2{margin:0 0 4px;font-size:34px}.col .d{font-size:20px;color:var(--sub);margin-bottom:18px}
+.down{text-align:center;font-size:30px;line-height:1;margin:8px 0}
+table{border-collapse:collapse;width:100%;font-size:21px;background:#fff;border-radius:14px;overflow:hidden}
+th,td{padding:12px 16px;border-bottom:1px solid #e3e5e7;text-align:left;vertical-align:top}th{background:#eef0f1;font-size:19px;color:var(--sub)}
+.pill{display:inline-block;border-radius:99px;padding:4px 14px;font-size:18px;font-weight:700;color:#fff}
+.flow{display:flex;gap:0;align-items:stretch}.flow .card{flex:1}.arr{width:46px;display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--sub)}
+.note{font-size:21px;color:var(--sub);margin-top:22px;line-height:1.5}
+</style></head><body>
+
+<!-- 00 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">00</div>
+ <h1 style="font-size:84px;margin-top:180px">IF 공방</h1>
+ <p class="sub" style="font-size:34px">사용자의 판단을 쌓고, 그 기준 안에서 AI 작업조가 프로젝트를 깎아 만들고,<br>시험대에서 재며 조금씩 다듬는 개발·운영 방식</p>
+ <div style="display:flex;gap:16px;margin-top:60px;flex-wrap:wrap">
+  <span class="pill" style="background:var(--brown)">대표</span><span class="pill" style="background:var(--blue)">반장</span><span class="pill" style="background:var(--teal)">작업조</span><span class="pill" style="background:var(--plum)">시험대</span><span class="pill" style="background:var(--red)">울타리</span><span class="pill" style="background:#8a6d1a">작업 일지 · 도면</span><span class="pill" style="background:#0c8599">곳간</span>
+ </div>
+ <div class="foot">근거: docs/concept.md</div>
+</section>
+
+<!-- 01 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">01</div>
+ <h1>공방의 전체 구조</h1><p class="sub">자료를 준비하고, 작업조가 깎고, 사용자의 기준으로 되돌린다.</p>
+ <div style="display:grid;grid-template-columns:1fr 60px 1fr 60px 1fr;align-items:stretch">
+  <div class="col colT"><h2 style="color:var(--teal)">01 곳간</h2><div class="d">AI가 읽을 참고 자료</div>
+   <div class="card t"><h3>검색 가능한 자료</h3><p>library_root 폴더<br>가장 먼저 믿는 곳</p></div><div class="down" style="color:var(--teal)">↓</div>
+   <div class="card t"><h3>검색 도구</h3><p>필요한 근거를 찾아 인용<br>지난 자료는 표시해 구분</p></div></div>
+  <div class="arr">→</div>
+  <div class="col colB"><h2 style="color:var(--blue)">02 작업장</h2><div class="d">AI가 실제로 일하는 곳</div>
+   <div class="card b"><h3>반장 · 작업조</h3><p>계획·조율·제작<br>다른 눈으로 검사</p></div><div class="down" style="color:var(--blue)">↓</div>
+   <div class="card b"><h3>울타리 · 시험대</h3><p>위험한 일은 승인 뒤에만<br>고친 뒤 숫자로 잰다</p></div></div>
+  <div class="arr">→</div>
+  <div class="col colO"><h2 style="color:var(--brown)">03 도면실</h2><div class="d">계속 쌓이는 사용자의 기준</div>
+   <div class="card o"><h3>작업 일지</h3><p>지적을 3줄로 남김<br>다음 작업이 먼저 읽음</p></div><div class="down" style="color:var(--brown)">↓</div>
+   <div class="card o"><h3>도면</h3><p>반복되고 승격된 것만<br>프로젝트의 정식 기준이 됨</p></div></div>
+ </div>
+ <div style="margin:26px 160px 0;border:3px solid var(--teal);border-top:none;height:34px;border-radius:0 0 12px 12px"></div>
+ <div style="text-align:center;color:var(--teal);font-size:23px;margin-top:8px">↑ 실행 결과와 수정 이유를 다시 곳간·도면에 반영</div>
+ <div class="foot">이름 뜻: 곳간=참고 자료, 반장=메인 에이전트, 작업조=구현·검수 AI, 울타리=규칙·훅·승인 관문, 시험대=평가, 도면=프로젝트 결정 문서</div>
+</section>
+
+<!-- 02 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">02</div>
+ <h1>일 하나가 흘러가는 길</h1><p class="sub">각자 맡은 칸에서만 일하고, 다음 칸으로 넘긴다.</p>
+ <div class="flow" style="margin-top:40px">
+  <div class="card o"><h3>1 지시</h3><p>무엇을, 왜</p></div><div class="arr">→</div>
+  <div class="card b"><h3>2 계획</h3><p>자료·일지·도면 읽고<br>착수 전 보고</p></div><div class="arr">→</div>
+  <div class="card o"><h3>3 승인</h3><p>"승인 ○○"</p></div><div class="arr">→</div>
+  <div class="card t"><h3>4 깎기</h3><p>테스트 먼저,<br>만들기</p></div><div class="arr">→</div>
+  <div class="card v"><h3>5 검사</h3><p>검수 → QA → 시험대</p></div><div class="arr">→</div>
+  <div class="card b"><h3>6 보고</h3><p>명령·숫자·<br>못 한 것</p></div><div class="arr">→</div>
+  <div class="card o"><h3>7 확인</h3><p>기준을 정함<br>지적</p></div>
+ </div>
+ <p class="note">통과하지 못하면 4번 깎기로 돌아간다. 지적은 작업 일지에 남아 다음 계획이 먼저 읽는다.</p>
+ <div class="foot">울타리: 3번 승인 없이 삭제·배포·push·설정 변경은 훅이 막는다. 2번 착수 전 보고 없는 코드 수정은 경고 모드로 시작할 수 있다.</div>
+</section>
+
+<!-- 03 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">03</div>
+ <h1>구현 담당과 검수 담당을 나누는 법</h1><p class="sub">만드는 AI는 하나로, 검사하는 눈은 가능하면 서로 다른 모델 계열 둘로.</p>
+ <div class="flow">
+  <div class="card b"><h3>반장</h3><p>계획을 쓰고<br>작업을 나눠 맡김<br>결과를 모아 보고</p></div><div class="arr">→</div>
+  <div class="card t"><h3>깎는 손</h3><p>테스트 먼저 쓰고 구현<br>작성은 한 계열만<br>(코드 일관성)</p></div><div class="arr">→</div>
+  <div style="flex:1.3;display:flex;flex-direction:column;gap:14px">
+   <div class="card v"><h3>보는 눈 ① 1차 검수</h3><p>넓게 훑기 · 빠름</p></div>
+   <div class="card r"><h3>보는 눈 ② 교차 점검</h3><p>다른 모델 계열 · 읽기 전용</p></div></div>
+  <div class="arr">→</div>
+  <div class="card o"><h3>모아서 결정</h3><p>P0·P1은 반드시 고침<br>P2는 판단, P3는 기록<br>다시 검사는 최대 2번</p></div>
+ </div>
+ <p class="note">같은 변경을 두 모델 계열에 보이면 서로 다른 것을 잡는 경우가 많다. 언제 둘 다 쓰나: 인증·권한·결제·삭제·외부 연동·배포·설정 변경은 필수로 두길 권장, 큰 기능은 권장, 문서·문구는 생략해도 된다.</p>
+ <div class="foot">근거: docs/rules/WORKFLOW.md §3-1</div>
+</section>
+
+<!-- 04 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">04</div>
+ <h1>검증은 다섯 겹</h1><p class="sub">"됐다"는 말이 아니라 실행 결과로 통과해야 다음 칸으로 간다.</p>
+ <div class="flow">
+  <div class="card t"><h3>① 코드 검사</h3><p>테스트 · 타입 검사 · lint<br>깎는 손이 매번 실행<br><b>코드가 안 깨졌나</b></p></div><div class="arr">→</div>
+  <div class="card v"><h3>② 검수 (리뷰)</h3><p>읽고 문제를 P0~P3로<br><b>설계·보안·회귀</b></p></div><div class="arr">→</div>
+  <div class="card b"><h3>③ QA (실제로 돌려 보기)</h3><p>임시 환경에서 실제 실행<br><b>진짜로 동작하나</b></p></div><div class="arr">→</div>
+  <div class="card o"><h3>④ 하네스 검문 · 시험대</h3><p>품질 기준표로 통과/실패<br><b>좋아졌나</b></p></div><div class="arr">→</div>
+  <div class="card r"><h3>⑤ 마지막 교차 점검</h3><p>같은 변경을 다른 계열이<br>읽기 전용으로 검사<br><b>놓친 큰 결함은 없나</b></p></div>
+ </div>
+ <div class="foot">어느 겹이든 실패하면 ① 깎기로 돌아간다. 완료 보고에는 실행 명령 · 출력 숫자 · 확인 못 한 것을 함께 쓴다.</div>
+</section>
+
+<!-- 05 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">05</div>
+ <h1>다듬질 — 한 바퀴씩 깎는 고리</h1><p class="sub">한 번에 하나만 고치고, 같은 시험으로 잰다.</p>
+ <div class="flow" style="margin-top:60px">
+  <div class="card t"><h3>① 돌려 본다</h3><p>실제로 실행하고 기록을 남긴다</p></div><div class="arr">→</div>
+  <div class="card b"><h3>② 원인을 가른다</h3><p>자료 · 기준 · 지시문 · 도구 중 어디인가</p></div><div class="arr">→</div>
+  <div class="card v"><h3>③ 한 곳만 깎는다</h3><p>증상 난 곳에 조건을 덧대지 않는다</p></div><div class="arr">→</div>
+  <div class="card r"><h3>④ 시험대에서 잰다</h3><p>고치기 전·후를 같은 시험으로</p></div><div class="arr">→</div>
+  <div class="card o"><h3>⑤ 대표가 정한다</h3><p>결과가 기준으로 자동 승격되지 않는다</p></div>
+ </div>
+ <p class="note" style="text-align:center;margin-top:60px;font-size:30px;font-weight:700">한 번에 한 가지씩, 그리고 다시 ①로</p>
+ <div class="foot">근거: docs/concept.md "다듬질"</div>
+</section>
+
+<!-- 06 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">06</div>
+ <h1>작업 일지 → 도면</h1><p class="sub">사용자가 한 번 한 말을 다음 작업이 기억하게 한다.</p>
+ <div class="flow">
+  <div class="card o"><h3>지적</h3><p>"이거 하지 마,<br>왜냐면 ~"</p></div><div class="arr">→</div>
+  <div class="card b"><h3>작업 일지 (3줄)</h3><p>① 실제 장면<br>② 그대로 쓸 수 없는 이유<br>③ 다음부터 적용할 기준<br>+ 원문 전체(고칠 수 없음)</p></div><div class="arr">→</div>
+  <div class="card t"><h3>다음 세션</h3><p>그 프로젝트 세션을 열면<br>일지를 먼저 보여 줌<br>"경험 · 아직 기준 아님"</p></div><div class="arr">→</div>
+  <div class="card v"><h3>승격 후보</h3><p>일정 기간 안에<br>서로 다른 세션 반복</p></div><div class="arr">→</div>
+  <div class="card o"><h3>도면</h3><p>"승격 L1-번호"<br>→ 프로젝트의 정식 기준<br>나빠지면 내림</p></div>
+ </div>
+ <table style="margin-top:34px">
+  <tr><th>섞지 않는 네 가지</th><th>어디에</th></tr>
+  <tr><td>확인 가능한 사실</td><td>곳간 (library_root)</td></tr>
+  <tr><td>한 번 겪은 경험</td><td>작업 일지</td></tr>
+  <tr><td>반복 검증되고 승인된 기준</td><td>도면 (프로젝트 결정 문서)</td></tr>
+  <tr><td>이번 일에만 필요한 정보</td><td>계획서 · 착수 전 보고</td></tr>
+ </table>
+ <div class="foot">저장: hooks/lessons_store.py (로컬 JSONL)</div>
+</section>
+
+<!-- 07 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">07</div>
+ <h1>곳간과 울타리</h1><p class="sub">믿을 자료는 한 곳에, 위험한 일은 장치로 막는다.</p>
+ <div style="display:grid;grid-template-columns:1fr 1fr;gap:30px">
+  <div class="col colT"><h2 style="color:var(--teal)">곳간</h2><div class="d">자료의 구분</div>
+   <div class="card t"><h3>지금 쓰는 자료</h3><p>library_root — 가장 먼저 믿는다</p></div><div class="down" style="color:var(--teal)">↑ 꾸준히 옮겨 정리</div>
+   <div class="card t" style="border-color:#8a8f94"><h3 style="color:#5b6168">지난 자료</h3><p>지우지 않고 "지난 자료"로 표시, 점점 줄인다</p></div></div>
+  <div class="col" style="background:var(--redb)"><h2 style="color:var(--red)">울타리</h2><div class="d">지시문이 아니라 장치가 막는다</div>
+   <table><tr><th>장치</th><th>막는 것</th></tr>
+   <tr><td>승인 관문</td><td>삭제·보관 이동·서비스 정지·DB 변경·배포·push·설정 편집 → "승인 ○○" 뒤 설정된 시간만</td></tr>
+   <tr><td>위험 명령 차단</td><td>되돌릴 수 없는 명령은 대표가 직접 실행</td></tr>
+   <tr><td>완료 보고 검증</td><td>실행 근거 없는 "완료·통과"</td></tr>
+   <tr><td>착수 전 보고</td><td>보고 없이 코드 수정 (경고 모드로 시작 가능)</td></tr></table>
+   <p class="note" style="font-size:19px">못 막는 것: 지시 준수 100%, 보고 내용의 질 → 계획 승인·검수·시험대로 잡는다.</p></div>
+ </div>
+ <div class="foot">훅 구현: hooks/scope_guard.py, hooks/block_dangerous.py, hooks/verify_claims.py, hooks/preflight_gate.py</div>
+</section>
+
+<!-- 08 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">08</div>
+ <h1>프로젝트가 진짜 자동화가 되려면</h1><p class="sub">사람 없이 돌아도 믿을 수 있게 — 프로젝트마다 세 가지.</p>
+ <div class="flow">
+  <div class="card v"><h3>① 시험대</h3><p>예시 입력 + 좋은 결과 기준 + 점수<br>고칠 때마다 같은 시험</p></div><div class="arr"> </div>
+  <div class="card r"><h3>② 혼자 돌 때 감시</h3><p>실패를 기록만 하지 말고<br>사람에게 먼저 알림</p></div><div class="arr"> </div>
+  <div class="card o"><h3>③ 사람 확인 지점</h3><p>발행·발송·결제·삭제처럼<br>틀리면 비싼 곳에만</p></div>
+ </div>
+ <p class="note">예: 콘텐츠 자동 발행 도구는 발행 직전에, 광고 소재 생성 도구는 집행 직전에 사람 확인을 둔다 — 업종이 달라도 "비싼 지점"만 사람이 본다는 원칙은 같다.</p>
+ <div class="foot">다음 단계: 프로젝트마다 시험대 만들기(계획서 → 승인).</div>
+</section>
+
+<!-- 09 -->
+<section class="slide">
+ <div class="kick"></div><div class="series">IF 공방 안내서</div><div class="no">09</div>
+ <h1>대표가 하실 일</h1><p class="sub">이것만 하면 공방이 돌아간다.</p>
+ <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px">
+  <div class="card o"><h3>정하기</h3><p>무엇을 왜 할지 한두 문장으로</p></div>
+  <div class="card o"><h3>승인</h3><p>채팅에 "승인 ○○" — 위험한 일은 이것 없이 안 열림</p></div>
+  <div class="card o"><h3>지적</h3><p>"이거 하지 마, 왜냐면 ~" — 이유가 붙으면 일지가 정확해짐</p></div>
+  <div class="card o"><h3>승격</h3><p>"승격 L1-번호" — 반복된 지적을 정식 기준으로</p></div>
+  <div class="card o"><h3>자료</h3><p>쓸 자료는 자료 폴더에, 지난 자료는 보면서 옮기고 줄이기</p></div>
+  <div class="card o"><h3>숫자 보기</h3><p>주기적으로: 지적 비율 · 반복된 일지 · 시험대 점수</p></div>
+ </div>
+ <p class="note">하지 않으셔도 되는 것: 같은 말 반복하기 · 진행 상황 묻기(작업판에 있음) · 코드 확인(검수·시험대가 함).</p>
+ <div class="foot">한 세션에는 한 프로젝트의 한 가지 일만 — 기록이 섞이지 않게.</div>
+</section>
+</body></html>
