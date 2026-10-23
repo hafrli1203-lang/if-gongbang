@@ -214,11 +214,14 @@ def check(command: str) -> tuple[str | None, str | None]:
 def main() -> int:
     try:
         data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError):
+    except Exception as e:
+        # Unreadable input means we cannot tell whether this call is dangerous: fail CLOSED.
+        print(f"BLOCKED: 입력 파싱 실패로 안전하게 차단({type(e).__name__})", file=sys.stderr)
+        return 2
+    if not isinstance(data, dict) or data.get("tool_name") != "Bash":
         return 0
-    if data.get("tool_name") != "Bash":
-        return 0
-    command = data.get("tool_input", {}).get("command", "")
+    tool_input = data.get("tool_input")
+    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
     if not command:
         return 0
     try:

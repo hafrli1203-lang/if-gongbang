@@ -120,6 +120,9 @@ GATE_DIR_RE = re.compile(r"gate[/\\]approved\b", re.I)
 # ---------------------------------------------------------------------------
 
 _TRIPLE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_TILDE_FENCE_RE = re.compile(r"~~~.*?~~~", re.DOTALL)
+# Markdown indented code (4 spaces or a tab at line start) is code as well.
+_INDENTED_CODE_RE = re.compile(r"(?m)^(?: {4}|\t).*$")
 _BACKTICK_RE = re.compile(r"`[^`\n]{0,200}`")
 _DQUOTE_RE = re.compile(r'"[^"\n]{0,200}"')
 _SQUOTE_RE = re.compile(r"'[^'\n]{0,200}'")
@@ -131,6 +134,8 @@ def strip_quotes_and_code(text: str) -> str:
     """Remove code fences and quoted spans so an approval mentioned only inside a quote or a
     code block (e.g. "'승인 X'를 입력하면...") can never be recognized as a real approval."""
     out = _TRIPLE_FENCE_RE.sub(" ", text)
+    out = _TILDE_FENCE_RE.sub(" ", out)
+    out = _INDENTED_CODE_RE.sub(" ", out)
     out = _BACKTICK_RE.sub(" ", out)
     out = _DQUOTE_RE.sub(" ", out)
     out = _SQUOTE_RE.sub(" ", out)

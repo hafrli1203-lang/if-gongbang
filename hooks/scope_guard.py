@@ -139,7 +139,9 @@ def _first_command(tokens: list[str]) -> tuple[str | None, int]:
     i = 0
     while i < len(tokens) and ASSIGN_RE.match(tokens[i]):
         i += 1
-    if i < len(tokens) and _basename(tokens[i]) in (ALLOWED_PREFIXES | {"sudo"}):
+    # "sudo" is deliberately NOT a skippable prefix: "sudo -u deploy git push" used to resolve to
+    # the option VALUE "deploy" as the command and slip past every gate. sudo itself is gated.
+    if i < len(tokens) and _basename(tokens[i]) in ALLOWED_PREFIXES:
         i += 1
         while i < len(tokens) and (ASSIGN_RE.match(tokens[i]) or tokens[i].startswith("-")):
             i += 1
@@ -628,15 +630,24 @@ def bash_work_queue_hit(cmd: str, cfg: dict) -> bool:
 # label would need a much bigger redesign (README "이 장치가 맡는 범위").
 # ---------------------------------------------------------------------------
 
+class _ProjectLookupError(Exception):
+    """apps_root itself cannot be listed (missing config, permission, I/O). The caller must treat
+    the approval as granting NOTHING (fail closed), never as "not a project name -> session-wide"."""
+
+
 def _project_dir_for(task: str, cfg: dict) -> str | None:
     """Returns the real project folder path under cfg["apps_root"] whose basename matches
     `task` case-insensitively, or None if `task` is not a project-folder name at all (an
     ordinary human-chosen label, handled as session-wide)."""
     apps_root = cfg.get("apps_root") or ""
+    if not apps_root:
+        return None  # project scoping not configured at all -> every approval is session-wide
     try:
         entries = os.listdir(apps_root)
-    except Exception:
-        return None
+    except (FileNotFoundError, NotADirectoryError):
+        return None  # no apps folder yet (fresh install) == an empty one -> no project names exist
+    except Exception as exc:
+        raise _ProjectLookupError(str(exc)) from exc  # exists but unreadable -> fail closed
     for name in entries:
         if name.lower() == task.lower():
             candidate = os.path.join(apps_root, name)
@@ -646,7 +657,10 @@ def _project_dir_for(task: str, cfg: dict) -> str | None:
 
 
 def _task_grants(task: str, cfg: dict, path: str, cwd: str) -> bool:
-    project_dir = _project_dir_for(task, cfg)
+    try:
+        project_dir = _project_dir_for(task, cfg)
+    except _ProjectLookupError:
+        return False  # scope could not be verified -> this approval grants nothing
     if project_dir is None:
         return True  # not a project-folder name -> ordinary session-wide approval
     target = path or cwd
