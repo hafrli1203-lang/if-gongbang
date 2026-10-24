@@ -21,7 +21,7 @@ jobs:
       - name: Run hook tests
         run: |
           git config --global user.name ci
-          git config --global user.email ci@example.invalid
+          git config --global user.email ci
           python -m pytest tests -q -p no:cacheprovider --junitxml=hooks-junit.xml
       - name: Summary
         if: always()
@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap
-          python -m pip install --upgrade pip pytest
+          python -m pip install --upgrade pip pytest uv
       - name: Environment
         run: |
           python --version
@@ -55,7 +55,7 @@ jobs:
         working-directory: v2
         run: |
           git config --global user.name ci
-          git config --global user.email ci@example.invalid
+          git config --global user.email ci
           python -m pytest -p no:cacheprovider -rs --junitxml=engine-junit.xml
       - name: Summary
         if: always()
