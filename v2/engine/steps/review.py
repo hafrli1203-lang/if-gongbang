@@ -473,7 +473,10 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     sandbox.prepare_worker_home(home_dir, real_home, login_files, subpaths)
     env["HOME"] = str(home_dir)
     writable = (_stations_dir(ctx),)
-    readonly: tuple[Path, ...] = (spec.workdir, home_dir)
+    from engine.steps.station import ENGINE_ROOT
+
+    # The reviewer may import this engine package inside the sandbox too.
+    readonly: tuple[Path, ...] = (spec.workdir, home_dir, ENGINE_ROOT)
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = ((ctx.config.home, ctx.config.secrets_dir, _repo(ctx))
               + _other_project_repos(ctx) + _ledger_hidden_root(ctx)

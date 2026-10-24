@@ -640,12 +640,11 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
         copy_entry = spec.copy_root / entry
         readonly += (copy_entry,)
         writable += tuple(copy_entry / subpath for subpath in link_subpaths)
-    if runner_needs_gate(runner):
-        # The gate hook imports this engine package inside the sandbox; when
-        # the engine itself lives under a hidden tree (e.g. a checkout under
-        # /tmp, which the sandbox replaces with an empty tmpfs) it must be
-        # re-exposed read-only or every gated tool call fails closed.
-        readonly += (ENGINE_ROOT,)
+    # Every worker process may import this engine package inside the
+    # sandbox (the gate hook, the scripted worker): when the engine lives
+    # under a hidden tree -- a checkout under the operator's HOME or /tmp --
+    # it is re-exposed read-only. The engine's own code is not secret.
+    readonly += (ENGINE_ROOT,)
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = _hidden_roots(ctx, repo) + _ledger_hidden_root(ctx)
     if real_home is not None:

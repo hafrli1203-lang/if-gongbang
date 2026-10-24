@@ -44,7 +44,16 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           python -m pip install --upgrade pip pytest uv
+          # The AI CLIs are never run here (live tests are deselected); the
+          # environment check only needs them to exist on PATH.
+          mkdir -p "$RUNNER_TEMP/fake-cli"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/fake-cli/claude"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/fake-cli/codex"
+          chmod +x "$RUNNER_TEMP/fake-cli/claude" "$RUNNER_TEMP/fake-cli/codex"
+          echo "$RUNNER_TEMP/fake-cli" >> "$GITHUB_PATH"
       - name: Environment
         run: |
           python --version
