@@ -3,6 +3,7 @@ Processor, plus direct checks of the call_publisher reconcile predicate."""
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 
 import pytest
 
@@ -83,20 +84,42 @@ def test_publish_fails_on_artifact_mismatch(workspace: Workspace) -> None:
     assert publisher.calls == []
 
 
-def test_call_publisher_reconcile_true_when_lookup_finds_call(workspace: Workspace) -> None:
+@dataclass
+class _StubPublisher:
+    """A minimal Publisher whose lookup() returns whatever fixed dict
+    (or None) the test wants, to exercise _reconcile_call_publisher's
+    receipt-field validation against shapes FakePublisher itself
+    cannot produce (it never sets "status" or a mismatched identity)."""
+    receipt: dict[str, object] | None
+
+    def publish(self, key: str, target: str, artifact_hash: str) -> dict[str, object]:
+        raise NotImplementedError("not used by these reconcile-only tests")
+
+    def lookup(self, key: str) -> dict[str, object] | None:
+        return self.receipt
+
+
+def _ctx_for(workspace: Workspace, rid: str, attempt_id: str, publisher: object) -> StepContext:
+    request = workspace.ledger.request(rid)
+    return StepContext(config=workspace.config, ledger=workspace.ledger,
+                       fakes=Fakes(publisher, FakeInstaller()),
+                       request=request, project="beta", attempt_id=attempt_id)
+
+
+def test_call_publisher_reconcile_false_before_any_call_and_true_after_a_validated_done(
+    workspace: Workspace,
+) -> None:
     attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job4",
                           "full", roles=("builder",))
     rid = submit(workspace.ledger, "beta", attempt_id, "publish",
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": "x"}, "owner")
-    request = workspace.ledger.request(rid)
-    publisher = FakePublisher()
-    ctx = StepContext(config=workspace.config, ledger=workspace.ledger,
-                      fakes=Fakes(publisher, FakeInstaller()),
-                      request=request, project="beta", attempt_id=attempt_id)
+    ctx = _ctx_for(workspace, rid, attempt_id, _StubPublisher(receipt=None))
     assert _reconcile_call_publisher(ctx) is False
-    publisher.publish(rid, "store", "x")
-    assert _reconcile_call_publisher(ctx) is True
+
+    ctx2 = _ctx_for(workspace, rid, attempt_id, _StubPublisher(
+        receipt={"key": rid, "target": "store", "artifact_hash": "x", "status": "done"}))
+    assert _reconcile_call_publisher(ctx2) is True
 
 
 def test_call_publisher_reconcile_raises_step_unknown_on_lookup_failure(workspace: Workspace) -> None:
@@ -110,6 +133,39 @@ def test_call_publisher_reconcile_raises_step_unknown_on_lookup_failure(workspac
     ctx = StepContext(config=workspace.config, ledger=workspace.ledger,
                       fakes=Fakes(publisher, FakeInstaller()),
                       request=request, project="beta", attempt_id=attempt_id)
+    with pytest.raises(StepUnknown):
+        _reconcile_call_publisher(ctx)
+
+
+def test_call_publisher_reconcile_treats_an_empty_receipt_as_unknown(
+    workspace: Workspace,
+) -> None:
+    """A receipt with no "status" field at all (missing/unrecognizable)
+    must never be treated as success -- only an explicit, validated
+    "done" is."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job-empty-receipt",
+                          "full", roles=("builder",))
+    rid = submit(workspace.ledger, "beta", attempt_id, "publish",
+                 {"target": "store", "artifact_path": "dist/bundle.js",
+                  "artifact_hash": "x"}, "owner")
+    ctx = _ctx_for(workspace, rid, attempt_id, _StubPublisher(receipt={}))
+    with pytest.raises(StepUnknown):
+        _reconcile_call_publisher(ctx)
+
+
+def test_call_publisher_reconcile_rejects_a_done_receipt_with_mismatched_artifact_hash(
+    workspace: Workspace,
+) -> None:
+    """A "done" receipt sitting at the right lookup key but naming a
+    DIFFERENT artifact_hash than this request's own payload must not be
+    trusted as this request's success."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job-mismatch",
+                          "full", roles=("builder",))
+    rid = submit(workspace.ledger, "beta", attempt_id, "publish",
+                 {"target": "store", "artifact_path": "dist/bundle.js",
+                  "artifact_hash": "x"}, "owner")
+    ctx = _ctx_for(workspace, rid, attempt_id, _StubPublisher(
+        receipt={"key": rid, "target": "store", "artifact_hash": "DIFFERENT", "status": "done"}))
     with pytest.raises(StepUnknown):
         _reconcile_call_publisher(ctx)
 

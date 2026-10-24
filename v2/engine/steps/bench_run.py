@@ -280,6 +280,16 @@ def _resolve_test_argv(ctx: StepContext) -> tuple[str, list[str]]:
 
 _VITEST_NO_TESTS_RE = re.compile(r"No test files found", re.I)
 _VITEST_ZERO_TESTS_SUMMARY_RE = re.compile(r"^\s*Tests\s+0\s", re.I | re.M)
+# A "Tests" summary line that never mentions "passed" or "failed"
+# anywhere on it, but does mention "skipped" -- every selected test
+# was skipped, not merely run and found correct, so nothing was
+# actually exercised even though the file-selection step itself
+# matched something (e.g. "Tests  1 skipped (1)"). The negative
+# lookahead scans the rest of the line before "skipped" is reached, so
+# a genuinely mixed line like "3 passed | 2 skipped (5)" does not
+# match this (at least one real pass/fail outcome did occur there).
+_VITEST_ALL_SKIPPED_RE = re.compile(
+    r"^\s*Tests\s+(?!.*\b(?:passed|failed)\b).*\bskipped\b", re.I | re.M)
 
 
 def _ran_zero_tests(scope: str, combined_output: str) -> bool:
@@ -289,13 +299,18 @@ def _ran_zero_tests(scope: str, combined_output: str) -> bool:
     (an installed vitest's own `passWithNoTests=true` default makes
     that exit 0, not 1, looking exactly like an ordinary clean pass),
     sometimes with no "Tests ..." summary line printed at all, or
-    occasionally a "Tests  0 ..." summary. Only ever checked for scope
-    "related" -- a "full" run legitimately exits 0 on an empty/trivial
-    project without this ever applying."""
+    occasionally a "Tests  0 ..." summary. The same is true when the
+    selector DID match files but every selected test was then skipped
+    (vitest's own "Tests  N skipped (N)", with no passed/failed count
+    on that line at all) -- a selector matching something is not the
+    same as anything actually having been exercised. Only ever checked
+    for scope "related" -- a "full" run legitimately exits 0 on an
+    empty/trivial project without this ever applying."""
     if scope != "related":
         return False
     return bool(_VITEST_NO_TESTS_RE.search(combined_output)
-                or _VITEST_ZERO_TESTS_SUMMARY_RE.search(combined_output))
+                or _VITEST_ZERO_TESTS_SUMMARY_RE.search(combined_output)
+                or _VITEST_ALL_SKIPPED_RE.search(combined_output))
 
 
 def _run_test_cmd(ctx: StepContext, repo: Path, test_cmd: list[str],

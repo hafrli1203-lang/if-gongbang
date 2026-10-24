@@ -33,13 +33,21 @@ class FakePublisher:
 
     def lookup(self, key: str) -> dict[str, object] | None:
         """Return the recorded call or None. Raises RuntimeError if
-        lookup_fails (simulates the status API being down)."""
+        lookup_fails (simulates the status API being down). "status":
+        "done" always -- FakePublisher has only one terminal outcome
+        (a recorded call always means the effect happened; it models
+        no "failed" exit code), so every receipt it can produce is
+        exactly that. "key" is included alongside "id" so callers that
+        validate a receipt's own identity fields (key/target/
+        artifact_hash) against the request's, the same way they would
+        for engine.publishers.ShellPublisher's receipts, see it too."""
         if self.lookup_fails:
             raise RuntimeError(f"publisher lookup unavailable for {key!r}")
         call = self._find(key)
         if call is None:
             return None
-        return {"id": call.key, "target": call.target, "artifact_hash": call.artifact_hash}
+        return {"id": call.key, "key": call.key, "target": call.target,
+                "artifact_hash": call.artifact_hash, "status": "done"}
 
     def _find(self, key: str) -> PublishCall | None:
         for call in self.calls:

@@ -45,10 +45,14 @@ workspace tree, so nothing here hardcodes a host path:
                       (config.json, ledger, home/, runs.json, ...).
                       Defaults to "~/.gongbang/workspace" if unset.
   GB2_APPS_ROOT      the directory holding each app's own source repo
-                      (the one `init`/`diff`/`init --with-release` read
-                      from and worktree off of). Required for `init` and
-                      `diff`; every other subcommand only touches
-                      GB2_WORKSPACE and never needs it.
+                      (the one `init`/`init --with-release` worktree
+                      off of). Required by every subcommand that
+                      touches an app's repo_dir at all -- `init`,
+                      `run`, `ship`, `sync`, `diff` -- since each of
+                      those re-verifies repo_dir is still a real
+                      worktree of GB2_APPS_ROOT/<app> before doing
+                      anything else; `status`/`log`/`skip-ship` never
+                      touch git and never need it.
   GB2_DEPLOY_SCRIPT  the deploy command a release-configured app's
                       top-level `publisher` argv runs. Defaults to
                       "<GB2_APPS_ROOT>/_shared/deploy.sh" if unset. Only
@@ -152,8 +156,29 @@ describe("gb2 negative control", () => {
 
 NEGATIVE_CONTROL_CASES = [
     {"name": "gb2_negative_control", "selector": "tests/gb2-negative-control.test.ts",
-     "expect_fail": True, "expected_signature": "exit:1", "env": {"GB2_NEGATIVE": "1"}},
+     "expect_fail": True, "expected_signature": "assertion", "env": {"GB2_NEGATIVE": "1"}},
 ]
+
+
+def _bench_cases_need_upgrade(bench_cases_path: Path) -> bool:
+    """True iff `bench_cases_path` already exists but its own
+    "gb2_negative_control" entry's expected_signature is not the
+    current one (engine.steps.bench_run._case_signature now classifies
+    a real vitest assertion failure as "assertion", never "exit:1" --
+    a workspace generated before that change would otherwise fail
+    every bench run with wrong_failure_signature forever, since
+    nothing else ever rewrites bench_cases.json once it exists)."""
+    try:
+        data = json.loads(bench_cases_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, list):
+        return False
+    for case in data:
+        if (isinstance(case, dict) and case.get("name") == "gb2_negative_control"
+                and case.get("expected_signature") != "assertion"):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------
@@ -273,6 +298,21 @@ def _verify_worktree_identity(source_repo: Path, repo_dir: Path) -> None:
     raise ValueError(f"{repo_dir} exists but is not a registered worktree of {source_repo}")
 
 
+def _verify_app_repo_identity(app: str) -> None:
+    """Re-verify that this app's repo_dir is STILL a registered
+    worktree of its source repo, on WORKTREE_BRANCH, before a
+    subcommand (run/ship/sync/diff) does anything else with it -- not
+    just a check `init` makes once. Guards against the directory
+    having been replaced, detached, or otherwise altered since init
+    (a stale symlink swap, a careless `rm -rf` + recreate by hand,
+    ...)."""
+    repo_dir = app_workspace(app) / "repo"
+    if not repo_dir.exists():
+        raise ValueError(f"not initialized: run `gb2 init {app}` first")
+    source_repo = (_apps_root() / app).resolve()
+    _verify_worktree_identity(source_repo, repo_dir)
+
+
 def _ensure_worktree(source_repo: Path, repo_dir: Path) -> None:
     existing_branches = _git(["branch", "--list", WORKTREE_BRANCH], cwd=source_repo)
     if not existing_branches:
@@ -309,6 +349,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
     if not (source_repo / "package.json").exists():
         return _err_json(f"no package.json under {source_repo}", 1)
+    repo_dir = workspace / "repo"
+    if repo_dir.exists():
+        # Verify BEFORE writing anything: an existing repo/ that turns
+        # out not to actually be this source's gb2/work worktree must
+        # never leave a config.json/bench_cases.json written for it
+        # first and only fail afterward.
+        _verify_worktree_identity(source_repo, repo_dir)
 
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "home").mkdir(exist_ok=True)
@@ -334,7 +381,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                            encoding="utf-8")
 
     bench_cases_path = workspace / "bench_cases.json"
-    if not bench_cases_path.exists():
+    if not bench_cases_path.exists() or _bench_cases_need_upgrade(bench_cases_path):
         bench_cases_path.write_text(
             json.dumps(NEGATIVE_CONTROL_CASES, ensure_ascii=False, indent=1),
             encoding="utf-8",
@@ -418,6 +465,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
              file=sys.stderr)
         return 1
+    _verify_app_repo_identity(args.app)
     if args.task_file:
         task = Path(args.task_file).read_text(encoding="utf-8")
     elif args.task:
@@ -478,6 +526,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
+    _verify_app_repo_identity(args.app)
     source_repo = _apps_root() / args.app
     stat = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}", "--stat"], cwd=source_repo)
     full = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}"], cwd=source_repo)
@@ -524,6 +573,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
     config = EngineConfig.from_json(config_path)
     project_config = config.projects[args.app]
     if project_config.release is None:
@@ -607,6 +657,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     repo_dir = app_workspace(args.app) / "repo"
     if not repo_dir.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
     status = _git(["status", "--porcelain"], cwd=repo_dir)
     if status:
         return _err_json("worktree_dirty: commit or stash before sync", 1)

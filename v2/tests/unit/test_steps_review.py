@@ -19,7 +19,7 @@ from engine.processor import submit as submit_request
 from engine.steps import review
 from engine.steps.open_job import open_job
 from engine.workers.scripted import ScriptedRunner
-from tests.conftest import GIT_ENV, Workspace
+from tests.conftest import GIT_ENV, Workspace, git
 
 
 def _diff_text_now(ws: Workspace, attempt_id: str, rid: str) -> str:
@@ -349,6 +349,36 @@ def test_review_git_calls_disable_fsmonitor_and_hooks(workspace: Workspace) -> N
     _diff_text_now(ws, attempt_id, rid)
 
     assert not canary.exists()
+
+
+def test_export_review_snapshot_ignores_export_attributes(workspace: Workspace) -> None:
+    """`git archive` honors `export-ignore` (omits the path entirely)
+    and `export-subst` (rewrites a `$Format:...$` placeholder) --
+    neither is appropriate for a snapshot that must match the
+    fingerprinted tree exactly, since evidence.record ties the
+    reviewer's pass/fail to that exact tree, not to whatever a
+    repository's own .gitattributes happens to let `git archive`
+    show. Both files must appear in the snapshot with their precise
+    committed bytes, `export-ignore` notwithstanding and the
+    `$Format:%H$` placeholder left completely unexpanded."""
+    ws = _review_workspace(workspace)
+    (ws.alpha / "secret.txt").write_text("TOP SECRET\n", encoding="utf-8")
+    (ws.alpha / "ver.txt").write_text("$Format:%H$\n", encoding="utf-8")
+    (ws.alpha / ".gitattributes").write_text(
+        "secret.txt export-ignore\nver.txt export-subst\n", encoding="utf-8",
+    )
+    git(ws.alpha, "add", "-A")
+    git(ws.alpha, "commit", "-q", "-m", "add export-attributed files")
+    attempt_id, rid = _submit_review(ws)
+
+    fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes)
+    req = ws.ledger.request(rid)
+    ctx = StepContext(config=ws.config, ledger=ws.ledger, fakes=None,
+                      request=req, project="alpha", attempt_id=attempt_id)
+    dest = review._export_review_snapshot(ctx, ws.alpha, fp)
+
+    assert (dest / "secret.txt").read_text(encoding="utf-8") == "TOP SECRET\n"
+    assert (dest / "ver.txt").read_text(encoding="utf-8") == "$Format:%H$\n"
 
 
 def test_review_prompt_includes_new_untracked_file(workspace: Workspace) -> None:

@@ -62,15 +62,18 @@ call_publisher   re-verifies the artifact hash and the used approval's
                  re-checks, for the same crash-and-resume-gap reason.
                  fakes.publisher.publish(key=request_id, target, hash)
                  on PublisherCrashed: request status -> unknown, stop
-                 reconcile: the publisher's own receipt decides --
-                 a validated "done" receipt means success (-> done); a
-                 "failed" receipt is a known, final outcome
-                 (StepFailed("deploy_failed"), never redispatched, never
-                 silently turned into success on a later retry_unknown);
-                 any other receipt (no receipt yet, "started", an
-                 unresolved "unknown", or a lookup error) stays
-                 unresolved (StepUnknown) rather than being redispatched
-                 or treated as done.
+                 reconcile: the publisher's own receipt decides -- the
+                 ONLY success is a receipt whose status is "done" AND
+                 whose own key/target/artifact_hash all match this
+                 request's (-> done); a "failed" status is a known,
+                 final outcome (StepFailed("deploy_failed"), never
+                 redispatched, never silently turned into success on a
+                 later retry_unknown); any other receipt (no receipt
+                 yet, "started", an unresolved "unknown", a "done"
+                 receipt whose fields don't match, missing/unknown
+                 status, or a lookup error) stays unresolved
+                 (StepUnknown) rather than being redispatched or
+                 treated as done.
 record_publish   evidence.record(kind='publish', ...) + publish.recorded
 report           report.write_report / report.exists
 """
@@ -348,30 +351,37 @@ def _run_call_publisher(ctx: StepContext) -> dict[str, object]:
 
 def _reconcile_call_publisher(ctx: StepContext) -> bool:
     """Explicit receipt semantics (never "any receipt at all means
-    success"): a validated "done" receipt is the only success; a
-    "failed" receipt is a known, final outcome -- StepFailed, never
-    silently turned into "done" by a later retry_unknown; anything
+    success", and never "status == done means success" alone either):
+    the ONLY success is a receipt whose status is "done" AND whose own
+    recorded identity (key, target, artifact_hash) matches this
+    request's -- a done receipt that happens to sit at the right
+    lookup key but names a different target/sha (data corruption, a
+    receipt file reused across keys, ...) must not be trusted. A
+    "failed" status is a known, final outcome -- StepFailed, never
+    silently turned into "done" by a later retry_unknown. Everything
     else (no receipt yet, "started", an unresolved "unknown", a
-    receipt with no recognizable status field at all, or a lookup
-    error) stays unresolved rather than being redispatched by run()
-    or quietly accepted as done."""
+    receipt missing/mismatching its own status or identity fields, or
+    a lookup error) stays unresolved rather than being redispatched by
+    run() or quietly accepted as done."""
     try:
         receipt = ctx.fakes.publisher.lookup(ctx.request.request_id)
     except RuntimeError as exc:
         raise StepUnknown("publish_status_unavailable") from exc
     if receipt is None:
         return False
-    status = receipt.get("status")
-    if status is None:
-        # No status field at all: a publisher with no concept of
-        # partial/failed receipts (e.g. FakePublisher) that still
-        # recorded this call -- the only outcome such a publisher can
-        # report for a call it already made is success.
-        return True
-    if status == "done":
-        return True
-    if status == "failed":
+    if receipt.get("status") == "failed":
         raise StepFailed("deploy_failed")
+    target = str(ctx.request.payload.get("target", ""))
+    artifact_hash = str(ctx.request.payload.get("artifact_hash", ""))
+    # "key" is ShellPublisher's receipt field name; FakePublisher's
+    # lookup() (test-only, never a real deploy) calls the same thing
+    # "id" instead -- accept either without requiring every Publisher
+    # implementation to agree on one field name.
+    receipt_key = receipt.get("key", receipt.get("id"))
+    if (receipt.get("status") == "done" and receipt_key == ctx.request.request_id
+            and receipt.get("target") == target
+            and receipt.get("artifact_hash") == artifact_hash):
+        return True
     raise StepUnknown("publish_response_lost")
 
 

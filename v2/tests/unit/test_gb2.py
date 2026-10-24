@@ -225,6 +225,7 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
     monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
     (workspace / "home").mkdir()
@@ -360,6 +361,7 @@ def test_sync_rebases_worktree_onto_current_master(
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
     monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = _make_source_repo(tmp_path / "source" / "demo")
     repo_dir = _worktree_repo(source_repo, apps_dir / "demo" / "repo")
 
@@ -384,6 +386,7 @@ def test_sync_refuses_when_worktree_is_dirty(
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
     monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = _make_source_repo(tmp_path / "source" / "demo")
     repo_dir = _worktree_repo(source_repo, apps_dir / "demo" / "repo")
     (repo_dir / "dirty.py").write_text("d\n", encoding="utf-8")
@@ -480,6 +483,7 @@ def test_cmd_run_drives_continue_job_exactly_once_with_the_full_stage_list(
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
     monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
     (workspace / "home").mkdir()
@@ -537,3 +541,136 @@ def test_cmd_init_hides_the_source_repo_from_every_sandbox(
     import json as _json
     written = _json.loads((tmp_path / "ws" / "apps" / "demo" / "config.json").read_text(encoding="utf-8"))
     assert written["projects"]["demo"]["hidden_paths"] == [str(source_repo.resolve())]
+
+
+# ---------------------------------------------------------------------------
+# The generated negative control's expected_signature
+# must match what engine.steps.bench_run._case_signature actually
+# returns for a real Vitest assertion failure ("assertion"), never the
+# stale "exit:1" -- otherwise bench always fails with
+# wrong_failure_signature and blocks every normal job.
+# ---------------------------------------------------------------------------
+
+_VITEST_ASSERTION_FAILURE_OUTPUT = """\
+ FAIL  tests/gb2-negative-control.test.ts > gb2 negative control > fails on purpose when GB2_NEGATIVE is set
+AssertionError: expected 1 to be 2 // Object.is equality
+
+- Expected
++ Received
+
+- 2
++ 1
+
+ ❯ tests/gb2-negative-control.test.ts:7:16
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+"""
+
+
+def test_negative_control_case_signature_matches_a_real_vitest_assertion_failure(
+    gb2: ModuleType,
+) -> None:
+    from engine.steps.bench_run import _case_signature
+
+    case = gb2.NEGATIVE_CONTROL_CASES[0]
+    signature = _case_signature(
+        {"text": _VITEST_ASSERTION_FAILURE_OUTPUT, "returncode": 1})
+
+    assert signature == "assertion"
+    assert signature == case["expected_signature"]
+
+
+def test_bench_cases_need_upgrade_detects_the_stale_exit1_signature(
+    gb2: ModuleType, tmp_path: Path,
+) -> None:
+    stale = tmp_path / "bench_cases.json"
+    stale.write_text(json.dumps([
+        {"name": "gb2_negative_control", "selector": "x", "expect_fail": True,
+         "expected_signature": "exit:1", "env": {}},
+    ]), encoding="utf-8")
+    assert gb2._bench_cases_need_upgrade(stale) is True
+
+    current = tmp_path / "current.json"
+    current.write_text(json.dumps(gb2.NEGATIVE_CONTROL_CASES), encoding="utf-8")
+    assert gb2._bench_cases_need_upgrade(current) is False
+
+
+def test_cmd_init_rewrites_stale_bench_cases_signature(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    source_repo = tmp_path / "source" / "demo"
+    source_repo.mkdir(parents=True)
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+    _make_source_repo_inplace = source_repo
+    _rgit(_make_source_repo_inplace, "init", "-q", "-b", "master")
+    (source_repo / "x.txt").write_text("x\n", encoding="utf-8")
+    _rgit(source_repo, "add", "-A")
+    _rgit(source_repo, "commit", "-q", "-m", "init")
+
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    bench_cases_path = workspace / "bench_cases.json"
+    bench_cases_path.write_text(json.dumps([
+        {"name": "gb2_negative_control", "selector": "tests/gb2-negative-control.test.ts",
+         "expect_fail": True, "expected_signature": "exit:1", "env": {"GB2_NEGATIVE": "1"}},
+    ]), encoding="utf-8")
+
+    args = gb2._build_parser().parse_args(["init", "demo"])
+    code = gb2.cmd_init(args)
+
+    assert code == 0
+    rewritten = json.loads(bench_cases_path.read_text(encoding="utf-8"))
+    assert rewritten[0]["expected_signature"] == "assertion"
+
+
+def test_cmd_init_refuses_unrelated_existing_repo_before_writing_config(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """identity must be verified BEFORE
+    any write -- an existing repo/ that is not actually this source's
+    worktree must refuse without ever creating config.json."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    source_repo = tmp_path / "source" / "demo"
+    source_repo.mkdir(parents=True)
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+    _rgit(source_repo, "init", "-q", "-b", "master")
+    (source_repo / "x.txt").write_text("x\n", encoding="utf-8")
+    _rgit(source_repo, "add", "-A")
+    _rgit(source_repo, "commit", "-q", "-m", "init")
+
+    unrelated_repo_dir = apps_dir / "demo" / "repo"
+    unrelated_repo_dir.mkdir(parents=True)
+    (unrelated_repo_dir / "stray.txt").write_text("not a worktree\n", encoding="utf-8")
+
+    code = gb2.main(["init", "demo"])
+
+    assert code == 1
+    assert not (apps_dir / "demo" / "config.json").exists()
+
+
+def test_cmd_run_refuses_when_repo_dir_identity_no_longer_matches(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run/ship/sync/diff must re-verify
+    repo_dir's identity before doing anything, not just trust it was
+    valid once at init time."""
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    repo_dir = job["repo_dir"]
+    # Simulate the worktree having been replaced since init: detach it
+    # from the source by removing it as a registered worktree (the
+    # directory itself still exists on disk).
+    _rgit(job["source_repo"], "worktree", "remove", "--force", str(repo_dir))
+    repo_dir.mkdir()
+    (repo_dir / "stray.txt").write_text("not a worktree anymore\n", encoding="utf-8")
+
+    code = gb2.main(["run", "demo", "do something"])
+
+    assert code == 1

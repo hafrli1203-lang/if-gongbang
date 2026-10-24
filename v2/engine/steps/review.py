@@ -131,21 +131,61 @@ def _review_snapshot_dir(ctx: StepContext) -> Path:
 
 
 def _export_review_snapshot(ctx: StepContext, repo: Path, fp: str) -> Path:
-    """Extracts the tree object `fp` -- the EXACT tree
-    evidence.fingerprint/range_tree already wrote into `repo`'s own
-    git object database, never a fresh read of the live working tree
-    -- into a fresh directory. `git archive` accepts any tree-ish, so
-    this reads directly from the object store (already-fixed content,
-    immune to anything written to the working tree after fp was
-    computed) rather than the files on disk again."""
+    """Extracts the tree object `fp` -- the EXACT tree evidence.
+    fingerprint/range_tree already wrote into `repo`'s own git object
+    database, never a fresh read of the live working tree -- into a
+    fresh directory, entry by entry via `git ls-tree` + `git cat-file
+    blob` (both through engine.gitutil, never a raw git invocation),
+    rather than `git archive`. `git archive` applies `export-ignore`/
+    `export-subst` .gitattributes: an `export-ignore`'d path can be
+    OMITTED from the archive entirely even though the fingerprinted
+    tree itself contains it (so a reviewer would never see a file the
+    recorded evidence says was part of what it reviewed), and an
+    `export-subst`'d path has its content REWRITTEN (a `$Format:...$`
+    placeholder expanded) rather than exported byte-for-byte. Neither
+    behavior is appropriate for a snapshot that must match the
+    fingerprinted tree exactly: `ls-tree -r` lists every blob (and
+    gitlink) entry regardless of attributes, and `cat-file blob`
+    returns that exact entry's bytes, unfiltered. A gitlink entry
+    (mode 160000, a submodule reference) is skipped outright -- there
+    is no blob to read for it, and this engine does not manage
+    submodules."""
     dest = _review_snapshot_dir(ctx)
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    archive = subprocess.run(
-        git_argv(repo, "archive", fp), check=True, capture_output=True,
+    listing = subprocess.run(
+        git_argv(repo, "ls-tree", "-r", "-z", fp),
+        check=True, capture_output=True,
     ).stdout
-    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
+    for raw_entry in listing.split(b"\0"):
+        if not raw_entry:
+            continue
+        meta, _, rel_bytes = raw_entry.partition(b"\t")
+        mode_bytes, obj_type_bytes, oid_bytes = meta.split(b" ")
+        mode = mode_bytes.decode("ascii")
+        obj_type = obj_type_bytes.decode("ascii")
+        if obj_type != "blob":
+            continue  # gitlink (submodule, type "commit"); never a blob to read
+        oid = oid_bytes.decode("ascii")
+        rel = rel_bytes.decode("utf-8", "surrogateescape")
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            # git itself never writes a tree entry shaped like this;
+            # fail closed rather than trust it regardless.
+            raise StepFailed("review_snapshot_path_unsafe")
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        blob = subprocess.run(
+            git_argv(repo, "cat-file", "blob", oid),
+            check=True, capture_output=True,
+        ).stdout
+        if mode == "120000":
+            target.symlink_to(blob.decode("utf-8", "surrogateescape"))
+        else:
+            target.write_bytes(blob)
+            if mode == "100755":
+                target.chmod(0o755)
     return dest
 
 

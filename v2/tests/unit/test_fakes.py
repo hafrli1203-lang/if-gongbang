@@ -26,7 +26,8 @@ def test_publisher_fail_after_effect_records_then_raises() -> None:
     assert len(pub.calls) == 1
     assert pub.calls[0].key == "R-2"
     # the side effect happened even though the caller never got a response
-    assert pub.lookup("R-2") == {"id": "R-2", "target": "store", "artifact_hash": "hash2"}
+    assert pub.lookup("R-2") == {"id": "R-2", "key": "R-2", "target": "store",
+                                 "artifact_hash": "hash2", "status": "done"}
 
 
 def test_publisher_lookup_fails_raises() -> None:

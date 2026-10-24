@@ -407,6 +407,41 @@ def test_related_scope_falls_back_to_full_when_related_cmd_ran_zero_tests(
     assert bench_evidence[0].payload["argv"] == list(ws.config.projects["alpha"].test_cmd)
 
 
+def test_related_scope_falls_back_to_full_when_every_selected_test_was_skipped(
+    workspace: Workspace,
+) -> None:
+    """A related_cmd whose selector DID match files, but vitest then
+    skipped every one of them (no passed/failed outcome at all, just
+    "Tests  1 skipped (1)") must fall back the same way a zero-match
+    selector does -- a selector matching something is not the same as
+    anything having actually been exercised."""
+    ws = _bench_workspace(workspace, variant=1)
+    changed_file = ws.alpha / "src" / "greeter" / "__init__.py"
+    changed_file.write_text(changed_file.read_text(encoding="utf-8") + "\n# touched\n",
+                            encoding="utf-8")
+    probe = (
+        sys.executable, "-c",
+        "import sys; print(' Test Files  1 skipped (1)\\n'"
+        " '      Tests  1 skipped (1)'); sys.exit(0)",
+        "{files}",
+    )
+    project_config = replace(
+        ws.config.projects["alpha"], bench_scope="related", related_cmd=probe,
+    )
+    ws = Workspace(
+        ws.root, replace(ws.config, projects={**ws.config.projects, "alpha": project_config}),
+        ws.ledger, ws.alpha, ws.beta,
+    )
+
+    attempt_id, rid = _submit_bench(ws)
+    proc = _processor(ws)
+    n = proc.run_once("alpha")
+    assert n == 1  # the full test_cmd (sample app's own, passing) ran
+    bench_evidence = ws.ledger.evidence(attempt_id, "bench")
+    assert bench_evidence[0].payload["scope"] == "full(fallback)"
+    assert bench_evidence[0].payload["argv"] == list(ws.config.projects["alpha"].test_cmd)
+
+
 def test_bench_scope_full_ignores_related_cmd(workspace: Workspace) -> None:
     """bench_scope="full" always runs test_cmd, even with related_cmd
     configured and a changed file present."""
@@ -465,3 +500,21 @@ def test_case_signature_classifies_vitest_output() -> None:
         "      Tests  1 failed (1)\n"
     )
     assert _case_signature({"text": other_error, "returncode": 1}) == "exit:1"
+
+
+def test_ran_zero_tests_detects_no_files_and_all_skipped() -> None:
+    from engine.steps.bench_run import _ran_zero_tests
+    assert _ran_zero_tests("related", "No test files found, exiting with code 1\n")
+    assert _ran_zero_tests("related", " Test Files  0 \n      Tests  0 \n")
+    assert _ran_zero_tests(
+        "related", " Test Files  1 skipped (1)\n      Tests  1 skipped (1)\n")
+    # A mixed line (some real pass/fail outcome alongside skips) must
+    # NOT be treated as zero coverage.
+    assert not _ran_zero_tests(
+        "related",
+        " Test Files  1 passed (1)\n      Tests  3 passed | 2 skipped (5)\n",
+    )
+    assert not _ran_zero_tests(
+        "related", " Test Files  1 failed (1)\n      Tests  1 failed (1)\n")
+    # Never applies to a "full" run.
+    assert not _ran_zero_tests("full", "No test files found, exiting with code 1\n")
