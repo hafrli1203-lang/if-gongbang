@@ -389,3 +389,47 @@ def test_no_worker_config_fails(workspace: Workspace) -> None:
     req = ws.ledger.request(rid)
     assert req.status == "failed"
     assert req.result == {"reason": "no_worker_config"}
+
+
+def test_full_spec_appends_builder_test_hint_to_task_text(workspace: Workspace) -> None:
+    """engine.config.ProjectConfig.builder_test_hint, when set, is
+    appended verbatim to the task text _full_spec builds -- a plain
+    config-authored guidance line, not something build_prompt's own
+    fixed test_cmd line (engine.workers.prompts, untouched here) does."""
+    ws = _station_workspace(workspace)
+    hint = "Run related tests while editing; run the full suite once at the end."
+    project_config = replace(ws.config.projects["alpha"], builder_test_hint=hint)
+    config = replace(ws.config, projects={**ws.config.projects, "alpha": project_config})
+    attempt_id, rid = _submit_station(
+        Workspace(ws.root, config, ws.ledger, ws.alpha, ws.beta), task="fix the bug",
+    )
+    request = ws.ledger.request(rid)
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(ws.root / "script.json")})
+    ctx = station.StepContext(config=config, ledger=ws.ledger, fakes=fakes,
+                              request=request, project="alpha", attempt_id=attempt_id)
+
+    spec, _worker, _runner = station._full_spec(ctx)
+
+    assert "fix the bug" in spec.task
+    assert hint in spec.task
+
+
+def test_full_spec_task_unchanged_when_no_builder_test_hint_configured(
+    workspace: Workspace,
+) -> None:
+    ws = _station_workspace(workspace)
+    assert ws.config.projects["alpha"].builder_test_hint is None
+    attempt_id, rid = _submit_station(ws, task="fix the bug")
+    request = ws.ledger.request(rid)
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(ws.root / "script.json")})
+    ctx = station.StepContext(config=ws.config, ledger=ws.ledger, fakes=fakes,
+                              request=request, project="alpha", attempt_id=attempt_id)
+
+    spec, _worker, _runner = station._full_spec(ctx)
+
+    assert "fix the bug" in spec.task
+    # No stray blank-line-plus-hint appended beyond what build_prompt's
+    # own test_cmd line already adds.
+    assert spec.task.count("\n\n") <= 1

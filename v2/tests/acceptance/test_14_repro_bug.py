@@ -43,7 +43,7 @@ _FIX_BUILDER_SCRIPT = [
     {"tool": "Write", "file_path": "src/greeter/__init__.py", "content": _FIXED_INIT_PY},
     {"final": {"status": "done", "summary": "fixed off-by-one initials bug", "requests": []}},
 ]
-_REVIEWER_SCRIPT = [{"final": {"passed": True, "findings": []}}]
+_REVIEWER_SCRIPT = [{"final": {"passed": True, "coverage": "full", "findings": []}}]
 
 
 def test_repro_bug_end_to_end_scripted(workspace: Workspace, tmp_path) -> None:

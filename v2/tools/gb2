@@ -5,6 +5,14 @@
     tools/gb2 init <app>                 create the engine workspace
     tools/gb2 run <app> "<task>"         run one job end to end
     tools/gb2 run <app> --task-file f    same, task text from a file
+    tools/gb2 fix <app> ["extra"]        continue the current job's
+                                          attempt after it failed at
+                                          review or bench, instead of
+                                          starting a fresh run (see
+                                          engine.fixup.fix); "extra" is
+                                          optional additional owner
+                                          instructions appended to the
+                                          composed continue-task
     tools/gb2 status <app>               engine.cli status, as JSON
     tools/gb2 log <app>                  last 5 jobs from this app's
                                           own run log (not the ledger --
@@ -21,6 +29,12 @@
     tools/gb2 sync <app>                 rebase gb2/work onto the
                                           current master (refuses if the
                                           worktree is dirty)
+    tools/gb2 resolve <app>              for a publish request stuck
+                                          "unknown": show its receipt,
+                                          run the deploy's check
+                                          command, ask the owner
+                                          "deployed"/"not deployed" on
+                                          a TTY, then report -> close
 
 Everything here calls existing engine.* functions (engine.steps.open_job
 .open_job, engine.processor.submit, engine.orbit.continue_job,
@@ -73,11 +87,13 @@ from pathlib import Path
 _ENGINE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ENGINE_ROOT))
 
-from engine import evidence, orbit, release  # noqa: E402
-from engine.cli import _build_fakes, _job_name_for_attempt, _outcome_dict  # noqa: E402
+from engine import evidence, fixup, orbit, release  # noqa: E402
+from engine.cli import _build_fakes, _drain, _job_name_for_attempt, _outcome_dict  # noqa: E402
 from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
 from engine.config import EngineConfig  # noqa: E402
 from engine.ledger import Ledger  # noqa: E402
+from engine.processor import retry_unknown  # noqa: E402
+from engine.publishers import ShellPublisher  # noqa: E402
 from engine.steps.open_job import open_job  # noqa: E402
 
 
@@ -448,6 +464,10 @@ def _summarize(config: EngineConfig, ledger: Ledger, app: str, attempt_id: str,
             cost = event.payload.get("cost_usd")
             if isinstance(cost, (int, float)):
                 cost_usd += float(cost)
+    metrics: dict[str, object] = {}
+    for _seq, event in ledger.events(app, "job.metrics"):
+        if event.attempt_id == attempt_id:
+            metrics = event.payload  # last one wins (report never repeats mid-job)
     return {
         "app": app, "attempt_id": attempt_id, "status": outcome.status,
         "reason": outcome.reason, "commit": commit_hash,
@@ -456,6 +476,8 @@ def _summarize(config: EngineConfig, ledger: Ledger, app: str, attempt_id: str,
         "findings_by_severity": _findings_by_severity(findings),
         "bench_scope": (bench_row.payload.get("scope") if bench_row else None),
         "bench_passed": (bench_row.payload.get("passed") if bench_row else None),
+        "durations_ms": metrics.get("durations_ms", {}),
+        "test_runs": metrics.get("test_runs", {}),
     }
 
 
@@ -479,8 +501,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
+        # Only "builder" gets a worker copy -- the reviewer runs
+        # against its own fresh snapshot (engine.steps.review),
+        # never a pre-made copy_root.
         attempt_id = open_job(config, ledger, args.app, job_name, "full",
-                              ("builder", "reviewer"))
+                              ("builder",))
         fakes = _build_fakes(config, args.app, attempt_id, None)
         stages = orbit.default_stages(config, attempt_id, "builder", "reviewer",
                                       task, job_name)
@@ -502,6 +527,58 @@ def cmd_run(args: argparse.Namespace) -> int:
         ledger.close()
 
     _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    if summary["status"] == "done":
+        return 0
+    if summary["status"] == "needs_owner":
+        return 2
+    return 3
+
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    """Continue the app's current job attempt after it failed at review
+    or bench (engine.fixup.fix): closes that attempt (archiving, never
+    discarding, its own merged-but-uncommitted work), opens a new
+    attempt on the same job, restores the archived work into the new
+    attempt's builder copy, and resubmits a run_station task composed
+    from the original request plus any review findings / failing test
+    output / `args.extra` the owner adds -- then runs the job's normal
+    stage list through to done/needs_owner/failed, same as `run`.
+    Refuses (exit 1, nothing changed) if the app's current attempt
+    never reached a failed review/bench request with merge already
+    done -- engine.fixup.FixupError's message says which."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
+             file=sys.stderr)
+        return 1
+    _verify_app_repo_identity(args.app)
+    config = EngineConfig.from_json(config_path)
+    extra = args.extra or ""
+
+    def fakes_for(attempt_id: str):
+        return _build_fakes(config, args.app, attempt_id, None)
+
+    def _progress(kind: str) -> None:
+        print(f"[{kind}] done", file=sys.stderr)
+
+    ledger = Ledger.open(config.ledger_path)
+    start = time.monotonic()
+    try:
+        try:
+            result = fixup.fix(config, ledger, args.app, extra, fakes_for,
+                               on_progress=_progress)
+        except fixup.FixupError as exc:
+            return _err_json(str(exc), 1)
+        wall_sec = time.monotonic() - start
+        summary = _summarize(config, ledger, args.app, result.new_attempt_id,
+                             result.outcome, wall_sec)
+        summary["old_attempt_id"] = result.old_attempt_id
+        summary["task"] = result.task
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": result.job_name, **summary})
     print(json.dumps(summary, ensure_ascii=False))
     if summary["status"] == "done":
         return 0
@@ -546,6 +623,19 @@ def _find_pending_publish(ledger: Ledger, project: str) -> tuple[str, str, str, 
     (JobOutcome status "needs_owner", reason "release_approval" --
     engine.orbit._run_stages), or None if there is none right now."""
     for row in ledger.queued_requests(project):
+        if row.kind == "publish":
+            return (row.request_id, row.attempt_id,
+                    str(row.payload.get("artifact_hash", "")),
+                    str(row.payload.get("target", "")))
+    return None
+
+
+def _find_unknown_publish(ledger: Ledger, project: str) -> tuple[str, str, str, str] | None:
+    """Same shape as _find_pending_publish, for a 'publish' request
+    that is stuck "unknown" (its deploy's outcome could not be
+    determined -- engine.publishers.ShellPublisher) instead of
+    "queued"."""
+    for row in ledger.unknown_requests(project):
         if row.kind == "publish":
             return (row.request_id, row.attempt_id,
                     str(row.payload.get("artifact_hash", "")),
@@ -650,6 +740,111 @@ def cmd_skip_ship(args: argparse.Namespace) -> int:
     return 0 if outcome.status == "done" else 3
 
 
+def _check_argv(config: EngineConfig, target: str) -> list[str]:
+    return [part.format(target=target) for part in config.publisher_dry_run_argv]
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    """For a publish request stuck "unknown" (engine.publishers.
+    ShellPublisher could not determine whether the deploy actually
+    happened): show the receipt, refuse outright if the receipt's own
+    recorded process group is still alive (never ask the owner to
+    guess while it might still be running), run the publisher's own
+    check command (dry_run_argv, e.g. "deploy.sh <app> --check"), and
+    require the owner -- on a TTY only -- to say "deployed" or "not
+    deployed". "deployed" is accepted only if the check command itself
+    exited 0; "not deployed" is always accepted. Either answer
+    REWRITES THE RECEIPT only (to "done" or "failed") and lets
+    retry_unknown/the ordinary reconcile path take it from there --
+    this never re-runs the real deploy command itself. Once the
+    request leaves "unknown", the job continues with report -> close
+    (orbit.release_followup_stages), same as ship/skip-ship."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
+    config = EngineConfig.from_json(config_path)
+    if config.publisher_kind != "shell":
+        return _err_json("resolve only applies to a project with publisher.kind=shell", 1)
+    if not sys.stdin.isatty():
+        return _err_json("refused: non-interactive shell, resolve requires a TTY", 4)
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        pending = _find_unknown_publish(ledger, args.app)
+        if pending is None:
+            return _err_json("no_unknown_publish_request", 1)
+        request_id, attempt_id, _artifact_hash, target = pending
+
+        publisher = ShellPublisher(
+            argv_template=config.publisher_argv,
+            dry_run_argv_template=config.publisher_dry_run_argv,
+            receipts_dir=config.home / "publish",
+            timeout_sec=config.publisher_timeout_sec, dry_run=config.publisher_dry_run,
+        )
+        receipt = publisher.lookup(request_id)
+        if receipt is None:
+            return _err_json("no_receipt_for_request", 1)
+
+        pgid = receipt.get("pgid")
+        if isinstance(pgid, int):
+            try:
+                os.killpg(pgid, 0)
+                return _err_json(
+                    f"refused: process group {pgid} is still alive -- wait for it "
+                    "to finish, then run `gb2 resolve` again", 1,
+                )
+            except ProcessLookupError:
+                pass  # confirmed gone -- safe to ask the owner
+            except OSError:
+                return _err_json(
+                    f"refused: could not confirm process group {pgid} is gone", 1,
+                )
+
+        check_argv = _check_argv(config, target)
+        check_result = subprocess.run(check_argv, capture_output=True, text=True)
+        check_tail = ((check_result.stdout or "") + (check_result.stderr or ""))[-4000:]
+        print(json.dumps({
+            "request_id": request_id, "receipt": receipt, "check_argv": check_argv,
+            "check_returncode": check_result.returncode, "check_tail": check_tail,
+        }, ensure_ascii=False, indent=1, sort_keys=True), file=sys.stderr)
+
+        answer = input('Did it actually deploy? Type "deployed" or "not deployed": ').strip()
+        if answer == "deployed":
+            if check_result.returncode != 0:
+                return _err_json(
+                    "refused: check command did not exit 0 -- cannot confirm deployed", 1,
+                )
+            new_status = "done"
+            new_returncode: object = 0
+        elif answer == "not deployed":
+            new_status = "failed"
+            new_returncode = receipt.get("returncode")
+        else:
+            return _err_json(f"refused: unrecognized answer {answer!r}, nothing changed", 1)
+
+        publisher._write_receipt(request_id, {
+            **receipt, "status": new_status, "ended_ts": time.time(),
+            "returncode": new_returncode, "tail": check_tail,
+        })
+
+        retry_unknown(ledger, request_id, "owner")
+        resolved_status = _drain(config, ledger, args.app, attempt_id, request_id)
+
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+        fakes = _build_fakes(config, args.app, attempt_id, None)
+        followup = orbit.release_followup_stages(job_name)
+        final_outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
+    finally:
+        ledger.close()
+
+    print(json.dumps({
+        "resolved_request_id": request_id, "resolved_status": resolved_status,
+        **_outcome_dict(final_outcome),
+    }, ensure_ascii=False))
+    return 0 if final_outcome.status == "done" else 3
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     """Rebase the app worktree's gb2/work branch onto the current
     master -- refuses (no rebase attempted) if the worktree has any
@@ -668,9 +863,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
-    "init": cmd_init, "run": cmd_run, "status": cmd_status,
+    "init": cmd_init, "run": cmd_run, "fix": cmd_fix, "status": cmd_status,
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
-    "skip-ship": cmd_skip_ship, "sync": cmd_sync,
+    "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
 }
 
 
@@ -691,6 +886,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--task-file", default=None)
     p_run.add_argument("--job-name", default=None)
 
+    p_fix = sub.add_parser("fix")
+    p_fix.add_argument("app")
+    p_fix.add_argument("extra", nargs="?", default=None)
+
     p_status = sub.add_parser("status")
     p_status.add_argument("app")
 
@@ -708,6 +907,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_sync = sub.add_parser("sync")
     p_sync.add_argument("app")
+
+    p_resolve = sub.add_parser("resolve")
+    p_resolve.add_argument("app")
 
     return parser
 

@@ -42,8 +42,10 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -142,9 +144,35 @@ class ShellPublisher:
         return self.receipts_dir / f"{key}.json"
 
     def _write_receipt(self, key: str, data: dict[str, object]) -> None:
+        """Atomic write: a temp file in the SAME directory as the real
+        receipt (so os.replace is a same-filesystem rename, not a
+        cross-device copy), fsynced before the rename -- a reader
+        (lookup(), or an operator's `gb2 resolve`) must never observe a
+        partially-written file, only the previous complete receipt or
+        the new complete one, even if this process is killed mid-write."""
         path = self._receipt_path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, ensure_ascii=False))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def _run_identity(self, pid: int | None = None) -> dict[str, object]:
+        """pid/pgid/host of the process actually running (or that ran)
+        the deploy command -- recorded in every receipt so a stuck
+        "unknown"/"started" request can be diagnosed (and, for `gb2
+        resolve`, checked for a still-alive process group) without
+        guessing which host or process the receipt refers to. pgid ==
+        pid here because publish() always spawns with
+        start_new_session=True, which makes the new process its own
+        session/group leader."""
+        return {"host": socket.gethostname(), "pid": pid, "pgid": pid}
 
     def _env(self) -> dict[str, str]:
         return {name: os.environ[name] for name in self.env_passthrough if name in os.environ}
@@ -174,7 +202,7 @@ class ShellPublisher:
             "key": key, "target": target, "artifact_hash": artifact_hash,
             "dry_run": self.dry_run, "status": "started",
             "started_ts": started_ts, "ended_ts": None,
-            "returncode": None, "tail": "",
+            "returncode": None, "tail": "", **self._run_identity(),
         })
         try:
             process = subprocess.Popen(
@@ -188,8 +216,21 @@ class ShellPublisher:
                 "dry_run": self.dry_run, "status": "failed",
                 "started_ts": started_ts, "ended_ts": time.time(),
                 "returncode": None, "tail": f"publish_spawn_failed:{exc}",
+                **self._run_identity(),
             })
             raise PublisherCrashed(key) from exc
+
+        # Rewrite (still "started") now that the real pid/pgid is known --
+        # purely informational for a human/gb2-resolve reading a stuck
+        # receipt later; publish()'s own idempotency guard above already
+        # refuses to redispatch once ANY receipt exists, with or without
+        # a pid recorded in it.
+        self._write_receipt(key, {
+            "key": key, "target": target, "artifact_hash": artifact_hash,
+            "dry_run": self.dry_run, "status": "started",
+            "started_ts": started_ts, "ended_ts": None,
+            "returncode": None, "tail": "", **self._run_identity(process.pid),
+        })
 
         try:
             stdout, stderr = process.communicate(timeout=self.timeout_sec)
@@ -212,7 +253,7 @@ class ShellPublisher:
                 "key": key, "target": target, "artifact_hash": artifact_hash,
                 "dry_run": self.dry_run, "status": status,
                 "started_ts": started_ts, "ended_ts": time.time(),
-                "returncode": None, "tail": tail,
+                "returncode": None, "tail": tail, **self._run_identity(process.pid),
             })
             raise PublisherCrashed(key)
 
@@ -220,7 +261,7 @@ class ShellPublisher:
             "key": key, "target": target, "artifact_hash": artifact_hash,
             "dry_run": self.dry_run, "status": ("done" if returncode == 0 else "failed"),
             "started_ts": started_ts, "ended_ts": time.time(),
-            "returncode": returncode, "tail": tail,
+            "returncode": returncode, "tail": tail, **self._run_identity(process.pid),
         })
         if returncode != 0:
             raise PublisherCrashed(key)

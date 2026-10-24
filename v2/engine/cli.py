@@ -151,9 +151,10 @@ def cmd_run(config: EngineConfig, args: argparse.Namespace) -> int:
         fakes = _build_fakes(config, args.project, args.attempt_id, args.script,
                              script_read_only=args.after_install)
         if args.after_install:
+            from engine.fixup import original_task
             stages = orbit.stages_after_install(
                 config, args.attempt_id, args.builder_role, args.reviewer_role,
-                job_name,
+                job_name, original_task(ledger, args.project, args.attempt_id),
             )
         else:
             if not args.task:

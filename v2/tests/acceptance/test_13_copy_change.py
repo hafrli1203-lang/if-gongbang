@@ -41,7 +41,7 @@ _BUILDER_SCRIPT = [
      "content": _TEST_GREETER_V1.replace('"Hello, World"', '"Welcome, World!"')},
     {"final": {"status": "done", "summary": "updated greeting wording", "requests": []}},
 ]
-_REVIEWER_SCRIPT = [{"final": {"passed": True, "findings": []}}]
+_REVIEWER_SCRIPT = [{"final": {"passed": True, "coverage": "full", "findings": []}}]
 
 
 def test_copy_change_end_to_end_scripted(workspace: Workspace, tmp_path) -> None:

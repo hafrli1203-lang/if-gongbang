@@ -33,6 +33,7 @@
         "--run",
         "{files}"
       ],
+      "builder_test_hint": "While editing, run only the tests related to the files you're changing (e.g. `npx vitest related --run <changed files>`), to get fast feedback. Run the full suite (`npx vitest run`) at most once, right before you finish.",
       "test_timeout_sec": 600,
       "manifest": "package.json",
       "install_cmd": [

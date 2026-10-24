@@ -29,13 +29,14 @@ review+bench rather than trusting evidence that may now be invalidated.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from engine import evidence
+from engine import evidence, gitutil
 from engine import release as release_mod
 from engine.config import EngineConfig
-from engine.ledger import Ledger, RequestRow
+from engine.ledger import Event, Ledger, RequestRow
 from engine.processor import Fakes, Processor, submit
 from engine.steps.open_job import copy_root
 from engine.steps.open_job import open_job as _open_job
@@ -75,14 +76,15 @@ def _stage_payload(config: EngineConfig, project: str, stage: Stage) -> dict[str
 def default_stages(config: EngineConfig, attempt_id: str, builder_role: str,
                     reviewer_role: str, task: str, job_name: str) -> list[Stage]:
     """run_station(build, builder, task) -> merge(builder's copy) ->
-    review(reviewer) -> bench -> commit -> report -> close."""
+    review(reviewer, task) -> bench -> commit -> report -> close."""
     build_copy = str(copy_root(config, attempt_id, builder_role))
     return [
         Stage("run_station", {"station": "build", "role": builder_role, "task": task}),
         Stage("merge", {"copies": [
             {"role": builder_role, "station": "build", "path": build_copy},
         ]}),
-        *stages_after_install(config, attempt_id, builder_role, reviewer_role, job_name),
+        *stages_after_install(config, attempt_id, builder_role, reviewer_role,
+                              job_name, task),
     ]
 
 
@@ -103,16 +105,40 @@ def release_followup_stages(job_name: str) -> list[Stage]:
     ]
 
 
+def fix_stages(config: EngineConfig, attempt_id: str, builder_role: str,
+              reviewer_role: str, task: str, job_name: str) -> list[Stage]:
+    """Same seven-stage sequence as default_stages() (run_station ->
+    merge -> review -> bench -> commit -> report -> close) for a
+    fix/resume attempt: an attempt that `engine.fixup.fix()` already
+    opened itself (NOT this function, and not run_job()/open_job()
+    directly) on a job whose previous attempt failed at review or
+    bench, after seeding this attempt's builder copy with that previous
+    attempt's own merged-but-uncommitted work (archived, never
+    discarded, by the close that preceded this new attempt) so
+    run_station's edits land on top of it instead of starting from a
+    clean slate. The stage shape is identical to default_stages() today
+    -- this is a separate function, not a thin default_stages() call
+    site, so that fact is documented where fixup.py calls it, and so a
+    future divergence (e.g. a fix-specific stage) has a seam to land in
+    without reaching into default_stages()'s own contract, which fresh
+    jobs still rely on unchanged."""
+    return default_stages(config, attempt_id, builder_role, reviewer_role, task, job_name)
+
+
 def stages_after_install(config: EngineConfig, attempt_id: str, builder_role: str,
-                         reviewer_role: str, job_name: str) -> list[Stage]:
-    """review -> bench -> commit -> report -> close. The stage list a job
-    resumes on after the owner submits an install a station asked for --
-    deliberately starting at "review" (not "bench"), since both review
-    and bench evidence are invalidated by an install (engine.steps.install
-    .invalidate_evidence) and must be redone, never resumed from a stale
-    pre-install verdict."""
+                         reviewer_role: str, job_name: str, task: str = "") -> list[Stage]:
+    """review(reviewer, task) -> bench -> commit -> report -> close. The
+    stage list a job resumes on after the owner submits an install a
+    station asked for -- deliberately starting at "review" (not
+    "bench"), since both review and bench evidence are invalidated by
+    an install (engine.steps.install.invalidate_evidence) and must be
+    redone, never resumed from a stale pre-install verdict. `task`
+    (the original request text, shown to the reviewer -- see
+    engine.steps.review) defaults to "" for a caller that resumes an
+    existing attempt without re-reading its own run_station request's
+    original task from the ledger first."""
     return [
-        Stage("review", {"role": reviewer_role}),
+        Stage("review", {"role": reviewer_role, "task": task}),
         Stage("bench", {}),
         Stage("commit", {"message": f"gongbang: {job_name}"}),
         Stage("report", {"summary": f"gongbang: {job_name}"}),
@@ -133,11 +159,15 @@ def run_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
            job_name: str, task: str, builder_role: str, reviewer_role: str,
            processor_factory: ProcessorFactory | None = None,
            on_progress: ProgressCallback | None = None) -> JobOutcome:
-    """Open a fresh job (roles = builder, reviewer) and run default_stages()
-    through to done/failed/needs_owner. `on_progress`, if given, is called
-    with each stage's kind right after it finishes (see _run_stages)."""
+    """Open a fresh job and run default_stages() through to done/failed/
+    needs_owner. `on_progress`, if given, is called with each stage's
+    kind right after it finishes (see _run_stages). Only the builder
+    role gets a worker copy from open_job -- the reviewer runs against
+    its own fresh snapshot (engine.steps.review's own export, spawned
+    straight from the repo), never a pre-made copy_root, so making one
+    for it here would just be an unused directory."""
     attempt_id = _open_job(config, ledger, project, job_name, "full",
-                           (builder_role, reviewer_role))
+                           (builder_role,))
     stages = default_stages(config, attempt_id, builder_role, reviewer_role,
                             task, job_name)
     return _run_stages(config, ledger, fakes, project, attempt_id, stages,
@@ -260,6 +290,20 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
     make_processor = processor_factory or _default_processor_factory
     proc = make_processor(config, ledger, fakes)
     completed: list[str] = []
+    # Wall-clock duration (ms) spent in each stage kind, accumulated
+    # across every time that kind actually ran this call (e.g. a
+    # resumed/retried stage after a crash adds to the same bucket) --
+    # recorded into a "job.metrics" ledger event once the "report"
+    # stage itself completes (see below). Seeded from any
+    # "job.metrics.partial" a PRIOR _run_stages call on this same
+    # attempt already persisted before stopping at needs_owner (a
+    # release approval wait) -- without this, gb2 ship/skip-ship's
+    # later continue_job(release_followup_stages(...)) call would
+    # start from an empty dict and the eventual job.metrics event
+    # would be missing every main-stage timing (run_station, merge,
+    # review, bench, commit) from before that stop.
+    durations_ms, git_calls_carried = _load_partial_metrics(ledger, project, attempt_id)
+    git_calls_at_start = gitutil.call_count()
     # Set by a run_station stage that asked the owner for something; acted
     # on once the very next stage (merge -- the station's own file changes
     # must land in the repo first) has also completed, not immediately --
@@ -269,17 +313,26 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
     while idx < len(stages):
         stage = stages[idx]
         if _should_run_parallel(config, stages, idx):
+            started = time.monotonic()
             outcome = _run_review_then_bench(
                 config, ledger, proc, project, attempt_id, stage, stages[idx + 1],
                 completed, on_progress,
+            )
+            durations_ms["review+bench(parallel)"] = (
+                durations_ms.get("review+bench(parallel)", 0.0)
+                + (time.monotonic() - started) * 1000
             )
             if outcome is not None:
                 return outcome
             idx += 2
             continue
+        started = time.monotonic()
         payload = _stage_payload(config, project, stage)
         rid = submit(ledger, project, attempt_id, stage.kind, payload, "owner")
         proc.run_once(project)
+        durations_ms[stage.kind] = (
+            durations_ms.get(stage.kind, 0.0) + (time.monotonic() - started) * 1000
+        )
         request = ledger.request(rid)
         error = _classify(request)
         if error is not None:
@@ -291,13 +344,22 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
         completed.append(stage.kind)
         if on_progress is not None:
             on_progress(stage.kind)
+        if stage.kind == "report":
+            _record_job_metrics(ledger, project, attempt_id, durations_ms,
+                                git_calls_carried + (gitutil.call_count() - git_calls_at_start))
         if stage.kind == "commit" and config.projects[project].release is not None:
             # The project's commit just landed -- submit its publish
             # request (artifact_path="@HEAD" at this exact commit) and
             # stop here, BEFORE report/close ever run, so a job with
             # `release` configured never reaches "done" on its own.
             # gb2's ship/skip-ship commands resume with
-            # release_followup_stages() once the owner has decided.
+            # release_followup_stages() once the owner has decided --
+            # persist what this call accumulated first (see
+            # _load_partial_metrics above), or it would be lost.
+            _record_job_metrics_partial(
+                ledger, project, attempt_id, durations_ms,
+                git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+            )
             request_id, summary = release_mod.prepare(config, ledger, project, attempt_id)
             pending = {"kind": "publish", "request_id": request_id, **summary}
             return JobOutcome(
@@ -322,6 +384,70 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
     )
 
 
+def _bench_run_counts(ledger: Ledger, attempt_id: str) -> dict[str, int]:
+    """How many non-stale bench evidence rows this attempt has, by
+    their own recorded "scope" ("related", "full", "full(fallback)")
+    -- e.g. {"related": 2, "full": 1}."""
+    counts: dict[str, int] = {}
+    for row in ledger.evidence(attempt_id, "bench"):
+        if row.stale:
+            continue
+        scope = str(row.payload.get("scope", ""))
+        if scope:
+            counts[scope] = counts.get(scope, 0) + 1
+    return counts
+
+
+def _load_partial_metrics(ledger: Ledger, project: str,
+                          attempt_id: str) -> tuple[dict[str, float], int]:
+    """(durations_ms, git_calls) from the newest "job.metrics.partial"
+    event this attempt has, or ({}, 0) if it never stopped at
+    needs_owner before (the normal, non-release case) -- see
+    _run_stages' own seeding comment."""
+    durations: dict[str, float] = {}
+    git_calls = 0
+    for _seq, event in ledger.events(project, "job.metrics.partial"):
+        if event.attempt_id == attempt_id:
+            durations = {str(k): float(v)
+                         for k, v in dict(event.payload.get("durations_ms", {})).items()}
+            git_calls = int(event.payload.get("git_calls", 0))
+    return durations, git_calls
+
+
+def _record_job_metrics_partial(ledger: Ledger, project: str, attempt_id: str,
+                                durations_ms: dict[str, float], git_calls: int) -> None:
+    """Persist what this _run_stages call accumulated so far, right
+    before returning a "needs_owner" release stop -- read back by
+    _load_partial_metrics the next time this attempt_id resumes
+    (gb2 ship/skip-ship's continue_job(release_followup_stages(...)))."""
+    ledger.append(Event(
+        project=project, kind="job.metrics.partial", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={
+            "durations_ms": {k: round(v, 1) for k, v in durations_ms.items()},
+            "git_calls": git_calls,
+        },
+    ))
+
+
+def _record_job_metrics(ledger: Ledger, project: str, attempt_id: str,
+                        durations_ms: dict[str, float], git_calls: int = 0) -> None:
+    """One "job.metrics" event per report, carrying this call's own
+    per-stage wall-clock durations (ms, see _run_stages) and how many
+    bench runs of each scope this attempt recorded (from the ledger's
+    own evidence rows, an observable fact -- not a counter this
+    function keeps itself). `gb2 log` reads this back for display."""
+    ledger.append(Event(
+        project=project, kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={
+            "durations_ms": {k: round(v, 1) for k, v in durations_ms.items()},
+            "test_runs": _bench_run_counts(ledger, attempt_id),
+            "git_calls": git_calls,
+        },
+    ))
+
+
 def _station_pending_requests(ledger: Ledger, project: str,
                               request_id: str) -> list[dict[str, object]]:
     """The "requests" a station.finished event (matching request_id) asked
@@ -336,6 +462,6 @@ def _station_pending_requests(ledger: Ledger, project: str,
 
 
 __all__ = [
-    "Stage", "JobOutcome", "ProgressCallback", "default_stages",
+    "Stage", "JobOutcome", "ProgressCallback", "default_stages", "fix_stages",
     "stages_after_install", "release_followup_stages", "run_job", "continue_job",
 ]

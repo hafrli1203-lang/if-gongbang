@@ -206,6 +206,58 @@ def test_close_drains_close_request_to_done(
     assert workspace.ledger.project("alpha").state == "CLOSED"
 
 
+def test_close_retries_after_fix_preserving_owner_dirty_files(
+    workspace: Workspace, capsys,
+) -> None:
+    """A failed close must be retryable through the real CLI: fix the
+    cause and run `close` again, rather than being stuck replaying the
+    same failed request forever (engine.processor.submit's retry_of/
+    retry_n mechanism). The owner's own pre-existing uncommitted file
+    (dirty_paths, captured at job-open time) must survive both the
+    failed attempt and the successful retry untouched."""
+    from engine import ids as ids_mod
+    from engine.config import write_json
+    from engine.steps.open_job import open_job
+
+    config = write_json(workspace.config, workspace.root / "engine.json")
+    owner_dirty = workspace.alpha / "owner_notes.txt"
+    owner_dirty.write_text("do not touch\n", encoding="utf-8")
+
+    attempt_id = open_job(config, workspace.ledger, "alpha", "close-retry",
+                          "full", ("builder",))
+    assert "owner_notes.txt" in workspace.ledger.project("alpha").dirty_paths
+
+    # Make close fail deterministically: block archive_tmp's own mkdir
+    # by pre-occupying its target directory's path with a plain file.
+    archive_root = (config.home / "archive" / "alpha"
+                    / ids_mod.attempt_dirname(attempt_id))
+    archive_root.parent.mkdir(parents=True, exist_ok=True)
+    archive_root.write_text("blocking file, not a directory\n", encoding="utf-8")
+
+    rc1 = cli.main(["close", "--config", str(config.config_path), "alpha", attempt_id])
+    out1 = json.loads(capsys.readouterr().out)
+    assert rc1 != 0, out1
+    first_rid = out1["request_id"]
+    assert workspace.ledger.request(first_rid).status == "failed"
+    assert workspace.ledger.project("alpha").state != "CLOSED"
+    assert owner_dirty.read_text(encoding="utf-8") == "do not touch\n"
+
+    # Fix the cause.
+    archive_root.unlink()
+
+    rc2 = cli.main(["close", "--config", str(config.config_path), "alpha", attempt_id])
+    out2 = json.loads(capsys.readouterr().out)
+    assert rc2 == 0, out2
+    second_rid = out2["request_id"]
+    assert second_rid != first_rid  # a genuinely new, retried request
+    second_request = workspace.ledger.request(second_rid)
+    assert second_request.payload.get("retry_of") == first_rid
+    assert second_request.payload.get("retry_n") == 1
+    assert out2["status"] == "done"
+    assert workspace.ledger.project("alpha").state == "CLOSED"
+    assert owner_dirty.read_text(encoding="utf-8") == "do not touch\n"
+
+
 def test_approve_refuses_without_yes_in_non_interactive_shell(
     workspace: Workspace, tmp_path: Path, capsys, monkeypatch,
 ) -> None:

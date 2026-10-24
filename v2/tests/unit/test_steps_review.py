@@ -4,6 +4,7 @@ evidence bound to a fingerprint -- using ScriptedRunner, never a real AI."""
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -59,17 +60,19 @@ def _processor(ws: Workspace, script: Path) -> Processor:
     return proc
 
 
-def _submit_review(ws: Workspace) -> tuple[str, str]:
+def _submit_review(ws: Workspace, task: str = "do the task") -> tuple[str, str]:
     attempt_id = open_job(ws.config, ws.ledger, "alpha", "review-job",
                           "full", ())
-    rid = submit_request(ws.ledger, "alpha", attempt_id, "review",
-                         {"role": "reviewer"}, "owner")
+    payload: dict[str, object] = {"role": "reviewer"}
+    if task:
+        payload["task"] = task
+    rid = submit_request(ws.ledger, "alpha", attempt_id, "review", payload, "owner")
     return attempt_id, rid
 
 
 def _verdict_script(passed: bool, findings: list[dict[str, object]] | None = None,
-                    ) -> list[dict[str, object]]:
-    return [{"final": {"passed": passed, "findings": findings or []}}]
+                    coverage: str = "full") -> list[dict[str, object]]:
+    return [{"final": {"passed": passed, "coverage": coverage, "findings": findings or []}}]
 
 
 def test_review_records_evidence_bound_to_fingerprint(workspace: Workspace) -> None:
@@ -146,6 +149,65 @@ def test_review_verdict_with_only_p2_findings_still_passes(
     assert len(evidence) == 1
     assert evidence[0].payload["passed"] is True
     assert evidence[0].payload["reviewer_passed"] is False
+
+
+def test_review_prompt_contains_the_original_task_text(workspace: Workspace) -> None:
+    """The reviewer must see the ORIGINAL request text the builder was
+    given, not an empty task -- it judges the change against what was
+    actually asked for, not the diff alone."""
+    ws = _review_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True))
+    attempt_id, rid = _submit_review(ws, task="Add a greet() function that says hi.")
+
+    captured: dict[str, object] = {}
+    from engine.workers import prompts as prompts_mod
+    original_review_prompt = prompts_mod.review_prompt
+    import engine.steps.review as review_mod
+
+    def _capturing_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent):
+        captured["original_task"] = original_task
+        return original_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent)
+
+    old = review_mod.review_prompt
+    review_mod.review_prompt = _capturing_review_prompt
+    try:
+        proc = _processor(ws, script)
+        n = proc.run_once("alpha")
+    finally:
+        review_mod.review_prompt = old
+
+    assert n == 1
+    assert captured["original_task"] == "Add a greet() function that says hi."
+
+
+def test_review_partial_coverage_never_passes(workspace: Workspace) -> None:
+    """A reviewer that reports coverage="partial" (it was only shown
+    the file list and part of the diff) must never pass the review,
+    regardless of what findings it reports -- "no blocking findings"
+    from a partial read proves nothing about the part it never saw.
+    The request fails closed with "review_incomplete", not the
+    ordinary "review_not_passed". The persisted "coverage" is the
+    engine's own calculation (here "full": this diff is small enough
+    to fit the whole-diff budget) -- "reviewer_coverage" keeps the
+    reviewer's own claim separately, for audit."""
+    ws = _review_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True, coverage="partial"))
+    attempt_id, rid = _submit_review(ws)
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 0
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "review_incomplete"}
+    evidence = ws.ledger.evidence(attempt_id, "review")
+    assert len(evidence) == 1
+    assert evidence[0].payload["passed"] is False
+    assert evidence[0].payload["reviewer_passed"] is True
+    assert evidence[0].payload["coverage"] == "full"
+    assert evidence[0].payload["reviewer_coverage"] == "partial"
 
 
 @pytest.mark.parametrize(
@@ -309,23 +371,170 @@ def test_diff_text_notes_binary_without_inlining(workspace: Workspace) -> None:
     assert "binary stuff" not in text
 
 
-def test_diff_text_capped_at_max_chars(workspace: Workspace) -> None:
-    """A single huge new file must not blow the diff past the overall
-    cap (engine.workers.prompts' own 60k-char budget) -- there is no
-    longer a PER-FILE size note (git diff shows a new file's content in
-    full, same as any other diff tool), so the cap is what actually
-    bounds the prompt."""
+def test_diff_text_itself_is_never_truncated(workspace: Workspace) -> None:
+    """_diff_text (the raw base_head..fp diff) is no longer capped on
+    its own -- sizing/truncation for the prompt is _prepare_diff_for_
+    prompt's job (see below), so a single huge new file's FULL diff
+    must come back from _diff_text itself, uncut."""
     ws = _review_workspace(workspace)
     attempt_id, rid = _submit_review(ws)
-    (ws.alpha / "huge.txt").write_text("x\n" * (review._DIFF_MAX_CHARS), encoding="utf-8")
+    big = "x\n" * (review._TOTAL_DIFF_BUDGET)
+    (ws.alpha / "huge.txt").write_text(big, encoding="utf-8")
     text = _diff_text_now(ws, attempt_id, rid)
-    assert len(text) == review._DIFF_MAX_CHARS
+    assert len(text) > review._TOTAL_DIFF_BUDGET
+
+
+def test_prepare_diff_for_prompt_marks_partial_over_budget() -> None:
+    """A diff that fits the total budget is sent in full (coverage
+    "full"); one that does not is truncated to the budget and marked
+    "partial" -- the reviewer's own JSON reply must then echo
+    "partial" back, and a "partial" verdict can never pass review
+    regardless of findings (see _run_record_review)."""
+    small = "x" * 100
+    sent, coverage = review._prepare_diff_for_prompt(small)
+    assert coverage == "full"
+    assert small in sent
+
+    huge = "y" * (review._TOTAL_DIFF_BUDGET + 1)
+    sent, coverage = review._prepare_diff_for_prompt(huge)
+    assert coverage == "partial"
+    # The sent text is chunk-labeled, so its length is a little over
+    # the raw budget, but it must never include anything past it.
+    assert "y" * (review._TOTAL_DIFF_BUDGET + 1) not in sent
+
+    empty_sent, empty_coverage = review._prepare_diff_for_prompt("")
+    assert empty_coverage == "full"
+    assert empty_sent == "(no diff)"
+
+
+def test_review_prompt_coverage_full_for_diff_over_60k_under_budget(
+    workspace: Workspace,
+) -> None:
+    """A diff over the OLD single-chunk 60k-char limit, but still under
+    the 240k-char total budget, is sent in full across multiple ≤60k-
+    char chunks in ONE prompt -- coverage stays "full", not "partial",
+    because every chunk was actually sent."""
+    ws = _review_workspace(workspace)
+    attempt_id, rid = _submit_review(ws)
+    big_content = "x\n" * 40_000  # file alone already exceeds 60k chars
+    (ws.alpha / "big_file.py").write_text(big_content, encoding="utf-8")
+
+    fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes)
+    full_diff = review._diff_text(
+        StepContext(config=ws.config, ledger=ws.ledger, fakes=None,
+                   request=ws.ledger.request(rid), project="alpha", attempt_id=attempt_id),
+        fp,
+    )
+    assert len(full_diff) > review._CHUNK_MAX_CHARS
+    assert len(full_diff) <= review._TOTAL_DIFF_BUDGET
+
+    sent, coverage = review._prepare_diff_for_prompt(full_diff)
+    assert coverage == "full"
+    assert sent.count("--- diff chunk") > 1
+    # Stripping the chunk-header markers (and the join newline that
+    # came with each) back out reconstructs the whole diff exactly --
+    # every chunk was sent, nothing was dropped.
+    stripped = re.sub(r"(^|\n)--- diff chunk \d+/\d+ ---\n", "", sent)
+    assert stripped == full_diff
 
 
 def test_diff_text_empty_when_nothing_changed(workspace: Workspace) -> None:
     ws = _review_workspace(workspace)
     attempt_id, rid = _submit_review(ws)
     assert _diff_text_now(ws, attempt_id, rid) == ""
+
+
+def test_review_fails_closed_when_engine_sent_partial_but_reviewer_claims_full(
+    workspace: Workspace,
+) -> None:
+    """The engine's OWN record of how much diff it actually sent
+    (coverage_sent, recomputed independently in record_review, never
+    trusted from what spawn_reviewer happened to compute) must agree
+    with the reviewer's reported coverage for a pass -- a reviewer
+    that reports "full" when the engine itself only sent a partial
+    diff must still fail "review_incomplete", not be taken at its
+    word. persisted "coverage" is the engine's own ("partial"),
+    "reviewer_coverage" the reviewer's claim ("full")."""
+    ws = _review_workspace(workspace)
+    attempt_id, rid = _submit_review(ws)
+    big_content = "x\n" * (review._TOTAL_DIFF_BUDGET)
+    (ws.alpha / "huge.txt").write_text(big_content, encoding="utf-8")
+
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True, coverage="full"))
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 0
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "review_incomplete"}
+    evidence = ws.ledger.evidence(attempt_id, "review")
+    assert len(evidence) == 1
+    assert evidence[0].payload["passed"] is False
+    assert evidence[0].payload["coverage"] == "partial"
+    assert evidence[0].payload["reviewer_coverage"] == "full"
+
+
+def test_review_recovers_missing_task_from_run_station_request(
+    workspace: Workspace,
+) -> None:
+    """A review request submitted with no "task" (e.g.
+    stages_after_install()'s own empty default) must still show the
+    reviewer the ORIGINAL request -- recovered from the attempt's own
+    run_station request via engine.fixup.original_task -- rather than
+    reviewing against an empty task."""
+    ws = _review_workspace(workspace)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "review-job", "full", ())
+    submit_request(ws.ledger, "alpha", attempt_id, "run_station",
+                   {"station": "build", "role": "builder",
+                    "task": "Recovered original task text."}, "owner")
+    rid = submit_request(ws.ledger, "alpha", attempt_id, "review", {"role": "reviewer"},
+                         "owner")
+
+    captured: dict[str, object] = {}
+    from engine.workers import prompts as prompts_mod
+    original_review_prompt = prompts_mod.review_prompt
+    import engine.steps.review as review_mod
+
+    def _capturing_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent):
+        captured["original_task"] = original_task
+        return original_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent)
+
+    old = review_mod.review_prompt
+    review_mod.review_prompt = _capturing_review_prompt
+    try:
+        script = ws.root / "script.json"
+        _write_script(script, _verdict_script(passed=True))
+        proc = _processor(ws, script)
+        n = proc.run_once("alpha")
+    finally:
+        review_mod.review_prompt = old
+
+    assert n == 1
+    assert captured["original_task"] == "Recovered original task text."
+
+
+def test_review_fails_incomplete_when_no_task_can_be_recovered(
+    workspace: Workspace,
+) -> None:
+    """A review request with no task, and no run_station request on
+    its attempt to recover one from either, must fail closed with
+    "review_incomplete" rather than silently reviewing against an
+    empty task."""
+    ws = _review_workspace(workspace)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "review-job", "full", ())
+    rid = submit_request(ws.ledger, "alpha", attempt_id, "review", {"role": "reviewer"},
+                         "owner")
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True))
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 0
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "review_incomplete"}
 
 
 def test_review_git_calls_disable_fsmonitor_and_hooks(workspace: Workspace) -> None:
@@ -391,13 +600,14 @@ def test_review_prompt_includes_new_untracked_file(workspace: Workspace) -> None
     attempt_id, rid = _submit_review(ws)
     (ws.alpha / "brand_new_module.py").write_text("x = 1\n", encoding="utf-8")
 
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
     from engine.workers import prompts as prompts_mod
     original_review_prompt = prompts_mod.review_prompt
 
-    def _capturing_review_prompt(spec, diff_text):
+    def _capturing_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent):
         captured["diff_text"] = diff_text
-        return original_review_prompt(spec, diff_text)
+        captured["changed_files"] = changed_files
+        return original_review_prompt(spec, original_task, changed_files, diff_text, coverage_sent)
 
     import engine.steps.review as review_mod
     old = review_mod.review_prompt
@@ -411,6 +621,7 @@ def test_review_prompt_includes_new_untracked_file(workspace: Workspace) -> None
     assert n == 1
     assert "brand_new_module.py" in captured["diff_text"]
     assert "x = 1" in captured["diff_text"]
+    assert any("brand_new_module.py" in f for f in captured["changed_files"])
 
 
 def test_diff_text_skips_excluded_paths(workspace: Workspace) -> None:

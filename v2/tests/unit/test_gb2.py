@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -15,12 +16,15 @@ from types import ModuleType
 
 import pytest
 
+from dataclasses import replace
+
+from engine.approvals import grant
 from engine.config import EngineConfig, ProjectConfig, ReleaseConfig, write_json
 from engine.evidence import fingerprint, record
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Ledger
-from engine.processor import Fakes
+from engine.processor import Fakes, Processor
 from engine.steps.open_job import open_job
 
 _GB2_PATH = Path(__file__).resolve().parents[2] / "tools" / "gb2"
@@ -158,6 +162,16 @@ def test_arg_parsing_run_with_task_file_and_job_name(gb2: ModuleType) -> None:
     assert args.job_name == "wording-fix"
 
 
+def test_arg_parsing_fix_with_and_without_extra(gb2: ModuleType) -> None:
+    args = gb2._build_parser().parse_args(["fix", "shortform"])
+    assert args.command == "fix"
+    assert args.app == "shortform"
+    assert args.extra is None
+
+    args = gb2._build_parser().parse_args(["fix", "shortform", "also check the edge case"])
+    assert args.extra == "also check the edge case"
+
+
 def test_arg_parsing_status_log_diff(gb2: ModuleType) -> None:
     parser = gb2._build_parser()
     assert parser.parse_args(["status", "shortform"]).command == "status"
@@ -260,7 +274,7 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
     (repo_dir / "app.py").write_text("v2\n", encoding="utf-8")
     fp = fingerprint(repo_dir, config.projects["demo"].excludes)
     record(ledger, "demo", attempt_id, "review", fp, payload={"passed": True})
-    record(ledger, "demo", attempt_id, "bench", fp, payload={"passed": True})
+    record(ledger, "demo", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
 
     fakes = Fakes(FakePublisher(), FakeInstaller())
     outcome = orbit.continue_job(
@@ -521,6 +535,95 @@ def test_cmd_run_drives_continue_job_exactly_once_with_the_full_stage_list(
     ]
 
 
+def test_cmd_fix_refuses_when_there_is_no_failed_attempt(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """A fresh (never-run) app workspace has no OPEN project at all --
+    engine.fixup.FixupError must surface as a clean refusal (exit 1,
+    one JSON error line on stderr), never an unhandled traceback."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    (workspace / "home").mkdir()
+    (workspace / "secrets").mkdir()
+    source_repo = _make_source_repo(tmp_path / "source" / "demo")
+    repo_dir = _worktree_repo(source_repo, workspace / "repo")
+
+    config = EngineConfig(
+        ledger_path=workspace / "ledger.sqlite", home=workspace / "home",
+        secrets_dir=workspace / "secrets",
+        projects={"demo": ProjectConfig("demo", repo_dir)},
+        station_owners={},
+    )
+    config = write_json(config, workspace / "config.json")
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    ledger.close()
+
+    code = gb2.main(["fix", "demo"])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "no_failed_attempt" in captured.err
+
+
+def test_cmd_fix_calls_fixup_fix_with_the_app_and_extra_text(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cmd_fix must hand off to engine.fixup.fix with this app's project
+    name and the owner's extra text, and report the resulting outcome
+    the same way cmd_run does (status/exit code) -- spied rather than
+    run for real (engine.fixup.fix itself, including the close+reopen+
+    overlay it does, is covered directly by tests/unit/test_fixup.py)."""
+    from engine import fixup as fixup_module
+    from engine import orbit as orbit_module
+
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    (workspace / "home").mkdir()
+    (workspace / "secrets").mkdir()
+    source_repo = _make_source_repo(tmp_path / "source" / "demo")
+    repo_dir = _worktree_repo(source_repo, workspace / "repo")
+
+    config = EngineConfig(
+        ledger_path=workspace / "ledger.sqlite", home=workspace / "home",
+        secrets_dir=workspace / "secrets",
+        projects={"demo": ProjectConfig("demo", repo_dir)},
+        station_owners={},
+    )
+    config = write_json(config, workspace / "config.json")
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    ledger.close()
+
+    calls: list[tuple[str, str]] = []
+
+    def _fake_fix(cfg, ledger_, project, extra, fakes_for, **kwargs):
+        calls.append((project, extra))
+        attempt_id = open_job(cfg, ledger_, project, "stub-fix-job", "full", ())
+        outcome = orbit_module.JobOutcome(
+            attempt_id=attempt_id, status="done", failed_request=None, reason=None,
+        )
+        return fixup_module.FixResult(
+            old_attempt_id="J-demo-OLD#1", new_attempt_id=attempt_id,
+            job_name="stub-fix-job", task="composed task text", outcome=outcome,
+        )
+
+    monkeypatch.setattr(gb2.fixup, "fix", _fake_fix)
+
+    code = gb2.main(["fix", "demo", "also check the edge case"])
+
+    assert code == 0
+    assert calls == [("demo", "also check the edge case")]
+
+
 def test_cmd_init_hides_the_source_repo_from_every_sandbox(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,3 +777,200 @@ def test_cmd_run_refuses_when_repo_dir_identity_no_longer_matches(
     code = gb2.main(["run", "demo", "do something"])
 
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve: for a publish request stuck "unknown", show the receipt,
+# refuse while its process group is still alive, run the check command,
+# and let the owner say whether it actually deployed.
+# ---------------------------------------------------------------------------
+
+def _setup_unknown_publish_job(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """Builds on _setup_release_job: grants the approval, then forces a
+    REAL ShellPublisher dispatch to end up "unknown" (process-group
+    termination could not be confirmed, per engine.publishers'
+    documented semantics) by monkeypatching
+    engine.publishers._terminate_process_group to return False while a
+    real (short-lived) child process actually runs and times out. The
+    child is explicitly reaped (os.waitpid) once the request is
+    confirmed "unknown", so a resolve test's own process-group-aliveness
+    check sees it as gone, not a lingering zombie this test created."""
+    import engine.publishers as publishers_module
+
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    workspace = job["config"].ledger_path.parent
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(0.05)\n", encoding="utf-8")
+    hang_config = replace(
+        job["config"], publisher_argv=(sys.executable, str(sleeper)),
+        publisher_timeout_sec=0.01,
+    )
+    hang_config = write_json(hang_config, workspace / "config.json")
+
+    ledger = Ledger.open(hang_config.ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+    monkeypatch.setattr(publishers_module, "_terminate_process_group", lambda process: False)
+    fakes = gb2._build_fakes(hang_config, "demo", job["attempt_id"], None)
+    proc = Processor(hang_config, ledger, fakes)
+    proc.register_defaults()
+    proc.run_once("demo")
+    assert ledger.request(job["request_id"]).status == "unknown"
+
+    receipt_path = hang_config.home / "publish" / f"{job['request_id']}.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "unknown"
+    pid = receipt["pid"]
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    ledger.close()
+
+    job["config"] = hang_config
+    job["receipt_path"] = receipt_path
+    return job
+
+
+def test_resolve_refuses_without_a_tty(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _setup_unknown_publish_job(gb2, tmp_path, monkeypatch)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 4
+    ledger = Ledger.open(job["config"].ledger_path)
+    assert ledger.request(job["request_id"]).status == "unknown"
+    ledger.close()
+
+
+def test_resolve_refuses_while_process_group_still_alive(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _setup_unknown_publish_job(gb2, tmp_path, monkeypatch)
+    # Claim the receipt's process group is THIS test process's own pid --
+    # guaranteed alive.
+    receipt = json.loads(job["receipt_path"].read_text(encoding="utf-8"))
+    receipt["pgid"] = os.getpid()
+    job["receipt_path"].write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 1
+    ledger = Ledger.open(job["config"].ledger_path)
+    assert ledger.request(job["request_id"]).status == "unknown"
+    ledger.close()
+
+
+def test_resolve_deployed_requires_check_command_to_pass(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answering "deployed" when the check command itself exits
+    non-zero must be refused -- the receipt and request stay
+    untouched."""
+    job = _setup_unknown_publish_job(gb2, tmp_path, monkeypatch)
+    failing_check = tmp_path / "failing_check.py"
+    failing_check.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+    config = replace(job["config"], publisher_dry_run_argv=(sys.executable, str(failing_check)))
+    config = write_json(config, job["config"].ledger_path.parent / "config.json")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "deployed")
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 1
+    ledger = Ledger.open(config.ledger_path)
+    assert ledger.request(job["request_id"]).status == "unknown"
+    ledger.close()
+
+
+def test_resolve_deployed_with_passing_check_records_done_and_closes(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _setup_unknown_publish_job(gb2, tmp_path, monkeypatch)
+    passing_check = tmp_path / "passing_check.py"
+    passing_check.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    config = replace(job["config"], publisher_dry_run_argv=(sys.executable, str(passing_check)))
+    config = write_json(config, job["config"].ledger_path.parent / "config.json")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "deployed")
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 0
+    ledger = Ledger.open(config.ledger_path)
+    assert ledger.request(job["request_id"]).status == "done"
+    assert ledger.project("demo").state == "CLOSED"
+    ledger.close()
+    receipt = json.loads(job["receipt_path"].read_text(encoding="utf-8"))
+    assert receipt["status"] == "done"
+
+
+def test_resolve_not_deployed_records_failed_and_closes_without_redeploy(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _setup_unknown_publish_job(gb2, tmp_path, monkeypatch)
+    check_log = tmp_path / "check.log"
+    check_script = tmp_path / "logging_check.py"
+    check_script.write_text(
+        f"import sys\nopen({str(check_log)!r}, 'w').write('ran')\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    config = replace(job["config"], publisher_dry_run_argv=(sys.executable, str(check_script)))
+    config = write_json(config, job["config"].ledger_path.parent / "config.json")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "not deployed")
+
+    code = gb2.main(["resolve", "demo"])
+
+    # the job's own report -> close followup still completes ("done")
+    # even though the publish request itself ends up "failed" below --
+    # same two-outcomes-at-once shape cmd_ship/cmd_skip_ship already have.
+    assert code == 0
+    assert check_log.exists()  # the check command DID run (just to inform the owner)
+    ledger = Ledger.open(config.ledger_path)
+    assert ledger.request(job["request_id"]).status == "failed"
+    assert ledger.project("demo").state == "CLOSED"  # report -> close still happens
+    ledger.close()
+    receipt = json.loads(job["receipt_path"].read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+
+
+def test_summarize_includes_job_metrics_for_gb2_log(gb2: ModuleType, tmp_path: Path) -> None:
+    """engine.orbit's job.metrics event (durations_ms, test_runs) must
+    surface through gb2's own _summarize dict, since cmd_log just
+    prints whatever _append_run_log stored verbatim."""
+    from engine.config import EngineConfig, ProjectConfig
+    from engine.ledger import Event, Ledger
+    from engine.steps.open_job import open_job as _open_job
+
+    repo = _make_source_repo(tmp_path / "repo")
+    config = EngineConfig(
+        ledger_path=tmp_path / "ledger.sqlite", home=tmp_path / "home",
+        secrets_dir=tmp_path / "secrets",
+        projects={"demo": ProjectConfig("demo", repo)},
+        station_owners={},
+    )
+    (tmp_path / "home").mkdir()
+    (tmp_path / "secrets").mkdir()
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    attempt_id = _open_job(config, ledger, "demo", "job1", "full", roles=())
+    ledger.append(Event(
+        project="demo", kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"durations_ms": {"commit": 12.3}, "test_runs": {"related": 2}},
+    ))
+
+    class _StubOutcome:
+        status = "done"
+        reason = None
+
+    summary = gb2._summarize(config, ledger, "demo", attempt_id, _StubOutcome(), 1.0)
+
+    assert summary["durations_ms"] == {"commit": 12.3}
+    assert summary["test_runs"] == {"related": 2}

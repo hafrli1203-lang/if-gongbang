@@ -288,3 +288,55 @@ def test_publish_never_redispatches_a_started_receipt(tmp_path: Path) -> None:
     assert not log.exists()  # the command was never actually run
     receipt = publisher.lookup("R-started")
     assert receipt["status"] == "started"  # untouched -- still the ambiguous receipt
+
+
+def test_publish_receipt_includes_pid_pgid_and_host(tmp_path: Path) -> None:
+    probe = _write_probe(tmp_path)
+    log = tmp_path / "x.log"
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(probe), str(log), "0", "ran"),
+        dry_run_argv_template=(sys.executable, str(probe), str(log), "0", "ran"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=False,
+    )
+    publisher.publish(key="R-identity", target="search", artifact_hash="f" * 40)
+    receipt = publisher.lookup("R-identity")
+    assert receipt["status"] == "done"
+    assert isinstance(receipt["pid"], int) and receipt["pid"] > 0
+    assert receipt["pgid"] == receipt["pid"]
+    assert receipt["host"]
+
+
+def test_write_receipt_is_atomic_no_partial_file_and_no_leftover_tmp(
+    tmp_path: Path,
+) -> None:
+    receipts_dir = tmp_path / "receipts"
+    publisher = ShellPublisher(
+        argv_template=(), dry_run_argv_template=(), receipts_dir=receipts_dir,
+    )
+    publisher._write_receipt("R-atomic", {"key": "R-atomic", "status": "started"})
+
+    entries = list(receipts_dir.iterdir())
+    assert entries == [receipts_dir / "R-atomic.json"]  # no .tmp-* left behind
+    assert publisher.lookup("R-atomic") == {"key": "R-atomic", "status": "started"}
+
+
+def test_write_receipt_cleans_up_tmp_file_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipts_dir = tmp_path / "receipts"
+    publisher = ShellPublisher(
+        argv_template=(), dry_run_argv_template=(), receipts_dir=receipts_dir,
+    )
+
+    real_replace = os.replace
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    with pytest.raises(OSError):
+        publisher._write_receipt("R-fail", {"key": "R-fail", "status": "started"})
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    assert list(receipts_dir.iterdir()) == []  # the .tmp-* file was removed

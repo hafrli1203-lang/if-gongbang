@@ -125,7 +125,7 @@ def test_default_stages_order(workspace: Workspace) -> None:
         {"role": "builder", "station": "build",
          "path": str(copy_root(workspace.config, attempt_id, "builder"))},
     ]}
-    assert stages[2].payload == {"role": "reviewer"}
+    assert stages[2].payload == {"role": "reviewer", "task": "fix the wording"}
     assert stages[3].payload == {}
     assert stages[4].payload == {"message": "gongbang: wording"}
     assert stages[6].payload == {}
@@ -532,3 +532,96 @@ def test_on_progress_fires_for_review_in_the_parallel_review_bench_path(
     assert outcome.status == "failed"
     assert outcome.reason == "no_bench_cases"
     assert seen == ["review"]
+
+
+def test_run_job_does_not_create_a_reviewer_work_copy(workspace: Workspace) -> None:
+    """run_job's open_job call only requests a copy for the builder
+    role -- the reviewer runs against its own snapshot
+    (engine.steps.review), never a pre-made copy_root, so one must
+    never be created for it."""
+    from engine.steps.open_job import copy_root as _copy_root
+
+    attempt_id = orbit.run_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", "job-no-reviewer-copy",
+        "fix the wording", "builder", "reviewer",
+    ).attempt_id
+
+    assert _copy_root(workspace.config, attempt_id, "builder").exists()
+    assert not _copy_root(workspace.config, attempt_id, "reviewer").exists()
+
+
+def test_job_metrics_recorded_at_report_with_durations_and_bench_counts(
+    workspace: Workspace,
+) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "metrics-job",
+                          "full", ())
+    (workspace.alpha / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    fp = evidence.fingerprint(workspace.alpha, workspace.config.projects["alpha"].excludes)
+    evidence.record(workspace.ledger, "alpha", attempt_id, "review", fp,
+                    payload={"passed": True})
+    evidence.record(workspace.ledger, "alpha", attempt_id, "bench", fp,
+                    payload={"passed": True, "scope": "related"})
+
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("commit", {"message": "gongbang: metrics"}),
+         orbit.Stage("report", {"summary": "gongbang: metrics"}),
+         orbit.Stage("close", {})],
+    )
+
+    assert outcome.status == "done"
+    events = [e for _seq, e in workspace.ledger.events("alpha", "job.metrics")
+              if e.attempt_id == attempt_id]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert "commit" in payload["durations_ms"]
+    assert "report" in payload["durations_ms"]
+    assert all(isinstance(v, (int, float)) and v >= 0 for v in payload["durations_ms"].values())
+    assert payload["test_runs"] == {"related": 1}
+    # merge, fingerprint, commit and close all run git through gitutil
+    assert isinstance(payload["git_calls"], int) and payload["git_calls"] > 0
+
+
+def test_release_job_keeps_main_stage_durations_across_the_ship_stop(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """A release-configured job's commit stage
+    stops at needs_owner BEFORE report ever runs, so the fresh
+    continue_job(release_followup_stages(...)) call gb2 ship/skip-ship
+    makes afterward must not start its own durations_ms from empty --
+    the final job.metrics event must still carry the earlier stages'
+    (here, "commit") timing, not just report/close's."""
+    config, _master_repo = _release_project(workspace, tmp_path)
+    attempt_id = open_job(config, workspace.ledger, "alpha", "ship-metrics", "full", ())
+    (workspace.alpha / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    fp = evidence.fingerprint(workspace.alpha, config.projects["alpha"].excludes)
+    evidence.record(workspace.ledger, "alpha", attempt_id, "review", fp,
+                    payload={"passed": True})
+    evidence.record(workspace.ledger, "alpha", attempt_id, "bench", fp,
+                    payload={"passed": True})
+
+    stop_outcome = orbit.continue_job(
+        config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("commit", {"message": "gongbang: ship-metrics"})],
+    )
+    assert stop_outcome.status == "needs_owner"
+
+    partial_events = [e for _seq, e in workspace.ledger.events("alpha", "job.metrics.partial")
+                      if e.attempt_id == attempt_id]
+    assert len(partial_events) == 1
+    assert "commit" in partial_events[0].payload["durations_ms"]
+
+    followup = orbit.release_followup_stages("ship-metrics")
+    final_outcome = orbit.continue_job(
+        config, workspace.ledger, _fakes(), "alpha", attempt_id, followup,
+    )
+    assert final_outcome.status == "done"
+
+    metrics_events = [e for _seq, e in workspace.ledger.events("alpha", "job.metrics")
+                      if e.attempt_id == attempt_id]
+    assert len(metrics_events) == 1
+    durations = metrics_events[0].payload["durations_ms"]
+    assert "commit" in durations  # carried over from the stop, not lost
+    assert "report" in durations  # this call's own stage (metrics are
+    # recorded exactly when "report" completes, before "close" runs --
+    # same as the non-release case, unaffected by this fix)

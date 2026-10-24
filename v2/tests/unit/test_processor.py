@@ -66,6 +66,82 @@ def test_submit_different_payload_new_id(tmp_path: Path) -> None:
     assert len(ledger.events("alpha", "request.submitted")) == 2
 
 
+def _mark_status(ledger: Ledger, attempt_id: str, request_id: str, status: str) -> None:
+    ledger.append(Event(
+        project="alpha", kind="request.status", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"request_id": request_id, "status": status, "result": {}},
+    ))
+
+
+def test_submit_retries_failed_request_with_new_id(tmp_path: Path) -> None:
+    """A failed request with this exact payload must NOT keep coming
+    back as-is forever -- submit() creates a genuinely new request
+    whose payload carries retry_of/retry_n, applying to every request
+    kind alike (engine.cli's `close` is one direct beneficiary)."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid1 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    _mark_status(ledger, attempt_id, rid1, "failed")
+
+    rid2 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    assert rid2 != rid1
+    req2 = ledger.request(rid2)
+    assert req2.status == "queued"
+    assert req2.payload["message"] == "hi"
+    assert req2.payload["retry_of"] == rid1
+    assert req2.payload["retry_n"] == 1
+    assert len(ledger.events("alpha", "request.submitted")) == 2
+
+
+def test_submit_retry_chain_increments_through_repeated_failures(tmp_path: Path) -> None:
+    """A SECOND failure (of the retry itself) advances the chain again
+    -- retry_n keeps counting, retry_of always points at the specific
+    request just retried (the immediately preceding one, not
+    necessarily the very first)."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid1 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    _mark_status(ledger, attempt_id, rid1, "failed")
+    rid2 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    _mark_status(ledger, attempt_id, rid2, "failed")
+    rid3 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+
+    assert len({rid1, rid2, rid3}) == 3
+    req3 = ledger.request(rid3)
+    assert req3.payload["retry_of"] == rid2
+    assert req3.payload["retry_n"] == 2
+    assert len(ledger.events("alpha", "request.submitted")) == 3
+
+
+def test_submit_retry_itself_idempotent_when_still_pending(tmp_path: Path) -> None:
+    """Calling submit() again for the SAME failed original, before the
+    retry it already created has itself finished, must return that
+    SAME retry -- not spawn yet another one just because submit() was
+    called twice."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid1 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    _mark_status(ledger, attempt_id, rid1, "failed")
+    rid2 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    rid2_again = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    assert rid2_again == rid2
+    assert len(ledger.events("alpha", "request.submitted")) == 2
+
+
+def test_submit_does_not_auto_retry_unknown_status(tmp_path: Path) -> None:
+    """'unknown' is deliberately NOT retried by submit() -- only
+    engine.processor.retry_unknown's explicit owner action resolves
+    that status; a plain re-submit must return the same unknown id."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid1 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    _mark_status(ledger, attempt_id, rid1, "unknown")
+    rid2 = submit(ledger, "alpha", attempt_id, "commit", {"message": "hi"}, "owner")
+    assert rid2 == rid1
+    assert len(ledger.events("alpha", "request.submitted")) == 1
+
+
 def test_done_step_skipped(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     attempt_id = _open_attempt(ledger)

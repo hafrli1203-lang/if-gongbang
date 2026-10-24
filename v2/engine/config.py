@@ -83,6 +83,13 @@ class ProjectConfig:
     # "{files}"]. Empty (default): bench_scope "related" always falls
     # back to the full test_cmd for this project.
     related_cmd: tuple[str, ...] = ()
+    # One hint line engine.steps.station appends to a builder's task
+    # text verbatim (never parsed/templated -- plain config-authored
+    # guidance), e.g. telling the builder to run related_cmd-style
+    # tests while editing and the full test_cmd suite at most once at
+    # the end. None (default): no hint line added, task text
+    # unchanged from before this field existed.
+    builder_test_hint: str | None = None
     # relative paths that _make_copy symlinks into a fresh worker copy
     # from the repo itself (e.g. "node_modules" -- a gitignored directory
     # `git archive` never puts in the copy, needed only so a Bash-run
@@ -350,7 +357,7 @@ _KNOWN_PROJECT_KEYS = frozenset({
     "repo", "excludes", "artifact_paths", "test_cmd", "install_cmd",
     "manifest", "bench_cases", "test_timeout_sec", "copy_links",
     "copy_link_writable_subpaths", "bench_scope", "related_cmd", "release",
-    "hidden_paths",
+    "hidden_paths", "builder_test_hint",
 })
 
 _KNOWN_RELEASE_KEYS = frozenset({"master_repo", "target"})
@@ -436,6 +443,9 @@ def _parse_projects(raw: dict[str, object], base: Path) -> dict[str, ProjectConf
                 raise ValueError(
                     f"project {name!r}: hidden_paths entry must be absolute: {entry!r}"
                 )
+        builder_test_hint = item.get("builder_test_hint")
+        if builder_test_hint is not None and not isinstance(builder_test_hint, str):
+            raise ValueError(f"project {name!r}: builder_test_hint must be a string or null")
         projects[name] = ProjectConfig(
             name=name,
             repo=(base / str(item["repo"])).resolve(),
@@ -452,6 +462,7 @@ def _parse_projects(raw: dict[str, object], base: Path) -> dict[str, ProjectConf
             related_cmd=tuple(_str_list(item.get("related_cmd"))),
             release=release,
             hidden_paths=tuple(Path(p) for p in hidden_paths_raw),
+            builder_test_hint=builder_test_hint,
         )
     return projects
 
@@ -638,6 +649,7 @@ def to_json_dict(config: EngineConfig) -> dict[str, object]:
             "bench_scope": project.bench_scope,
             "related_cmd": list(project.related_cmd),
             "hidden_paths": [str(p) for p in project.hidden_paths],
+            "builder_test_hint": project.builder_test_hint,
         }
         if project.release is not None:
             projects[name]["release"] = {

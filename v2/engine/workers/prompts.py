@@ -28,6 +28,7 @@ VERDICT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "passed": {"type": "boolean"},
+        "coverage": {"type": "string", "enum": ["full", "partial"]},
         "findings": {
             "type": "array",
             "items": {
@@ -43,7 +44,7 @@ VERDICT_SCHEMA: dict[str, object] = {
             },
         },
     },
-    "required": ["passed", "findings"],
+    "required": ["passed", "coverage", "findings"],
     "additionalProperties": False,
 }
 
@@ -82,15 +83,44 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
     )
 
 
-def review_prompt(spec: WorkerSpec, diff_text: str) -> str:
-    """A reviewer's full prompt: the original task plus the diff to
-    review, and the verdict JSON shape to reply with."""
+def review_prompt(spec: WorkerSpec, original_task: str, changed_files: list[str],
+                   diff_text: str, coverage_sent: str) -> str:
+    """A reviewer's full prompt: the ORIGINAL request text the builder
+    was given (so the reviewer judges the change against what was
+    actually asked for, not only against the diff on its own), the
+    list of changed files, the diff itself (or as much of it as fits
+    the sent budget), and the verdict JSON shape to reply with.
+
+    `coverage_sent` ("full" or "partial") describes how much of the
+    diff `diff_text` actually contains -- "partial" means the diff was
+    too large to send in full and only the changed-file list plus the
+    first part of it is included here. The reviewer is told this
+    explicitly and REQUIRED to echo it back as "coverage" in its own
+    verdict JSON (never silently assumed by the caller), so a reviewer
+    that did not actually see the whole change cannot report a verdict
+    that looks indistinguishable from one that did."""
+    files_text = "\n".join(f"- {f}" for f in changed_files) or "(no changed files)"
+    if coverage_sent == "full":
+        scope_text = (
+            f"Review scope: FULL diff, all {len(changed_files)} changed "
+            f"file(s) shown below. Reply with \"coverage\": \"full\"."
+        )
+    else:
+        scope_text = (
+            "Review scope: PARTIAL -- the full diff was too large to send "
+            "in one prompt. Only the changed-file list above and the "
+            "first part of the diff are shown below; you have NOT seen "
+            "the whole change. Reply with \"coverage\": \"partial\" -- "
+            "do not report \"full\"."
+        )
     return (
-        f"Review the following change against this task:\n{spec.task}\n\n"
+        f"Original request:\n{original_task}\n\n"
+        f"Changed files:\n{files_text}\n\n"
+        f"{scope_text}\n\n"
         f"Diff:\n{diff_text}\n\n"
         "Reply with exactly ONE final JSON object, with no other text "
         "after it:\n"
-        '{"passed": true or false, "findings": [{"severity": '
-        '"P0"|"P1"|"P2"|"P3", "file": "<path>", "line": <int>, '
-        '"note": "<text>"}]}\n'
+        '{"passed": true or false, "coverage": "full"|"partial", '
+        '"findings": [{"severity": "P0"|"P1"|"P2"|"P3", "file": "<path>", '
+        '"line": <int>, "note": "<text>"}]}\n'
     )

@@ -179,7 +179,7 @@ def test_codex_argv_read_only_and_schema(tmp_path: Path) -> None:
     schema_path = Path(argv[argv.index("--output-schema") + 1])
     assert schema_path.exists()
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    assert schema["required"] == ["passed", "findings"]
+    assert schema["required"] == ["passed", "coverage", "findings"]
     assert argv[argv.index("-o") + 1] == str(spec.result_path)
 
 

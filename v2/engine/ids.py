@@ -72,7 +72,21 @@ def content_hash(payload: object) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def with_retry(payload: dict[str, object], retry_of: str, retry_n: int) -> dict[str, object]:
+    """A copy of `payload` with "retry_of"/"retry_n" merged in -- used
+    by engine.processor.submit to build a deterministically NEW
+    request (a different payload hashes to a different request_id)
+    when retrying one with otherwise identical content whose previous
+    attempt ended 'failed'. `retry_of` is the id of the specific
+    request this one retries (the immediately preceding attempt, not
+    necessarily the very first one -- callers walk that chain one link
+    at a time if they need the original); `retry_n` is how many times
+    in a row this exact (project, attempt, kind, original payload)
+    has now been retried."""
+    return {**payload, "retry_of": retry_of, "retry_n": retry_n}
+
+
 __all__ = [
     "ulid_like", "new_job_id", "attempt_id", "attempt_dirname", "canonical_json",
-    "request_id", "content_hash",
+    "request_id", "content_hash", "with_retry",
 ]

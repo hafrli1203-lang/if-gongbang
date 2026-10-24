@@ -450,7 +450,29 @@ class Processor:
 def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
            payload: dict[str, object], actor_id: str) -> str:
     """Append request.submitted unless a request with the same request_id
-    exists (then return the existing id, no new event). Returns request_id.
+    exists AND is not 'failed' (then return that existing id, no new
+    event -- ordinary idempotency for an in-flight/done request, e.g. a
+    caller that calls submit() again after a crash before the original
+    call ever returned). Returns request_id.
+
+    If the request with this exact payload's id DOES exist but is
+    'failed', this is instead a RETRY: a brand-new request is created
+    whose payload is `payload` plus "retry_of"/"retry_n" (engine.ids.
+    with_retry) -- a different payload, so it hashes to a genuinely
+    different, deterministic request_id, never the same stale failed
+    one. This applies to every request kind alike (there is nothing
+    kind-specific about "the previous attempt at this exact action
+    failed, and the caller wants to try it again now that the cause is
+    fixed"); engine.cli's `close` command is a direct beneficiary --
+    calling it again after a failed close resubmits the close request
+    as a retry rather than forever returning the same failed one. If
+    THAT retry also already exists and is itself 'failed' (e.g. this
+    function is called twice before the retry is ever actually run),
+    the chain is walked one level at a time until either a non-failed
+    existing request is found (returned as-is) or a request_id that
+    does not exist yet is reached (created). 'unknown' is deliberately
+    NOT auto-retried this way -- only engine.processor.retry_unknown's
+    explicit owner action resolves that status.
 
     Validates before touching the ledger (ValueError, no event appended):
     the project must be registered, the kind must be one of
@@ -475,19 +497,27 @@ def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
             f"attempt {attempt_id!r} does not belong to project {project!r}"
         )
 
-    rid = ids.request_id(project, attempt_id, kind, payload)
-    try:
-        ledger.request(rid)
-        return rid
-    except LedgerError:
-        pass
+    current_payload = payload
+    current_rid = ids.request_id(project, attempt_id, kind, current_payload)
+    retry_n = 0
+    while True:
+        try:
+            existing = ledger.request(current_rid)
+        except LedgerError:
+            break  # current_rid has never been submitted -- create it below
+        if existing.status != "failed":
+            return current_rid
+        retry_n += 1
+        current_payload = ids.with_retry(payload, current_rid, retry_n)
+        current_rid = ids.request_id(project, attempt_id, kind, current_payload)
     ledger.append(Event(
         project=project, kind="request.submitted", actor_kind="owner",
         actor_id=actor_id, attempt_id=attempt_id,
-        payload={"request_id": rid, "kind": kind,
-                  "content_hash": ids.content_hash(payload), "payload": payload},
+        payload={"request_id": current_rid, "kind": kind,
+                  "content_hash": ids.content_hash(current_payload),
+                  "payload": current_payload},
     ))
-    return rid
+    return current_rid
 
 
 def retry_unknown(ledger: Ledger, request_id: str, actor_id: str) -> None:

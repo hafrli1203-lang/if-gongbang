@@ -50,7 +50,7 @@ _DEP_BUILDER_SCRIPT = [
     {"final": {"status": "blocked", "summary": "needs vendored_pkg",
               "requests": [_INSTALL_REQUEST]}},
 ]
-_REVIEWER_SCRIPT = [{"final": {"passed": True, "findings": []}}]
+_REVIEWER_SCRIPT = [{"final": {"passed": True, "coverage": "full", "findings": []}}]
 
 
 def test_dependency_external_end_to_end_scripted(workspace: Workspace, tmp_path) -> None:

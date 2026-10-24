@@ -23,6 +23,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from engine import evidence
 from engine.approvals import ApprovalError, grant, parse_owner_message
 from engine.config import EngineConfig
 from engine.gitutil import git_argv
@@ -254,16 +255,124 @@ def prepare(config: EngineConfig, ledger: Ledger, project: str,
     return request_id, summary
 
 
+def _latest_full_bench_passed(ledger: Ledger, attempt_id: str, fp: str) -> bool:
+    """True iff the newest non-stale bench evidence recorded against
+    exactly `fp` passed AND ran the full suite (scope "full" or the
+    "full(fallback)" a related-only run falls back to when it selected
+    zero real tests) -- a "related"-only passing bench is not enough
+    to ship."""
+    rows = [row for row in ledger.evidence(attempt_id, "bench")
+            if not row.stale and row.fingerprint == fp]
+    if not rows:
+        return False
+    latest = rows[-1]
+    if latest.payload.get("passed") is not True:
+        return False
+    return str(latest.payload.get("scope", "")).startswith("full")
+
+
+def _ledger_generation(ledger: Ledger, project: str) -> int:
+    """A number that strictly increases with every ledger write for
+    this project (the seq of its latest event, 0 if none yet) -- used
+    as a bench payload nonce so a resubmission forced by
+    ensure_full_bench (because the evidence check says fresh evidence
+    is required even though submit()'s normal, deterministic
+    request_id already names an old, terminal request) always gets a
+    request_id submit() has never seen before, rather than
+    deterministically colliding with that same old request again."""
+    events = ledger.events(project)
+    return events[-1][0] if events else 0
+
+
+def ensure_full_bench(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                      attempt_id: str, max_iterations: int = 50) -> dict[str, object]:
+    """Before advance_master ever runs for a ship: the commit being
+    released must have a FULL-suite passing bench recorded against its
+    exact fingerprint, not merely whatever scope satisfied the earlier
+    commit step's three_match (bench_scope "related" is enough for
+    that). If the latest passing, non-stale bench evidence for the
+    current fingerprint already has scope "full"/"full(fallback)",
+    this is a no-op ("ran": False).
+
+    Otherwise submits a bench request with payload {"fp": fp, "scope":
+    "full"} -- engine.steps.bench_run._resolve_test_argv treats
+    payload["scope"] == "full" as an override that skips the
+    related-tests shortcut entirely, regardless of the project's own
+    bench_scope/related_cmd config. submit() is deterministic
+    (request_id = hash of the payload), so if an EARLIER bench request
+    with this exact payload already exists and is already terminal
+    (done/failed/unknown) -- e.g. it passed once, then its evidence
+    was later invalidated (an install) or marked stale -- submit()
+    would just hand back that same old, already-resolved request_id
+    with no new bench run at all, and trusting its "done" status as-is
+    would silently resurrect a since-invalidated pass. So: if the
+    request submit() returns is already terminal, resubmit once with
+    _ledger_generation() mixed into the payload, forcing a request_id
+    that has never existed before and therefore WILL actually run.
+    Either way, the final "passed" is read back from the ledger's own
+    evidence for this exact fingerprint (_latest_full_bench_passed),
+    never from the bench request's own status -- the request's status
+    is used only to drive run_request's resume loop, never trusted as
+    the verdict by itself.
+
+    Returns {"ran", "passed", "fp", "request_id"?, "status"?}; never
+    raises -- a request kind this project doesn't support, or any
+    other failure, surfaces as "passed": False."""
+    project_config = config.projects[project]
+    fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+    if _latest_full_bench_passed(ledger, attempt_id, fp):
+        return {"ran": False, "passed": True, "fp": fp}
+
+    payload: dict[str, object] = {"fp": fp, "scope": "full"}
+    request_id = submit(ledger, project, attempt_id, "bench", payload, "owner")
+    if ledger.request(request_id).status not in ("queued", "running"):
+        # submit() handed back an already-terminal request for this
+        # exact payload -- see the docstring above for why that must
+        # not be trusted as-is here.
+        payload = {**payload, "_generation": _ledger_generation(ledger, project)}
+        request_id = submit(ledger, project, attempt_id, "bench", payload, "owner")
+
+    processor = Processor(config, ledger, fakes)
+    processor.register_defaults()
+    # run_request (not run_once): this project may ALREADY have the
+    # publish request itself sitting queued/approved (prepare() submits
+    # it, and approve_and_run grants it, before ever calling this) --
+    # run_once would drain the WHOLE project queue in one call, which
+    # could dispatch (or, if not yet approved, wrongly fail with
+    # "no_approval") that unrelated publish request as a side effect of
+    # just trying to run this bench. run_request touches ONLY this one
+    # request_id.
+    status = ledger.request(request_id).status
+    for _ in range(max_iterations):
+        if status not in ("queued", "running"):
+            break
+        status = processor.run_request(project, request_id)
+    request = ledger.request(request_id)
+    return {
+        # The verdict is the ledger's own evidence for this exact fp,
+        # never request.status alone (see docstring).
+        "ran": True, "passed": _latest_full_bench_passed(ledger, attempt_id, fp), "fp": fp,
+        "request_id": request_id, "status": request.status, "result": request.result,
+    }
+
+
 def approve_and_run(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                     request_id: str, owner_text: str,
                     max_iterations: int = 50) -> dict[str, object]:
     """Parse `owner_text` (must be exactly "승인 R-..." per
     approvals.parse_owner_message), refuse if it names a different
-    request than `request_id`, grant the approval, then drive a fresh
-    Processor's run_once in a bounded loop until this request leaves
-    queued/running (done/failed/unknown). Never calls the real deploy
-    script itself -- that only happens if `fakes.publisher` is wired to
-    a real ShellPublisher by the caller."""
+    request than `request_id`, grant the approval, then -- BEFORE ever
+    running the publish request forward (so advance_master has not
+    touched master yet) -- require ensure_full_bench to pass; a failed
+    or still-running full bench refuses the whole ship ("reason":
+    "full_bench_failed") without consuming the grant's one-time use
+    (approvals.check, inside the publish request's own check_approval
+    step, is what actually marks it used -- never run here). Only then
+    drives a fresh Processor's run_once in a bounded loop until the
+    publish request leaves queued/running (done/failed/unknown). Never
+    calls the real deploy script itself -- that only happens if
+    `fakes.publisher` is wired to a real ShellPublisher by the
+    caller."""
     parsed = parse_owner_message(owner_text)
     if parsed is None:
         return {"status": "rejected", "reason": "owner_text_malformed",
@@ -276,16 +385,24 @@ def approve_and_run(config: EngineConfig, ledger: Ledger, fakes: Fakes, project:
     except ApprovalError as exc:
         return {"status": "rejected", "reason": str(exc), "request_id": request_id}
 
+    attempt_id = ledger.request(request_id).attempt_id
+    bench_check = ensure_full_bench(config, ledger, fakes, project, attempt_id)
+    if not bench_check["passed"]:
+        return {"status": "rejected", "reason": "full_bench_failed",
+                "request_id": request_id, "bench": bench_check}
+
     processor = Processor(config, ledger, fakes)
     processor.register_defaults()
-    request = ledger.request(request_id)
+    # run_request, same reasoning as ensure_full_bench: touch only this
+    # request_id, never the whole project queue.
+    status = ledger.request(request_id).status
     for _ in range(max_iterations):
-        if request.status not in ("queued", "running"):
+        if status not in ("queued", "running"):
             break
-        processor.run_once(project)
-        request = ledger.request(request_id)
+        status = processor.run_request(project, request_id)
+    request = ledger.request(request_id)
     return {"status": request.status, "result": request.result,
-            "request_id": request_id}
+            "request_id": request_id, "bench": bench_check}
 
 
 __all__ = [
@@ -293,5 +410,5 @@ __all__ = [
     "master_untracked_paths", "master_untracked_or_ignored_paths",
     "master_is_clean", "merge_range_paths", "incoming_added_paths",
     "overlapping_paths", "ff_merge", "build_summary",
-    "prepare", "approve_and_run",
+    "prepare", "approve_and_run", "ensure_full_bench",
 ]

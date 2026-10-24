@@ -13,14 +13,16 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
 
-from engine import release
+from engine import evidence, release
 from engine.approvals import grant
 from engine.config import EngineConfig, ProjectConfig, ReleaseConfig
+from engine.evidence import invalidate_after, record
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.faults import CrashInjected, Faults
@@ -288,6 +290,12 @@ def test_release_approve_and_run_succeeds(rws: ReleaseWorkspace) -> None:
     attempt_id = _open(rws, "job5")
     sha = _commit(rws.repo, "app.py", "v2\n", "advance")
     request_id, summary = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    # approve_and_run's own full-suite-bench gate (ensure_full_bench) is
+    # exercised separately below -- pre-seed a passing full-scope bench
+    # for this exact commit so this test stays focused on the approval/
+    # dispatch flow it was written for.
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    record(rws.ledger, "gamma", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
 
     publisher = FakePublisher()
     fakes = Fakes(publisher, FakeInstaller())
@@ -530,3 +538,146 @@ def test_call_publisher_rechecks_master_clean_right_before_dispatch(
     assert req.status == "failed"
     assert req.result == {"reason": "master_not_clean"}
     assert publisher.calls == []
+
+
+# ---------------------------------------------------------------------------
+# ensure_full_bench / approve_and_run's full-suite-bench gate: a ship
+# must have a FULL-scope passing bench for the exact released
+# fingerprint, not merely whatever scope satisfied the earlier commit
+# step. Uses the real pytest-based sample app (tests.fixtures.sample_app,
+# variant 1) so run_tests actually executes real tests.
+# ---------------------------------------------------------------------------
+
+def _rws_with_real_tests(tmp_path: Path) -> ReleaseWorkspace:
+    from tests.fixtures.sample_app import make_sample
+
+    sample = make_sample(tmp_path / "repos" / "gamma", 1, Path(sys.executable))
+    repo = sample.repo
+    master_repo = _clone_shared(repo, tmp_path / "master" / "gamma")
+    home = tmp_path / "home"
+    secrets = tmp_path / "secrets"
+    home.mkdir()
+    secrets.mkdir()
+    config = EngineConfig(
+        ledger_path=tmp_path / "ledger.sqlite", home=home, secrets_dir=secrets,
+        projects={"gamma": ProjectConfig(
+            "gamma", repo, test_cmd=sample.test_cmd, bench_cases=sample.bench_cases,
+            release=ReleaseConfig(master_repo=master_repo, target="gamma-app"),
+        )},
+        station_owners={}, approval_ttl_sec=3600,
+    )
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("gamma")
+    return ReleaseWorkspace(tmp_path, config, ledger, repo, master_repo)
+
+
+def test_ensure_full_bench_runs_full_suite_after_a_related_only_pass(
+    tmp_path: Path,
+) -> None:
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-fullbench")
+    _commit(rws.repo, "note.txt", "note\n", "advance")
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    # Simulate the commit step's own three_match having been satisfied
+    # by a "related"-only bench (allowed there) -- never "full".
+    record(rws.ledger, "gamma", attempt_id, "bench", fp,
+          payload={"passed": True, "scope": "related"})
+
+    fakes = Fakes(FakePublisher(), FakeInstaller())
+    result = release.ensure_full_bench(rws.config, rws.ledger, fakes, "gamma", attempt_id)
+
+    assert result["ran"] is True
+    assert result["passed"] is True
+    full_rows = [
+        row for row in rws.ledger.evidence(attempt_id, "bench")
+        if not row.stale and row.fingerprint == fp and row.payload.get("scope") == "full"
+    ]
+    assert len(full_rows) == 1
+    assert full_rows[0].payload["passed"] is True
+
+
+def test_ensure_full_bench_is_a_noop_when_latest_bench_is_already_full(
+    tmp_path: Path,
+) -> None:
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-fullbench-noop")
+    _commit(rws.repo, "note.txt", "note\n", "advance")
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    record(rws.ledger, "gamma", attempt_id, "bench", fp,
+          payload={"passed": True, "scope": "full"})
+
+    fakes = Fakes(FakePublisher(), FakeInstaller())
+    result = release.ensure_full_bench(rws.config, rws.ledger, fakes, "gamma", attempt_id)
+
+    assert result == {"ran": False, "passed": True, "fp": fp}
+
+
+def test_full_bench_failure_blocks_approve_and_run_before_any_merge(
+    tmp_path: Path,
+) -> None:
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-fullbench-fail")
+    _commit(rws.repo, "note.txt", "note\n", "advance")
+    master_before = release.head_sha(rws.master_repo)
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    record(rws.ledger, "gamma", attempt_id, "bench", fp,
+          payload={"passed": True, "scope": "related"})
+
+    # Force the full suite to fail regardless of the sample app's own
+    # (passing) tests.
+    failing_project = replace(
+        rws.config.projects["gamma"],
+        test_cmd=(sys.executable, "-c", "import sys; sys.exit(1)"),
+    )
+    failing_config = replace(
+        rws.config, projects={**rws.config.projects, "gamma": failing_project},
+    )
+
+    request_id, summary = release.prepare(failing_config, rws.ledger, "gamma", attempt_id)
+    fakes = Fakes(FakePublisher(), FakeInstaller())
+    outcome = release.approve_and_run(
+        failing_config, rws.ledger, fakes, "gamma", request_id, summary["owner_text"])
+
+    assert outcome["status"] == "rejected"
+    assert outcome["reason"] == "full_bench_failed"
+    assert outcome["bench"]["passed"] is False
+    assert release.head_sha(rws.master_repo) == master_before  # never merged
+    assert fakes.publisher.calls == []  # never dispatched
+
+
+def test_ensure_full_bench_reruns_after_evidence_invalidated_instead_of_trusting_old_done_request(
+    tmp_path: Path,
+) -> None:
+    """submit() is deterministic -- a bench request
+    for an unchanged {fp, scope: "full"} payload that already ran once
+    and passed, then had its evidence invalidated (e.g. a later
+    install), must NOT be trusted as still passing just because that
+    OLD request's own status is still "done". ensure_full_bench must
+    detect this, resubmit with a fresh identity, and actually run the
+    full suite again."""
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-regen")
+    _commit(rws.repo, "note.txt", "note\n", "advance")
+    fakes = Fakes(FakePublisher(), FakeInstaller())
+
+    first = release.ensure_full_bench(rws.config, rws.ledger, fakes, "gamma", attempt_id)
+    assert first["ran"] is True
+    assert first["passed"] is True
+    first_request_id = first["request_id"]
+    fp = first["fp"]
+
+    # Simulate the evidence being invalidated afterward (e.g. an
+    # install) -- the fingerprint itself is unchanged (no new commit).
+    invalidate_after(rws.ledger, "gamma", attempt_id, ("bench",))
+    assert release._latest_full_bench_passed(rws.ledger, attempt_id, fp) is False
+
+    second = release.ensure_full_bench(rws.config, rws.ledger, fakes, "gamma", attempt_id)
+
+    assert second["ran"] is True
+    assert second["passed"] is True
+    assert second["request_id"] != first_request_id  # a genuinely new request
+    fresh_rows = [
+        row for row in rws.ledger.evidence(attempt_id, "bench")
+        if not row.stale and row.fingerprint == fp and row.payload.get("scope") == "full"
+    ]
+    assert len(fresh_rows) == 1  # the invalidated row stays stale; one fresh row exists

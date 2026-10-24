@@ -1,23 +1,41 @@
 """review — launch a reviewer (claude/codex/scripted) read-only against
-the project repo's current diff against this attempt's base_head, and
-record pass/fail evidence bound to a fingerprint.
+an isolated snapshot of the project repo's current tree against this
+attempt's base_head, and record pass/fail evidence bound to a
+fingerprint.
 
-Request payload contract: {"role": str}.
+Request payload contract: {"role": str, "task": str (optional, "" if
+absent) -- the ORIGINAL request text the builder was given, shown to
+the reviewer so it judges the change against what was actually asked
+for}.
 
 compute_fingerprint  fp = evidence.fingerprint(repo); journal {fp}.
                      reconcile False -- a crash mid-run always
                      re-computes rather than trusting a half-written row.
-spawn_reviewer       workdir = repo itself (the reviewer is read-only --
-                     no worker copy exists for it); prompt =
-                     prompts.review_prompt(spec, diff_text), diff_text =
-                     `git diff {base_head}..HEAD` (committed changes
-                     since the job opened) + `git diff HEAD` (the
-                     working tree -- e.g. a merge's uncommitted result)
-                     + a pseudo-diff for every untracked (brand-new)
-                     file (`git diff` omits those entirely -- a merge
-                     that adds a whole new file would otherwise be
-                     invisible to the reviewer), truncated to 60k chars.
-                     Same spawn/reconcile shape as station.spawn_worker.
+spawn_reviewer       _export_review_snapshot(fp) extracts the EXACT
+                     fingerprinted tree (git ls-tree + cat-file blob,
+                     never `git archive`, which honors .gitattributes
+                     export-ignore/export-subst) into a fresh per-
+                     request directory outside the live repo; workdir
+                     = that snapshot, never the repo itself (isolates
+                     the reviewer from a concurrently running bench
+                     with write access to the live repo). prompt =
+                     prompts.review_prompt(spec, task, changed_files,
+                     diff_text, coverage_sent): changed_files from
+                     `git diff --name-status base_head fp`; diff_text
+                     from one `git diff base_head fp` (two already-
+                     fixed tree-ish objects -- fp's own construction
+                     already unions committed/staged/untracked content
+                     and applies excludes, so this single diff covers
+                     everything `git diff`'s separate committed-range/
+                     working-tree/untracked-pseudo-diff used to need
+                     three steps for); _prepare_diff_for_prompt sends
+                     the whole diff (chunked into <=60k-char pieces)
+                     when it fits a 240k-char total budget, else only
+                     the file list plus as much of the diff as fits,
+                     marking coverage_sent "partial" -- the reviewer's
+                     own JSON reply is then REQUIRED to echo this back
+                     as "coverage". Same spawn/reconcile shape as
+                     station.spawn_worker.
 await_reviewer       same shape as station.await_worker.
 record_review        recompute the fingerprint; if it differs from
                      compute_fingerprint's, StepFailed
@@ -31,18 +49,25 @@ record_review        recompute the fingerprint; if it differs from
                      ("review_malformed"), before anything is derived
                      from it or recorded. `passed` is NOT the
                      reviewer's own verdict boolean (kept separately as
-                     "reviewer_passed") but derived from `findings`:
-                     True iff no finding has severity P0 or P1 (a
-                     reviewer that returns passed=false over P2/P3
-                     findings alone must not block the job).
+                     "reviewer_passed") but derived from `findings` AND
+                     `coverage`: True iff no finding has severity P0 or
+                     P1 AND coverage == "full" (a reviewer that returns
+                     passed=false over P2/P3 findings alone must not
+                     block the job; one that only saw part of the diff
+                     can never pass, regardless of findings, since "no
+                     blocking findings" from a partial read proves
+                     nothing about the part never seen).
                      evidence.record(kind="review", fp, payload=
                      {"passed", "reviewer_passed", "findings",
-                     "request_id"}) FIRST, then, if not passed, raise
-                     StepFailed("review_not_passed") -- same pattern as
+                     "coverage", "request_id"}) FIRST, then, if not
+                     passed, raise StepFailed("review_incomplete") for
+                     coverage != "full" or StepFailed
+                     ("review_not_passed") otherwise -- same pattern as
                      bench_run.record_bench: the evidence stays visible
                      even though the request ends 'failed', and the
                      orbit stops here rather than continuing on to
-                     bench/commit against a tree review never passed.
+                     bench/commit on a tree a review never actually
+                     passed (or never actually finished reviewing).
 """
 from __future__ import annotations
 
@@ -51,14 +76,17 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from engine import evidence, ids, procs, sandbox
+from engine import evidence, fixup, ids, procs, sandbox
 from engine.gitutil import git_argv
 from engine.ledger import Event
 from engine.processor import StepContext, StepDef, StepFailed
 from engine.workers.base import WorkerSpec, wait_for_exit
 from engine.workers.prompts import review_prompt
 
-_DIFF_MAX_CHARS = 60_000
+_CHUNK_MAX_CHARS = 60_000
+# Up to 4 chunks' worth sent in one prompt before the diff counts as too
+# large to send in full -- see _prepare_diff_for_prompt.
+_TOTAL_DIFF_BUDGET = 4 * _CHUNK_MAX_CHARS
 
 
 def _project_config(ctx: StepContext):
@@ -211,12 +239,83 @@ def _diff_text(ctx: StepContext, fp: str) -> str:
         git_argv(repo, "diff", base_head, fp),
         capture_output=True, text=True,
     )
-    diff = result.stdout if result.returncode == 0 else ""
-    return diff[:_DIFF_MAX_CHARS]
+    return result.stdout if result.returncode == 0 else ""
 
 
-def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
+def _changed_files(ctx: StepContext, fp: str) -> list[str]:
+    """One line per changed path from `git diff --name-status base_head
+    fp` -- the SAME two already-fixed tree-ish objects _diff_text
+    diffs, so this list and the diff text always describe the same
+    change. Given to the reviewer as an overview even when the full
+    diff cannot be (see _prepare_diff_for_prompt)."""
+    repo = _repo(ctx)
+    base_head = _base_head(ctx)
+    result = subprocess.run(
+        git_argv(repo, "diff", "--name-status", base_head, fp),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _diff_chunks(text: str, chunk_size: int = _CHUNK_MAX_CHARS) -> list[str]:
+    if not text:
+        return []
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _prepare_diff_for_prompt(full_diff: str) -> tuple[str, str]:
+    """(diff_text_to_send, coverage): "full" sends the WHOLE diff --
+    however many <=60k-char chunks that takes, concatenated back
+    together with chunk headers -- when it fits within the 240k-char
+    total budget; "partial" sends only as much as fits that same
+    budget when the full diff is larger than it. The reviewer's own
+    verdict JSON is REQUIRED to echo this back as "coverage" (see
+    review_prompt / _verdict_is_well_formed) -- never silently assumed
+    "full" here just because some number of bytes happened to be
+    sent, and a "partial" verdict can never pass review regardless of
+    what findings it reports (see _run_record_review): a reviewer that
+    did not see the whole change proves nothing about the part it
+    never saw."""
+    if len(full_diff) <= _TOTAL_DIFF_BUDGET:
+        sendable, coverage = full_diff, "full"
+    else:
+        sendable, coverage = full_diff[:_TOTAL_DIFF_BUDGET], "partial"
+    chunks = _diff_chunks(sendable)
+    if not chunks:
+        return "(no diff)", coverage
+    labeled = "\n".join(
+        f"--- diff chunk {i + 1}/{len(chunks)} ---\n{chunk}"
+        for i, chunk in enumerate(chunks)
+    )
+    return labeled, coverage
+
+
+def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     role = str(ctx.request.payload["role"])
+    # The ORIGINAL request text the builder was given -- "" for a
+    # request submitted before this field existed, or one built by a
+    # caller that never set it (e.g. stages_after_install()'s own
+    # default, or a hand-built request). Never trusted for anything
+    # but display: the reviewer judges the change against it, but
+    # nothing here re-derives write permissions or scope from it. If
+    # the request itself carries none, recover it from the attempt's
+    # own run_station request (engine.fixup.original_task reads the
+    # ledger directly, independent of what this particular request
+    # happened to be submitted with) rather than silently reviewing
+    # against an empty task -- a reviewer with no idea what was asked
+    # for cannot meaningfully judge whether the change satisfies it,
+    # and an empty task must never look indistinguishable from "no
+    # task was needed". If NEITHER source has one, fail closed the
+    # same way a partial-coverage verdict does: a review that cannot
+    # even state what it is reviewing against is never "done" let
+    # alone "passed".
+    original_task = str(ctx.request.payload.get("task", ""))
+    if not original_task:
+        original_task = fixup.original_task(ctx.ledger, ctx.project, ctx.attempt_id)
+    if not original_task:
+        raise StepFailed("review_incomplete")
     worker = ctx.config.workers.get(role)
     if worker is None:
         raise StepFailed("no_worker_config")
@@ -239,9 +338,12 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
         task="", result_path=_result_path(ctx), config_path=ctx.config.config_path,
         env_passthrough=ctx.config.worker_env_passthrough,
     )
-    full_task = review_prompt(base_spec, _diff_text(ctx, fp))
+    changed_files = _changed_files(ctx, fp)
+    diff_text, coverage_sent = _prepare_diff_for_prompt(_diff_text(ctx, fp))
+    full_task = review_prompt(base_spec, original_task, changed_files,
+                              diff_text, coverage_sent)
     spec = dataclasses.replace(base_spec, task=full_task)
-    return spec, worker, runner
+    return spec, worker, runner, coverage_sent
 
 
 def _other_project_repos(ctx: StepContext) -> tuple[Path, ...]:
@@ -305,7 +407,7 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
 def _run_spawn_reviewer(ctx: StepContext) -> dict[str, object]:
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
     _export_review_snapshot(ctx, _repo(ctx), fp)
-    spec, worker, runner = _full_spec(ctx)
+    spec, worker, runner, _coverage_sent = _full_spec(ctx)
     argv = runner.argv(spec, worker)
     env = runner.env(spec, worker)
     argv = _sandboxed_argv(ctx, spec, argv, env, runner)
@@ -343,7 +445,7 @@ def _spawned_pid(ctx: StepContext) -> int:
 
 
 def _run_await_reviewer(ctx: StepContext) -> dict[str, object]:
-    spec, worker, _runner = _full_spec(ctx)
+    spec, worker, _runner, _coverage_sent = _full_spec(ctx)
     pid = _spawned_pid(ctx)
     code = wait_for_exit(pid, worker.timeout_sec)
     if code is None:
@@ -355,7 +457,7 @@ def _run_await_reviewer(ctx: StepContext) -> dict[str, object]:
 
 
 def _reconcile_await_reviewer(ctx: StepContext) -> bool:
-    spec, _worker, _runner = _full_spec(ctx)
+    spec, _worker, _runner, _coverage_sent = _full_spec(ctx)
     live = ctx.ledger.live_procs(ctx.attempt_id, spec.station)
     return not live and _stdout_path(ctx).exists()
 
@@ -366,15 +468,21 @@ _VALID_SEVERITIES = frozenset({"P0", "P1", "P2", "P3"})
 def _verdict_is_well_formed(verdict: dict[str, object]) -> bool:
     """True iff `verdict` matches the reviewer's own JSON schema
     (engine.workers.prompts.VERDICT_SCHEMA) closely enough to derive a
-    verdict from: "passed" a bool, "findings" a list of dicts each
-    with "severity" in the CLOSED, case-sensitive set {P0,P1,P2,P3},
-    "file" a str and "note" a str. Without this check, a malformed
-    verdict shape -- `{}`, a dict-valued "findings", or a severity
-    like "critical"/"p1" -- would pass through untouched and derive
-    passed=True (no P0/P1 found because nothing was recognized as a
-    finding at all); this fails closed on any of these instead of
-    silently treating the unknown shape as "no blocking findings"."""
+    verdict from: "passed" a bool, "coverage" one of the CLOSED set
+    {"full","partial"} (review_prompt requires the reviewer to echo
+    back how much of the diff it actually saw -- see
+    _prepare_diff_for_prompt), "findings" a list of dicts each with
+    "severity" in the CLOSED, case-sensitive set {P0,P1,P2,P3}, "file"
+    a str and "note" a str. Without this check, a malformed verdict
+    shape -- `{}`, a dict-valued "findings", a severity like
+    "critical"/"p1", or a missing/garbled "coverage" -- would pass
+    through untouched and derive passed=True (no P0/P1 found because
+    nothing was recognized as a finding at all); this fails closed on
+    any of these instead of silently treating the unknown shape as "no
+    blocking findings"."""
     if not isinstance(verdict.get("passed"), bool):
+        return False
+    if verdict.get("coverage") not in ("full", "partial"):
         return False
     findings = verdict.get("findings")
     if not isinstance(findings, list):
@@ -392,7 +500,7 @@ def _verdict_is_well_formed(verdict: dict[str, object]) -> bool:
 
 
 def _run_record_review(ctx: StepContext) -> dict[str, object]:
-    spec, _worker, runner = _full_spec(ctx)
+    spec, _worker, runner, coverage_sent = _full_spec(ctx)
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
     try:
         now_fp = evidence.fingerprint(_repo(ctx), _excludes(ctx))
@@ -407,6 +515,7 @@ def _run_record_review(ctx: StepContext) -> dict[str, object]:
     if not isinstance(verdict, dict) or not _verdict_is_well_formed(verdict):
         raise StepFailed("review_malformed")
     reviewer_passed = bool(verdict.get("passed"))
+    reviewer_coverage = str(verdict.get("coverage"))
     findings = verdict.get("findings", [])
     # The reviewer's own `passed` boolean is not trusted as-is (live
     # observation: a reviewer returned passed=false with only P2
@@ -418,12 +527,23 @@ def _run_record_review(ctx: StepContext) -> dict[str, object]:
         isinstance(f, dict) and f.get("severity") in ("P0", "P1")
         for f in findings
     )
-    passed = not blocking
+    # coverage must be "full" on BOTH sides, never the reviewer's
+    # claim alone: `coverage_sent` is the ENGINE's own, independently
+    # recomputed record of what was actually in the prompt (see
+    # _prepare_diff_for_prompt) -- a reviewer that (honestly or not)
+    # reports "full" when the engine itself only sent a partial diff
+    # must still never pass, since "no blocking findings" over content
+    # it was never shown proves nothing about the part it never saw.
+    # Trusting the reviewer's own report alone (as a prior version of
+    # this function did) let exactly that slip through.
+    passed = not blocking and coverage_sent == "full" and reviewer_coverage == "full"
     evidence.record(
         ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
         payload={
             "passed": passed, "reviewer_passed": reviewer_passed,
-            "findings": findings, "request_id": ctx.request.request_id,
+            "findings": findings, "coverage": coverage_sent,
+            "reviewer_coverage": reviewer_coverage,
+            "request_id": ctx.request.request_id,
         },
     )
     if not passed:
@@ -432,6 +552,8 @@ def _run_record_review(ctx: StepContext) -> dict[str, object]:
         # three_match/record even though this request itself ends
         # 'failed', and orbit must stop here -- not continue on to
         # bench/commit on a tree a review never actually passed.
+        if coverage_sent != "full" or reviewer_coverage != "full":
+            raise StepFailed("review_incomplete")
         raise StepFailed("review_not_passed")
     return {"fp": fp, "passed": passed}
 

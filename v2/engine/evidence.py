@@ -113,6 +113,60 @@ def _index_env(env_base: dict[str, str], tmp: Path) -> dict[str, str]:
     return env
 
 
+def _needs_slow_path(rel: str) -> bool:
+    """True for a path byte sequence that would corrupt the batched,
+    newline/tab-delimited `hash-object --stdin-paths` and `update-index
+    --index-info` formats -- git has no NUL-safe variant of either, so
+    such a (pathological, essentially never seen in practice) path
+    falls back to the old one-subprocess-per-path handling instead of
+    being silently mishandled. Newline/tab break the line-oriented
+    format outright; a backslash is git's own quoted-path escape
+    character, and a path that STARTS WITH a double quote makes git
+    try to parse the whole line as a C-quoted string (verified
+    directly: `printf '"q.txt\\n' | git hash-object --stdin-paths`
+    fails the entire batch with "line is badly quoted" rather than
+    just mishandling that one path) -- excluded here rather than
+    risked, in either direction (misinterpretation or an outright
+    failure that would otherwise fail every OTHER path in the same
+    batch too)."""
+    return "\n" in rel or "\t" in rel or "\\" in rel or rel.startswith('"')
+
+
+def _hash_entries_batch(repo: Path, paths: list[str],
+                        env: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """path -> (mode, blob_sha) for every REGULAR-file path in `paths`,
+    computed with a single `git hash-object --stdin-paths -w` call
+    instead of one `git hash-object -w <path>` subprocess per path --
+    verified to return the identical sha, in the same order as the
+    newline-separated input, as the old per-path call (manual probe:
+    both produced the same object for the same file). Never called
+    with a symlink path: `git hash-object`, with or without
+    --stdin-paths, always DEREFERENCES a symlink and hashes its
+    TARGET file's content (verified empirically -- there is no
+    --no-follow in this git version) -- the opposite of what a
+    symlink's own tree entry must store, so _hash_entry's separate
+    readlink-based path remains the only correct way to hash one."""
+    if not paths:
+        return {}
+    stdin_data = "\n".join(paths) + "\n"
+    result = subprocess.run(
+        git_argv(repo, "hash-object", "--stdin-paths", "-w"),
+        input=stdin_data, check=True, capture_output=True, env=env, text=True,
+    )
+    shas = result.stdout.splitlines()
+    if len(shas) != len(paths):
+        raise FingerprintError(
+            f"hash-object --stdin-paths returned {len(shas)} lines for "
+            f"{len(paths)} paths"
+        )
+    entries: dict[str, tuple[str, str]] = {}
+    for rel, sha in zip(paths, shas):
+        full = repo / rel
+        mode = "100755" if os.access(full, os.X_OK) else "100644"
+        entries[rel] = (mode, sha)
+    return entries
+
+
 def _build_index(repo: Path, paths: list[str], excludes: tuple[str, ...],
                  head_entries: dict[str, tuple[str, str]],
                  env: dict[str, str]) -> None:
@@ -120,18 +174,46 @@ def _build_index(repo: Path, paths: list[str], excludes: tuple[str, ...],
     env["GIT_INDEX_FILE"]: current on-disk content normally, or the
     unchanged HEAD blob for an excluded path that is tracked in HEAD (so
     excludes never delete a tracked file from a commit built off this
-    tree)."""
+    tree). Batches the common case (regular files, paths with no
+    newline/tab) into one hash-object call and one update-index call
+    total, rather than two subprocess calls PER path -- symlinks and
+    pathological paths still go through the original one-call-per-path
+    sequence, each correctly, just not batched."""
+    batch_entries: dict[str, tuple[str, str]] = {}
+    slow_rels: list[str] = []
+    to_hash: list[str] = []
     for rel in paths:
         if _is_excluded_rel(rel, excludes):
             head_entry = head_entries.get(rel)
             if head_entry is None:
                 continue  # excluded and never tracked: omit from the tree
-            mode, blob_sha = head_entry
+            if _needs_slow_path(rel):
+                slow_rels.append(rel)
+            else:
+                batch_entries[rel] = head_entry
+            continue
+        full = repo / rel
+        if not os.path.lexists(full):
+            continue  # deleted tracked file: omit from the tree
+        if _needs_slow_path(rel) or full.is_symlink():
+            slow_rels.append(rel)
         else:
-            full = repo / rel
-            if not os.path.lexists(full):
-                continue  # deleted tracked file: omit from the tree
-            mode, blob_sha = _hash_entry(repo, full, env)
+            to_hash.append(rel)
+    if to_hash:
+        batch_entries.update(_hash_entries_batch(repo, to_hash, env))
+    if batch_entries:
+        index_info = "".join(
+            f"{mode} {sha} 0\t{rel}\n" for rel, (mode, sha) in batch_entries.items()
+        )
+        subprocess.run(
+            git_argv(repo, "update-index", "--index-info"),
+            input=index_info, check=True, capture_output=True, env=env, text=True,
+        )
+    for rel in slow_rels:
+        if _is_excluded_rel(rel, excludes):
+            mode, blob_sha = head_entries[rel]
+        else:
+            mode, blob_sha = _hash_entry(repo, repo / rel, env)
         subprocess.run(
             git_argv(repo, "update-index", "--add",
              "--cacheinfo", f"{mode},{blob_sha},{rel}"),

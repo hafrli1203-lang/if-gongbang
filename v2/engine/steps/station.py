@@ -259,6 +259,16 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
     station = str(ctx.request.payload["station"])
     role = str(ctx.request.payload["role"])
     task = str(ctx.request.payload["task"])
+    builder_test_hint = ctx.config.projects[ctx.project].builder_test_hint
+    if builder_test_hint:
+        # Plain, config-authored guidance appended verbatim to the task
+        # text itself (never templated/parsed) -- e.g. telling the
+        # builder to run related_cmd-style tests while editing and the
+        # full test_cmd suite at most once at the end. build_prompt's
+        # own test_cmd line (engine.workers.prompts, not touched here)
+        # is unrelated to this -- this is a task-text addition, not a
+        # change to that fixed "run exactly this command" line.
+        task = f"{task}\n\n{builder_test_hint}"
 
     worker = ctx.config.workers.get(role)
     if worker is None:
