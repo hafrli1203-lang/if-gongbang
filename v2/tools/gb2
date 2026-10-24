@@ -35,6 +35,12 @@
                                           optional additional owner
                                           instructions appended to the
                                           composed continue-task
+    tools/gb2 doctor                     check every external dependency
+                                          gb2 itself relies on (python3.12,
+                                          git, bwrap, claude, codex, node,
+                                          npm, GB2_APPS_ROOT, and a release
+                                          app's deploy script); exit 1 if
+                                          anything required is missing
     tools/gb2 status <app>               engine.cli status, as JSON
     tools/gb2 log <app>                  last 5 jobs from this app's
                                           own run log (not the ledger --
@@ -102,10 +108,12 @@ import json
 import os
 import shlex
 import re
+import shutil
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 _ENGINE_ROOT = Path(__file__).resolve().parent.parent
@@ -114,9 +122,9 @@ sys.path.insert(0, str(_ENGINE_ROOT))
 from engine import evidence, fixup, orbit, release  # noqa: E402
 from engine.cli import _build_fakes, _drain, _job_name_for_attempt, _outcome_dict  # noqa: E402
 from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
-from engine.config import EngineConfig  # noqa: E402
+from engine.config import EngineConfig, WorkerConfig  # noqa: E402
 from engine.ledger import Event, Ledger  # noqa: E402
-from engine.processor import retry_unknown  # noqa: E402
+from engine.processor import Fakes, retry_unknown  # noqa: E402
 from engine.publishers import ShellPublisher  # noqa: E402
 from engine.steps.open_job import open_job  # noqa: E402
 
@@ -337,6 +345,60 @@ def _git(args: list[str], cwd: Path) -> str:
 # init
 # --------------------------------------------------------------------
 
+def _detect_default_branch(source_repo: Path) -> str:
+    """The source repo's own default branch, in order of preference:
+    (1) `git symbolic-ref refs/remotes/origin/HEAD` (what the remote
+    itself calls its default, if this repo has an "origin" at all);
+    (2) this repo's own current HEAD branch (a local-only repo, or one
+    whose remote tracking ref was never fetched); (3) whichever of
+    "master"/"main" exists as a local branch. Never assumes "master"
+    (older repos) or "main" (newer ones) outright -- WORKTREE_BASE
+    stays only as the brand-new-repo default `cmd_new`'s own
+    `_scaffold_new_app_repo` creates from scratch, where there is
+    nothing yet to detect. Raises ValueError if none of these resolve
+    (e.g. a repo with no commits at all)."""
+    try:
+        ref = _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=source_repo)
+    except subprocess.CalledProcessError:
+        ref = ""
+    if ref:
+        return ref.split("/", 1)[1] if "/" in ref else ref
+    try:
+        head = _git(["symbolic-ref", "--short", "HEAD"], cwd=source_repo)
+    except subprocess.CalledProcessError:
+        head = ""
+    if head:
+        return head
+    for candidate in ("master", "main"):
+        if _git(["branch", "--list", candidate], cwd=source_repo):
+            return candidate
+    raise ValueError(f"cannot determine default branch for {source_repo}")
+
+
+def _worktree_base_path(app: str) -> Path:
+    """Where this app's own detected default-branch name is kept --
+    gb2's own bookkeeping file (like runs.json), never a key inside
+    config.json: engine/config.py's own strict key validation is outside
+    this script's owned scope, so nothing here can add a new field to
+    the engine config it writes."""
+    return app_workspace(app) / "worktree_base.txt"
+
+
+def _read_worktree_base(app: str) -> str:
+    """The base branch `gb2 init`/`gb2 new` detected and recorded for
+    this app, or WORKTREE_BASE ("master") if this app's workspace
+    predates _worktree_base_path existing at all -- back-compat only,
+    never written fresh."""
+    path = _worktree_base_path(app)
+    if not path.exists():
+        return WORKTREE_BASE
+    text = path.read_text(encoding="utf-8").strip()
+    return text or WORKTREE_BASE
+
+
+def _write_worktree_base(app: str, base: str) -> None:
+    _worktree_base_path(app).write_text(base, encoding="utf-8")
+
 def _verify_worktree_identity(source_repo: Path, repo_dir: Path) -> None:
     """Raise ValueError unless `repo_dir` is ALREADY a worktree git
     itself registers for `source_repo`, currently on WORKTREE_BRANCH --
@@ -378,10 +440,10 @@ def _verify_app_repo_identity(app: str) -> None:
     _verify_worktree_identity(source_repo, repo_dir)
 
 
-def _ensure_worktree(source_repo: Path, repo_dir: Path) -> None:
+def _ensure_worktree(source_repo: Path, repo_dir: Path, base: str) -> None:
     existing_branches = _git(["branch", "--list", WORKTREE_BRANCH], cwd=source_repo)
     if not existing_branches:
-        _git(["branch", WORKTREE_BRANCH, WORKTREE_BASE], cwd=source_repo)
+        _git(["branch", WORKTREE_BRANCH, base], cwd=source_repo)
     if repo_dir.exists():
         _verify_worktree_identity(source_repo, repo_dir)
         return
@@ -462,7 +524,9 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
             encoding="utf-8",
         )
 
-    _ensure_worktree(source_repo, workspace / "repo")
+    base_branch = _detect_default_branch(source_repo)
+    _write_worktree_base(app, base_branch)
+    _ensure_worktree(source_repo, workspace / "repo", base_branch)
 
     config = EngineConfig.from_json(config_path)
     ledger = Ledger.open(config.ledger_path) if config.ledger_path.exists() \
@@ -511,32 +575,80 @@ def _render_skeleton_text(text: str, app_name: str) -> str:
     return text.replace("__APP__", app_name)
 
 
+_NEW_APP_MARKER_NAME = ".gongbang-new"
+
+
+def _new_app_marker_path(source_repo: Path) -> Path:
+    """gb2's own sentinel (never committed -- _scaffold_new_app_repo adds
+    only the named skeleton files, never `-A`, so this is never staged)
+    marking a `gb2 new` init still in progress for `source_repo`. Its
+    PRESENCE is what lets `cmd_new` tell "a previous `gb2 new` crashed
+    partway through, safe to resume" apart from "a real, already-
+    complete app (or one gb2 never touched at all) -- never adopt it"."""
+    return source_repo / _NEW_APP_MARKER_NAME
+
+
+def _validate_workspace_source_repo_disjoint(app: str, source_repo: Path) -> None:
+    """The same coincide-or-nest check `_setup_app_workspace` makes on
+    its own -- duplicated here so `cmd_new` can run it BEFORE ever
+    creating `source_repo` on disk (see cmd_new's own docstring: this is
+    a config mistake, not something that should ever leave a half-made
+    app repo around for a later `gb2 new` to have to resume from)."""
+    workspace = app_workspace(app)
+    if source_repo == workspace or _is_within(workspace, source_repo) \
+            or _is_within(source_repo, workspace):
+        raise ValueError(
+            f"workspace {workspace} and source repo {source_repo} must not "
+            "coincide or nest -- check GB2_WORKSPACE/GB2_APPS_ROOT"
+        )
+
+
 def _scaffold_new_app_repo(source_repo: Path, app: str) -> None:
     """Create `source_repo` as a brand-new git repository seeded from
     tools/templates/new-app/ (README, .gitignore, a minimal Node+Vitest
     package.json with no dependencies installed yet, an empty
     tests/scenes/ -- the planner role is the only one later allowed to
-    write under tests/scenes/), with one initial commit. Refuses
-    (raises ValueError, nothing created) if `source_repo` already
-    exists -- callers must check that themselves before calling this,
-    so a caller can distinguish "already exists" from any other
-    failure before touching disk at all."""
-    if source_repo.exists():
+    write under tests/scenes/), with one initial commit.
+
+    Idempotent/resumable: if `source_repo` already exists but still
+    carries `_new_app_marker_path`'s marker (a previous `gb2 new` call
+    crashed somewhere inside this function, or inside the
+    `_setup_app_workspace` call right after it, before the marker could
+    be removed), this finishes whatever is still missing -- an existing
+    skeleton file is left untouched (never re-rendered over real,
+    already-produced content), `git init` is skipped if `.git` already
+    exists, and the initial commit is skipped if HEAD already resolves
+    -- instead of raising. An existing `source_repo` WITHOUT that
+    marker (a real, already-complete app, or one gb2 never touched at
+    all) is still refused outright, nothing created."""
+    marker = _new_app_marker_path(source_repo)
+    if source_repo.exists() and not marker.exists():
         raise ValueError(f"app_exists: {source_repo}")
     skeleton_dir = TEMPLATES_DIR / "new-app"
     if not skeleton_dir.is_dir():
         raise ValueError(f"missing skeleton template dir: {skeleton_dir}")
-    source_repo.mkdir(parents=True)
+    source_repo.mkdir(parents=True, exist_ok=True)
+    marker.write_text(app, encoding="utf-8")
     for rel in _NEW_APP_SKELETON_FILES:
         src = skeleton_dir / rel
         dest = source_repo / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(_render_skeleton_text(src.read_text(encoding="utf-8"), app),
-                        encoding="utf-8")
-    _git(["init", "-q", "-b", WORKTREE_BASE], cwd=source_repo)
-    _git(["add", "-A"], cwd=source_repo)
-    _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
-         "commit", "-q", "-m", f"chore: scaffold {app} via gb2 new"], cwd=source_repo)
+        if not dest.exists():
+            dest.write_text(_render_skeleton_text(src.read_text(encoding="utf-8"), app),
+                            encoding="utf-8")
+    if not (source_repo / ".git").is_dir():
+        _git(["init", "-q", "-b", WORKTREE_BASE], cwd=source_repo)
+    try:
+        _git(["rev-parse", "HEAD"], cwd=source_repo)
+        has_commit = True
+    except subprocess.CalledProcessError:
+        has_commit = False
+    if not has_commit:
+        # Named paths, never `-A`: the marker file sits in this same
+        # directory and must never be staged/committed.
+        _git(["add", *_NEW_APP_SKELETON_FILES], cwd=source_repo)
+        _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
+             "commit", "-q", "-m", f"chore: scaffold {app} via gb2 new"], cwd=source_repo)
 
 
 def _exit_code_for_full_outcome(status: str) -> int:
@@ -589,6 +701,92 @@ def _progress_printer(kind: str) -> None:
     print(f"[{kind}] done", file=sys.stderr)
 
 
+# --------------------------------------------------------------------
+# GB2_SCRIPTED_WORKERS -- a test-only seam (not a documented
+# subcommand/flag) letting an acceptance test drive the whole full
+# orbit through the REAL `gb2 new`/`gb2 change`/`gb2 continue`/
+# `gb2 approve-design` commands with deterministic ScriptedRunner
+# workers instead of a live claude/codex CLI call. Unset (the default
+# for every normal invocation), none of this runs: `_fakes_builder`
+# returns `config` untouched and the exact `fakes_for` closure that
+# was inlined here before this seam existed.
+# --------------------------------------------------------------------
+
+def _scripted_workers_dir() -> Path | None:
+    """The directory GB2_SCRIPTED_WORKERS points at, or None if that
+    env var is unset/empty -- read lazily (once per full-orbit call,
+    not at import time) so nothing here changes behavior for a normal
+    `gb2` invocation that never sets it."""
+    value = os.environ.get("GB2_SCRIPTED_WORKERS", "").strip()
+    return Path(value) if value else None
+
+
+def _apply_scripted_workers(config: EngineConfig,
+                            workers_dir: Path) -> tuple[EngineConfig, dict[str, object]]:
+    """Return (`config` with every role in `config.workers` rewritten
+    to runner "scripted_<role>", {"scripted_<role>": ScriptedRunner}
+    for each of those roles) so a full-orbit run drives EVERY role
+    (facts/prober/planner/designer/builder/reviewer, whichever this
+    config defines) from `workers_dir`/<role>.json instead of a live
+    claude/codex CLI. The reviewer role's ScriptedRunner is built
+    read_only=True, same as every other scripted-reviewer fixture in
+    this codebase (tests/acceptance/test_t1_new_app.py etc.) -- review
+    never writes files, and engine.steps.review's own
+    "reviewer_not_read_only" check would fail the job otherwise.
+
+    Raises ValueError (nothing built, nothing started) if `workers_dir`
+    is missing even one role's own script file -- a half-scripted job
+    must never silently fall through to a real AI call for the role
+    whose file is missing."""
+    from engine.workers.scripted import ScriptedRunner
+
+    missing = sorted(role for role in config.workers if not (workers_dir / f"{role}.json").exists())
+    if missing:
+        raise ValueError(
+            f"GB2_SCRIPTED_WORKERS={workers_dir}: missing script file(s) for role(s) "
+            f"{', '.join(missing)} -- expected {workers_dir}/<role>.json for every role "
+            "in config.workers"
+        )
+    scripted_runners: dict[str, object] = {}
+    new_workers: dict[str, WorkerConfig] = {}
+    for role, worker in config.workers.items():
+        runner_key = f"scripted_{role}"
+        new_workers[role] = replace(worker, runner=runner_key)
+        scripted_runners[runner_key] = ScriptedRunner(
+            workers_dir / f"{role}.json", read_only=(role == "reviewer"),
+        )
+    return replace(config, workers=new_workers), scripted_runners
+
+
+def _fakes_builder(config: EngineConfig, app: str):
+    """(config, fakes_for) for a full-orbit call against `app`: by
+    default exactly `(config, lambda attempt_id: _build_fakes(config,
+    app, attempt_id, None))` -- the real installer/publisher plus the
+    real claude/codex runners, unchanged from before this function
+    existed. When GB2_SCRIPTED_WORKERS is set (see
+    _scripted_workers_dir/_apply_scripted_workers), `config`'s workers
+    are rewritten to deterministic scripted runners and the returned
+    `fakes_for` keeps `_build_fakes`'s own real installer/publisher but
+    merges in those scripted runners -- so a test can drive the real
+    `gb2` subcommands end to end with no live AI call anywhere.
+
+    Raises ValueError (caller already catches this the same way it
+    catches every other config-time ValueError) if the scripted
+    workers dir is missing a role's script file."""
+    workers_dir = _scripted_workers_dir()
+    if workers_dir is None:
+        return config, (lambda attempt_id: _build_fakes(config, app, attempt_id, None))
+
+    config, scripted_runners = _apply_scripted_workers(config, workers_dir)
+
+    def fakes_for(attempt_id: str):
+        base = _build_fakes(config, app, attempt_id, None)
+        return Fakes(publisher=base.publisher, installer=base.installer,
+                     runners={**base.runners, **scripted_runners})
+
+    return config, fakes_for
+
+
 def _run_full_job_and_report(args: argparse.Namespace, config: EngineConfig,
                              job_name: str, request: str) -> int:
     """Shared tail of cmd_new/cmd_change: engine.full_orbit.run_full_job
@@ -600,8 +798,10 @@ def _run_full_job_and_report(args: argparse.Namespace, config: EngineConfig,
     `gb2 run`) must keep working even before engine.full_orbit exists."""
     from engine import full_orbit
 
-    def fakes_for(attempt_id: str):
-        return _build_fakes(config, args.app, attempt_id, None)
+    try:
+        config, fakes_for = _fakes_builder(config, args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
 
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
@@ -628,11 +828,22 @@ def _read_requirement(args: argparse.Namespace) -> str | None:
 
 def cmd_new(args: argparse.Namespace) -> int:
     """`gb2 new <app> "요구사항"`: refuse if the app folder already
-    exists, else scaffold it from tools/templates/new-app/ (one initial
-    commit), set up its engine workspace exactly like `gb2 init`, then
-    run the full orbit (engine.full_orbit.run_full_job) end to end:
-    facts -> plan -> [design, if the plan is a UI job] -> the task
-    loop -> acceptance -> report."""
+    exists as a real, unrelated/complete app, else scaffold it from
+    tools/templates/new-app/ (one initial commit), set up its engine
+    workspace exactly like `gb2 init`, then run the full orbit
+    (engine.full_orbit.run_full_job) end to end: facts -> plan ->
+    [design, if the plan is a UI job] -> the task loop -> acceptance ->
+    report.
+
+    Everything is validated BEFORE the app folder is ever created
+    (app name, requirement text, the workspace/source-repo coincide-or-
+    nest check _setup_app_workspace would otherwise only catch after
+    `source_repo` already exists) -- a config mistake must never leave
+    a half-made app repo behind. If a PREVIOUS `gb2 new <app>` call left
+    `source_repo` with _new_app_marker_path's marker still in it (it
+    crashed somewhere inside scaffolding or workspace setup before ever
+    reaching the orbit run), this resumes that same init instead of
+    refusing "app_exists" -- see _scaffold_new_app_repo's own docstring."""
     try:
         _validate_app_name(args.app)
     except ValueError as exc:
@@ -641,14 +852,17 @@ def cmd_new(args: argparse.Namespace) -> int:
     if not request:
         return _err_json("requirement text (or --task-file) required", 1)
     source_repo = (_apps_root() / args.app).resolve()
-    if source_repo.exists():
+    marker = _new_app_marker_path(source_repo)
+    if source_repo.exists() and not marker.exists():
         return _err_json(f"app_exists: {source_repo}", 1)
 
     try:
+        _validate_workspace_source_repo_disjoint(args.app, source_repo)
         _scaffold_new_app_repo(source_repo, args.app)
         config = _setup_app_workspace(args.app, args.with_release)
     except ValueError as exc:
         return _err_json(str(exc), 1)
+    marker.unlink(missing_ok=True)
 
     job_name = args.job_name or f"gb2-new-{int(time.time())}"
     return _run_full_job_and_report(args, config, job_name, request)
@@ -691,6 +905,10 @@ def cmd_approve_design(args: argparse.Namespace) -> int:
     if not sys.stdin.isatty():
         return _err_json("refused: non-interactive shell, approve-design requires a TTY", 4)
     config = EngineConfig.from_json(config_path)
+    try:
+        config, fakes_for = _fakes_builder(config, args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
 
     from engine import full_orbit
 
@@ -710,9 +928,6 @@ def cmd_approve_design(args: argparse.Namespace) -> int:
             project=args.app, kind="design.approved", actor_kind="owner",
             actor_id="owner", attempt_id=attempt_id, payload={"job": job_name},
         ))
-
-        def fakes_for(attempt_id_: str):
-            return _build_fakes(config, args.app, attempt_id_, None)
 
         start = time.monotonic()
         outcome = full_orbit.continue_full_job(
@@ -739,6 +954,10 @@ def cmd_continue(args: argparse.Namespace) -> int:
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
     _verify_app_repo_identity(args.app)
     config = EngineConfig.from_json(config_path)
+    try:
+        config, fakes_for = _fakes_builder(config, args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
 
     from engine import full_orbit
 
@@ -749,9 +968,6 @@ def cmd_continue(args: argparse.Namespace) -> int:
         if attempt_id is None:
             return _err_json("no_active_job", 1)
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
-
-        def fakes_for(attempt_id_: str):
-            return _build_fakes(config, args.app, attempt_id_, None)
 
         start = time.monotonic()
         outcome = full_orbit.continue_full_job(
@@ -1006,11 +1222,109 @@ def cmd_board(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------
+
+def _doctor_cmd_present(name: str) -> tuple[bool, str]:
+    found = shutil.which(name)
+    return (found is not None, found or "not found on PATH")
+
+
+def _doctor_bwrap_runs() -> tuple[bool, str]:
+    """shutil.which alone is not enough -- a bwrap binary that is present
+    but cannot actually create its own namespaces (e.g. missing kernel
+    support, missing setuid bit) fails exactly the way the real sandbox
+    would at job time, so this runs the same read-only self-mount the
+    docstring promises (`bwrap --ro-bind / / true`) rather than trusting
+    PATH alone."""
+    if shutil.which("bwrap") is None:
+        return False, "not found on PATH"
+    try:
+        result = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "true"],
+            capture_output=True, timeout=10,
+        )
+    except OSError as exc:
+        return False, f"could not run: {exc}"
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    if result.returncode != 0:
+        tail = (result.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+        return False, f"exited {result.returncode}: {tail}" if tail else f"exited {result.returncode}"
+    return True, "ok"
+
+
+def _doctor_release_apps() -> list[str]:
+    """Every app (under GB2_WORKSPACE/apps/) whose config.json has at
+    least one project with a "release" key configured -- `doctor` only
+    requires a deploy script to exist for THESE apps, never for a
+    workspace that has no release-configured app at all."""
+    apps: list[str] = []
+    for app in _discover_apps():
+        try:
+            raw = json.loads((app_workspace(app) / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        projects = raw.get("projects")
+        if isinstance(projects, dict) and any(
+            isinstance(p, dict) and "release" in p for p in projects.values()
+        ):
+            apps.append(app)
+    return apps
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check every external dependency `gb2` itself relies on (never a
+    per-app concern, so this never touches an app's own repo/worktree):
+    python3.12, git, a bwrap that actually runs, the claude/codex CLIs,
+    node/npm (an app's own test_cmd/install_cmd need these, not gb2
+    itself, but they are required by tools/install.sh and checked here
+    for the same reason), GB2_APPS_ROOT being set, and -- only if some
+    app has release configured -- its deploy script existing on disk.
+    Prints one line per check; exit 1 if anything required is missing,
+    0 otherwise."""
+    checks: list[tuple[str, bool, str]] = []
+
+    for name in ("python3.12", "git", "claude", "codex", "node", "npm"):
+        ok, detail = _doctor_cmd_present(name)
+        checks.append((name, ok, detail))
+
+    bwrap_ok, bwrap_detail = _doctor_bwrap_runs()
+    checks.append(("bwrap", bwrap_ok, bwrap_detail))
+
+    apps_root_value = os.environ.get("GB2_APPS_ROOT", "")
+    checks.append(("GB2_APPS_ROOT", bool(apps_root_value),
+                   apps_root_value if apps_root_value else "not set"))
+
+    release_apps = _doctor_release_apps()
+    if release_apps:
+        if apps_root_value:
+            deploy_script = _deploy_script_path(Path(apps_root_value))
+            exists = deploy_script.exists()
+            detail = f"{deploy_script} (release apps: {', '.join(release_apps)})"
+        else:
+            exists, detail = False, "GB2_APPS_ROOT not set -- cannot resolve deploy script"
+        checks.append(("deploy_script", exists, detail))
+
+    width = max(len(name) for name, _ok, _detail in checks)
+    for name, ok, detail in checks:
+        mark = "OK" if ok else "MISSING"
+        print(f"{mark:7} {name.ljust(width)}  {detail}")
+
+    missing = [name for name, ok, _detail in checks if not ok]
+    if missing:
+        print(f"missing: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_diff(args: argparse.Namespace) -> int:
     _verify_app_repo_identity(args.app)
     source_repo = _apps_root() / args.app
-    stat = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}", "--stat"], cwd=source_repo)
-    full = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}"], cwd=source_repo)
+    base = _read_worktree_base(args.app)
+    stat = _git(["diff", f"{base}...{WORKTREE_BRANCH}", "--stat"], cwd=source_repo)
+    full = _git(["diff", f"{base}...{WORKTREE_BRANCH}"], cwd=source_repo)
     print(stat)
     print(full)
     return 0
@@ -1400,8 +1714,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     """Rebase the app worktree's gb2/work branch onto the current
-    master -- refuses (no rebase attempted) if the worktree has any
-    uncommitted change, tracked or untracked."""
+    default branch (the one `gb2 init`/`gb2 new` detected for this app --
+    see _detect_default_branch/_read_worktree_base) -- refuses (no
+    rebase attempted) if the worktree has any uncommitted change,
+    tracked or untracked."""
     repo_dir = app_workspace(args.app) / "repo"
     if not repo_dir.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
@@ -1409,7 +1725,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     status = _git(["status", "--porcelain"], cwd=repo_dir)
     if status:
         return _err_json("worktree_dirty: commit or stash before sync", 1)
-    _git(["rebase", WORKTREE_BASE], cwd=repo_dir)
+    _git(["rebase", _read_worktree_base(args.app)], cwd=repo_dir)
     head = _git(["rev-parse", "HEAD"], cwd=repo_dir)
     print(json.dumps({"ok": True, "app": args.app, "head": head}, ensure_ascii=False))
     return 0
@@ -1420,7 +1736,7 @@ _HANDLERS = {
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
     "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
     "new": cmd_new, "change": cmd_change, "approve-design": cmd_approve_design,
-    "continue": cmd_continue, "board": cmd_board,
+    "continue": cmd_continue, "board": cmd_board, "doctor": cmd_doctor,
 }
 
 
@@ -1487,6 +1803,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_continue = sub.add_parser("continue")
     p_continue.add_argument("app")
+
+    sub.add_parser("doctor")
 
     p_board = sub.add_parser("board")
     p_board.add_argument("app", nargs="?", default=None,

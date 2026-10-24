@@ -346,6 +346,16 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     worker = ctx.config.workers.get(role)
     if worker is None:
         raise StepFailed("no_worker_config")
+    # codex's own CLI (the only reviewer runner this engine ships today
+    # that is read_only) has no --mcp-config of its own here -- a
+    # review request that carries mcp tools for a codex reviewer must
+    # fail clearly rather than silently run with none of the mcp
+    # access the request actually asked for (see
+    # _allowed_mcp_servers/_payload_mcp_names: narrowing that down to
+    # {} and proceeding would look identical to a request that never
+    # asked for mcp at all).
+    if worker.runner == "codex" and _payload_mcp_names(ctx.request.payload):
+        raise StepFailed("reviewer_mcp_unsupported")
     runner = ctx.fakes.runners.get(worker.runner)
     if runner is None:
         raise StepFailed("no_runner")

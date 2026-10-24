@@ -27,12 +27,13 @@ from pathlib import Path
 import pytest
 
 from engine import full_orbit, orbit
+from engine.config import ReleaseConfig
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
 from engine.processor import Fakes, Processor, StepContext, StepDef, StepFailed
 from engine.steps.open_job import copy_root, dirty_paths
-from tests.conftest import Workspace
+from tests.conftest import GIT_ENV, Workspace
 from tests.fixtures.sample_app import make_sample
 
 FULL_STATION_OWNERS = {
@@ -169,9 +170,39 @@ class _AcceptanceHandoffFakes:
     handoff_calls: list[_FakeAcceptanceResult] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class _FakeSecurityResult:
+    passed: bool
+    findings: tuple[str, ...] = ()
+    ran: tuple[str, ...] = ()
+
+
+def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch, *,
+                               passed: bool = True) -> list[tuple[str, str]]:
+    """Stands in for s10-ops' own engine.app_security module (not yet
+    merged into this worktree -- engine.full_orbit imports it lazily by
+    name, same pattern as engine.acceptance/engine.handoff above).
+    Returns the list `check` calls append (project, attempt_id) to, so
+    a test can assert it ran exactly once."""
+    calls: list[tuple[str, str]] = []
+    security_mod = types.ModuleType("engine.app_security")
+
+    def check(config, project, attempt_id, plan):
+        calls.append((project, attempt_id))
+        return _FakeSecurityResult(passed=passed)
+
+    security_mod.check = check  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "engine.app_security", security_mod)
+    import engine as _engine_pkg
+    monkeypatch.setattr(_engine_pkg, "app_security", security_mod, raising=False)
+    return calls
+
+
 def _install_fake_acceptance_and_handoff(
-    monkeypatch: pytest.MonkeyPatch, results: list[_FakeAcceptanceResult],
+    monkeypatch: pytest.MonkeyPatch, results: list[_FakeAcceptanceResult], *,
+    security_passed: bool = True,
 ) -> _AcceptanceHandoffFakes:
+    _install_fake_app_security(monkeypatch, passed=security_passed)
     state = _AcceptanceHandoffFakes(results=list(results))
 
     acceptance_mod = types.ModuleType("engine.acceptance")
@@ -181,6 +212,23 @@ def _install_fake_acceptance_and_handoff(
         return state.results.pop(0)
 
     acceptance_mod.run_acceptance = run_acceptance  # type: ignore[attr-defined]
+
+    def run_probe_scripts(config, ledger, project, attempt_id, job_name, targets):
+        # Stands in for the engine's own run of each probe script: a
+        # target passes when its scripted log says PROBE OK (the stub
+        # scripts in these tests write a log, not a runnable script).
+        from types import SimpleNamespace
+        repo = config.projects[project].repo
+        out = []
+        for name, _url in targets:
+            log = repo / ".gongbang" / job_name / "probe" / f"{name}.log"
+            text = log.read_text(encoding="utf-8") if log.exists() else ""
+            ok = "PROBE OK" in text and "PROBE FAIL" not in text
+            out.append(SimpleNamespace(name=name, script=str(log), returncode=0 if ok else 1,
+                                       stdout_tail=text[-200:], ok=ok))
+        return tuple(out)
+
+    acceptance_mod.run_probe_scripts = run_probe_scripts  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine.acceptance", acceptance_mod)
     import engine as _engine_pkg
     monkeypatch.setattr(_engine_pkg, "acceptance", acceptance_mod, raising=False)
@@ -640,3 +688,192 @@ def test_worker_stuck_resume_reruns_build_task_before_review(
     assert (ws.alpha / "src/greeter/extra1.py").read_text(encoding="utf-8") == "VALUE_1 = 1\n"
     assert state.acceptance_calls == 1
     assert len(state.handoff_calls) == 1
+
+
+# ---- 10. release: ONE publish request for the whole job, not one per task --
+
+def _release_project(ws: Workspace, tmp_path: Path):
+    """Give "alpha" a `release` config whose master_repo is a `git clone
+    --shared` of alpha made BEFORE any of this job's own commits --
+    same technique/rationale as tests/unit/test_orbit.py's own
+    _release_project."""
+    master_repo = tmp_path / "release-master"
+    subprocess.run(["git", "clone", "--shared", "-q", str(ws.alpha), str(master_repo)],
+                  check=True, capture_output=True, env=GIT_ENV)
+    from dataclasses import replace as _replace
+
+    project_config = _replace(
+        ws.config.projects["alpha"],
+        release=ReleaseConfig(master_repo=master_repo, target="alpha-app"),
+    )
+    config = _replace(ws.config, projects={**ws.config.projects, "alpha": project_config})
+    return config, master_repo
+
+
+def test_release_configured_project_makes_one_publish_request_for_the_whole_job(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    config, _master_repo = _release_project(ws, tmp_path)
+    job_name = "release-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+        {"id": "t2", "title": "둘째 파일", "detail": "", "owns": ["src/greeter/extra2.py"],
+         "depends_on": ["t1"]},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},
+            {"src/greeter/extra2.py": "VALUE_2 = 2\n"},
+        ],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    outcome = full_orbit.run_full_job(
+        config, ws.ledger, _fakes(), "alpha", job_name, "두 파일을 만들어줘",
+        processor_factory=_processor_factory(stub),
+    )
+
+    # Both tasks built in full BEFORE the job ever stops for release --
+    # a per-task release stop (the bug this fixes) would have returned
+    # needs_owner right after task t1's own commit, with t2 never built.
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+    assert (ws.alpha / "src/greeter/extra2.py").exists()
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "release_approval"
+
+    publish_requests = [r for r in ws.ledger.queued_requests("alpha") if r.kind == "publish"]
+    assert len(publish_requests) == 1
+
+
+# ---- 11. resume table: probe_failed/plan_review_failed rerun their station --
+
+def test_continue_after_probe_failed_reruns_probe_then_finishes(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "probe-retry-job"
+    facts_md = (
+        "# 사실확정\n- 요청 확인: 통과 (출처: request)\n\n"
+        "## 외부 대상\n- stripe: https://docs.stripe.com/api\n"
+    )
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": facts_md}],
+        "probe": [
+            {f".gongbang/{job_name}/probe/stripe.log":
+             "https://docs.stripe.com/api\nPROBE FAIL\nconnection refused\n"},
+            {f".gongbang/{job_name}/probe/stripe.log":
+             "https://docs.stripe.com/api\nPROBE OK\n{\"status\": 200}\n"},
+        ],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+    factory = _processor_factory(stub)
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "stripe 결제 붙여줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "probe_failed:stripe"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_PROBE_RETRY
+    assert progress.get("resume_at") == full_orbit.STAGE_PROBE_RETRY
+    assert ("plan", "planner") not in stub.calls
+
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert done.status == "done", done
+    assert [c for c in stub.calls if c[0] == "probe"] == [
+        ("probe", "prober"), ("probe", "prober"),
+    ]
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
+def test_continue_after_plan_review_failed_reruns_plan_and_review(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "plan-retry-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [
+            {f".gongbang/{job_name}/plan.json": plan_json},
+            {f".gongbang/{job_name}/plan.json": plan_json},
+        ],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    review_calls = {"n": 0}
+
+    def _review_fails_once_then_passes(ctx: StepContext) -> list[StepDef]:
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls["n"] += 1
+            if review_calls["n"] == 1:
+                raise StepFailed("review_not_passed")
+            from engine import evidence
+
+            project_config = ctx.config.projects[ctx.project]
+            fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            if review_calls["n"] == 1:
+                return False
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", _review_fails_once_then_passes)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "plan_review_failed"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_PLAN_REVIEW
+    assert ("build", "builder") not in stub.calls
+
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert done.status == "done", done
+    assert [c for c in stub.calls if c[0] == "plan"] == [
+        ("plan", "planner"), ("plan", "planner"),
+    ]
+    # probe was never run again -- facts.md names no external target, so
+    # the resume starts straight at "plan", not "probe".
+    assert ("probe", "prober") not in stub.calls
+    assert (ws.alpha / "src/greeter/extra1.py").exists()

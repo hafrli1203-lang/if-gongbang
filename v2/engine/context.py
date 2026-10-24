@@ -27,6 +27,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -165,15 +166,19 @@ class _StdioMcpClient:
         except (BrokenPipeError, OSError) as exc:
             raise McpClientError(f"write failed: {exc}") from exc
 
-    def _read_line_with_timeout(self) -> str:
-        """Reads one line off stdout, bounded by `self._timeout` --
+    def _read_line_with_timeout(self, timeout_sec: float) -> str:
+        """Reads one line off stdout, bounded by `timeout_sec` --
         `readline()` on a pipe blocks indefinitely on its own, so a
         stuck/slow server would otherwise hang gather()/build() forever.
         Read happens on a daemon thread; if it has not produced a line
         within the timeout, the server process is killed and a
         McpClientError raised. The reader thread itself is left to exit
         on its own once the killed process's stdout closes (its result,
-        if any, is simply never collected)."""
+        if any, is simply never collected). `timeout_sec` is the
+        REMAINING budget of the caller's own overall deadline (see
+        _request), never `self._timeout` itself -- a single read must
+        never get a fresh full window just because it is one of several
+        reads inside one request."""
         if self._proc.stdout is None:
             raise McpClientError("no stdout")
         result: "queue.Queue[str]" = queue.Queue(maxsize=1)
@@ -186,7 +191,7 @@ class _StdioMcpClient:
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
-        thread.join(self._timeout)
+        thread.join(max(timeout_sec, 0.0))
         if thread.is_alive():
             self._kill()
             raise McpClientError(f"stdio MCP server timed out after {self._timeout}s")
@@ -202,8 +207,8 @@ class _StdioMcpClient:
         except Exception:
             pass
 
-    def _read_message(self) -> dict[str, object]:
-        line = self._read_line_with_timeout()
+    def _read_message(self, timeout_sec: float) -> dict[str, object]:
+        line = self._read_line_with_timeout(timeout_sec)
         if not line:
             raise McpClientError("stdio MCP server closed stdout")
         try:
@@ -218,12 +223,23 @@ class _StdioMcpClient:
         """Sends one JSON-RPC request and reads messages until one with
         a matching `id` arrives. A message without a matching id (e.g.
         a server notification sent ahead of the real reply) is not the
-        reply and is skipped rather than mistaken for it."""
+        reply and is skipped rather than mistaken for it -- but skipping
+        one never resets the clock: this whole call has ONE overall
+        deadline (`self._timeout` from when it started), not one fresh
+        `self._timeout` window per message read. Without this, a server
+        that keeps emitting a notification every (timeout_sec - epsilon)
+        could keep this loop alive indefinitely, since each individual
+        read would always finish just inside its own fresh window."""
         request_id = self._next_id
         self._next_id += 1
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + self._timeout
         while True:
-            message = self._read_message()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill()
+                raise McpClientError(f"stdio MCP server timed out after {self._timeout}s")
+            message = self._read_message(remaining)
             if message.get("id") != request_id:
                 continue
             if "error" in message:

@@ -61,11 +61,17 @@ Tool-name to Action mapping:
   Bash                                -> terminal, command = command
   mcp__<server>__<tool>               -> mcp, target = <server> (the
                                           bit between the first and
-                                          second "__"); malformed (no
-                                          second "__") -> deny
-                                          "tool_not_allowed" without
-                                          calling Policy, same as any
-                                          other unrecognized tool.
+                                          second "__"), mcp_tool =
+                                          <tool> (everything after the
+                                          second "__", passed through
+                                          for engine.policy's optional
+                                          per-server mcp_tool_allow
+                                          check); malformed (no second
+                                          "__", or nothing after it) ->
+                                          deny "tool_not_allowed"
+                                          without calling Policy, same
+                                          as any other unrecognized
+                                          tool.
   anything else (WebFetch, Task, ...)  -> deny "tool_not_allowed"
                                                   without calling Policy,
                                                   recorded as a
@@ -218,19 +224,19 @@ def _check_pattern_field(raw: object) -> None:
             raise _AmbiguousPath("pattern_escapes")
 
 
-def _mcp_server_name(tool_name: str) -> str | None:
-    """"mcp__<server>__<tool>" -> "<server>"; None if `tool_name` does
-    not have the "mcp__" prefix followed by a second "__" (so the
-    server name is never empty or ambiguous -- a malformed name is
-    treated as an unrecognized tool, not as some server with an empty
-    name)."""
+def _mcp_server_and_tool(tool_name: str) -> tuple[str, str] | None:
+    """"mcp__<server>__<tool>" -> (<server>, <tool>); None if `tool_name`
+    does not have the "mcp__" prefix followed by a second "__" and a
+    non-empty tool part (so neither half is ever empty or ambiguous --
+    a malformed name is treated as an unrecognized tool, not as some
+    server/tool with an empty name)."""
     if not tool_name.startswith(_MCP_PREFIX):
         return None
     rest = tool_name[len(_MCP_PREFIX):]
-    server, sep, _tool = rest.partition("__")
-    if not sep or not server:
+    server, sep, tool = rest.partition("__")
+    if not sep or not server or not tool:
         return None
-    return server
+    return server, tool
 
 
 def _load_facts(path_str: str | None, *, expected_project: str) -> ProjectFacts:
@@ -351,8 +357,9 @@ def decide(hook_input: dict[str, object], env: Mapping[str, str]) -> dict[str, o
             command = tool_input.get("command")
             action = Action(tool="terminal",
                              command=(str(command) if command is not None else None))
-        elif isinstance(tool_name, str) and _mcp_server_name(tool_name) is not None:
-            action = Action(tool="mcp", target=_mcp_server_name(tool_name))
+        elif isinstance(tool_name, str) and (server_and_tool := _mcp_server_and_tool(tool_name)):
+            server, mcp_tool = server_and_tool
+            action = Action(tool="mcp", target=server, mcp_tool=mcp_tool)
         else:
             sink.record(Event(
                 project=project, kind="gate.denied", actor_kind="worker",

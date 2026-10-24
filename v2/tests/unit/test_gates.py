@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from engine.gates import check_design_approved, check_facts, check_probe, check_probe_targets
+import pytest
+
+from engine.gates import (
+    ProbeTargetsError, check_design_approved, check_facts, check_probe, check_probe_targets,
+)
 from engine.ledger import Event, Ledger
 
 
@@ -162,17 +166,38 @@ def test_check_probe_targets_parses_name_and_url(tmp_path: Path) -> None:
     ]
 
 
-def test_check_probe_targets_skips_unparseable_lines(tmp_path: Path) -> None:
+def test_check_probe_targets_raises_on_malformed_line(tmp_path: Path) -> None:
     text = (
         "## 외부 대상\n"
         "- stripe: https://docs.stripe.com/api\n"
         "- 이름만 있고 콜론이 없는 줄\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    with pytest.raises(ProbeTargetsError):
+        check_probe_targets(tmp_path, "job")
+
+
+def test_check_probe_targets_raises_on_non_bullet_line(tmp_path: Path) -> None:
+    text = (
+        "## 외부 대상\n"
+        "- stripe: https://docs.stripe.com/api\n"
         "그냥 글 (불릿 아님)\n"
     )
     _write_facts(tmp_path, "job", text)
-    assert check_probe_targets(tmp_path, "job") == [
-        ("stripe", "https://docs.stripe.com/api"),
-    ]
+    with pytest.raises(ProbeTargetsError):
+        check_probe_targets(tmp_path, "job")
+
+
+def test_check_probe_targets_empty_mark_means_no_targets(tmp_path: Path) -> None:
+    text = "## 외부 대상\n(없음)\n"
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == []
+
+
+def test_check_probe_targets_bulleted_empty_mark_means_no_targets(tmp_path: Path) -> None:
+    text = "## 외부 대상\n- (없음)\n"
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == []
 
 
 def _write_probe_log(repo: Path, job: str, name: str, content: str) -> None:

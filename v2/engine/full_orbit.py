@@ -86,18 +86,21 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Callable
 
 from engine import context as context_mod
 from engine import orbit
 from engine.config import EngineConfig
 from engine.gates import _facts_path as _facts_md_path
-from engine.gates import check_design_approved, check_facts, check_probe, check_probe_targets
+from engine.gates import (
+    ProbeTargetsError, check_design_approved, check_facts, check_probe_targets,
+)
 from engine.gitutil import git_argv
 from engine.ledger import Event, Ledger
 from engine.plan import (
-    Plan, PlanError, Task, classify_skill_tools, load_plan, ordered_tasks, skill_catalog_text,
-    tools_for_station,
+    Plan, PlanError, Task, classify_skill_tools, load_plan, ordered_tasks, plan_path,
+    requirement_coverers, skill_catalog_text, tools_for_station,
     validate_plan, validate_tools,
 )
 from engine.processor import Fakes
@@ -113,6 +116,16 @@ PLANNER_ROLE = "planner"
 DESIGNER_ROLE = "designer"
 BUILDER_ROLE = "builder"
 REVIEWER_ROLE = "reviewer"
+
+# full_orbit.progress "stage" values a needs_owner stop may record --
+# continue_full_job dispatches on exactly these (see _RESUME_TABLE).
+STAGE_DESIGN_APPROVAL = "awaiting_design_approval"
+STAGE_TASK_OWNER = "awaiting_task_owner"
+STAGE_PROBE_RETRY = "awaiting_probe_retry"
+STAGE_PLAN_REVIEW = "awaiting_plan_review"
+STAGE_REQUIREMENTS_REVIEW = "awaiting_requirements_review"
+STAGE_SECURITY_FIX = "awaiting_security_fix"
+STAGE_RELEASE_APPROVAL = "awaiting_release_approval"
 
 # Characters of one probe log kept for the planner prompt's own "실측
 # 결과" section -- bounds a single huge/looping log from blowing up the
@@ -275,6 +288,85 @@ def _config_for_build_task(config: EngineConfig, job_name: str, plan: Plan) -> E
     return replace(config, station_owners=station_owners)
 
 
+def _config_without_release(config: EngineConfig, project: str) -> EngineConfig:
+    """`config`, unchanged, except this project's own `release` is None --
+    used for every PER-TASK attempt (each build task and each fix round,
+    see _run_task_attempt/continue_full_job's awaiting_task_owner resume)
+    so engine.orbit's own commit-stage release special case
+    (_run_stages: "a project with `release` configured stops EVERY
+    task's own attempt at needs_owner right after its commit") never
+    fires mid-job. The full-orbit contract makes exactly ONE publish
+    request for the whole job, submitted directly by
+    _maybe_release_or_done once every task + acceptance + the security
+    check have all passed -- never one per task."""
+    if config.projects[project].release is None:
+        return config
+    stripped = replace(config.projects[project], release=None)
+    return replace(config, projects={**config.projects, project: stripped})
+
+
+def _uncovered_requirement_ids(plan: Plan, acc: object) -> tuple[str, ...]:
+    """requirement ids (plan.requirements) not actually covered once
+    acceptance has run: covered by a scene that passed, or by any task
+    (every task in `plan.tasks` already finished "done" by the time
+    this is called -- see _finish_from_tasks/_run_tasks). validate_plan
+    already refuses a plan where some requirement has NO covering scene
+    or task at all (static check, at plan-load time) -- this is the
+    runtime half: a requirement whose only covering scene actually
+    FAILED still reads as uncovered here, even though the plan itself
+    was valid."""
+    if not plan.requirements:
+        return ()
+    coverers = requirement_coverers(plan)
+    passed_scene_ids = {s.id for s in acc.scenes if s.passed}  # type: ignore[attr-defined]
+    task_ids = {t.id for t in plan.tasks}
+    uncovered: list[str] = []
+    for requirement in plan.requirements:
+        covered = any(
+            (kind == "scene" and cid in passed_scene_ids) or (kind == "task" and cid in task_ids)
+            for kind, cid in coverers.get(requirement.id, ())
+        )
+        if not covered:
+            uncovered.append(requirement.id)
+    return tuple(uncovered)
+
+
+def _maybe_release_or_done(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
+                           attempt_id: str, report_path: Path, max_fix_rounds: int) -> FullOutcome:
+    """The LAST step of a whole job (ENGINE.md release track, s10
+    contract item 6): a project with no `release` configured reaches
+    "done" straight away, exactly as before. A project WITH `release`
+    configured instead submits ONE publish request for the whole job
+    (engine.release.prepare, bound to `attempt_id`'s own current repo
+    HEAD -- by now that HEAD already carries every task's commits plus
+    the handoff commit) and stops needs_owner "release_approval";
+    gb2's ship/skip-ship flow (outside this module) drives that request
+    to done/failed, after which continue_full_job's own
+    STAGE_RELEASE_APPROVAL branch turns it into this job's final
+    FullOutcome."""
+    release_config = config.projects[project].release
+    if release_config is None:
+        return FullOutcome("done", None, attempt_id, str(report_path))
+    from engine import release as release_mod  # worker C's module; lazy import
+
+    # engine.release.prepare's own submit() requires an ACTIVE attempt --
+    # `attempt_id` (the last task/fix attempt) already closed by the time
+    # this runs (its own "close" stage already ran). Open a fresh, roleless
+    # attempt purely to carry this one publish request -- "a final attempt
+    # bound to the final commit" (s10 contract item 1): its base_head is
+    # this exact repo HEAD (every task's commit plus the handoff commit),
+    # and it is left OPEN (never closed here) while the job waits for the
+    # owner's approval -- continue_full_job's own attempts_for_job_name
+    # lookup resumes on exactly this attempt.
+    release_attempt_id = open_job(config, ledger, project, job_name, "full", ())
+    request_id, _summary = release_mod.prepare(config, ledger, project, release_attempt_id)
+    _record_progress(ledger, project, release_attempt_id, job_name,
+                     stage=STAGE_RELEASE_APPROVAL, stop_reason="release_approval",
+                     resume_at=STAGE_RELEASE_APPROVAL, request_id=request_id,
+                     report_path=str(report_path), max_fix_rounds=max_fix_rounds)
+    return FullOutcome("needs_owner", "release_approval", release_attempt_id, None)
+
+
 def _record_context(ledger: Ledger, project: str, attempt_id: str | None, station: str,
                     sc: "context_mod.StationContext") -> None:
     """Appends the context.injected ledger event for this station's
@@ -342,14 +434,31 @@ def _run_and_merge(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: 
     station's own gate passed (see _commit_job_trail). `extra_payload`
     (the design call site's own plan.tools table, see
     engine.plan.tools_for_station) is merged into the run_station
-    payload on top of the fixed station/role/task keys."""
+    payload on top of the fixed station/role/task keys. `task_text`
+    already differs on a STAGE_PROBE_RETRY/STAGE_PLAN_REVIEW resume
+    (the caller appends the previous attempt's own log/plan.json as
+    context -- see _run_probe/_run_plan_and_review), so run_station's
+    own deterministic request_id is never the problem; the merge
+    stage's payload, on its own, names only role/station/path (fixed
+    for this attempt), so a SECOND merge of the same role here would
+    otherwise collide with the first merge's own already-"done" request
+    and never actually reapply anything (engine.processor.submit's
+    idempotency) -- `merge_retry_n` (how many merges this attempt has
+    already recorded) makes each retry's merge payload genuinely new."""
     payload: dict[str, object] = {"station": station, "role": role, "task": task_text}
     if extra_payload:
         payload.update(extra_payload)
     copy = str(copy_root(config, attempt_id, role))
+    merge_retry_n = sum(1 for _seq, event in ledger.events(project, "merge.recorded")
+                        if event.attempt_id == attempt_id)
+    merge_payload: dict[str, object] = {
+        "copies": [{"role": role, "station": station, "path": copy}],
+    }
+    if merge_retry_n:
+        merge_payload["merge_retry_n"] = merge_retry_n
     stages = [
         orbit.Stage("run_station", payload),
-        orbit.Stage("merge", {"copies": [{"role": role, "station": station, "path": copy}]}),
+        orbit.Stage("merge", merge_payload),
     ]
     return orbit.continue_job(config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id, stages,
                               processor_factory=processor_factory, on_progress=on_progress)
@@ -418,7 +527,10 @@ def _run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     `owns`, which default_stages() has no parameter for."""
     attempt_id = open_job(config, ledger, project, job_name, "full", (BUILDER_ROLE,))
     build_copy = str(copy_root(config, attempt_id, BUILDER_ROLE))
-    build_config = _config_for_build_task(config, job_name, plan)
+    # Never the project's own `release` for a per-task attempt's commit
+    # stage -- see _config_without_release's own docstring.
+    build_config = _config_without_release(
+        _config_for_build_task(config, job_name, plan), project)
     stages = [
         orbit.Stage("run_station", _builder_run_station_payload(task, task_text, plan,
                                                                  build_config, job_name)),
@@ -463,7 +575,8 @@ def _run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                 remaining = [t.id for t in tasks[index:]]
                 _record_progress(
                     ledger, project, outcome.attempt_id, job_name,
-                    stage="awaiting_task_owner", remaining_task_ids=remaining,
+                    stage=STAGE_TASK_OWNER, resume_at=STAGE_TASK_OWNER,
+                    remaining_task_ids=remaining,
                     current_task_id=task.id, current_task_text=task_text,
                     current_base_task_text=base_task_text, stop_reason=outcome.reason,
                 )
@@ -487,7 +600,15 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
         all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
         fix_task = Task(id=f"fix-{rounds + 1}", title="수락 실패 수정", detail="",
                         owns=all_owns, depends_on=())
-        base_task_text = fix_task_text(fix_task, plan.goal, failing, job_name, plan.ui)
+        # getattr with a default: these two AcceptanceResult fields (s10
+        # contract item 2) may not exist yet in this worktree's own
+        # engine.acceptance -- fix_task_text falls back to its own
+        # "no failing scene" wording either way.
+        base_task_text = fix_task_text(
+            fix_task, plan.goal, failing, job_name, plan.ui,
+            full_suite_returncode=getattr(acc, "full_suite_returncode", None),
+            full_suite_tail=getattr(acc, "full_suite_tail", ""),
+        )
         task_text = _prompt_with_context(config, ledger, project, None, "build",
                                          base_task_text, base_task_text,
                                          _planned_skills(config, plan, "build"))
@@ -500,7 +621,7 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
             if outcome.status == "needs_owner" or outcome.pending_requests:
                 _record_progress(
                     ledger, project, outcome.attempt_id, job_name,
-                    stage="awaiting_task_owner", remaining_task_ids=[],
+                    stage=STAGE_TASK_OWNER, resume_at=STAGE_TASK_OWNER, remaining_task_ids=[],
                     current_task_id=fix_task.id, current_task_text=task_text,
                     current_base_task_text=base_task_text, stop_reason=outcome.reason,
                     fix_round=rounds, fixing=True, max_fix_rounds=max_fix_rounds,
@@ -513,11 +634,41 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
     if not acc.passed:
         return FullOutcome("failed", "max_fix_rounds_exceeded", last_attempt_id, None)
 
+    uncovered = _uncovered_requirement_ids(plan, acc)
+    if uncovered:
+        reason = f"requirements_uncovered:{','.join(uncovered)}"
+        _record_progress(ledger, project, last_attempt_id, job_name,
+                         stage=STAGE_REQUIREMENTS_REVIEW, resume_at=STAGE_REQUIREMENTS_REVIEW,
+                         stop_reason=reason, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("needs_owner", reason, last_attempt_id, None)
+
     report_path = handoff_mod.write_handoff(config, ledger, project, last_attempt_id,
                                             job_name, plan, acc)
     _commit_job_trail(config, ledger, project, last_attempt_id, job_name,
                       f"gongbang: {job_name} - handoff")
-    return FullOutcome("done", None, last_attempt_id, str(report_path))
+    return _finish_after_handoff(config, ledger, project, job_name, plan, last_attempt_id,
+                                 report_path, max_fix_rounds)
+
+
+def _finish_after_handoff(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
+                          plan: Plan, attempt_id: str, report_path: Path,
+                          max_fix_rounds: int) -> FullOutcome:
+    """Everything after the handoff report is written and committed:
+    the app-wide security check (s10 contract item 1 -- s10-ops' own
+    engine.app_security module, lazy-imported the same way engine.
+    acceptance/engine.handoff are) and, only once that passes, the
+    job's single release request (_maybe_release_or_done)."""
+    from engine import app_security  # worker B's module; lazy import
+
+    security = app_security.check(config, project, attempt_id, plan)
+    if not security.passed:
+        _record_progress(ledger, project, attempt_id, job_name,
+                         stage=STAGE_SECURITY_FIX, resume_at=STAGE_SECURITY_FIX,
+                         stop_reason="security_failed", report_path=str(report_path),
+                         max_fix_rounds=max_fix_rounds)
+        return FullOutcome("needs_owner", "security_failed", attempt_id, None)
+    return _maybe_release_or_done(config, ledger, project, job_name, attempt_id,
+                                  report_path, max_fix_rounds)
 
 
 def _finish_from_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
@@ -532,6 +683,196 @@ def _finish_from_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, proje
     return _run_acceptance_and_handoff(config, ledger, fakes, project, job_name, plan,
                                        max_fix_rounds, on_progress, processor_factory,
                                        last_attempt_id)
+
+
+def _run_probe(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+              job_name: str, attempt_id: str, request: str,
+              on_progress: ProgressCallback | None,
+              processor_factory: orbit.ProcessorFactory | None,
+              max_fix_rounds: int) -> tuple[FullOutcome | None, str]:
+    """Runs the probe station from scratch (a fresh run_station call --
+    used both for a job's very first probe attempt and for a
+    STAGE_PROBE_RETRY resume, see _probe_plan_design_close). Returns
+    (None, probe_text) to keep going, or (the needs_owner/failed
+    FullOutcome to return right now, "")."""
+    repo = config.projects[project].repo
+    try:
+        targets = check_probe_targets(repo, job_name)
+    except ProbeTargetsError as exc:
+        # A malformed 외부 대상 line is never silently skipped: a person
+        # fixes facts.md, then continue reruns this station.
+        reason = f"probe_targets_invalid:{exc}"[:200]
+        _record_progress(ledger, project, attempt_id, job_name,
+                         stage=STAGE_PROBE_RETRY, resume_at=STAGE_PROBE_RETRY,
+                         stop_reason=reason, request=request, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("needs_owner", reason, attempt_id, None), ""
+    if not targets:
+        ledger.append(Event(
+            project=project, kind="probe.skipped", actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id, payload={"job": job_name},
+        ))
+        return None, ""
+    base_probe_text = prober_prompt(request, job_name, targets)
+    # A STAGE_PROBE_RETRY resume reruns this on the SAME (never-closed)
+    # attempt -- engine.ids/submit's own request_id is deterministic from
+    # this payload, so an unchanged prompt would collide with the FIRST
+    # run's already-"done" request and never actually run again (the
+    # RunStationStub-shaped bug this fixed). The previous attempt's own
+    # already-committed logs (if any -- "" on a job's first probe call)
+    # make the retry's payload genuinely different, and give the worker
+    # real context on what failed last time.
+    previous_logs = _probe_logs_text(repo, job_name, targets)
+    probe_prompt_text = (f"{base_probe_text}\n\n이전 시도 로그(다시 시도한다):\n{previous_logs}"
+                         if previous_logs else base_probe_text)
+    probe_task_text = _prompt_with_context(config, ledger, project, attempt_id, "probe",
+                                           request, probe_prompt_text)
+    outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "probe",
+                             PROBER_ROLE, probe_task_text, on_progress,
+                             processor_factory)
+    full = _station_outcome_to_full(outcome, "probe")
+    if full is not None:
+        return full, ""
+    _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                      f"gongbang: {job_name} - probe")
+    # Pass/fail comes from the engine's own run of each probe script
+    # (probe.executed: script, return code, output); the worker's log
+    # text ("PROBE OK") is supporting context only.
+    from engine import acceptance as acceptance_mod
+
+    evidence = acceptance_mod.run_probe_scripts(config, ledger, project, attempt_id,
+                                                job_name, targets)
+    failed = [e.name for e in evidence if not e.ok]
+    if failed:
+        failed_names = ",".join(failed)
+        reason = f"probe_failed:{failed_names}"
+        _record_progress(ledger, project, attempt_id, job_name,
+                         stage=STAGE_PROBE_RETRY, resume_at=STAGE_PROBE_RETRY,
+                         stop_reason=reason, request=request, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("needs_owner", reason, attempt_id, None), ""
+    return None, _probe_logs_text(repo, job_name, targets)
+
+
+def _run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                         job_name: str, attempt_id: str, request: str, probe_text: str,
+                         on_progress: ProgressCallback | None,
+                         processor_factory: orbit.ProcessorFactory | None,
+                         max_fix_rounds: int) -> tuple[FullOutcome | None, Plan | None]:
+    """Runs the plan station, then reviews that same change, from
+    scratch -- used both for a job's first plan attempt and for a
+    STAGE_PLAN_REVIEW resume. Returns (None, plan) to keep going, or
+    (the needs_owner/failed FullOutcome to return right now, None)."""
+    repo = config.projects[project].repo
+    facts_md = _facts_md_text(repo, job_name)
+    base_plan_prompt = planner_prompt(request, job_name, facts_md, skill_catalog_text(config),
+                                      probe_text)
+    # A STAGE_PLAN_REVIEW resume reruns this on the SAME (never-closed)
+    # attempt -- same idempotent-request_id reasoning as _run_probe's own
+    # retry note: an unchanged prompt would collide with the first
+    # attempt's own already-"done" run_station request. The previous
+    # (review-rejected, never committed) plan.json, still sitting in the
+    # working tree from that first attempt's own merge, makes the retry's
+    # payload different and shows the worker what it wrote last time.
+    try:
+        previous_plan_json = plan_path(repo, job_name).read_text(encoding="utf-8")
+    except OSError:
+        previous_plan_json = ""
+    plan_prompt_text = (
+        f"{base_plan_prompt}\n\n이전 시도의 plan.json(검토를 통과하지 못했다. 고쳐 다시 "
+        f"쓴다):\n{previous_plan_json}" if previous_plan_json else base_plan_prompt
+    )
+    plan_task_text = _prompt_with_context(config, ledger, project, attempt_id, "plan",
+                                          request, plan_prompt_text)
+    outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "plan",
+                             PLANNER_ROLE, plan_task_text,
+                             on_progress, processor_factory)
+    full = _station_outcome_to_full(outcome, "plan")
+    if full is not None:
+        return full, None
+    try:
+        plan = load_plan(repo, job_name)
+    except PlanError as exc:
+        return FullOutcome("failed", f"plan:{exc.reason}", attempt_id, None), None
+    problems = validate_plan(plan, repo, _build_prefixes(config))
+    problems += validate_tools(plan, config)
+    if problems:
+        return FullOutcome("failed", "plan:" + "; ".join(problems), attempt_id, None), None
+
+    # Review the planner's own merged-but-uncommitted change (plan.json +
+    # tests/scenes/) BEFORE it is committed as the orchestrator's own plan
+    # trail -- otherwise it becomes every later reviewer's base_head
+    # (nothing to diff against) and is never judged by anyone (Codex
+    # finding). One plain review Stage on this same attempt; the diff it
+    # sees is exactly base_head..current (this merge's own files, nothing
+    # else has touched the tree yet).
+    plan_review_outcome = orbit.continue_job(
+        config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id,
+        [orbit.Stage("review", _review_payload(config, ledger, project, plan, request))],
+        processor_factory=processor_factory, on_progress=on_progress,
+    )
+    if plan_review_outcome.status != "done":
+        _record_progress(ledger, project, attempt_id, job_name,
+                         stage=STAGE_PLAN_REVIEW, resume_at=STAGE_PLAN_REVIEW,
+                         stop_reason="plan_review_failed", request=request,
+                         probe_text=probe_text, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("needs_owner", "plan_review_failed", attempt_id, None), None
+
+    _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                      f"gongbang: {job_name} - plan", station="plan", role=PLANNER_ROLE)
+    return None, plan
+
+
+def _probe_plan_design_close(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                             job_name: str, attempt_id: str, request: str,
+                             max_fix_rounds: int, on_progress: ProgressCallback | None,
+                             processor_factory: orbit.ProcessorFactory | None, *,
+                             start: str = "probe", probe_text: str = "") -> FullOutcome:
+    """probe -> plan+review -> (design, if plan.ui) -> close -> build
+    loop. `start` is "probe" (a fresh job, or a STAGE_PROBE_RETRY
+    resume) or "plan" (a STAGE_PLAN_REVIEW resume -- probe already
+    succeeded and stays as-is, `probe_text` is its already-committed
+    logs, read by the resume caller)."""
+    if start == "probe":
+        full, probe_text = _run_probe(config, ledger, fakes, project, job_name, attempt_id,
+                                      request, on_progress, processor_factory, max_fix_rounds)
+        if full is not None:
+            return full
+
+    full, plan = _run_plan_and_review(config, ledger, fakes, project, job_name, attempt_id,
+                                      request, probe_text, on_progress, processor_factory,
+                                      max_fix_rounds)
+    if full is not None:
+        return full
+    assert plan is not None
+
+    if plan.ui:
+        usable_skills, _needs_install = classify_skill_tools(plan, config)
+        design_task_text = _prompt_with_context(config, ledger, project, attempt_id, "design",
+                                                request, designer_prompt(request, job_name, plan.goal),
+                                                _planned_skills(config, plan, "design"))
+        outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "design",
+                                 DESIGNER_ROLE, design_task_text,
+                                 on_progress, processor_factory,
+                                 extra_payload={"tools": tools_for_station(
+                                     plan, "design", usable_skills=usable_skills)})
+        full = _station_outcome_to_full(outcome, "design")
+        if full is not None:
+            return full
+        _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                          f"gongbang: {job_name} - design")
+        if not check_design_approved(ledger, project, job_name):
+            _record_progress(ledger, project, attempt_id, job_name,
+                             stage=STAGE_DESIGN_APPROVAL, resume_at=STAGE_DESIGN_APPROVAL,
+                             stop_reason="design_approval", max_fix_rounds=max_fix_rounds)
+            return FullOutcome("needs_owner", "design_approval", attempt_id, None)
+
+    close_outcome = _close_attempt(config, ledger, fakes, project, attempt_id, job_name,
+                                   on_progress, processor_factory)
+    if close_outcome.status != "done":
+        return FullOutcome("failed", f"close:{close_outcome.reason}", attempt_id, None)
+
+    return _finish_from_tasks(config, ledger, fakes, project, job_name, plan,
+                              ordered_tasks(plan), max_fix_rounds, on_progress,
+                              processor_factory)
 
 
 def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
@@ -555,96 +896,38 @@ def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
     if problems:
         return FullOutcome("failed", "facts:" + "; ".join(problems), attempt_id, None)
 
-    facts_md = _facts_md_text(repo, job_name)
-    targets = check_probe_targets(repo, job_name)
-    probe_text = ""
-    if not targets:
-        ledger.append(Event(
-            project=project, kind="probe.skipped", actor_kind="processor",
-            actor_id="processor", attempt_id=attempt_id, payload={"job": job_name},
-        ))
-    else:
-        probe_task_text = _prompt_with_context(config, ledger, project, attempt_id, "probe",
-                                               request, prober_prompt(request, job_name, targets))
-        outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "probe",
-                                 PROBER_ROLE, probe_task_text, on_progress,
-                                 processor_factory)
-        full = _station_outcome_to_full(outcome, "probe")
-        if full is not None:
-            return full
-        _commit_job_trail(config, ledger, project, attempt_id, job_name,
-                          f"gongbang: {job_name} - probe")
-        probe_problems = check_probe(repo, job_name, targets)
-        if probe_problems:
-            failed_names = ",".join(p.split(":", 1)[0] for p in probe_problems)
-            return FullOutcome("needs_owner", f"probe_failed:{failed_names}", attempt_id, None)
-        probe_text = _probe_logs_text(repo, job_name, targets)
+    return _probe_plan_design_close(config, ledger, fakes, project, job_name, attempt_id,
+                                    request, max_fix_rounds, on_progress, processor_factory,
+                                    start="probe")
 
-    plan_task_text = _prompt_with_context(config, ledger, project, attempt_id, "plan",
-                                          request, planner_prompt(request, job_name, facts_md,
-                                                                   skill_catalog_text(config),
-                                                                   probe_text))
-    outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "plan",
-                             PLANNER_ROLE, plan_task_text,
-                             on_progress, processor_factory)
-    full = _station_outcome_to_full(outcome, "plan")
-    if full is not None:
-        return full
-    try:
-        plan = load_plan(repo, job_name)
-    except PlanError as exc:
-        return FullOutcome("failed", f"plan:{exc.reason}", attempt_id, None)
-    problems = validate_plan(plan, repo, _build_prefixes(config))
-    problems += validate_tools(plan, config)
-    if problems:
-        return FullOutcome("failed", "plan:" + "; ".join(problems), attempt_id, None)
 
-    # Review the planner's own merged-but-uncommitted change (plan.json +
-    # tests/scenes/) BEFORE it is committed as the orchestrator's own plan
-    # trail -- otherwise it becomes every later reviewer's base_head
-    # (nothing to diff against) and is never judged by anyone (Codex
-    # finding). One plain review Stage on this same attempt; the diff it
-    # sees is exactly base_head..current (this merge's own files, nothing
-    # else has touched the tree yet).
-    plan_review_outcome = orbit.continue_job(
-        config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id,
-        [orbit.Stage("review", _review_payload(config, ledger, project, plan, request))],
-        processor_factory=processor_factory, on_progress=on_progress,
-    )
-    if plan_review_outcome.status != "done":
-        return FullOutcome("needs_owner", "plan_review_failed", attempt_id, None)
-
-    _commit_job_trail(config, ledger, project, attempt_id, job_name,
-                      f"gongbang: {job_name} - plan", station="plan", role=PLANNER_ROLE)
-
-    if plan.ui:
-        usable_skills, _needs_install = classify_skill_tools(plan, config)
-        design_task_text = _prompt_with_context(config, ledger, project, attempt_id, "design",
-                                                request, designer_prompt(request, job_name, plan.goal),
-                                                _planned_skills(config, plan, "design"))
-        outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "design",
-                                 DESIGNER_ROLE, design_task_text,
-                                 on_progress, processor_factory,
-                                 extra_payload={"tools": tools_for_station(
-                                     plan, "design", usable_skills=usable_skills)})
-        full = _station_outcome_to_full(outcome, "design")
-        if full is not None:
-            return full
-        _commit_job_trail(config, ledger, project, attempt_id, job_name,
-                          f"gongbang: {job_name} - design")
-        if not check_design_approved(ledger, project, job_name):
-            _record_progress(ledger, project, attempt_id, job_name,
-                             stage="awaiting_design_approval", max_fix_rounds=max_fix_rounds)
-            return FullOutcome("needs_owner", "design_approval", attempt_id, None)
-
-    close_outcome = _close_attempt(config, ledger, fakes, project, attempt_id, job_name,
+def _reopen_for_retry(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                      job_name: str, stale_attempt_id: str,
+                      on_progress: ProgressCallback | None,
+                      processor_factory: orbit.ProcessorFactory | None) -> tuple[FullOutcome | None, str]:
+    """Closes `stale_attempt_id` (report -> close, same as the design-
+    approval resume already does on this shared facts/probe/plan/design
+    attempt) and opens a brand-new one for the SAME job. Needed before
+    a STAGE_PROBE_RETRY/STAGE_PLAN_REVIEW resume reruns a station whose
+    own merge already landed and was committed once on `stale_attempt_id`
+    -- engine.steps.merge's own base_head check (_verify_destinations_
+    unchanged) refuses a SECOND merge of the same path on the SAME
+    attempt, because the repo's HEAD (carrying that first, already-
+    committed probe/plan trail) no longer matches that attempt's fixed
+    base_head: "someone else's committed change landed there since this
+    copy's base" -- true here even though the "someone else" is this
+    very job's own earlier station. A fresh attempt's own base_head is
+    the CURRENT repo HEAD (already including that earlier commit), so
+    the retry's own new merge sees no conflict. Returns (None, the new
+    attempt_id) to keep going, or (the failed FullOutcome to return
+    right now, "")."""
+    close_outcome = _close_attempt(config, ledger, fakes, project, stale_attempt_id, job_name,
                                    on_progress, processor_factory)
     if close_outcome.status != "done":
-        return FullOutcome("failed", f"close:{close_outcome.reason}", attempt_id, None)
-
-    return _finish_from_tasks(config, ledger, fakes, project, job_name, plan,
-                              ordered_tasks(plan), max_fix_rounds, on_progress,
-                              processor_factory)
+        return FullOutcome("failed", f"close:{close_outcome.reason}", stale_attempt_id, None), ""
+    new_attempt_id = open_job(config, ledger, project, job_name, "full",
+                              (FACTS_ROLE, PROBER_ROLE, PLANNER_ROLE, DESIGNER_ROLE))
+    return None, new_attempt_id
 
 
 def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
@@ -660,15 +943,40 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     if progress is None:
         raise FullOrbitError(f"no pending stop recorded for job {job_name!r}")
 
+    max_fix_rounds = int(progress.get("max_fix_rounds", 2))
+    stage = progress.get("stage")
+
+    # These two stages stop BEFORE plan.json ever exists (a probe retry)
+    # or before it was ever committed (a plan-review retry rerun from
+    # scratch) -- load_plan below would raise "plan_missing" for either,
+    # so both are dispatched first, never touching `plan` at all.
+    if stage == STAGE_PROBE_RETRY:
+        request = str(progress.get("request", ""))
+        failed, fresh_attempt_id = _reopen_for_retry(config, ledger, fakes, project, job_name,
+                                                      attempt_id, on_progress, processor_factory)
+        if failed is not None:
+            return failed
+        return _probe_plan_design_close(config, ledger, fakes, project, job_name,
+                                        fresh_attempt_id, request, max_fix_rounds, on_progress,
+                                        processor_factory, start="probe")
+
+    if stage == STAGE_PLAN_REVIEW:
+        request = str(progress.get("request", ""))
+        probe_text = str(progress.get("probe_text", ""))
+        failed, fresh_attempt_id = _reopen_for_retry(config, ledger, fakes, project, job_name,
+                                                      attempt_id, on_progress, processor_factory)
+        if failed is not None:
+            return failed
+        return _probe_plan_design_close(config, ledger, fakes, project, job_name,
+                                        fresh_attempt_id, request, max_fix_rounds, on_progress,
+                                        processor_factory, start="plan", probe_text=probe_text)
+
     try:
         plan = load_plan(repo, job_name)
     except PlanError as exc:
         return FullOutcome("failed", f"plan:{exc.reason}", attempt_id, None)
 
-    max_fix_rounds = int(progress.get("max_fix_rounds", 2))
-    stage = progress.get("stage")
-
-    if stage == "awaiting_design_approval":
+    if stage == STAGE_DESIGN_APPROVAL:
         if not check_design_approved(ledger, project, job_name):
             return FullOutcome("needs_owner", "design_approval", attempt_id, None)
         close_outcome = _close_attempt(config, ledger, fakes, project, attempt_id, job_name,
@@ -679,7 +987,31 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                                   ordered_tasks(plan), max_fix_rounds, on_progress,
                                   processor_factory)
 
-    if stage == "awaiting_task_owner":
+    if stage == STAGE_REQUIREMENTS_REVIEW:
+        # The owner has (outside this call) presumably fixed the plan's
+        # own scenes/tasks `covers` or the app itself -- re-run
+        # acceptance and the coverage check fresh, rather than trusting
+        # the stale AcceptanceResult that caused this stop.
+        return _run_acceptance_and_handoff(config, ledger, fakes, project, job_name,
+                                           plan, max_fix_rounds, on_progress,
+                                           processor_factory, attempt_id)
+
+    if stage == STAGE_SECURITY_FIX:
+        report_path = Path(str(progress.get("report_path", "")))
+        return _finish_after_handoff(config, ledger, project, job_name, plan, attempt_id,
+                                     report_path, max_fix_rounds)
+
+    if stage == STAGE_RELEASE_APPROVAL:
+        request_id = str(progress.get("request_id", ""))
+        report_path = str(progress.get("report_path", ""))
+        request_row = ledger.request(request_id)
+        if request_row.status == "done":
+            return FullOutcome("done", None, attempt_id, report_path)
+        if request_row.status in ("failed", "unknown"):
+            return FullOutcome("failed", "release_rejected", attempt_id, None)
+        return FullOutcome("needs_owner", "release_approval", attempt_id, None)
+
+    if stage == STAGE_TASK_OWNER:
         # The reviewer is always shown the plain base task text (no build-
         # station skill appendix) -- current_base_task_text falls back to
         # current_task_text only for a progress event recorded before this
@@ -698,7 +1030,11 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
             if task_obj is None:
                 raise FullOrbitError(f"unknown task id for resume: {current_task_id!r}")
 
-        run_config = config
+        # Never the project's own `release` for this per-task attempt's
+        # commit stage either (see _config_without_release) -- a task-
+        # attempt resume must not trigger engine.orbit's own per-commit
+        # release stop any more than a fresh task attempt does.
+        run_config = _config_without_release(config, project)
         if progress.get("stop_reason") == "worker_stuck":
             # run_station itself stopped (engine.orbit's own continuation
             # limit, see CONTINUABLE_REASONS/MAX_STATION_CONTINUES) BEFORE
@@ -711,7 +1047,7 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
             # continuation of the exhausted one -- on the SAME attempt/copy,
             # then merge, then review onward.
             task_text = str(progress.get("current_task_text", base_task_text))
-            run_config = _config_for_build_task(config, job_name, plan)
+            run_config = _config_for_build_task(run_config, job_name, plan)
             build_copy = str(copy_root(run_config, attempt_id, BUILDER_ROLE))
             resume_stages = [
                 orbit.Stage("run_station", _builder_run_station_payload(
@@ -719,11 +1055,11 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                 orbit.Stage("merge", {"copies": [
                     {"role": BUILDER_ROLE, "station": "build", "path": build_copy},
                 ]}),
-                *orbit.stages_after_install(config, attempt_id, BUILDER_ROLE,
+                *orbit.stages_after_install(run_config, attempt_id, BUILDER_ROLE,
                                             REVIEWER_ROLE, job_name, base_task_text),
             ]
         else:
-            resume_stages = orbit.stages_after_install(config, attempt_id, BUILDER_ROLE,
+            resume_stages = orbit.stages_after_install(run_config, attempt_id, BUILDER_ROLE,
                                                         REVIEWER_ROLE, job_name, base_task_text)
         outcome = orbit.continue_job(run_config, ledger, _fakes_for(fakes, attempt_id), project,
                                      attempt_id, resume_stages, processor_factory=processor_factory,
@@ -750,4 +1086,6 @@ __all__ = [
     "FullOutcome", "FullOrbitError", "run_full_job", "continue_full_job",
     "FACTS_ROLE", "PROBER_ROLE", "PLANNER_ROLE", "DESIGNER_ROLE", "BUILDER_ROLE",
     "REVIEWER_ROLE",
+    "STAGE_DESIGN_APPROVAL", "STAGE_TASK_OWNER", "STAGE_PROBE_RETRY", "STAGE_PLAN_REVIEW",
+    "STAGE_REQUIREMENTS_REVIEW", "STAGE_SECURITY_FIX", "STAGE_RELEASE_APPROVAL",
 ]

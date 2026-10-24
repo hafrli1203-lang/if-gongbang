@@ -199,7 +199,10 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
     status" field; full_orbit's own FullOutcome is a return value, not a
     ledger row). Rule, in priority order:
     1. the LAST full_orbit.progress event's stage starts with
-       "awaiting_" -> 사람 확인 대기 (owner input needed).
+       "awaiting_" -> "사람 확인 대기" (plus ": <stop_reason>" when that
+       same progress event carries a "stop_reason" field -- s10 contract
+       item 5; an older progress event recorded before that field
+       existed just reads as the plain label, unchanged).
     2. a job.handoff_written event exists for one of this job's
        attempts -> 완료. This is deliberately NOT 'report.written':
        every attempt's own "report" stage appends that generic event
@@ -208,22 +211,37 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
        task's report stage ran, even with many tasks still left --
        job.handoff_written (engine.handoff.write_handoff) is the one
        event for the WHOLE job's own final handoff, appended once.
-    3. the latest attempt's own status is abandoned/interrupted -> 중단.
-    4. otherwise -> 진행 중.
+    3. the LAST "job.metrics" event (engine.orbit's own per-attempt
+       outcome record, written right before a stage-list call returns
+       early) has payload["outcome"] == "failed" -> "실패".
+    4. the latest attempt's own status is abandoned/interrupted -> 중단.
+    5. otherwise -> 진행 중.
     """
     last_progress_stage: str | None = None
+    last_progress_reason: str | None = None
+    last_metrics_outcome: str | None = None
     has_handoff = False
     for event in job_events:
         if event.kind == "full_orbit.progress":
             stage = event.payload.get("stage")
             if isinstance(stage, str):
                 last_progress_stage = stage
+                reason = event.payload.get("stop_reason")
+                last_progress_reason = reason if isinstance(reason, str) else None
         elif event.kind == "job.handoff_written":
             has_handoff = True
+        elif event.kind == "job.metrics":
+            outcome = event.payload.get("outcome")
+            if isinstance(outcome, str):
+                last_metrics_outcome = outcome
     if last_progress_stage and last_progress_stage.startswith(_AWAITING_PREFIX):
+        if last_progress_reason:
+            return f"사람 확인 대기: {last_progress_reason}"
         return "사람 확인 대기"
     if has_handoff:
         return "완료"
+    if last_metrics_outcome == "failed":
+        return "실패"
     if latest_attempt is not None and latest_attempt.status in ("abandoned", "interrupted"):
         return "중단"
     return "진행 중"
@@ -362,9 +380,21 @@ tr:last-child td { border-bottom: 1px solid var(--line-strong); }
 _STATUS_BADGE = {
     "완료": "badge-pos",
     "사람 확인 대기": "badge-warn",
+    "실패": "badge-neg",
     "중단": "badge-neg",
     "진행 중": "badge-soft",
 }
+
+
+def _status_badge_class(status: str) -> str:
+    """_STATUS_BADGE, matched by prefix for "사람 확인 대기: <reason>"
+    (s10 contract item 5 -- the badge itself only cares about the fixed
+    label, never the free-text reason after the colon)."""
+    if status in _STATUS_BADGE:
+        return _STATUS_BADGE[status]
+    if status.startswith("사람 확인 대기"):
+        return _STATUS_BADGE["사람 확인 대기"]
+    return "badge-soft"
 
 
 def _esc(value: Any) -> str:
@@ -491,7 +521,7 @@ def _render_jobs_table(apps: list[AppBoard]) -> str:
     jobs = sorted(jobs, key=lambda j: (j.last_ts or 0), reverse=True)
     rows = []
     for job in jobs:
-        badge_cls = _STATUS_BADGE.get(job.status, "badge-soft")
+        badge_cls = _status_badge_class(job.status)
         rows.append(
             "<tr>"
             f"<td>{_esc(job.app)}</td>"

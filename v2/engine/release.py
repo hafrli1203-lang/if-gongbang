@@ -21,6 +21,7 @@ engine.steps.open_job and engine.steps.publish's own HEAD checks.
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
 
 from engine import evidence
@@ -28,7 +29,7 @@ from engine.approvals import ApprovalError, grant, parse_owner_message
 from engine.config import EngineConfig
 from engine.gitutil import git_argv
 from engine.ledger import Event, Ledger, LedgerError
-from engine.processor import CancelError, Fakes, Processor, cancel_request, submit
+from engine.processor import CancelError, Fakes, Processor, ProcessorBusy, cancel_request, submit
 
 
 def head_sha(repo: Path) -> str:
@@ -436,17 +437,36 @@ def cancel_pending_publish(ledger: Ledger, project: str, attempt_id: str,
     reconciled through `gb2 resolve`/retry_unknown, never force-
     cancelled here. Returns the request_ids actually cancelled,
     oldest-submitted first; [] if this attempt has no queued publish
-    request at all."""
-    cancelled: list[str] = []
-    for request in ledger.queued_requests(project):
-        if request.kind != "publish" or request.attempt_id != attempt_id:
-            continue
-        if request.status != "queued":
-            continue  # 'running': has an external effect -- not ours to touch
-        cancel_request(ledger, project, request.request_id, reason)
-        _revoke_unused_approvals(ledger, project, attempt_id, request.request_id)
-        cancelled.append(request.request_id)
-    return cancelled
+    request at all.
+
+    Holds the project lock (the same one Processor.run_once/run_request
+    takes) for the whole read-queued-requests-then-cancel sequence, not
+    just the final write: without it, a caller's own "is this safe to
+    cancel" check (e.g. tools/gb2's `skip-ship`, which checks
+    _project_lock_is_free and the publisher's own receipt BEFORE calling
+    this) and this function's cancellation could straddle a live
+    processor's dispatch -- a request seen 'queued' here could flip to
+    'running'/dispatched between that caller's own check and this
+    function's own read, cancelling a request a processor had, by then,
+    already started delivering. Raises ProcessorBusy (no ledger write at
+    all) if the lock is already held by a live processor -- callers must
+    retry rather than proceed as if nothing needed cancelling."""
+    holder = f"cancel-pending-publish-{uuid.uuid4().hex[:8]}"
+    if not ledger.acquire_lock(project, holder):
+        raise ProcessorBusy(f"project {project!r} locked by another processor")
+    try:
+        cancelled: list[str] = []
+        for request in ledger.queued_requests(project):
+            if request.kind != "publish" or request.attempt_id != attempt_id:
+                continue
+            if request.status != "queued":
+                continue  # 'running': has an external effect -- not ours to touch
+            cancel_request(ledger, project, request.request_id, reason)
+            _revoke_unused_approvals(ledger, project, attempt_id, request.request_id)
+            cancelled.append(request.request_id)
+        return cancelled
+    finally:
+        ledger.release_lock(project, holder)
 
 
 def _revoke_unused_approvals(ledger: Ledger, project: str, attempt_id: str,

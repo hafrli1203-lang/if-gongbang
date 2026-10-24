@@ -367,6 +367,57 @@ def test_review_refuses_non_read_only_runner(workspace: Workspace) -> None:
     assert ws.ledger.evidence(attempt_id, "review") == []
 
 
+def test_review_codex_reviewer_with_mcp_tools_fails_clearly(workspace: Workspace) -> None:
+    """codex's own CLI (the real, read_only reviewer runner this engine
+    ships) has no --mcp-config wiring here -- a review request that
+    carries mcp tools for a codex-runner reviewer must fail with a
+    clear reason rather than silently run with none of the requested
+    mcp access (which would look identical to a request that never
+    asked for any)."""
+    ws = _review_workspace(workspace)
+    config = replace(
+        ws.config,
+        workers={"reviewer": WorkerConfig(runner="codex", timeout_sec=5.0)},
+        mcp_servers={"library": McpServerConfig(command=("python3", "-m", "lib"))},
+        station_mcp_allow={"review": ("library",)},
+    )
+    ws = Workspace(ws.root, config, ws.ledger, ws.alpha, ws.beta)
+    attempt_id = open_job(config, ws.ledger, "alpha", "review-codex-mcp-job", "full", ())
+    rid = submit_request(
+        ws.ledger, "alpha", attempt_id, "review",
+        {"role": "reviewer", "task": "do the task", "tools": {"mcp": ["library"]}},
+        "owner",
+    )
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(), runners={})
+    proc = Processor(config=config, ledger=ws.ledger, fakes=fakes, holder="p1")
+    proc.register("review", review.steps)
+    proc.run_once("alpha")
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "reviewer_mcp_unsupported"}
+    assert ws.ledger.evidence(attempt_id, "review") == []
+
+
+def test_review_codex_reviewer_without_mcp_tools_is_unaffected(workspace: Workspace) -> None:
+    """A codex reviewer that was never asked for any mcp tool keeps
+    failing for whatever OTHER reason it would have before this check
+    existed (here: no scripted/codex runner registered in fakes) --
+    the new check must never fire for a plain request."""
+    ws = _review_workspace(workspace)
+    config = replace(ws.config, workers={"reviewer": WorkerConfig(runner="codex", timeout_sec=5.0)})
+    ws = Workspace(ws.root, config, ws.ledger, ws.alpha, ws.beta)
+    attempt_id, rid = _submit_review(ws)
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(), runners={})
+    proc = Processor(config=config, ledger=ws.ledger, fakes=fakes, holder="p1")
+    proc.register("review", review.steps)
+    proc.run_once("alpha")
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "no_runner"}
+
+
 def test_review_no_worker_config_fails(workspace: Workspace) -> None:
     ws = _review_workspace(workspace)
     ws = Workspace(ws.root, replace(ws.config, workers={}), ws.ledger,

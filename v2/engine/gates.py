@@ -15,7 +15,12 @@ check_probe_targets  facts.md's optional "## 외부 대상" section ->
               [(name, url), ...] -- the external APIs/CLIs/file formats
               this job depends on, each with its own official-doc URL.
               [] (no such section, or facts.md missing) means the probe
-              station is skipped entirely (engine.full_orbit).
+              station is skipped entirely (engine.full_orbit). A line in
+              that section that is neither "(없음)" (explicitly "no
+              targets") nor a well-formed "- name: url" bullet raises
+              ProbeTargetsError -- a malformed line is never silently
+              dropped, since a target engine.full_orbit never saw is a
+              target it never ran a probe script for.
 check_probe   [] iff every target in a check_probe_targets() list has
               its own .gongbang/<job>/probe/<name>.log containing
               "PROBE OK" -- a missing log or one without that marker is
@@ -33,6 +38,17 @@ _SOURCE_MARK = "출처"
 _CODE_VALUES_HEADER = "코드에 넣는 값"
 _PROBE_TARGETS_HEADER = "외부 대상"
 _PROBE_OK_MARK = "PROBE OK"
+_PROBE_EMPTY_MARK = "없음"
+
+
+class ProbeTargetsError(Exception):
+    """facts.md's "## 외부 대상" section has a line that is neither
+    "(없음)" nor a well-formed "- name: url" bullet -- see
+    check_probe_targets."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 def _facts_path(repo: Path, job: str) -> Path:
@@ -154,11 +170,15 @@ def check_design_approved(ledger: Ledger, project: str, job: str) -> bool:
 def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
     """facts.md's optional "## 외부 대상" section, parsed line by line:
     "- <name>: <공식 문서 URL>" -> (name, url), in the order they
-    appear, skipping any line that does not match that shape. []
-    (never raises) if facts.md does not exist, or has no such section
-    at all -- engine.full_orbit treats that as "this job touches no
-    external API/CLI/file format" and skips the probe station
-    entirely."""
+    appear. [] (never raises for either of these) if facts.md does not
+    exist, has no such section at all, or the section's only content
+    is the sentinel "(없음)" (optionally bulleted "- (없음)") -- engine.
+    full_orbit treats any of these as "this job touches no external
+    API/CLI/file format" and skips the probe station entirely. Any
+    OTHER line in the section that is not a well-formed "- name: url"
+    bullet raises ProbeTargetsError rather than being silently
+    skipped -- a malformed target line must stop the job, not quietly
+    disappear from the list engine.full_orbit runs probes against."""
     path = _facts_path(repo, job)
     try:
         text = path.read_text(encoding="utf-8")
@@ -168,13 +188,19 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
     targets: list[tuple[str, str]] = []
     for line in section:
         stripped = line.strip()
-        if not stripped.startswith("-"):
+        if not stripped:
             continue
+        bare = stripped.lstrip("-").strip()
+        if bare in (f"({_PROBE_EMPTY_MARK})", _PROBE_EMPTY_MARK):
+            return []
+        if not stripped.startswith("-"):
+            raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
         body = stripped[1:].strip()
         name, sep, url = body.partition(":")
         name, url = name.strip(), url.strip()
-        if sep and name and url:
-            targets.append((name, url))
+        if not sep or not name or not url:
+            raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
+        targets.append((name, url))
     return targets
 
 
@@ -201,4 +227,5 @@ def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[st
 
 __all__ = [
     "check_facts", "check_design_approved", "check_probe_targets", "check_probe",
+    "ProbeTargetsError",
 ]

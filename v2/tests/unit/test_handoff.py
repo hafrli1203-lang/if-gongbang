@@ -115,6 +115,49 @@ def test_open_items_empty_when_everything_passed(workspace: Workspace) -> None:
     assert "없음 (모든 장면과 전체 시험 통과)" in text
 
 
+def test_scene_table_pairs_by_requirement_id_not_position(workspace: Workspace) -> None:
+    """s10 contract item 4: the 대조표 pairs a requirement with whatever
+    scene/task actually covers its id -- not with whatever happens to
+    sit at the same list index."""
+    from engine.plan import Plan as RealPlan
+    from engine.plan import Requirement
+    from engine.plan import Scene as RealScene
+    from engine.plan import Task as RealTask
+
+    ws = _sample_workspace(workspace)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "job1", "full",
+                          roles=("builder",))
+    plan = RealPlan(
+        goal="x", ui=False,
+        requirements=(
+            Requirement(id="R1", text="인사말이 Hello, X 형태로 나온다", kind="function"),
+            Requirement(id="R2", text="입력을 검증한다", kind="security"),
+        ),
+        # Scene s2 is declared BEFORE s1 here -- deliberately out of
+        # requirement order, so a positional pairing would mismatch R1/R2.
+        scenes=(
+            RealScene(id="s2", actor_does="y", app_shows="y", where="cli",
+                     cmd=(sys.executable, "-c", "pass"), covers=()),
+            RealScene(id="s1", actor_does="x", app_shows="Hello, World", where="cli",
+                     cmd=(sys.executable, "-c", "pass"), covers=("R1",)),
+        ),
+        tasks=(RealTask(id="t1", title="검증", detail="", owns=("src/",),
+                        depends_on=(), covers=("R2",)),),
+        acceptance=("인사말이 Hello, X 형태로 나온다",),
+    )
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    path = write_handoff(ws.config, ws.ledger, "alpha", attempt_id, "job1", plan, acc)
+    text = path.read_text(encoding="utf-8")
+
+    r1_line = next(line for line in text.splitlines() if line.startswith("| R1"))
+    assert "scene:s1" in r1_line
+    assert "통과" in r1_line
+    r2_line = next(line for line in text.splitlines() if line.startswith("| R2"))
+    assert "task:t1" in r2_line
+    assert "통과(작업 완료)" in r2_line
+
+
 def test_report_overwritten_by_a_later_write_for_the_same_job(workspace: Workspace) -> None:
     """write_handoff always overwrites report.md -- the file reflects the
     most recent AcceptanceResult passed to it, not the first one."""

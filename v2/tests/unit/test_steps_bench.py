@@ -518,3 +518,11 @@ def test_ran_zero_tests_detects_no_files_and_all_skipped() -> None:
         "related", " Test Files  1 failed (1)\n      Tests  1 failed (1)\n")
     # Never applies to a "full" run.
     assert not _ran_zero_tests("full", "No test files found, exiting with code 1\n")
+
+
+def test_vitest_failure_signature_survives_colour_codes() -> None:
+    from engine.steps.bench_run import _case_signature
+
+    coloured = ("AssertionError: expected 1 to be 2\n"
+                "\x1b[31m Tests \x1b[39m \x1b[1m\x1b[31m1 failed\x1b[39m\x1b[22m | 3 passed\n")
+    assert _case_signature({"text": coloured}) == "assertion"

@@ -12,6 +12,22 @@ from pathlib import Path
 from engine.ledger import Event, Ledger
 
 
+def exit_file_for(stdout_path: Path) -> Path:
+    """The file spawn() has the real command write its own exit code
+    into, derived deterministically from `stdout_path` -- never a
+    separate parameter a caller also has to pass. Every call site that
+    spawns a worker gives procs.spawn a stdout_path AND always lists
+    that same path first in the progress_paths it later hands
+    engine.workers.base.wait_while_progressing, so that function derives
+    the identical path from progress_paths[0] with no new argument of
+    its own either. This is what lets wait_for_exit recover a process's
+    real exit code after a crash-and-resume lands it in a different OS
+    process (no longer this engine's child, so plain waitpid() can never
+    tell it apart from "exited successfully") without engine.steps.
+    station/review threading a new parameter through."""
+    return stdout_path.with_name(stdout_path.name + ".exit")
+
+
 def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
           argv: list[str], cwd: Path, *, env: dict[str, str] | None = None,
           stdout_path: Path | None = None, stdin_devnull: bool = False,
@@ -27,14 +43,36 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     stdout+stderr and closed again once Popen has started the child (the
     child already has its own duplicated fd by then); stdin_devnull
     redirects stdin from /dev/null instead of inheriting it (needed by
-    e.g. `codex exec`, which otherwise blocks on stdin)."""
+    e.g. `codex exec`, which otherwise blocks on stdin).
+
+    When stdout_path is given, the real argv is wrapped as
+    `sh -c '"$@"; code=$?; echo "$code" > "$0"; exit "$code"'
+    <exit_file> <argv...>` -- sh's own convention makes the first operand
+    after the script text $0 (never part of "$@"), so the wrapped
+    command's own argv[0]/quoting reaches the real process completely
+    unchanged. This runs OUTSIDE whatever sandbox wrapping (e.g. a bwrap
+    invocation) argv already carries -- it wraps the whole spawned
+    command, sandboxed or not, rather than reaching inside it -- and
+    exits with the real command's own exit code either way, so every
+    existing caller of this exit code is unaffected. See exit_file_for's
+    own docstring for why the exit-code file's path needs no new
+    parameter anywhere else."""
     stdout_handle = None
+    real_argv = argv
+    if stdout_path is not None:
+        exit_file = exit_file_for(stdout_path)
+        try:
+            exit_file.unlink()
+        except FileNotFoundError:
+            pass
+        real_argv = ["sh", "-c", '"$@"; code=$?; echo "$code" > "$0"; exit "$code"',
+                     str(exit_file), *argv]
     try:
         if stdout_path is not None:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             stdout_handle = open(stdout_path, "wb")
         proc = subprocess.Popen(
-            argv, cwd=str(cwd), env=env,
+            real_argv, cwd=str(cwd), env=env,
             stdout=stdout_handle if stdout_handle is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if stdout_handle is not None else subprocess.DEVNULL,
             stdin=subprocess.DEVNULL if stdin_devnull else None,

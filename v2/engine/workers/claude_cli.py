@@ -84,6 +84,38 @@ def _mcp_config_json(mcp_servers: dict[str, McpServerConfig]) -> str:
     return json.dumps({"mcpServers": servers})
 
 
+def _mcp_config_path(spec: WorkerSpec) -> Path:
+    # A sibling of spec.result_path, in the same (worker-writable)
+    # stations dir -- never a new directory of its own, so this file
+    # disappears/gets cleaned up exactly the way every other per-request
+    # station file already does.
+    return spec.result_path.with_name(spec.result_path.name + ".mcp-config.json")
+
+
+def _write_mcp_config_file(spec: WorkerSpec, mcp_servers: dict[str, McpServerConfig]) -> Path:
+    """Writes `_mcp_config_json(mcp_servers)` to a 0600 file and returns
+    its path -- `--mcp-config` is then given that PATH, never the JSON
+    (and the env_passthrough secrets it can carry) directly on argv,
+    which any local user can read off this process's own command line
+    (e.g. /proc/<pid>/cmdline) for as long as it runs. O_NOFOLLOW/
+    fchmod close the gap between creating the file and locking its
+    mode down -- an attacker-planted symlink at this path is refused
+    outright rather than written through, and the mode is set on the
+    open file descriptor itself before any other process could observe
+    a wider one."""
+    path = _mcp_config_path(spec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _mcp_config_json(mcp_servers).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return path
+
+
 def _gate_settings() -> str:
     return json.dumps({
         "hooks": {
@@ -131,8 +163,12 @@ class ClaudeRunner:
             # --strict-mcp-config: only the servers in this generated
             # config are available -- no other .mcp.json/project/user
             # config source is consulted (same "nothing but what we
-            # just built" intent as --setting-sources "" above).
-            argv += ["--mcp-config", _mcp_config_json(spec.mcp_servers), "--strict-mcp-config"]
+            # just built" intent as --setting-sources "" above). The
+            # config itself (which can carry env_passthrough secrets)
+            # is written to a 0600 file and only ITS PATH ever reaches
+            # argv -- see _write_mcp_config_file.
+            mcp_config_path = _write_mcp_config_file(spec, spec.mcp_servers)
+            argv += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
         return argv
 
     def env(self, spec: WorkerSpec, worker: WorkerConfig) -> dict[str, str]:

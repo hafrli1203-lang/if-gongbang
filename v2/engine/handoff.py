@@ -239,12 +239,40 @@ def _screens_section(config: EngineConfig, project: str, job: str) -> str:
 
 
 def _scene_table(plan: "Plan", acc: AcceptanceResult) -> str:
-    """requirement(plan.acceptance) <-> scene <-> pass/fail. plan.acceptance
-    and plan.scenes are two separate lists with no id linking one entry
-    of either to the other (the fixed Plan interface carries no such
-    foreign key) -- paired positionally where both exist, remaining
-    rows of whichever list is longer appended on their own, rather than
-    inventing a link the schema does not have."""
+    """requirement(plan.requirements) <-> scene/task <-> pass/fail,
+    paired by requirement id (engine.plan.requirement_coverers) -- never
+    positionally. A plan with no requirements yet (predates s10's
+    requirements/covers fields) falls back to plan.acceptance paired
+    positionally with plan.scenes, same as before that field existed."""
+    requirements = getattr(plan, "requirements", ())
+    if not requirements:
+        return _scene_table_legacy(plan, acc)
+    from engine.plan import requirement_coverers
+
+    by_scene_id = {s.id: s for s in acc.scenes}
+    coverers = requirement_coverers(plan)
+    rows = ["| 요구사항(ID) | 덮는 장면/작업 | 상태 | 비고 |", "|---|---|---|---|"]
+    for requirement in requirements:
+        pairs = coverers.get(requirement.id, ())
+        if not pairs:
+            rows.append(f"| {requirement.id}: {requirement.text} | - | 덮이지 않음 | - |")
+            continue
+        covered_by = ", ".join(f"{kind}:{cid}" for kind, cid in pairs)
+        scene_results = [by_scene_id.get(cid) for kind, cid in pairs if kind == "scene"]
+        scene_results = [r for r in scene_results if r is not None]
+        if scene_results:
+            status = "통과" if all(r.passed for r in scene_results) else "실패"
+        else:
+            # Covered only by a task, never a scene -- the requirement
+            # counts as covered as soon as that task's own attempt
+            # reached "done" (there is no separate pass/fail signal for
+            # it here; see engine.full_orbit's own post-acceptance check).
+            status = "통과(작업 완료)"
+        rows.append(f"| {requirement.id}: {requirement.text} | {covered_by} | {status} | |")
+    return "\n".join(rows)
+
+
+def _scene_table_legacy(plan: "Plan", acc: AcceptanceResult) -> str:
     by_id = {s.id: s for s in acc.scenes}
     rows = ["| 요구사항(수락 조건) | 장면 | 상태 | 비고 |", "|---|---|---|---|"]
     acceptance = list(plan.acceptance)

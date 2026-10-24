@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Protocol
 
 from engine.config import McpServerConfig, WorkerConfig
-from engine.procs import is_alive
+from engine.procs import exit_file_for, is_alive
 
 # Matches EngineConfig.worker_env_passthrough's default exactly. Runners
 # use this fixed list rather than threading EngineConfig through the
@@ -272,11 +272,18 @@ def wait_while_progressing(pid: int, stall_sec: float,
     of tool calls, ...) changed size or mtime. There is no total time
     limit: a worker that keeps working is never cut off. Returns the exit
     code, or None only when nothing changed for `stall_sec` in a row
-    (the worker is stuck, e.g. waiting on input it will never get)."""
+    (the worker is stuck, e.g. waiting on input it will never get).
+
+    Every call site lists the worker's stdout path first in
+    `progress_paths` (the same path it gave engine.procs.spawn as
+    stdout_path) -- exit_file_for derives the matching exit-code file
+    from it, so wait_for_exit can recover a real exit code after a
+    crash-and-resume with no extra parameter threaded through here."""
+    exit_file = exit_file_for(progress_paths[0]) if progress_paths else None
     last_mark = _progress_mark(progress_paths)
     last_change = time.time()
     while True:
-        code = wait_for_exit(pid, 1.0)
+        code = wait_for_exit(pid, 1.0, exit_file)
         if code is not None:
             return code
         mark = _progress_mark(progress_paths)
@@ -287,21 +294,52 @@ def wait_while_progressing(pid: int, stall_sec: float,
             return None
 
 
-def wait_for_exit(pid: int, timeout_sec: float) -> int | None:
+_UNKNOWN_EXIT = -1  # distinct from every real exit code (0-255); callers
+                    # already treat -1 (WIFEXITED false, a signalled
+                    # process) as abnormal/failed, so this reuses that
+                    # existing meaning rather than inventing a new one.
+
+
+def _read_exit_file(exit_file: Path | None) -> int | None:
+    if exit_file is None:
+        return None
+    try:
+        text = exit_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def wait_for_exit(pid: int, timeout_sec: float,
+                  exit_file: Path | None = None) -> int | None:
     """Poll until `pid` exits or `timeout_sec` elapses. Returns the exit
     code, or None on timeout. Reaps via waitpid(WNOHANG) when this
     process is still pid's parent (the normal case: it spawned the
-    worker itself). If waitpid raises ChildProcessError (resumed in a
-    different OS process after a crash, so we are no longer the
-    parent), falls back to is_alive() polling and reports exit code 0
-    once the process is gone -- consistent with this step's own
-    reconcile check, which treats "no live process left" as finished."""
+    worker itself, or it is resuming into an already-reaped same-process
+    attempt -- see below). If waitpid raises ChildProcessError -- no
+    live child entry for `pid` at all, either because this process was
+    never its parent (resumed in a different OS process after a crash)
+    or because an earlier call already reaped it -- and the process is
+    confirmed gone (not is_alive), the real exit code is read from
+    `exit_file` (engine.procs.exit_file_for/spawn's own wrapper writes
+    it there unconditionally). Trusting a bare "process is gone" as
+    success, the way this used to work, silently turned a crashed or
+    killed worker into a reported success; `exit_file` is None's/
+    missing/unreadable fallback is `_UNKNOWN_EXIT` (-1), which every
+    existing caller already treats as a failure, never 0."""
     deadline = time.time() + timeout_sec
     while True:
         try:
             reaped_pid, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            reaped_pid, status = (pid, 0) if not is_alive(pid) else (0, 0)
+            if is_alive(pid):
+                reaped_pid, status = 0, 0
+            else:
+                code = _read_exit_file(exit_file)
+                return code if code is not None else _UNKNOWN_EXIT
         if reaped_pid == pid:
             return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
         if time.time() >= deadline:

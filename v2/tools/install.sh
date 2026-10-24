@@ -32,6 +32,8 @@ need git "작업 사본"
 need bwrap "작업자 격리(bubblewrap)"
 need claude "구현 작업자(Claude Code CLI)"
 need codex "검토 작업자(Codex CLI)"
+need node "앱 test_cmd/install_cmd 실행"
+need npm "앱 패키지 관리"
 [ "$MISSING" = 0 ] || { echo "위 도구를 먼저 설치한 뒤 다시 실행한다." >&2; exit 1; }
 
 if [ ! -x "$ENGINE/.venv/bin/python" ]; then
@@ -77,3 +79,5 @@ echo "  gb2 명령      $HOME/.local/bin/gb2"
 echo "  AI 직원       $HOME/.claude/agents/ ($(ls "$ENGINE"/tools/agents | wc -l)명)"
 echo "  /일 명령      $HOME/.claude/skills/일"
 echo "확인: gb2 --help"
+
+"$HOME/.local/bin/gb2" doctor

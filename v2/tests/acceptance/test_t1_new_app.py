@@ -30,6 +30,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -145,13 +146,17 @@ def _plan_json(job: str) -> str:
     return json.dumps({
         "goal": "인사말 앱: 만나면 Hello, 헤어지면 Goodbye를 보여준다",
         "ui": False,
+        "requirements": [
+            {"id": "R1", "text": "greet()이 Hello, X 형태를 돌려준다", "kind": "function"},
+            {"id": "R2", "text": "farewell()이 Goodbye, X 형태를 돌려준다", "kind": "function"},
+        ],
         "scenes": [
             {"id": "s1", "actor_does": "이름을 주고 인사를 받는다",
              "app_shows": "Hello, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s1_greet.py"]},
+             "cmd": [sys.executable, "tests/scenes/s1_greet.py"], "covers": ["R1"]},
             {"id": "s2", "actor_does": "이름을 주고 작별 인사를 받는다",
              "app_shows": "Goodbye, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s2_farewell.py"]},
+             "cmd": [sys.executable, "tests/scenes/s2_farewell.py"], "covers": ["R2"]},
         ],
         "tasks": [
             {"id": "t1", "title": "greet 구현", "detail": "greet()과 그 시험을 만든다",
@@ -175,6 +180,23 @@ def _plan_json(job: str) -> str:
             "farewell()이 Goodbye, X 형태를 돌려준다",
         ],
     }, ensure_ascii=False)
+
+
+def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stands in for s10-ops' own engine.app_security module (not yet
+    merged into this worktree -- engine.full_orbit imports it lazily by
+    name, right after handoff, same as engine.acceptance/engine.handoff
+    above). Always reports passed=True here: T1/T2 are about the
+    facts->plan->build->accept->handoff flow, not security findings."""
+    security_mod = types.ModuleType("engine.app_security")
+
+    def check(config, project, attempt_id, plan):
+        return types.SimpleNamespace(passed=True, findings=(), ran=())
+
+    security_mod.check = check  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "engine.app_security", security_mod)
+    import engine as _engine_pkg
+    monkeypatch.setattr(_engine_pkg, "app_security", security_mod, raising=False)
 
 
 def _write(path: Path, content: str) -> None:
@@ -216,7 +238,10 @@ def _make_new_app_skeleton(repo: Path) -> None:
     _git(repo, "commit", "-q", "-m", "init: empty skeleton")
 
 
-def test_new_app_facts_plan_two_tasks_and_handoff(tmp_path: Path) -> None:
+def test_new_app_facts_plan_two_tasks_and_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_app_security(monkeypatch)
     repo = tmp_path / "repo"
     _make_new_app_skeleton(repo)
 
@@ -346,3 +371,8 @@ def test_new_app_facts_plan_two_tasks_and_handoff(tmp_path: Path) -> None:
     report_text = report_path.read_text(encoding="utf-8")
     assert "s1" in report_text and "s2" in report_text
     assert "통과" in report_text
+    # s10 contract item 4: the 대조표 pairs requirement id <-> scene id,
+    # not list position -- both requirements' own rows carry the scene
+    # that actually covers them.
+    assert "R1" in report_text and "scene:s1" in report_text
+    assert "R2" in report_text and "scene:s2" in report_text

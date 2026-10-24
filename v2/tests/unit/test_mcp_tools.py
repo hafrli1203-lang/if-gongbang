@@ -360,6 +360,127 @@ def test_policy_mcp_denied_without_facts_snapshot(tmp_path: Path) -> None:
     assert decision.reason == "mcp_not_in_request_allow"
 
 
+def test_gate_denies_mcp_tool_name_with_empty_tool_part(tmp_path: Path) -> None:
+    """"mcp__server__" (nothing after the second "__") must be treated
+    as a malformed tool name, same as one with no second "__" at
+    all -- never as some server called with an empty tool."""
+    config, config_path, attempt_id, copy_root = _setup(tmp_path, {
+        "mcp_servers": {"library": {"command": ["python3"]}},
+        "station_mcp_allow": {"build": ["library"]},
+    })
+    facts_path, log_path = _write_gate_facts_and_log(tmp_path, mcp_allow=["library"])
+    stdin = json.dumps({"tool_name": "mcp__library__", "cwd": str(copy_root), "tool_input": {}})
+    output = _run_gate(stdin, _base_env(config_path, attempt_id, copy_root, facts_path, log_path))
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecisionReason"] == "tool_not_allowed"
+
+
+# ---- engine.config / engine.policy: mcp_tool_allow (per-server tool list) --
+
+def test_config_mcp_tool_allow_round_trips(tmp_path: Path) -> None:
+    config = _config_with_mcp(tmp_path, {"library": {"command": ["python3", "-m", "lib"]}})
+    config_path = tmp_path / "engine.json"
+    base = json.loads(config_path.read_text(encoding="utf-8"))
+    base["mcp_tool_allow"] = {"library": ["library_search"]}
+    config_path.write_text(json.dumps(base), encoding="utf-8")
+    loaded = EngineConfig.from_json(config_path)
+    assert loaded.mcp_tool_allow == {"library": ("library_search",)}
+
+
+def test_config_mcp_tool_allow_rejects_unregistered_server(tmp_path: Path) -> None:
+    make_repo(tmp_path / "repo", {"a.txt": "x"})
+    config_path = tmp_path / "engine.json"
+    config_path.write_text(json.dumps({
+        "projects": {"alpha": {"repo": "repo"}},
+        "station_owners": {"build": {"builder": ["src/"]}},
+        "mcp_tool_allow": {"ghost": ["x"]},
+    }), encoding="utf-8")
+    with pytest.raises(ValueError):
+        EngineConfig.from_json(config_path)
+
+
+def test_policy_mcp_tool_allow_denies_tool_not_in_list(tmp_path: Path) -> None:
+    config, config_path, attempt_id, copy_root = _setup(tmp_path, {
+        "mcp_servers": {"library": {"command": ["python3"]}},
+        "station_mcp_allow": {"build": ["library"]},
+        "mcp_tool_allow": {"library": ["library_search"]},
+    })
+    from engine.policy import Action, Actor, LedgerSink, Policy, ProjectFacts
+
+    ledger = Ledger.open(config.ledger_path)
+    facts = ProjectFacts(project="alpha", registered=True, state="OPEN", generation=1,
+                         attempt_id=attempt_id, attempt_active=True, mcp_allow=("library",))
+    policy = Policy(config, facts=facts, sink=LedgerSink(ledger))
+    actor = Actor(kind="worker", role="builder", attempt_id=attempt_id, generation=1,
+                  station="build", copy_root=copy_root)
+    decision = policy.check("alpha", actor, Action(
+        tool="mcp", target="library", mcp_tool="library_get"))
+    ledger.close()
+    assert decision.allowed is False
+    assert decision.reason == "mcp_tool_not_in_allow"
+
+
+def test_policy_mcp_tool_allow_allows_tool_in_list(tmp_path: Path) -> None:
+    config, config_path, attempt_id, copy_root = _setup(tmp_path, {
+        "mcp_servers": {"library": {"command": ["python3"]}},
+        "station_mcp_allow": {"build": ["library"]},
+        "mcp_tool_allow": {"library": ["library_search"]},
+    })
+    from engine.policy import Action, Actor, LedgerSink, Policy, ProjectFacts
+
+    ledger = Ledger.open(config.ledger_path)
+    facts = ProjectFacts(project="alpha", registered=True, state="OPEN", generation=1,
+                         attempt_id=attempt_id, attempt_active=True, mcp_allow=("library",))
+    policy = Policy(config, facts=facts, sink=LedgerSink(ledger))
+    actor = Actor(kind="worker", role="builder", attempt_id=attempt_id, generation=1,
+                  station="build", copy_root=copy_root)
+    decision = policy.check("alpha", actor, Action(
+        tool="mcp", target="library", mcp_tool="library_search"))
+    ledger.close()
+    assert decision.allowed is True
+    assert decision.reason == "mcp_allowed"
+
+
+def test_policy_mcp_tool_allow_absent_server_is_unrestricted(tmp_path: Path) -> None:
+    """A server with no mcp_tool_allow entry at all keeps the
+    server-level checks as the whole story -- any tool name passes
+    this particular check."""
+    config, config_path, attempt_id, copy_root = _setup(tmp_path, {
+        "mcp_servers": {"library": {"command": ["python3"]}},
+        "station_mcp_allow": {"build": ["library"]},
+    })
+    from engine.policy import Action, Actor, LedgerSink, Policy, ProjectFacts
+
+    ledger = Ledger.open(config.ledger_path)
+    facts = ProjectFacts(project="alpha", registered=True, state="OPEN", generation=1,
+                         attempt_id=attempt_id, attempt_active=True, mcp_allow=("library",))
+    policy = Policy(config, facts=facts, sink=LedgerSink(ledger))
+    actor = Actor(kind="worker", role="builder", attempt_id=attempt_id, generation=1,
+                  station="build", copy_root=copy_root)
+    decision = policy.check("alpha", actor, Action(
+        tool="mcp", target="library", mcp_tool="anything_at_all"))
+    ledger.close()
+    assert decision.allowed is True
+
+
+def test_gate_passes_mcp_tool_name_through_to_policy(tmp_path: Path) -> None:
+    """engine.gate must parse the <tool> part of mcp__<server>__<tool>
+    and hand it to Policy as action.mcp_tool -- a config with
+    mcp_tool_allow then actually denies an unlisted tool through the
+    real gate subprocess, not merely in-process."""
+    config, config_path, attempt_id, copy_root = _setup(tmp_path, {
+        "mcp_servers": {"library": {"command": ["python3"]}},
+        "station_mcp_allow": {"build": ["library"]},
+        "mcp_tool_allow": {"library": ["library_search"]},
+    })
+    facts_path, log_path = _write_gate_facts_and_log(tmp_path, mcp_allow=["library"])
+    stdin = json.dumps({"tool_name": "mcp__library__library_get", "cwd": str(copy_root),
+                        "tool_input": {}})
+    output = _run_gate(stdin, _base_env(config_path, attempt_id, copy_root, facts_path, log_path))
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecisionReason"] == "mcp_tool_not_in_allow"
+
+
 # ---- engine.workers.claude_cli: --mcp-config / --strict-mcp-config -----
 
 def _spec(tmp_path: Path, mcp_servers: dict[str, McpServerConfig] | None = None) -> WorkerSpec:
@@ -393,7 +514,11 @@ def test_argv_with_mcp_servers_adds_strict_mcp_config_and_tool_names(tmp_path: P
     tools = argv[argv.index("--tools") + 1]
     assert "mcp__library__*" in tools.split(",")
 
-    mcp_json = json.loads(argv[argv.index("--mcp-config") + 1])
+    # --mcp-config carries a path, not the JSON itself (see
+    # engine.workers.claude_cli._write_mcp_config_file).
+    mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
+    assert all("should-not-leak-if-not-passthrough" not in arg for arg in argv)
+    mcp_json = json.loads(mcp_config_path.read_text(encoding="utf-8"))
     entry = mcp_json["mcpServers"]["library"]
     assert entry["command"] == "python3"
     assert entry["args"] == ["-m", "lib", "--quiet"]
@@ -407,7 +532,8 @@ def test_argv_mcp_env_only_carries_configured_names(tmp_path: Path, monkeypatch)
         "library": McpServerConfig(command=("python3",), env_passthrough=()),
     })
     argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
-    mcp_json = json.loads(argv[argv.index("--mcp-config") + 1])
+    mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
+    mcp_json = json.loads(mcp_config_path.read_text(encoding="utf-8"))
     assert "env" not in mcp_json["mcpServers"]["library"]
 
 

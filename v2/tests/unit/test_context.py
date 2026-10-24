@@ -95,6 +95,22 @@ def test_gather_skips_notification_sent_before_the_real_reply() -> None:
     assert "안경원 재주문 기준" in titles
 
 
+def test_gather_flood_of_notifications_cannot_extend_the_overall_deadline() -> None:
+    """A server that keeps writing a notification every 0.3s, forever,
+    instead of ever answering the tools/call must still time out after
+    roughly ONE configured timeout_sec -- not be kept alive
+    indefinitely by a per-message window that each individual
+    notification arrives comfortably inside of."""
+    import time
+
+    config = _StubConfig(_library_mcp_config(flag="--flood-notifications", timeout_sec=1.0))
+    started = time.monotonic()
+    ctx = gather(config, "alpha", "facts", "질문")
+    elapsed = time.monotonic() - started
+    assert ctx.failed is True
+    assert elapsed < 5.0  # well under what an unbounded per-message window would allow
+
+
 def test_decision_item_included_when_path_configured(tmp_path: Path) -> None:
     decisions = tmp_path / "CURRENT_DECISIONS.md"
     decisions.write_text("# 결정\n화면은 shadcn 부품을 쓴다.\n", encoding="utf-8")

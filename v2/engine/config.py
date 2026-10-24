@@ -325,6 +325,15 @@ class EngineConfig:
     # with this table -- see engine.plan.tools_for_station). A station
     # absent from this table may never use any MCP server.
     station_mcp_allow: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # mcp server name -> the specific tool names (the <tool> of
+    # mcp__<server>__<tool>) that server may ever be called with,
+    # regardless of station_mcp_allow/the request's own gate facts. A
+    # server ABSENT from this table keeps today's behavior unchanged --
+    # every tool that server's own station/request allow lists permit.
+    # A server PRESENT here denies any tool call not named in its list
+    # (engine.policy._decide_mcp), on top of (never instead of) the
+    # existing server-level checks.
+    mcp_tool_allow: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # The skill library's own index file (e.g. "~/.claude/skills-library/
     # INDEX.md") the planner prompt is given so it only ever asks for a
     # skill that is actually listed there (engine.plan.
@@ -406,6 +415,14 @@ class EngineConfig:
                     raise ValueError(
                         f"station_mcp_allow[{station!r}] names unknown mcp server: {name!r}"
                     )
+        # mcp_tool_allow is keyed by server name, same reasoning as
+        # station_mcp_allow above: a typo here would silently restrict
+        # nothing (the server-level checks still fail closed) but a
+        # key naming an unregistered server is a config error, caught
+        # at load time.
+        for server in self.mcp_tool_allow:
+            if server not in self.mcp_servers:
+                raise ValueError(f"mcp_tool_allow names unknown mcp server: {server!r}")
 
     @staticmethod
     def from_json(path: Path) -> "EngineConfig":
@@ -426,7 +443,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "stations", "optional_stations", "workers", "station_terminal_allow",
     "worker_env_passthrough", "sandbox", "bench_home_writable",
     "bench_readonly_paths", "publisher", "parallel_review_bench",
-    "mcp_servers", "station_mcp_allow", "skill_index_path", "context",
+    "mcp_servers", "station_mcp_allow", "mcp_tool_allow", "skill_index_path", "context",
 })
 
 _KNOWN_MCP_SERVER_KEYS = frozenset({"command", "args", "env_passthrough"})
@@ -613,6 +630,13 @@ def _parse_station_mcp_allow(raw: dict[str, object]) -> dict[str, tuple[str, ...
     return {str(station): tuple(_str_list(names)) for station, names in table_raw.items()}
 
 
+def _parse_mcp_tool_allow(raw: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    table_raw = raw.get("mcp_tool_allow", {})
+    if not isinstance(table_raw, dict):
+        raise ValueError("mcp_tool_allow must be an object")
+    return {str(server): tuple(_str_list(names)) for server, names in table_raw.items()}
+
+
 def _opt_str(value: object) -> str | None:
     if value is None:
         return None
@@ -697,6 +721,8 @@ def _parse_optional_fields(raw: dict[str, object], base: Path) -> dict[str, obje
         fields["mcp_servers"] = _parse_mcp_servers(raw)
     if "station_mcp_allow" in raw:
         fields["station_mcp_allow"] = _parse_station_mcp_allow(raw)
+    if "mcp_tool_allow" in raw:
+        fields["mcp_tool_allow"] = _parse_mcp_tool_allow(raw)
     if "skill_index_path" in raw:
         value = raw["skill_index_path"]
         if not isinstance(value, str) or not value:
@@ -887,6 +913,7 @@ def to_json_dict(config: EngineConfig) -> dict[str, object]:
             for name, s in config.mcp_servers.items()
         },
         "station_mcp_allow": {s: list(v) for s, v in config.station_mcp_allow.items()},
+        "mcp_tool_allow": {s: list(v) for s, v in config.mcp_tool_allow.items()},
         **_optional_entries(config),
         "context": _context_to_json(config.context),
     }

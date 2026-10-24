@@ -549,6 +549,30 @@ def _latest_fix_event_after(ledger: Ledger, project: str, kind: str,
     return matches[-1] if matches else None
 
 
+def _already_opened_new_attempt(ledger: Ledger, project: str, job_name: str,
+                                old_attempt_id: str) -> str | None:
+    """If open_job() already succeeded for this fix cycle -- the project
+    is OPEN on a fresh attempt of this same job -- but a crash hit before
+    "fix.opened_new" could be journaled for it, return that attempt_id so
+    fix() can record the missing event and move on instead of calling
+    open_job() again. A second open_job() call there would simply raise
+    (the project is OPEN, not CLOSED, by then -- open_job only accepts
+    CLOSED) rather than silently forking a duplicate attempt, but that
+    still leaves the fix cycle permanently stuck; detecting the already-
+    open attempt here is what actually lets it resume. Returns None when
+    there is nothing to detect (open_job genuinely has not run yet, or
+    failed before completing) -- fix() then calls open_job() as usual."""
+    row = ledger.project(project)
+    if row.state != "OPEN" or row.current_attempt_id is None:
+        return None
+    candidate = row.current_attempt_id
+    if candidate == old_attempt_id:
+        return None
+    if any(a.attempt_id == candidate for a in ledger.attempts_for_job_name(project, job_name)):
+        return candidate
+    return None
+
+
 def _find_unfinished_fix_cycle(ledger: Ledger, project: str) -> tuple[int, dict[str, object]] | None:
     """(fix.started's own seq, its payload) for the most recent fix()
     transition that started but never reached "fix.finished" -- or None
@@ -644,11 +668,17 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
 
     opened = _latest_fix_event_after(ledger, project, "fix.opened_new", started_seq)
     if opened is None:
-        # Only the builder role needs a fresh copy -- the reviewer runs
-        # against its own exported snapshot (engine.steps.review._export_
-        # review_snapshot), never a worker copy at all, so making one for
-        # it here would just be an unused checkout cost on every fix.
-        new_attempt_id = open_job(config, ledger, project, job_name, "full", (builder_role,))
+        # A prior call may have already run open_job() successfully and
+        # crashed before this journal write -- detect that already-open
+        # attempt instead of calling open_job() again (which would just
+        # raise: the project is OPEN, not CLOSED, by then).
+        new_attempt_id = _already_opened_new_attempt(ledger, project, job_name, old_attempt_id)
+        if new_attempt_id is None:
+            # Only the builder role needs a fresh copy -- the reviewer runs
+            # against its own exported snapshot (engine.steps.review._export_
+            # review_snapshot), never a worker copy at all, so making one for
+            # it here would just be an unused checkout cost on every fix.
+            new_attempt_id = open_job(config, ledger, project, job_name, "full", (builder_role,))
         _append_fix_event(ledger, project, "fix.opened_new", old_attempt_id,
                           {"new_attempt_id": new_attempt_id})
     else:

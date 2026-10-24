@@ -846,6 +846,37 @@ def test_cancel_pending_publish_leaves_a_running_request_untouched(
     assert rws.ledger.request(request_id).status == "running"
 
 
+def test_cancel_pending_publish_refuses_while_a_processor_holds_the_lock(
+    rws: ReleaseWorkspace,
+) -> None:
+    """cancel_pending_publish must hold the project lock for its whole
+    check-then-cancel sequence, not just the final write -- otherwise a
+    caller's own "safe to cancel" check and this function's own read of
+    queued_requests could straddle a live processor's dispatch. Proven
+    here by holding the lock externally first (as Processor.run_once/
+    run_request would) and asserting cancel_pending_publish refuses
+    outright (ProcessorBusy, no ledger write) instead of proceeding."""
+    from engine.processor import ProcessorBusy
+
+    attempt_id = _open(rws, "job-cancel-busy")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+
+    assert rws.ledger.acquire_lock("gamma", "other-processor") is True
+    try:
+        with pytest.raises(ProcessorBusy):
+            release.cancel_pending_publish(rws.ledger, "gamma", attempt_id, "x")
+    finally:
+        rws.ledger.release_lock("gamma", "other-processor")
+
+    # refused outright -- the request is untouched, no approval revoked.
+    req = rws.ledger.request(request_id)
+    assert req.status == "queued"
+    approvals = rws.ledger.approvals_for(request_id)
+    assert approvals[0].used_seq is None
+
+
 # ---------------------------------------------------------------------------
 # engine.release.cancel_running_publish_before_dispatch
 # ---------------------------------------------------------------------------

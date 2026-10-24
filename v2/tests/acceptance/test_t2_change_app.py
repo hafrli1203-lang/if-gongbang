@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -116,23 +117,29 @@ def _plan_json(job: str) -> str:
     return json.dumps({
         "goal": "기존 인사말 앱에 initials/farewell 기능을 더한다",
         "ui": False,
+        "requirements": [
+            {"id": "R1", "text": "initials()가 각 단어 첫 글자를 대문자로 돌려준다", "kind": "function"},
+            {"id": "R2", "text": "farewell()이 Goodbye, X 형태를 돌려준다", "kind": "function"},
+        ],
         "scenes": [
             {"id": "s1", "actor_does": "기존 인사를 그대로 받는다 (회귀 확인)",
              "app_shows": "Hello, World", "where": "cli",
              "cmd": [sys.executable, "tests/scenes/s1_greet_regression.py"]},
             {"id": "s2", "actor_does": "이름의 이니셜을 구한다",
              "app_shows": "AL", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s2_initials.py"]},
+             "cmd": [sys.executable, "tests/scenes/s2_initials.py"], "covers": ["R1"]},
         ],
         "tasks": [
             {"id": "t1", "title": "initials 추가",
              "detail": "initials()와 그 시험을 만든다",
              "owns": ["src/greeter/initials.py", "tests/test_initials.py"],
              "depends_on": []},
+            # R2 (farewell) has no automated pass/fail scene in this plan
+            # -- covered by this task instead (engine.plan.Task.covers).
             {"id": "t2", "title": "farewell 추가",
              "detail": "farewell()과 그 시험을 만든다",
              "owns": ["src/greeter/farewell.py", "tests/test_farewell.py"],
-             "depends_on": ["t1"]},
+             "depends_on": ["t1"], "covers": ["R2"]},
         ],
         "acceptance": [
             "initials()가 각 단어 첫 글자를 대문자로 돌려준다",
@@ -146,7 +153,25 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def test_change_keeps_pre_existing_test_green_and_adds_two_tasks(tmp_path: Path) -> None:
+def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stands in for s10-ops' own engine.app_security module (not yet
+    merged into this worktree) -- see test_t1_new_app.py's own copy of
+    this helper for the full rationale."""
+    security_mod = types.ModuleType("engine.app_security")
+
+    def check(config, project, attempt_id, plan):
+        return types.SimpleNamespace(passed=True, findings=(), ran=())
+
+    security_mod.check = check  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "engine.app_security", security_mod)
+    import engine as _engine_pkg
+    monkeypatch.setattr(_engine_pkg, "app_security", security_mod, raising=False)
+
+
+def test_change_keeps_pre_existing_test_green_and_adds_two_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_app_security(monkeypatch)
     sample = make_sample(tmp_path / "repo", 1, Path(sys.executable))
     repo = sample.repo
     (repo / "tests" / "scenes").mkdir(parents=True, exist_ok=True)
@@ -247,4 +272,7 @@ def test_change_keeps_pre_existing_test_green_and_adds_two_tasks(tmp_path: Path)
     assert {s["id"] for s in acceptance["scenes"]} == {"s1", "s2"}
 
     report_text = (repo / ".gongbang" / "greeter" / "report.md").read_text(encoding="utf-8")
-    assert "s1" in report_text and "s2" in report_text
+    # s10 contract item 4: R1 is covered by scene s2 (initials), R2 has
+    # no scene of its own and is covered by task t2 (farewell) instead.
+    assert "R1" in report_text and "scene:s2" in report_text
+    assert "R2" in report_text and "task:t2" in report_text

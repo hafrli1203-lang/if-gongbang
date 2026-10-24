@@ -216,3 +216,60 @@ def test_load_app_board_works_when_ledger_path_contains_a_question_mark(tmp_path
 
     assert board.error is None
     assert len(board.jobs) == 1
+
+
+def test_load_app_board_needs_owner_status_includes_stop_reason(tmp_path):
+    """s10 contract item 5: a needs_owner stop recorded with its own
+    stop_reason shows it on the board, not just the generic label."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_probe_retry", "stop_reason": "probe_failed:stripe"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기: probe_failed:stripe"
+
+
+def test_load_app_board_failed_status_from_job_metrics_outcome(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"durations_ms": {}, "test_runs": {}, "git_calls": 0,
+                 "outcome": "failed", "failed_stage": "bench"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "실패"
+
+
+def test_render_board_html_shows_failed_badge(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"durations_ms": {}, "test_runs": {}, "git_calls": 0, "outcome": "failed"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+    page = render_board_html([board], generated_ts=1_700_000_000.0)
+
+    assert "badge-neg" in page
+    assert "실패" in page

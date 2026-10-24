@@ -33,15 +33,19 @@ Rules (first match wins) — see plan §4:
     resolved path is under one of config.station_owners[station][role]
     prefixes joined to the worker copy.
  5c. mcp (a tool named mcp__<server>__<tool>, engine.gate parses `server`
-    into action.target, no path): no target -> denied
-    ("mcp_requires_target"); `server` not in facts.mcp_allow (the
-    per-request allow list, set by whoever writes gate_facts.json from
-    engine.plan.tools_for_station) -> denied ("mcp_not_in_request_allow");
-    `server` not in config.station_mcp_allow[station] (the project-wide
-    upper bound) -> denied ("mcp_not_in_station_allow"); else the
-    configured hooks are consulted same as rule 5, then allowed
-    ("mcp_allowed"). A plan's own tool table can only narrow a
-    station's mcp access, never widen it past station_mcp_allow.
+    into action.target and `<tool>` into action.mcp_tool, no path): no
+    target -> denied ("mcp_requires_target"); `server` not in
+    facts.mcp_allow (the per-request allow list, set by whoever writes
+    gate_facts.json from engine.plan.tools_for_station) -> denied
+    ("mcp_not_in_request_allow"); `server` not in
+    config.station_mcp_allow[station] (the project-wide upper bound) ->
+    denied ("mcp_not_in_station_allow"); `server` has a
+    config.mcp_tool_allow entry and `action.mcp_tool` is not in it ->
+    denied ("mcp_tool_not_in_allow") -- absent entirely for that
+    server, this check is skipped; else the configured hooks are
+    consulted same as rule 5, then allowed ("mcp_allowed"). A plan's
+    own tool table can only narrow a station's mcp access, never widen
+    it past station_mcp_allow.
  5b. worker terminal actions (a path-less tool with a command): command
     None/empty -> denied ("terminal_requires_command"); command containing
     any shell metacharacter (; & | ` $ newline > <, note: any "$", not
@@ -94,6 +98,10 @@ class Action:
     path: Path | None = None
     target: str | None = None
     command: str | None = None
+    # For tool="mcp": the <tool> part of mcp__<server>__<tool> (`target`
+    # carries the <server> part) -- None for anything that isn't an mcp
+    # call, or for a caller built before this field existed.
+    mcp_tool: str | None = None
 
 
 _SHELL_METACHARS = (";", "&", "|", "`", "$", "\n", ">", "<")
@@ -514,14 +522,19 @@ class Policy:
 
     def _decide_mcp(self, project: str, actor: Actor, action: Action) -> Decision:
         """A tool named mcp__<server>__<tool> (engine.gate parses the
-        server name into action.target). Allowed only if `server` is
-        in BOTH the per-request allow list (self.facts.mcp_allow --
-        None when this Policy is built straight from a ledger, no
-        facts snapshot at all, which fails closed the same as an empty
-        tuple) AND config.station_mcp_allow[actor.station] (the
-        project-wide upper bound on what that station may ever be
-        handed) -- a plan's own tool table can only narrow a station's
-        access, never widen it past what the operator configured."""
+        server name into action.target, the tool name into
+        action.mcp_tool). Allowed only if `server` is in BOTH the
+        per-request allow list (self.facts.mcp_allow -- None when this
+        Policy is built straight from a ledger, no facts snapshot at
+        all, which fails closed the same as an empty tuple) AND
+        config.station_mcp_allow[actor.station] (the project-wide
+        upper bound on what that station may ever be handed) -- a
+        plan's own tool table can only narrow a station's access,
+        never widen it past what the operator configured -- AND, if
+        config.mcp_tool_allow names `server` at all, `action.mcp_tool`
+        is in that server's own list (a server absent from
+        mcp_tool_allow keeps the server-level checks as the whole
+        story)."""
         server = action.target
         if not server:
             return Decision(False, "mcp_requires_target")
@@ -531,6 +544,15 @@ class Policy:
         station_allow = self.config.station_mcp_allow.get(actor.station or "", ())
         if server not in station_allow:
             return Decision(False, "mcp_not_in_station_allow")
+
+        # Optional per-server tool allow list (operator config, never a
+        # request's own gate facts): absent for this server leaves the
+        # server-level checks above as the whole story, same as before
+        # this field existed. Present: a tool name not in it is denied
+        # outright, on top of (never instead of) those checks.
+        tool_allow = self.config.mcp_tool_allow.get(server)
+        if tool_allow is not None and action.mcp_tool not in tool_allow:
+            return Decision(False, "mcp_tool_not_in_allow")
 
         hook_denial = self._run_hooks(project, actor, action)
         if hook_denial is not None:

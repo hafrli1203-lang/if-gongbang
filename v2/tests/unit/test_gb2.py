@@ -687,7 +687,7 @@ def test_ensure_worktree_rejects_an_unrelated_existing_directory(
     (unrelated_dir / "stray.txt").write_text("not a worktree\n", encoding="utf-8")
 
     with pytest.raises(ValueError):
-        gb2._ensure_worktree(source_repo, unrelated_dir)
+        gb2._ensure_worktree(source_repo, unrelated_dir, "master")
 
 
 def test_ensure_worktree_accepts_its_own_previously_created_worktree(
@@ -695,9 +695,9 @@ def test_ensure_worktree_accepts_its_own_previously_created_worktree(
 ) -> None:
     source_repo = _make_source_repo(tmp_path / "source" / "demo")
     repo_dir = tmp_path / "apps" / "demo" / "repo"
-    gb2._ensure_worktree(source_repo, repo_dir)  # creates it
+    gb2._ensure_worktree(source_repo, repo_dir, "master")  # creates it
 
-    gb2._ensure_worktree(source_repo, repo_dir)  # re-entrant: must not raise
+    gb2._ensure_worktree(source_repo, repo_dir, "master")  # re-entrant: must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +904,164 @@ def test_negative_control_case_signature_matches_a_real_vitest_assertion_failure
 
     assert signature == "assertion"
     assert signature == case["expected_signature"]
+
+
+def test_detect_default_branch_prefers_origin_head(
+    tmp_path: Path, gb2: ModuleType,
+) -> None:
+    source = _make_source_repo(tmp_path / "source")
+    remote = _make_source_repo(tmp_path / "remote")
+    _rgit(remote, "branch", "-m", "trunk")
+    _rgit(source, "remote", "add", "origin", str(remote))
+    _rgit(source, "fetch", "-q", "origin")
+    _rgit(source, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+
+    assert gb2._detect_default_branch(source) == "trunk"
+
+
+def test_detect_default_branch_falls_back_to_current_head_branch(
+    tmp_path: Path, gb2: ModuleType,
+) -> None:
+    source = tmp_path / "source" / "demo"
+    source.mkdir(parents=True)
+    _rgit(source, "init", "-q", "-b", "main")
+    (source / "app.py").write_text("v1\n", encoding="utf-8")
+    _rgit(source, "add", "-A")
+    _rgit(source, "commit", "-q", "-m", "init")
+
+    assert gb2._detect_default_branch(source) == "main"
+
+
+def test_detect_default_branch_falls_back_to_main_or_master_when_detached(
+    tmp_path: Path, gb2: ModuleType,
+) -> None:
+    source = tmp_path / "source" / "demo"
+    source.mkdir(parents=True)
+    _rgit(source, "init", "-q", "-b", "main")
+    (source / "app.py").write_text("v1\n", encoding="utf-8")
+    _rgit(source, "add", "-A")
+    _rgit(source, "commit", "-q", "-m", "init")
+    head = _rgit(source, "rev-parse", "HEAD")
+    _rgit(source, "checkout", "-q", head)  # detach HEAD
+
+    assert gb2._detect_default_branch(source) == "main"
+
+
+def test_cmd_init_against_a_main_only_repo_uses_main_as_worktree_base(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source repo whose only branch is "main" (never "master") must
+    have its gb2/work worktree branched off "main", with that detected
+    base recorded for `gb2 sync`/`gb2 diff` to reuse -- the hardcoded
+    WORKTREE_BASE ("master") must never be assumed."""
+    apps_root = tmp_path / "source"
+    source_repo = apps_root / "demo"
+    source_repo.mkdir(parents=True)
+    _rgit(source_repo, "init", "-q", "-b", "main")
+    (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
+    _rgit(source_repo, "add", "-A")
+    _rgit(source_repo, "commit", "-q", "-m", "init")
+    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
+    args = gb2._build_parser().parse_args(["init", "demo"])
+
+    code = gb2.cmd_init(args)
+
+    assert code == 0
+    assert gb2._read_worktree_base("demo") == "main"
+    repo_dir = tmp_path / "ws" / "apps" / "demo" / "repo"
+    branch = _rgit(repo_dir, "branch", "--show-current")
+    assert branch == "gb2/work"
+    merge_base = _rgit(source_repo, "merge-base", "main", "gb2/work")
+    main_head = _rgit(source_repo, "rev-parse", "main")
+    assert merge_base == main_head  # gb2/work branched off main, not a nonexistent master
+
+
+# ---------------------------------------------------------------------------
+# gb2 doctor
+# ---------------------------------------------------------------------------
+
+def test_doctor_cmd_present_reports_found_path(
+    gb2: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: "/usr/bin/" + name)
+    ok, detail = gb2._doctor_cmd_present("git")
+    assert ok is True
+    assert detail == "/usr/bin/git"
+
+
+def test_doctor_cmd_present_reports_missing(
+    gb2: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None)
+    ok, detail = gb2._doctor_cmd_present("codex")
+    assert ok is False
+    assert "not found" in detail
+
+
+def test_doctor_bwrap_runs_reports_missing_binary(
+    gb2: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None)
+    ok, detail = gb2._doctor_bwrap_runs()
+    assert ok is False
+    assert "not found" in detail
+
+
+def test_doctor_bwrap_runs_actually_executes_it(gb2: ModuleType) -> None:
+    """Real environment check -- xfail-free: bwrap not being on this
+    machine's PATH is itself a legitimate "MISSING" result, not a test
+    failure, since doctor's whole job is to report that accurately."""
+    ok, detail = gb2._doctor_bwrap_runs()
+    assert isinstance(ok, bool)
+    assert isinstance(detail, str)
+
+
+def test_doctor_release_apps_lists_only_apps_with_release_configured(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "ws" / "apps"
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    (apps_dir / "with-release").mkdir(parents=True)
+    (apps_dir / "with-release" / "config.json").write_text(json.dumps({
+        "projects": {"with-release": {"repo": "repo", "release": {
+            "master_repo": "/x", "target": "with-release"}}},
+    }), encoding="utf-8")
+    (apps_dir / "no-release").mkdir(parents=True)
+    (apps_dir / "no-release" / "config.json").write_text(json.dumps({
+        "projects": {"no-release": {"repo": "repo"}},
+    }), encoding="utf-8")
+
+    assert gb2._doctor_release_apps() == ["with-release"]
+
+
+def test_cmd_doctor_exit_1_when_something_required_is_missing(
+    gb2: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None)
+    monkeypatch.delenv("GB2_APPS_ROOT", raising=False)
+    args = gb2._build_parser().parse_args(["doctor"])
+
+    code = gb2.cmd_doctor(args)
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "MISSING" in out
+    assert "git" in out
+
+
+def test_cmd_doctor_exit_0_when_everything_present(
+    gb2: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2, "_doctor_release_apps", lambda: [])
+    monkeypatch.setenv("GB2_APPS_ROOT", "/tmp/apps-root")
+    args = gb2._build_parser().parse_args(["doctor"])
+
+    code = gb2.cmd_doctor(args)
+
+    assert code == 0
 
 
 def test_bench_cases_need_upgrade_detects_the_stale_exit1_signature(

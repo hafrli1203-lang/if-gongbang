@@ -89,10 +89,33 @@ def test_claude_argv_mcp_config_has_only_the_spec_servers(tmp_path: Path) -> Non
     tools = argv[argv.index("--tools") + 1]
     assert "mcp__playwright__*" in tools.split(",")
 
-    mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
+    # --mcp-config carries a PATH, never the JSON itself (argv is
+    # readable by any local user for the life of the process) -- see
+    # engine.workers.claude_cli._write_mcp_config_file.
+    mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
+    assert mcp_config_path.exists()
+    mode = mcp_config_path.stat().st_mode & 0o777
+    assert mode == 0o600
+    mcp_config = json.loads(mcp_config_path.read_text(encoding="utf-8"))
     assert list(mcp_config["mcpServers"]) == ["playwright"]
     assert mcp_config["mcpServers"]["playwright"]["command"] == "npx"
     assert mcp_config["mcpServers"]["playwright"]["args"] == ["-y", "@playwright/mcp"]
+
+
+def test_claude_argv_mcp_config_file_never_leaks_secret_onto_argv(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIBRARY_TOKEN", "super-secret-value")
+    spec = replace(_spec(tmp_path), mcp_servers={
+        "library": McpServerConfig(command=("python3", "-m", "lib"),
+                                   env_passthrough=("LIBRARY_TOKEN",)),
+    })
+    argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
+
+    assert all("super-secret-value" not in arg for arg in argv)
+    mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
+    config = json.loads(mcp_config_path.read_text(encoding="utf-8"))
+    assert config["mcpServers"]["library"]["env"]["LIBRARY_TOKEN"] == "super-secret-value"
 
 
 def test_claude_env_only_passthrough_plus_gb(tmp_path: Path, monkeypatch) -> None:

@@ -46,6 +46,10 @@ class Scene:
     app_shows: str
     where: str
     cmd: tuple[str, ...]  # runs in repo root; exit 0 = pass
+    # requirement ids (Plan.requirements) this scene demonstrates -- the
+    # handoff 대조표 and the post-acceptance requirement-coverage check
+    # (engine.full_orbit) both key off this, never off position.
+    covers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,21 @@ class Task:
     detail: str
     owns: tuple[str, ...]
     depends_on: tuple[str, ...]
+    # requirement ids this task implements but that have no scene of
+    # their own (e.g. a "security" requirement with no automated
+    # pass/fail scene) -- counts as covered once this task's own
+    # attempt reaches "done" (see engine.full_orbit._uncovered_requirement_ids).
+    covers: tuple[str, ...] = ()
+
+
+_KNOWN_REQUIREMENT_KINDS = ("function", "security")
+
+
+@dataclass(frozen=True)
+class Requirement:
+    id: str
+    text: str
+    kind: str  # "function" | "security"
 
 
 _KNOWN_TOOL_KINDS = ("skill", "mcp")
@@ -87,6 +106,7 @@ class Plan:
     tasks: tuple[Task, ...]
     acceptance: tuple[str, ...]
     tools: tuple[Tool, ...] = ()
+    requirements: tuple[Requirement, ...] = ()
 
 
 def plan_path(repo: Path, job: str) -> Path:
@@ -128,7 +148,19 @@ def _parse_scene(raw: object, index: int) -> Scene:
         app_shows=_require_str(raw, "app_shows", where),
         where=_require_str(raw, "where", where),
         cmd=_require_str_tuple(raw, "cmd", where, allow_empty=False),
+        covers=_require_str_tuple(raw, "covers", where),
     )
+
+
+def _parse_requirement(raw: object, index: int) -> Requirement:
+    if not isinstance(raw, dict):
+        raise PlanError(f"requirements[{index}]_must_be_object")
+    rid = _require_str(raw, "id", f"requirements[{index}]")
+    where = f"requirement[{rid}]"
+    kind = _require_str(raw, "kind", where)
+    if kind not in _KNOWN_REQUIREMENT_KINDS:
+        raise PlanError(f"{where}.kind_must_be_function_or_security")
+    return Requirement(id=rid, text=_require_str(raw, "text", where), kind=kind)
 
 
 def _parse_tool(raw: object, index: int) -> Tool:
@@ -155,6 +187,7 @@ def _parse_task(raw: object, index: int) -> Task:
         detail=_require_str_allow_empty(raw, "detail", where),
         owns=_require_str_tuple(raw, "owns", where, allow_empty=False),
         depends_on=_require_str_tuple(raw, "depends_on", where),
+        covers=_require_str_tuple(raw, "covers", where),
     )
 
 
@@ -178,6 +211,10 @@ def _parse_plan(raw: object) -> Plan:
     if not isinstance(tools_raw, list):
         raise PlanError("plan.tools_must_be_list")
     tools = tuple(_parse_tool(t, i) for i, t in enumerate(tools_raw))
+    requirements_raw = raw.get("requirements", [])
+    if not isinstance(requirements_raw, list):
+        raise PlanError("plan.requirements_must_be_list")
+    requirements = tuple(_parse_requirement(r, i) for i, r in enumerate(requirements_raw))
 
     task_ids = [t.id for t in tasks]
     if len(set(task_ids)) != len(task_ids):
@@ -185,8 +222,11 @@ def _parse_plan(raw: object) -> Plan:
     scene_ids = [s.id for s in scenes]
     if len(set(scene_ids)) != len(scene_ids):
         raise PlanError("plan.scenes_ids_not_unique")
+    requirement_ids = [r.id for r in requirements]
+    if len(set(requirement_ids)) != len(requirement_ids):
+        raise PlanError("plan.requirements_ids_not_unique")
     return Plan(goal=goal, ui=ui, scenes=scenes, tasks=tasks, acceptance=acceptance,
-                tools=tools)
+                tools=tools, requirements=requirements)
 
 
 def load_plan(repo: Path, job: str) -> Plan:
@@ -255,6 +295,22 @@ def ordered_tasks(plan: Plan) -> list[Task]:
     return ordered
 
 
+def requirement_coverers(plan: Plan) -> dict[str, tuple[tuple[str, str], ...]]:
+    """requirement id -> tuple of (kind, id) pairs ("scene"|"task", that
+    scene's/task's own id) that cover it, in plan order -- the single
+    place both validate_plan and engine.full_orbit's post-acceptance
+    check look up who covers a given requirement, so the two never
+    drift apart on what "covers" means."""
+    coverers: dict[str, list[tuple[str, str]]] = {r.id: [] for r in plan.requirements}
+    for scene in plan.scenes:
+        for rid in scene.covers:
+            coverers.setdefault(rid, []).append(("scene", scene.id))
+    for task in plan.tasks:
+        for rid in task.covers:
+            coverers.setdefault(rid, []).append(("task", task.id))
+    return {rid: tuple(pairs) for rid, pairs in coverers.items()}
+
+
 def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> list[str]:
     """[] iff `plan` is internally consistent and safe to run:
       - every task's `owns` is non-empty and a subset of
@@ -265,6 +321,9 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
       - every scene's `cmd` that names a tests/scenes/ script
         references a file that actually exists in `repo` (the planner
         owns writing that file)
+      - every scene/task `covers` entry names a real requirement id,
+        and every requirement is covered by at least one scene or task
+        (requirement_coverers)
     Schema-level problems (missing/mistyped fields) are not re-checked
     here -- load_plan already raised PlanError for those before a Plan
     object could exist."""
@@ -283,6 +342,20 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
         ordered_tasks(plan)
     except PlanError as exc:
         problems.append(str(exc.reason))
+
+    requirement_ids = {r.id for r in plan.requirements}
+    for scene in plan.scenes:
+        for rid in scene.covers:
+            if rid not in requirement_ids:
+                problems.append(f"scene {scene.id}: covers unknown requirement {rid!r}")
+    for task in plan.tasks:
+        for rid in task.covers:
+            if rid not in requirement_ids:
+                problems.append(f"task {task.id}: covers unknown requirement {rid!r}")
+    coverers = requirement_coverers(plan)
+    for requirement in plan.requirements:
+        if not coverers.get(requirement.id):
+            problems.append(f"requirement {requirement.id}: not covered by any scene or task")
     return problems
 
 
@@ -466,7 +539,7 @@ def validate_tools(plan: Plan, config: "EngineConfig") -> list[str]:
 
 
 __all__ = [
-    "Scene", "Task", "Tool", "Plan", "PlanError", "plan_path", "load_plan",
+    "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "validate_tools", "tools_for_station", "classify_skill_tools",
-    "ordered_tasks",
+    "ordered_tasks", "requirement_coverers",
 ]

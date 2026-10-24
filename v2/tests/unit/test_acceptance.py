@@ -9,7 +9,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from engine.acceptance import acceptance_path, run_acceptance
+from engine.acceptance import acceptance_path, run_acceptance, run_probe_scripts
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
 from tests.fixtures.sample_app import make_sample
@@ -148,6 +148,114 @@ def test_failing_full_suite_fails_acceptance_even_with_a_passing_scene(
     assert acc.scenes[0].passed is True
     assert acc.full_suite_passed is False
     assert acc.passed is False
+
+
+def test_scene_that_changes_the_tree_fails_acceptance(workspace: Workspace) -> None:
+    """A scene that writes a new file into the repo while it runs must
+    be caught by the before/after fingerprint comparison -- it is never
+    enough for the scene itself to exit 0 and the full suite to pass."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                     cmd=(sys.executable, "-c",
+                          "open('untracked_by_scene.txt', 'w').write('x')")),),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert acc.full_suite_passed is True
+    assert acc.tree_changed is True
+    assert acc.passed is False
+
+    data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
+    assert data["tree_changed"] is True
+    assert data["passed"] is False
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
+    assert events[0].payload["tree_changed"] is True
+    assert events[0].payload["reason"] == "tree_changed"
+
+
+def test_unchanged_tree_keeps_tree_changed_false(workspace: Workspace) -> None:
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                     cmd=(sys.executable, "-c", "pass")),),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.tree_changed is False
+    assert acc.passed is True
+
+
+def test_run_probe_scripts_runs_existing_script_and_records_evidence(
+    workspace: Workspace,
+) -> None:
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
+    probe_dir.mkdir(parents=True)
+    (probe_dir / "stripe.py").write_text(
+        "print('PROBE OK')\n", encoding="utf-8",
+    )
+
+    results = run_probe_scripts(
+        ws.config, ws.ledger, "alpha", attempt_id, "job1",
+        [("stripe", "https://docs.stripe.com/api")],
+    )
+
+    assert len(results) == 1
+    assert results[0].name == "stripe"
+    assert results[0].ok is True
+    assert results[0].returncode == 0
+    assert "PROBE OK" in results[0].stdout_tail
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "probe.executed")]
+    assert len(events) == 1
+    assert events[0].payload["name"] == "stripe"
+    assert events[0].payload["returncode"] == 0
+
+
+def test_run_probe_scripts_missing_script_is_not_ok(workspace: Workspace) -> None:
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+
+    results = run_probe_scripts(
+        ws.config, ws.ledger, "alpha", attempt_id, "job1",
+        [("slack", "https://api.slack.com/web")],
+    )
+
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert results[0].returncode == -1
+    assert results[0].stdout_tail == "script_missing"
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "probe.executed")]
+    assert events[0].payload["script"] == ""
+
+
+def test_run_probe_scripts_failing_script_is_not_ok(workspace: Workspace) -> None:
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
+    probe_dir.mkdir(parents=True)
+    (probe_dir / "slack.sh").write_text("exit 1\n", encoding="utf-8")
+
+    results = run_probe_scripts(
+        ws.config, ws.ledger, "alpha", attempt_id, "job1",
+        [("slack", "https://api.slack.com/web")],
+    )
+
+    assert results[0].ok is False
+    assert results[0].returncode == 1
 
 
 def test_no_test_cmd_configured_fails_closed(workspace: Workspace) -> None:

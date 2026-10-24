@@ -125,7 +125,7 @@ def _bench_home_dir(ctx: StepContext) -> Path:
 
 
 def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
-                        env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+                        env: dict[str, str], *, net: bool = False) -> tuple[list[str], dict[str, str]]:
     """Bench sandbox policy: writable = the repo itself (test runners
     write __pycache__/coverage/etc there). readonly = repo/.git,
     mounted AFTER the repo's own writable bind (deeper path wins) so
@@ -205,7 +205,7 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     try:
         wrapped = sandbox.wrap(
             argv, cwd=repo, writable=writable, hidden=hidden, readonly=readonly,
-            readonly_remap=readonly_remap, net=False, mode=ctx.config.sandbox,
+            readonly_remap=readonly_remap, net=net, mode=ctx.config.sandbox,
             child_env=child_env,
         )
     except sandbox.SandboxUnavailable as exc:
@@ -378,6 +378,7 @@ _ERROR_LINE = re.compile(r"^E\s+(?:([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\
 # failure a negative control's expected_signature "assertion" is
 # supposed to prove actually fired.
 _VITEST_FAILED_COUNT_RE = re.compile(r"\b\d+\s+failed\b", re.I)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def _case_signature(output: dict[str, object]) -> str | None:
@@ -386,7 +387,9 @@ def _case_signature(output: dict[str, object]) -> str | None:
     AssertionError` in a traceback source line) -- import/collection
     failures win over assertions. vitest-shaped output (no pytest
     `E   ` line matched at all): see the vitest regexes above."""
-    text = str(output.get("text", ""))
+    # Test runners may colour their output; terminal escape codes would
+    # otherwise break word boundaries in the summary-line patterns.
+    text = _ANSI_ESCAPE.sub("", str(output.get("text", "")))
     names = [m.group(1) or "assert" for m in _ERROR_LINE.finditer(text)]
     for name in names:
         short = name.rsplit(".", 1)[-1]

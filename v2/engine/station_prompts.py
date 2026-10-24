@@ -36,8 +36,10 @@ def prober_prompt(request: str, job: str, targets: tuple[tuple[str, str], ...]) 
         "이 일이 의존하는 외부 대상(API·CLI·파일 형식)마다 공식 문서를 "
         "열고 실제로 한 번 호출해 본다. 대상:\n"
         f"{targets_text}\n\n"
-        f"대상마다 .gongbang/{job}/probe/<이름>.py (또는 .sh, .ts)에 "
-        "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. 그다음 "
+        f"대상마다 .gongbang/{job}/probe/<이름>.py (또는 .sh, .js)에 "
+        "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. <이름>은 대상 "
+        "이름을 영어 소문자·숫자·-만 남긴 것이다. 엔진이 이 스크립트를 다시 "
+        "실행해 종료 코드 0이어야 통과로 본다(성공이면 0, 실패면 0이 아닌 값으로 끝낸다). 그다음 "
         f".gongbang/{job}/probe/<이름>.log 를 쓴다 -- 첫 줄은 그 대상의 "
         "공식 문서 URL이고, 성공하면 \"PROBE OK\", 실패하면 \"PROBE "
         "FAIL\"과 에러 내용을 적은 뒤 실제 요청·응답 형태도 남긴다. "
@@ -67,15 +69,23 @@ def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = ""
         f".gongbang/{job}/plan.json 과, 필요하면 tests/scenes/ 아래 장면 "
         "스크립트를 쓴다. plan.json 스키마: "
         '{"goal": str, "ui": bool, '
-        '"scenes": [{"id","actor_does","app_shows","where","cmd": [argv...]}], '
+        '"requirements": [{"id","text","kind": "function"|"security"}], '
+        '"scenes": [{"id","actor_does","app_shows","where","cmd": [argv...], '
+        '"covers": [requirement id...]}], '
         '"tasks": [{"id","title","detail","owns": [관련 경로...], '
-        '"depends_on": [task id...]}], "acceptance": [str]}. '
+        '"depends_on": [task id...], "covers": [requirement id...]}], '
+        '"acceptance": [str]}. '
         "장면(scene)마다 cmd가 실행할 스크립트를 tests/scenes/ 아래에 실제로 "
         "만든다 — 통과 장면은 사람의 행동 → 결과를 그대로 자동으로 확인하는 "
         "스크립트이고, exit 0이면 통과다. 작업(task)마다 owns에 그 작업이 "
         "쓸 파일·폴더만 적는다(다른 작업의 소유 경로와 겹치지 않게 나눈다), "
         "depends_on으로 작업 순서를 정한다. 화면이 있는 요청이면 ui를 "
-        "true로 둔다."
+        "true로 둔다.\n\n"
+        "requirements에는 이 요청이 실제로 요구하는 것을 하나씩 적는다 "
+        "(기능은 kind \"function\", 보안·검증처럼 통과 장면으로 자동 확인하기 "
+        "어려운 것은 kind \"security\"). requirement 하나는 반드시 장면 "
+        "하나 이상의 covers 또는 작업 하나 이상의 covers에 그 id로 나타나야 "
+        "한다 — 덮이지 않은 requirement가 있으면 이 계획은 통과하지 못한다."
         + tools_part
     )
 
@@ -109,12 +119,27 @@ def builder_task_text(task: Task, plan_goal: str, job: str | None = None,
 
 
 def fix_task_text(task: Task, plan_goal: str, failing_scenes: tuple[str, ...],
-                  job: str | None = None, ui: bool = False) -> str:
+                  job: str | None = None, ui: bool = False, *,
+                  full_suite_returncode: int | None = None,
+                  full_suite_tail: str = "") -> str:
+    """`full_suite_returncode`/`full_suite_tail` (engine.acceptance.
+    AcceptanceResult's own fields, read with getattr default by the
+    caller so this works whether or not that field exists yet) are
+    given only when NO scene failed but the project's own full test
+    suite did -- the one case where `failing_scenes` alone leaves the
+    builder with nothing to go on."""
     base = builder_task_text(task, plan_goal, job, ui)
-    scenes_list = ", ".join(failing_scenes)
+    if failing_scenes:
+        scenes_list = ", ".join(failing_scenes)
+        return (
+            f"{base}\n\n수락 시험에서 다음 통과 장면이 실패했다: {scenes_list}. "
+            "원인을 고쳐 다시 통과하게 만든다."
+        )
+    tail = full_suite_tail[-2000:] if full_suite_tail else "(출력 없음)"
     return (
-        f"{base}\n\n수락 시험에서 다음 통과 장면이 실패했다: {scenes_list}. "
-        "원인을 고쳐 다시 통과하게 만든다."
+        f"{base}\n\n통과 장면은 모두 통과했지만, 프로젝트의 전체 시험(test_cmd)이 "
+        f"실패했다 (종료 코드 {full_suite_returncode}). 마지막 출력:\n{tail}\n\n"
+        "원인을 고쳐 전체 시험이 다시 통과하게 만든다."
     )
 
 

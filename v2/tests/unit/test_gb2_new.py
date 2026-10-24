@@ -212,6 +212,79 @@ def test_cmd_new_scaffolds_repo_workspace_and_calls_run_full_job(
     assert built.installer is not None
 
 
+def test_cmd_new_resumes_an_interrupted_init_via_its_marker(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A previous `gb2 new demo ...` call crashed after creating
+    source_repo (its marker, README.md and .gitignore already on disk)
+    but before the initial commit or the engine workspace ever existed.
+    A retry must resume -- finish the skeleton/commit, set up the
+    workspace, and run the orbit -- instead of refusing app_exists."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    source_repo = source_root / "demo"
+    source_repo.mkdir(parents=True)
+    gb2._new_app_marker_path(source_repo).write_text("demo", encoding="utf-8")
+    (source_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+    (source_repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+
+    code = gb2.main(["new", "demo", "할 일을 정리하는 앱을 만들어줘"])
+
+    assert code == 0
+    assert len(run_calls) == 1
+    assert (source_repo / "package.json").exists()
+    assert _rgit(source_repo, "log", "--format=%s") == "chore: scaffold demo via gb2 new"
+    assert not gb2._new_app_marker_path(source_repo).exists()
+    workspace = apps_dir / "demo"
+    assert (workspace / "config.json").exists()
+
+
+def test_cmd_new_resume_never_commits_the_marker_file(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    _install_fake_full_orbit(monkeypatch)
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 0
+    source_repo = source_root / "demo"
+    tracked = _rgit(source_repo, "ls-files").splitlines()
+    assert gb2._NEW_APP_MARKER_NAME not in tracked
+
+
+def test_cmd_new_still_refuses_a_real_app_folder_without_the_marker(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing app folder that gb2 never touched (no marker at all)
+    must still be refused outright -- the marker-based resume must
+    never silently adopt an unrelated directory."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    source_repo = source_root / "demo"
+    source_repo.mkdir(parents=True)
+    (source_repo / "some_real_file.txt").write_text("real app\n", encoding="utf-8")
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 1
+    assert run_calls == []
+    assert (source_repo / "some_real_file.txt").exists()
+    assert not (source_repo / "package.json").exists()
+
+
 def test_cmd_new_reports_needs_owner_with_exit_code_2(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,6 +300,98 @@ def test_cmd_new_reports_needs_owner_with_exit_code_2(
     code = gb2.main(["new", "demo", "요구사항"])
 
     assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# GB2_SCRIPTED_WORKERS (test-only seam: drive a real `gb2` subcommand
+# end to end against deterministic ScriptedRunner workers instead of a
+# live claude/codex CLI -- see tools/gb2's own _fakes_builder/
+# _apply_scripted_workers docstrings)
+# ---------------------------------------------------------------------------
+
+_SCRIPTED_ROLES = ("facts", "prober", "planner", "designer", "builder", "reviewer")
+
+
+def _write_scripted_worker_dir(root: Path) -> Path:
+    scripts_dir = root / "scripts"
+    scripts_dir.mkdir()
+    for role in _SCRIPTED_ROLES:
+        (scripts_dir / f"{role}.json").write_text("[]", encoding="utf-8")
+    return scripts_dir
+
+
+def test_cmd_new_without_env_keeps_the_real_claude_codex_runners(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    monkeypatch.delenv("GB2_SCRIPTED_WORKERS", raising=False)
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 0
+    (cfg, *_rest) = run_calls[0]
+    assert cfg.workers["builder"].runner == "claude"
+    assert cfg.workers["reviewer"].runner == "codex"
+
+
+def test_cmd_new_with_scripted_workers_env_rewrites_every_role(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    scripts_dir = _write_scripted_worker_dir(tmp_path)
+    monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(scripts_dir))
+
+    code = gb2.main(["new", "demo", "할 일을 정리하는 앱을 만들어줘"])
+
+    assert code == 0
+    assert len(run_calls) == 1
+    (cfg, _ledger, fakes_for, *_rest) = run_calls[0]
+    # every role in config.workers got rewritten, not just the ones this
+    # job happens to use (prober/designer are skipped at runtime for a
+    # non-UI, no-external-target job -- the rewrite does not know that).
+    for role in _SCRIPTED_ROLES:
+        assert cfg.workers[role].runner == f"scripted_{role}"
+
+    from engine.workers.scripted import ScriptedRunner
+
+    built = fakes_for("A-demo-1#1")
+    builder_runner = built.runners["scripted_builder"]
+    reviewer_runner = built.runners["scripted_reviewer"]
+    assert isinstance(builder_runner, ScriptedRunner)
+    assert isinstance(reviewer_runner, ScriptedRunner)
+    assert builder_runner.read_only is False
+    assert reviewer_runner.read_only is True
+    # the real installer/publisher _build_fakes wires in are left alone --
+    # only the AI-shaped runners are replaced.
+    assert built.installer is not None
+
+
+def test_cmd_new_with_scripted_workers_env_refuses_when_a_role_file_is_missing(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "facts.json").write_text("[]", encoding="utf-8")
+    # builder.json/reviewer.json/... deliberately missing
+    monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(scripts_dir))
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 1
+    assert run_calls == []
 
 
 # ---------------------------------------------------------------------------

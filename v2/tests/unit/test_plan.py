@@ -210,6 +210,80 @@ def test_ordered_tasks_cycle_raises(tmp_path: Path) -> None:
     assert exc.value.reason.startswith("dependency_cycle")
 
 
+# ---- requirements/covers (s10 contract item 4) ----------------------
+
+def test_requirement_covered_by_scene_is_valid(tmp_path: Path) -> None:
+    data = _valid_plan_dict(
+        requirements=[{"id": "R1", "text": "클릭하면 결과가 나온다", "kind": "function"}],
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert plan.requirements[0].id == "R1"
+    assert plan.scenes[0].covers == ("R1",)
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_requirement_not_covered_by_any_scene_or_task_is_a_problem(tmp_path: Path) -> None:
+    data = _valid_plan_dict(
+        requirements=[{"id": "R1", "text": "보안 점검", "kind": "security"}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("R1" in p and "not covered" in p for p in problems)
+
+
+def test_requirement_covered_by_task_only_is_valid(tmp_path: Path) -> None:
+    data = _valid_plan_dict(
+        requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
+        tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
+                "depends_on": [], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_scene_covers_unknown_requirement_is_a_problem(tmp_path: Path) -> None:
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"], "covers": ["GHOST"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("GHOST" in p for p in problems)
+
+
+def test_requirement_duplicate_ids_raise(tmp_path: Path) -> None:
+    data = _valid_plan_dict(requirements=[
+        {"id": "R1", "text": "a", "kind": "function"},
+        {"id": "R1", "text": "b", "kind": "function"},
+    ])
+    _write_plan(tmp_path, "job", data)
+    with pytest.raises(PlanError) as exc:
+        load_plan(tmp_path, "job")
+    assert exc.value.reason == "plan.requirements_ids_not_unique"
+
+
+def test_requirement_coverers_lists_scene_and_task_pairs(tmp_path: Path) -> None:
+    from engine.plan import requirement_coverers
+
+    data = _valid_plan_dict(
+        requirements=[{"id": "R1", "text": "a", "kind": "function"}],
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"], "covers": ["R1"]}],
+        tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
+                "depends_on": [], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    coverers = requirement_coverers(plan)
+    assert coverers["R1"] == (("scene", "s1"), ("task", "t1"))
+
+
 def test_ordered_tasks_unknown_dep_raises(tmp_path: Path) -> None:
     data = _valid_plan_dict(tasks=[
         {"id": "t1", "title": "a", "detail": "", "owns": ["src/"], "depends_on": ["ghost"]},

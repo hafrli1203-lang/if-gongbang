@@ -17,7 +17,13 @@ never answers it (sleeps well past any sane test timeout), so a test
 can exercise the client's own read-timeout path. `--notify-before-reply`
 writes one id-less JSON-RPC notification before each tools/call's real
 reply, so a test can exercise the client's id-matching (a notification
-must never be mistaken for the reply it is waiting on)."""
+must never be mistaken for the reply it is waiting on). `--flood-
+notifications` writes an id-less notification every 0.3s, forever,
+instead of ever answering the tools/call -- so a test can check that
+the client enforces ONE overall deadline for the whole request, not a
+fresh per-message window that a steady drip of notifications (each
+well inside any single read's own timeout) could otherwise stretch out
+indefinitely."""
 from __future__ import annotations
 
 import json
@@ -54,6 +60,7 @@ def main() -> None:
     crash_after_init = "--crash-after-init" in sys.argv[1:]
     hang_on_call = "--hang-on-call" in sys.argv[1:]
     notify_before_reply = "--notify-before-reply" in sys.argv[1:]
+    flood_notifications = "--flood-notifications" in sys.argv[1:]
     while True:
         request = _read()
         if request is None:
@@ -70,6 +77,10 @@ def main() -> None:
             if hang_on_call:
                 time.sleep(3600)
                 return
+            if flood_notifications:
+                while True:
+                    time.sleep(0.3)
+                    _write({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
             if notify_before_reply:
                 _write({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
             params = request.get("params", {})
