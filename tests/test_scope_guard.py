@@ -205,6 +205,68 @@ def test_sudo_git_push_denied(fence_home):
     assert classify(r) == "DENY", r.stdout + r.stderr
 
 
+def test_sudo_with_user_option_rm_denied(fence_home):
+    # sudo's own option VALUE ("root") must not be mistaken for the real command - rm must
+    # still be gated even though sudo's "-u root" sits in front of it.
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("sudo -u root rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_env_with_option_value_rm_denied(fence_home):
+    # Before the option-arity table, env's "-u FOO" value token was mistaken for the command,
+    # so this slipped through completely ungated.
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("env -u FOO rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_nice_with_option_value_rm_denied(fence_home):
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("nice -n 5 rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_ionice_with_option_value_rm_denied(fence_home):
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("ionice -c 3 rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_timeout_with_duration_rm_denied(fence_home):
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("timeout 10 rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_stdbuf_with_option_rm_denied(fence_home):
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("stdbuf -oL rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_chained_prefixes_rm_denied(fence_home):
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("sudo -E env X=1 nice -n 5 rm -rf x", sid, now=_now())
+    assert classify(r) == "DENY", r.stdout + r.stderr
+
+
+def test_nice_with_option_value_on_harmless_command_allowed(fence_home):
+    # Negative control: a prefix's option VALUE must not itself be mistaken for a gated
+    # command, and an ordinary command behind a prefix must not be over-blocked.
+    sid = "sid-bypass"
+    fence_home.write_transcript(sid, [])
+    r = fence_home.bash("nice -n 5 echo hello", sid, now=_now())
+    assert classify(r) == "ALLOW", r.stdout + r.stderr
+
+
 def test_plain_git_status_allowed(fence_home):
     sid = "sid-bypass"
     fence_home.write_transcript(sid, [])

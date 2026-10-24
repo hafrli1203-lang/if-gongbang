@@ -29,6 +29,12 @@ class FenceHome:
         self.home = home
         self.proj_dir = os.path.join(home, ".claude", "projects", "x")
         os.makedirs(self.proj_dir, exist_ok=True)
+        # scope_guard's default apps_root ("~/apps") resolves inside this throwaway home too.
+        # It exists but stays empty, matching an ordinary workspace where the apps folder is
+        # present (so project-scoped-approval lookups can actually be resolved) but may not yet
+        # contain a project matching any particular approval label - as opposed to apps_root
+        # being genuinely missing/unreadable, which is its own (fail-closed) test case.
+        os.makedirs(os.path.join(home, "apps"), exist_ok=True)
 
     def transcript_path(self, session_id: str) -> str:
         return os.path.join(self.proj_dir, f"{session_id}.jsonl")

@@ -100,7 +100,33 @@ GATED_PATH = [
 ]
 
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-ALLOWED_PREFIXES = {"exec", "xargs", "env", "nohup", "nice", "time", "command"}
+# Command-runner prefixes whose own options are skipped (blindly, as bare "-x" flags with no
+# value) before looking for the next token in the chain. sudo/env/nice/ionice/timeout/stdbuf are
+# NOT handled here - they have options that take a separate value token (-u NAME, -n N, ...), so
+# they go through PREFIX_VALUE_OPTS/PREFIX_POSITIONAL_ARGS below instead, where that value can't
+# be mistaken for the next command.
+ALLOWED_PREFIXES = {"exec", "xargs", "nohup", "time", "command", "builtin"}
+
+# Prefixes whose options are explicitly enumerated so an option's VALUE token is never mistaken
+# for the next command in the chain (sudo -u deploy, env -u NAME, nice -n 5, ionice -c 3,
+# timeout -s KILL, stdbuf -o L). A long "--opt=value" form carries its value in the same token
+# and needs no extra skip; the short forms below always take the following token as their value.
+PREFIX_VALUE_OPTS = {
+    "sudo": {"-u", "-g", "-p", "-r", "-t", "-C",
+             "--user", "--group", "--prompt", "--role", "--type", "--close-from"},
+    "env": {"-u", "-C", "-S", "-P",
+            "--unset", "--chdir", "--split-string"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "--class", "--classdata"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+}
+# "timeout" takes a required DURATION as a bare positional argument (not an option), consumed
+# right after its own flags and before the real command: "timeout 10 rm -rf /".
+PREFIX_POSITIONAL_ARGS = {"timeout": 1}
+
+PREFIX_COMMANDS = ALLOWED_PREFIXES | set(PREFIX_VALUE_OPTS)
+
 NESTED_SHELLS = {"bash", "sh", "zsh", "dash", "ash"}
 SEPARATORS = {";", "&&", "||", "|", "&"}
 
@@ -133,21 +159,56 @@ def _split_segments(tokens: list[str]) -> list[list[str]]:
     return [s for s in segs if s]
 
 
-def _first_command(tokens: list[str]) -> tuple[str | None, int]:
-    """Skips leading VAR=value assignments and one command-runner prefix (sudo/env/xargs/...),
-    returns (basename of the real command token, its index), or (None, -1) if none found."""
+def _skip_one_prefix(tokens: list[str], i: int) -> int:
+    """Given tokens[i] is a known prefix command's name, returns the index just past its own
+    options (and, for "timeout", its required duration argument) - the start of whatever comes
+    next in the chain. Options that take a separate value (PREFIX_VALUE_OPTS) consume that value
+    token too, so it is never mistaken for the next command."""
+    name = _basename(tokens[i])
+    value_opts = PREFIX_VALUE_OPTS.get(name, set())
+    j = i + 1
+    while j < len(tokens):
+        t = tokens[j]
+        if ASSIGN_RE.match(t):
+            j += 1
+            continue
+        if not t.startswith("-"):
+            break
+        j += 1
+        if t in value_opts:
+            j += 1
+    for _ in range(PREFIX_POSITIONAL_ARGS.get(name, 0)):
+        if j < len(tokens) and not tokens[j].startswith("-"):
+            j += 1
+    return j
+
+
+def _skip_prefix_chain(tokens: list[str]) -> tuple[str | None, int, set[str]]:
+    """Skips leading VAR=value assignments and a CHAIN of command-runner prefixes (sudo, env,
+    nice, ionice, timeout, nohup, stdbuf, command, exec, xargs, builtin, time - any mix,
+    nested as deep as the command actually goes: "sudo -u root env X=1 nice -n 5 rm -rf /").
+    Returns (basename of the real command token, its index, the set of prefix basenames that
+    were skipped to get there) - the set lets a caller check "was sudo anywhere in this chain"
+    even though sudo's own prefix is unwrapped to find the real command behind it."""
     i = 0
-    while i < len(tokens) and ASSIGN_RE.match(tokens[i]):
-        i += 1
-    # "sudo" is deliberately NOT a skippable prefix: "sudo -u deploy git push" used to resolve to
-    # the option VALUE "deploy" as the command and slip past every gate. sudo itself is gated.
-    if i < len(tokens) and _basename(tokens[i]) in ALLOWED_PREFIXES:
-        i += 1
-        while i < len(tokens) and (ASSIGN_RE.match(tokens[i]) or tokens[i].startswith("-")):
+    seen: set[str] = set()
+    while True:
+        while i < len(tokens) and ASSIGN_RE.match(tokens[i]):
             i += 1
-    if i >= len(tokens):
-        return None, -1
-    return _basename(tokens[i]), i
+        if i >= len(tokens):
+            return None, -1, seen
+        name = _basename(tokens[i])
+        if name not in PREFIX_COMMANDS:
+            return name, i, seen
+        seen.add(name)
+        i = _skip_one_prefix(tokens, i)
+
+
+def _first_command(tokens: list[str]) -> tuple[str | None, int]:
+    """Convenience wrapper over _skip_prefix_chain for callers that only need the real command
+    and its index, not which prefixes (if any) were skipped to find it."""
+    name, i, _ = _skip_prefix_chain(tokens)
+    return name, i
 
 
 def _expand_nested_shell_segment(segment: list[str], depth: int = 0) -> list[list[str]]:
@@ -241,15 +302,19 @@ SIMPLE_PROGRAM_GATES = [
 
 
 def _simple_program_hit(segment: list[str]) -> str | None:
-    name, i = _first_command(segment)
+    name, i, prefixes = _skip_prefix_chain(segment)
+    # sudo is checked against the PREFIX chain, not just "is it the first command" - sudo is
+    # unwrapped like any other prefix to find the real command behind it (so "sudo -u root rm
+    # -rf /" is still recognized as an rm/git/etc hit too), but its own presence anywhere in the
+    # chain must still require approval regardless of what runs after it.
+    if "sudo" in prefixes:
+        return "sudo 실행"
     if name is None:
         return None
     rest_text = " ".join(segment[i + 1:])
     for names, pat, why in SIMPLE_PROGRAM_GATES:
         if name in names and (pat == "" or re.search(pat, rest_text, re.I)):
             return why
-    if name == "sudo":
-        return "sudo 실행"
     if name == "kill" and re.search(r"-9\b", rest_text):
         return "프로세스 강제 종료"
     if name == "crontab" and re.search(r"(^-[er]$|^-$|\.txt$)", " ".join(segment[i + 1:i + 2]) or ""):
@@ -644,10 +709,13 @@ def _project_dir_for(task: str, cfg: dict) -> str | None:
         return None  # project scoping not configured at all -> every approval is session-wide
     try:
         entries = os.listdir(apps_root)
-    except (FileNotFoundError, NotADirectoryError):
-        return None  # no apps folder yet (fresh install) == an empty one -> no project names exist
     except Exception as exc:
-        raise _ProjectLookupError(str(exc)) from exc  # exists but unreadable -> fail closed
+        # apps_root IS configured but can't be listed (missing directory, permission, I/O, ...):
+        # whether `task` names a project folder can't be determined at all, so this must fail
+        # closed, the same as an unreadable-but-present directory - never fall back to treating
+        # it as "no project names exist, so grant session-wide" (that would let a missing/typo'd
+        # apps_root silently widen every project-scoped approval to the whole session).
+        raise _ProjectLookupError(str(exc)) from exc
     for name in entries:
         if name.lower() == task.lower():
             candidate = os.path.join(apps_root, name)

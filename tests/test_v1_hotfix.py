@@ -32,9 +32,9 @@ def test_apps_root_configured_but_unreadable_denies(tmp_path, monkeypatch):
     assert sg._task_grants("someproj", cfg, str(tmp_path / "x.txt"), "") is False
 
 
-def test_apps_root_missing_dir_is_session_wide(tmp_path):
+def test_apps_root_missing_dir_denies(tmp_path):
     cfg = {"apps_root": str(tmp_path / "does-not-exist")}
-    assert sg._task_grants("someproj", cfg, str(tmp_path / "x.txt"), "") is True
+    assert sg._task_grants("someproj", cfg, str(tmp_path / "x.txt"), "") is False
 
 
 def test_apps_root_not_configured_is_session_wide(tmp_path):

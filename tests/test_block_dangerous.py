@@ -87,6 +87,73 @@ def test_rm_rf_ordinary_relative_dir_is_not_hard_blocked():
     assert reason is None
 
 
+# --- catastrophic inner command behind a command-runner prefix chain ----------------------
+# A prefix like sudo/env/nice/ionice/timeout/stdbuf must never hide a catastrophic rm/git
+# command from the structural check - the inner command is always evaluated, no matter how
+# many of these are chained in front of it.
+
+def test_rm_rf_root_behind_sudo_with_option_is_blocked():
+    reason, _ = bd.check("sudo -u root rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_reordered_flags_behind_sudo_is_blocked():
+    # -fr (reordered) and split -f -r must still be caught, not just the literal "-rf" substring.
+    reason, _ = bd.check("sudo -u root rm -fr /")
+    assert reason is not None
+    reason, _ = bd.check("sudo -u root rm -f -r /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_env_with_option_value_is_blocked():
+    reason, _ = bd.check("env -u FOO rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_nice_with_option_value_is_blocked():
+    reason, _ = bd.check("nice -n 5 rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_ionice_with_option_value_is_blocked():
+    reason, _ = bd.check("ionice -c 3 rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_timeout_with_duration_is_blocked():
+    reason, _ = bd.check("timeout 10 rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_stdbuf_with_option_is_blocked():
+    reason, _ = bd.check("stdbuf -oL rm -rf /")
+    assert reason is not None
+    reason, _ = bd.check("stdbuf -o L rm -rf /")
+    assert reason is not None
+
+
+def test_rm_rf_root_behind_chained_prefixes_is_blocked():
+    reason, _ = bd.check("sudo -E env X=1 nice -n 5 rm -rf /")
+    assert reason is not None
+
+
+def test_git_push_force_behind_sudo_with_option_is_blocked():
+    reason, _ = bd.check("sudo -u root git push --force")
+    assert reason is not None
+
+
+def test_git_reset_hard_behind_sudo_with_option_is_blocked():
+    reason, _ = bd.check("sudo -u root git reset --hard")
+    assert reason is not None
+
+
+def test_nice_with_option_value_on_a_harmless_command_is_not_blocked():
+    # Negative control: a prefix's own option value must not be mistaken for a dangerous
+    # command, and an ordinary command behind a prefix must not be over-blocked.
+    reason, warn = bd.check("nice -n 5 echo hello")
+    assert reason is None and warn is None
+
+
 def test_main_fails_closed_on_internal_error(monkeypatch, capsys):
     import json
     import io
