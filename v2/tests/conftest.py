@@ -94,3 +94,31 @@ def workspace(tmp_path: Path) -> Workspace:
     ledger.register_project("alpha")
     ledger.register_project("beta")
     return Workspace(tmp_path, config, ledger, alpha, beta)
+
+
+_LIVE_CLIS = {"claude", "codex"}
+
+
+@pytest.fixture(autouse=True)
+def _no_live_ai_cli(monkeypatch: pytest.MonkeyPatch):
+    """Refuse to start a real claude/codex worker from any test unless
+    GB2_LIVE=1 is set. Every worker (station and review) is started
+    through engine.procs.spawn, so one guard there covers all of them,
+    whatever module-import order a test run happens to have."""
+    import os
+
+    from engine import procs
+
+    if os.environ.get("GB2_LIVE") == "1":
+        yield
+        return
+    real_spawn = procs.spawn
+
+    def guarded(ledger, project, attempt_id, station, argv, cwd, **kwargs):
+        if any(Path(str(a)).name in _LIVE_CLIS for a in argv):
+            raise RuntimeError(
+                f"test tried to start a live AI CLI ({station}); set GB2_LIVE=1 to allow")
+        return real_spawn(ledger, project, attempt_id, station, argv, cwd, **kwargs)
+
+    monkeypatch.setattr(procs, "spawn", guarded)
+    yield

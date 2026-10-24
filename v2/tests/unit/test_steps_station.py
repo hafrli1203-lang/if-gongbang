@@ -156,7 +156,7 @@ def test_worker_timeout_kills_group(workspace: Workspace) -> None:
 
     req = ws.ledger.request(rid)
     assert req.status == "failed"
-    assert req.result == {"reason": "worker_timeout"}
+    assert req.result == {"reason": "worker_stalled"}
 
     deadline = time.time() + 5
     while not pidfile.exists() and time.time() < deadline:

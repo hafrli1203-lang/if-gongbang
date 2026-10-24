@@ -5,14 +5,17 @@ experiment, plan §0)."""
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
 
-from engine.config import WorkerConfig
+from engine.config import McpServerConfig, WorkerConfig
 from engine.workers.base import (
     WorkerResult, WorkerSpec, parse_cli_shaped_result, worker_env,
 )
+
+_BASE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep", "Bash")
 
 _SYSTEM_PROMPT = (
     "You are an automated worker inside a sandboxed copy of a repository. "
@@ -52,6 +55,35 @@ def _gate_command() -> str:
     return f"sh -c {shlex.quote(f'{gate_cmd} || exit 2')}"
 
 
+def _mcp_config_json(mcp_servers: dict[str, McpServerConfig]) -> str:
+    """The `--mcp-config` JSON for the stdio servers named in
+    `mcp_servers`: the documented Claude Code mcpServers map shape
+    (command/args/env), never a raw byte copy of anything -- built
+    fresh from each McpServerConfig. `env` carries only the configured
+    env_passthrough NAMES, each resolved from THIS (engine) process's
+    own os.environ -- never a worker's own env (worker_env()'s
+    deliberately tiny GB_*/passthrough set), and never anything not
+    explicitly named by the project's own config.
+
+    Unverified against a real `claude` CLI probe log (MASTER_RULES
+    §실측): `--mcp-config`/`--strict-mcp-config` are the flag names the
+    plan this was built from specifies; this module keeps the
+    separately-measured `--tools` flag (see module docstring) rather
+    than the plan's own `--allowedTools` wording, since `--tools` is
+    what ENGINE.md records as actually measured against this CLI."""
+    servers: dict[str, object] = {}
+    for name, cfg in sorted(mcp_servers.items()):
+        command, *extra_args = cfg.command
+        entry: dict[str, object] = {
+            "command": command, "args": list(extra_args) + list(cfg.args),
+        }
+        env = {var: os.environ[var] for var in cfg.env_passthrough if var in os.environ}
+        if env:
+            entry["env"] = env
+        servers[name] = entry
+    return json.dumps({"mcpServers": servers})
+
+
 def _gate_settings() -> str:
     return json.dumps({
         "hooks": {
@@ -79,17 +111,28 @@ class ClaudeRunner:
         argv = ["claude", "-p", spec.task]
         if worker.model:
             argv += ["--model", worker.model]
+        if worker.max_turns is not None:
+            argv += ["--max-turns", str(worker.max_turns)]
+        if worker.budget_usd is not None:
+            argv += ["--max-budget-usd", str(worker.budget_usd)]
+        tools = ",".join(_BASE_TOOLS)
+        if spec.mcp_servers:
+            tools += "," + ",".join(f"mcp__{name}__*" for name in sorted(spec.mcp_servers))
         argv += [
-            "--max-turns", str(worker.max_turns),
-            "--max-budget-usd", str(worker.budget_usd),
             "--output-format", "json",
             "--no-session-persistence",
             "--setting-sources", "",
             "--settings", _gate_settings(),
-            "--tools", "Read,Edit,Write,Glob,Grep,Bash",
+            "--tools", tools,
             "--permission-mode", "manual",
             "--system-prompt", _SYSTEM_PROMPT,
         ]
+        if spec.mcp_servers:
+            # --strict-mcp-config: only the servers in this generated
+            # config are available -- no other .mcp.json/project/user
+            # config source is consulted (same "nothing but what we
+            # just built" intent as --setting-sources "" above).
+            argv += ["--mcp-config", _mcp_config_json(spec.mcp_servers), "--strict-mcp-config"]
         return argv
 
     def env(self, spec: WorkerSpec, worker: WorkerConfig) -> dict[str, str]:

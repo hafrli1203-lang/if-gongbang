@@ -55,11 +55,34 @@
   },
   "publisher": {
     "kind": "shell",
-    "argv": ["__DEPLOY_SCRIPT__", "{target}"],
-    "dry_run_argv": ["__DEPLOY_SCRIPT__", "{target}", "--check"],
+    "argv": [
+      "__DEPLOY_SCRIPT__",
+      "{target}"
+    ],
+    "dry_run_argv": [
+      "__DEPLOY_SCRIPT__",
+      "{target}",
+      "--check"
+    ],
     "dry_run": false
   },
   "station_owners": {
+    "facts": {
+      "facts": [
+        ".gongbang/"
+      ]
+    },
+    "plan": {
+      "planner": [
+        ".gongbang/",
+        "tests/scenes/"
+      ]
+    },
+    "design": {
+      "designer": [
+        ".gongbang/"
+      ]
+    },
     "build": {
       "builder": [
         "src/",
@@ -91,17 +114,28 @@
     "AGENTS.md"
   ],
   "workers": {
+    "facts": {
+      "runner": "claude",
+      "model": "sonnet",
+      "timeout_sec": 600
+    },
+    "planner": {
+      "runner": "claude",
+      "model": "sonnet",
+      "timeout_sec": 900
+    },
+    "designer": {
+      "runner": "claude",
+      "model": "sonnet",
+      "timeout_sec": 900
+    },
     "builder": {
       "runner": "claude",
       "model": "sonnet",
-      "max_turns": 60,
-      "budget_usd": 2.5,
       "timeout_sec": 1500
     },
     "reviewer": {
       "runner": "codex",
-      "max_turns": 40,
-      "budget_usd": 2.0,
       "timeout_sec": 900,
       "reasoning": "medium"
     }
@@ -109,5 +143,54 @@
   "bench_readonly_paths": [
     "~/.cache/ms-playwright",
     "~/.npm"
-  ]
+  ],
+  "skill_index_path": "~/.claude/skills-library/INDEX.md",
+  "mcp_servers": {
+    "playwright": {
+      "command": [
+        "npx",
+        "@playwright/mcp@latest"
+      ],
+      "args": [],
+      "env_passthrough": []
+    }
+  },
+  "station_mcp_allow": {
+    "design": [
+      "playwright"
+    ],
+    "review": [
+      "playwright"
+    ],
+    "build": [
+      "playwright"
+    ]
+  },
+  "context": {
+    "skill_roots": [
+      "~/.claude/skills",
+      "~/.claude/skills-library"
+    ],
+    "station_skills": {
+      "facts": [
+        "크래시-아웃"
+      ],
+      "plan": [
+        "writing-plans",
+        "육칠",
+        "skill-library"
+      ],
+      "design": [
+        "아우라-파밍",
+        "impeccable",
+        "화면-품질-점검"
+      ],
+      "review": [
+        "화면-품질-점검"
+      ],
+      "report": [
+        "진행-보고"
+      ]
+    }
+  }
 }

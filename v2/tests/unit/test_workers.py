@@ -338,3 +338,9 @@ def test_last_json_block_skips_oversized_int_candidate() -> None:
     from engine.workers.base import last_json_block
     text = '{"n": ' + "9" * 5000 + '} then {"status": "done", "summary": "s", "requests": []}'
     assert last_json_block(text) == {"status": "done", "summary": "s", "requests": []}
+
+
+def test_claude_argv_has_no_budget_cap_by_default(tmp_path: Path) -> None:
+    argv = ClaudeRunner().argv(_spec(tmp_path), WorkerConfig(runner="claude"))
+    assert "--max-budget-usd" not in argv
+    assert "--max-turns" not in argv

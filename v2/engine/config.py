@@ -11,6 +11,8 @@ import posixpath
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from engine.context import ContextConfig, LibraryMcpConfig
+
 _RUNNER_KINDS = ("claude", "codex", "scripted")
 
 
@@ -20,17 +22,24 @@ class WorkerConfig:
 
     runner: str  # "claude" | "codex" | "scripted"
     model: str | None = None
-    max_turns: int = 40
-    budget_usd: float = 3.0
+    max_turns: int | None = None  # None: no turn cap; timeout_sec still stops a hung worker
+    budget_usd: float | None = None  # None: no per-run spend cap (subscription use)
     timeout_sec: float = 900.0
     reasoning: str | None = None  # codex: model_reasoning_effort
 
     def __post_init__(self) -> None:
-        if self.runner not in _RUNNER_KINDS:
+        if not _is_known_runner(self.runner):
             raise ValueError(f"unknown worker runner: {self.runner!r}")
 
 
 _KNOWN_RUNNERS = frozenset({"claude", "codex", "scripted"})
+
+
+def _is_known_runner(name: object) -> bool:
+    """claude, codex, scripted, or a named scripted variant ("scripted_<role>") so a
+    test can give each role its own script; real configs use the first three."""
+    return isinstance(name, str) and (
+        name in _KNOWN_RUNNERS or (name.startswith("scripted_") and len(name) > len("scripted_")))
 _KNOWN_BENCH_SCOPES = frozenset({"related", "full"})
 
 
@@ -190,6 +199,33 @@ def _validate_copy_links_entry(entry: str) -> None:
         raise ValueError(f"copy_links entry must not be inside .git: {entry!r}")
 
 
+@dataclass(frozen=True)
+class McpServerConfig:
+    """One stdio MCP server this engine may wire into a worker's own
+    --mcp-config for a job whose plan.tools names it (engine.plan.Tool
+    kind="mcp") -- never handed to a worker directly; ClaudeRunner
+    builds a per-request JSON containing only the servers that
+    request's station/role is actually allowed (station_mcp_allow,
+    engine.policy's own mcp rule). `command` is the full argv (program
+    first, e.g. ["npx", "-y", "@acme/mcp-server"]); `args` are extra
+    arguments appended after it for this engine's own use (kept
+    separate from `command` so a shared base command can be reused
+    with different trailing args, same shape plan §"mcp" asks for);
+    `env_passthrough` is a list of environment variable NAMES this
+    engine process's own os.environ supplies values for when building
+    the server's own "env" entry -- the worker's env is never widened
+    by this (the mcp server runs as the CLI's own child, not inside
+    the worker's shell)."""
+
+    command: tuple[str, ...]
+    args: tuple[str, ...] = ()
+    env_passthrough: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.command:
+            raise ValueError("mcp server command must be a non-empty list")
+
+
 def _validate_copy_link_writable_subpath(subpath: str) -> None:
     if not subpath or subpath.startswith("/"):
         raise ValueError(
@@ -276,6 +312,36 @@ class EngineConfig:
     # in Python (e.g. most unit tests), which must then never spawn a
     # worker that relies on GB_CONFIG.
     config_path: Path | None = None
+    # name -> stdio MCP server launch info this engine may grant a
+    # worker for a job whose plan.tools names it (engine.plan.Tool
+    # kind="mcp"). Empty (default): no project uses engine-granted MCP
+    # access -- byte-identical to before this field existed.
+    mcp_servers: dict[str, McpServerConfig] = field(default_factory=dict)
+    # station -> the mcp_servers names that station may EVER be handed,
+    # regardless of what a job's own plan.tools asks for -- the upper
+    # bound engine.policy's mcp rule checks a request's gate facts
+    # against (the facts carry the actual per-request allow list, which
+    # engine.full_orbit computes as plan.tools(mcp, station) intersected
+    # with this table -- see engine.plan.tools_for_station). A station
+    # absent from this table may never use any MCP server.
+    station_mcp_allow: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # The skill library's own index file (e.g. "~/.claude/skills-library/
+    # INDEX.md") the planner prompt is given so it only ever asks for a
+    # skill that is actually listed there (engine.plan.
+    # classify_skill_tools re-checks the same index at job-validation
+    # time: a plan.tools skill entry NOT in it becomes "needs_install",
+    # never granted to a worker, and reported as such in the handoff).
+    # Expanded ("~" and resolved) at config load time, here, not
+    # wherever it is later read from -- this process's own HOME, never
+    # a worker's. None (default): no skill index configured, so every
+    # plan.tools skill entry is needs_install.
+    skill_index_path: Path | None = None
+    # Optional context-injection settings (engine.context/engine.skills):
+    # skill roots, per-station skill names, the company-library stdio
+    # MCP server, per-project CURRENT_DECISIONS.md paths and lessons
+    # app names. None (default): engine.context.gather/build inject
+    # nothing, same as before this field existed.
+    context: "ContextConfig | None" = None
 
     def __post_init__(self) -> None:
         if self.sandbox not in _KNOWN_SANDBOX_MODES:
@@ -328,6 +394,18 @@ class EngineConfig:
             for root in forbidden_roots:
                 if _is_ancestor_or_equal(entry, root):
                     raise ValueError("bench_readonly_path_forbidden")
+        # station_mcp_allow is an upper bound ON TOP OF mcp_servers, not
+        # a second place to name a server -- a typo here would silently
+        # grant a request nothing (engine.policy still fails closed)
+        # but a config that NAMES an unregistered server is a config
+        # error, caught at load time rather than discovered later as a
+        # request that mysteriously never gets its mcp server.
+        for station, names in self.station_mcp_allow.items():
+            for name in names:
+                if name not in self.mcp_servers:
+                    raise ValueError(
+                        f"station_mcp_allow[{station!r}] names unknown mcp server: {name!r}"
+                    )
 
     @staticmethod
     def from_json(path: Path) -> "EngineConfig":
@@ -348,7 +426,10 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "stations", "optional_stations", "workers", "station_terminal_allow",
     "worker_env_passthrough", "sandbox", "bench_home_writable",
     "bench_readonly_paths", "publisher", "parallel_review_bench",
+    "mcp_servers", "station_mcp_allow", "skill_index_path", "context",
 })
+
+_KNOWN_MCP_SERVER_KEYS = frozenset({"command", "args", "env_passthrough"})
 
 _KNOWN_SANDBOX_MODES = frozenset({"none", "bwrap"})
 _KNOWN_PUBLISHER_KINDS = frozenset({"fake", "shell"})
@@ -476,13 +557,13 @@ def _parse_workers(raw: dict[str, object]) -> dict[str, WorkerConfig]:
         if not isinstance(item, dict):
             raise ValueError(f"worker {role!r} must be an object")
         runner = item.get("runner")
-        if runner not in _KNOWN_RUNNERS:
+        if not _is_known_runner(runner):
             raise ValueError(f"worker {role!r}: unknown runner {runner!r}")
         workers[role] = WorkerConfig(
             runner=str(runner),
             model=_opt_str(item.get("model")),
-            max_turns=int(item.get("max_turns", 40)),
-            budget_usd=float(item.get("budget_usd", 3.0)),
+            max_turns=(None if item.get("max_turns") is None else int(item["max_turns"])),
+            budget_usd=(None if item.get("budget_usd") is None else float(item["budget_usd"])),
             timeout_sec=float(item.get("timeout_sec", 900.0)),
             reasoning=_opt_str(item.get("reasoning")),
         )
@@ -501,6 +582,35 @@ def _parse_station_terminal_allow(
             raise ValueError(f"station_terminal_allow[{station!r}] must be an object")
         table[station] = {r: tuple(_str_list(p)) for r, p in roles.items()}
     return table
+
+
+def _parse_mcp_servers(raw: dict[str, object]) -> dict[str, McpServerConfig]:
+    servers_raw = raw.get("mcp_servers", {})
+    if not isinstance(servers_raw, dict):
+        raise ValueError("mcp_servers must be an object")
+    servers: dict[str, McpServerConfig] = {}
+    for name, item in servers_raw.items():
+        if not isinstance(item, dict):
+            raise ValueError(f"mcp_servers[{name!r}] must be an object")
+        unknown = set(item) - _KNOWN_MCP_SERVER_KEYS
+        if unknown:
+            raise ValueError(f"mcp_servers[{name!r}]: unknown key(s): {sorted(unknown)}")
+        command = tuple(_str_list(item.get("command")))
+        if not command:
+            raise ValueError(f"mcp_servers[{name!r}]: command must be a non-empty list")
+        servers[str(name)] = McpServerConfig(
+            command=command,
+            args=tuple(_str_list(item.get("args"))),
+            env_passthrough=tuple(_str_list(item.get("env_passthrough"))),
+        )
+    return servers
+
+
+def _parse_station_mcp_allow(raw: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    table_raw = raw.get("station_mcp_allow", {})
+    if not isinstance(table_raw, dict):
+        raise ValueError("station_mcp_allow must be an object")
+    return {str(station): tuple(_str_list(names)) for station, names in table_raw.items()}
 
 
 def _opt_str(value: object) -> str | None:
@@ -583,7 +693,77 @@ def _parse_optional_fields(raw: dict[str, object], base: Path) -> dict[str, obje
         if not isinstance(value, bool):
             raise ValueError("parallel_review_bench must be a boolean")
         fields["parallel_review_bench"] = value
+    if "mcp_servers" in raw:
+        fields["mcp_servers"] = _parse_mcp_servers(raw)
+    if "station_mcp_allow" in raw:
+        fields["station_mcp_allow"] = _parse_station_mcp_allow(raw)
+    if "skill_index_path" in raw:
+        value = raw["skill_index_path"]
+        if not isinstance(value, str) or not value:
+            raise ValueError("skill_index_path must be a non-empty string")
+        # expanduser reads THIS (engine) process's own HOME -- never a
+        # worker's or planner's env, same rule as bench_readonly_paths.
+        fields["skill_index_path"] = Path(os.path.expanduser(value)).resolve()
+    if "context" in raw and raw["context"] is not None:
+        fields["context"] = _parse_context(raw["context"], base)
     return fields
+
+
+_KNOWN_CONTEXT_KEYS = frozenset({
+    "skill_roots", "station_skills", "library_mcp", "decisions_paths", "lessons_app",
+    "direction_path",
+})
+_KNOWN_LIBRARY_MCP_KEYS = frozenset({"command", "timeout_sec"})
+
+
+def _parse_library_mcp(raw: object) -> "LibraryMcpConfig":
+    if not isinstance(raw, dict):
+        raise ValueError("context.library_mcp must be an object")
+    unknown = set(raw) - _KNOWN_LIBRARY_MCP_KEYS
+    if unknown:
+        raise ValueError(f"context.library_mcp: unknown key(s): {sorted(unknown)}")
+    command = tuple(_str_list(raw.get("command")))
+    if not command:
+        raise ValueError("context.library_mcp.command must be a non-empty list")
+    timeout = raw.get("timeout_sec", 10.0)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("context.library_mcp.timeout_sec must be a number")
+    return LibraryMcpConfig(command=command, timeout_sec=float(timeout))
+
+
+def _parse_context(raw: object, base: Path) -> "ContextConfig":
+    del base  # skill_roots/decisions_paths are taken as-given, not resolved against base
+    if not isinstance(raw, dict):
+        raise ValueError("context must be an object")
+    unknown = set(raw) - _KNOWN_CONTEXT_KEYS
+    if unknown:
+        raise ValueError(f"context: unknown key(s): {sorted(unknown)}")
+    station_skills_raw = raw.get("station_skills", {})
+    if not isinstance(station_skills_raw, dict):
+        raise ValueError("context.station_skills must be an object")
+    station_skills = {
+        str(station): tuple(_str_list(names))
+        for station, names in station_skills_raw.items()
+    }
+    decisions_raw = raw.get("decisions_paths", {})
+    if not isinstance(decisions_raw, dict) or not all(
+        isinstance(v, str) for v in decisions_raw.values()
+    ):
+        raise ValueError("context.decisions_paths must be an object of strings")
+    lessons_raw = raw.get("lessons_app", {})
+    if not isinstance(lessons_raw, dict) or not all(
+        isinstance(v, str) for v in lessons_raw.values()
+    ):
+        raise ValueError("context.lessons_app must be an object of strings")
+    library_mcp_raw = raw.get("library_mcp")
+    return ContextConfig(
+        skill_roots=tuple(_str_list(raw.get("skill_roots"))),
+        station_skills=station_skills,
+        library_mcp=_parse_library_mcp(library_mcp_raw) if library_mcp_raw is not None else None,
+        decisions_paths={str(k): str(v) for k, v in decisions_raw.items()},
+        lessons_app={str(k): str(v) for k, v in lessons_raw.items()},
+        direction_path=(str(raw["direction_path"]) if raw.get("direction_path") else None),
+    )
 
 
 _KNOWN_PUBLISHER_KEYS = frozenset({
@@ -626,6 +806,20 @@ def _str_list(value: object) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError("expected a list of strings")
     return list(value)
+
+
+def _optional_entries(config: EngineConfig) -> dict[str, object]:
+    """Top-level keys that are only present in the JSON when set --
+    `_parse_optional_fields` requires a REAL string for
+    skill_index_path when the key is present at all (round-tripping a
+    literal JSON null through it would raise), so to_json_dict must
+    omit the key entirely for the None default rather than write null,
+    the same "absent key == default" contract every other optional
+    field here already has."""
+    entries: dict[str, object] = {}
+    if config.skill_index_path is not None:
+        entries["skill_index_path"] = str(config.skill_index_path)
+    return entries
 
 
 def to_json_dict(config: EngineConfig) -> dict[str, object]:
@@ -687,6 +881,31 @@ def to_json_dict(config: EngineConfig) -> dict[str, object]:
             "dry_run": config.publisher_dry_run,
         },
         "parallel_review_bench": config.parallel_review_bench,
+        "mcp_servers": {
+            name: {"command": list(s.command), "args": list(s.args),
+                   "env_passthrough": list(s.env_passthrough)}
+            for name, s in config.mcp_servers.items()
+        },
+        "station_mcp_allow": {s: list(v) for s, v in config.station_mcp_allow.items()},
+        **_optional_entries(config),
+        "context": _context_to_json(config.context),
+    }
+
+
+def _context_to_json(context: "ContextConfig | None") -> dict[str, object] | None:
+    if context is None:
+        return None
+    return {
+        "skill_roots": list(context.skill_roots),
+        "station_skills": {s: list(names) for s, names in context.station_skills.items()},
+        "library_mcp": (
+            {"command": list(context.library_mcp.command),
+             "timeout_sec": context.library_mcp.timeout_sec}
+            if context.library_mcp is not None else None
+        ),
+        "decisions_paths": dict(context.decisions_paths),
+        "lessons_app": dict(context.lessons_app),
+        "direction_path": context.direction_path,
     }
 
 
@@ -699,4 +918,4 @@ def write_json(config: EngineConfig, path: Path) -> EngineConfig:
 
 
 __all__ = ["EngineConfig", "ProjectConfig", "ReleaseConfig", "WorkerConfig",
-           "to_json_dict", "write_json"]
+           "McpServerConfig", "to_json_dict", "write_json"]

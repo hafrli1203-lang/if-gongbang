@@ -90,3 +90,21 @@ tools/gb2 status|log|diff <app>
 - 같은 사용자 권한의 작업자 코드는 샌드박스가 보여 주는 범위를 정책 없이 읽는다. 관문 로그는 감사 기록일 뿐이다.
 - 세션을 떼어 낸 자손 프로세스는 프로세스 그룹 종료로 못 잡는다(cgroup 미사용). 처리기가 죽은 동안 끝난 작업자의 종료코드는 알 수 없다.
 - 복구된 회차가 이전 회차의 설치 표식을 보지 못해 끝난 설치를 반복할 수 있다.
+
+## 전체 궤도 (`engine/full_orbit.py`)
+- 사실확정·계획·(시안)은 한 회차를 함께 쓰고, 계획의 작업(task)마다 새 회차에서 구현 → 합치기 → 검토 + 시험대 → 커밋 → 보고 → 닫기를 돈다. 작업의 `owns`가 그 회차의 쓰기 범위다.
+- 마지막 작업 뒤 계획의 통과 장면(`tests/scenes/`)과 전체 시험을 돌리고(`engine/acceptance.py`), 실패하면 고치기 작업을 정해진 횟수만큼 돈 뒤 인계 보고(`report.md`)를 쓴다.
+- 시안이 있는 일은 사람이 `gb2 approve-design`으로 승인해야 구현이 열린다.
+
+## 칸별 주입 (`engine/context.py`, `engine/skills.py`)
+- 설정 `context`: `skill_roots`, `station_skills`(칸의 바탕 스킬), `library_mcp`(회사 자료 stdio MCP), `decisions_paths`, `lessons_app`, `direction_path`.
+- 계획 칸은 스킬 목록 전체(바로 쓰는 스킬 설명, 창고 색인, 묶음 안 스킬 이름, 허락 가능한 MCP)를 받고 `plan.json`의 `tools`에 칸별 도구표를 쓴다. 구현·시안·검토 칸 지시문에는 바탕 스킬 + 계획이 고른 스킬 본문이 들어간다. 어느 뿌리에도 없는 스킬은 주입하지 않고 보고서에 "설치 필요"로 남는다.
+- 자료 MCP 결과 중 AI가 만든 출력(`run_output`)은 넣지 않는다. 사람이 정한 글(결정·방향)은 자르지 않는다. 장부에 `context.injected {station, items, base, planned, missing}`.
+
+## MCP 허락 (`engine/policy.py`, `engine/workers/claude_cli.py`)
+- `mcp_servers`와 `station_mcp_allow`(칸별 상한). 한 요청에 열리는 서버 = 계획 도구표 ∩ 칸 상한. 작업자에게는 그 서버만 담은 `--mcp-config`와 `--strict-mcp-config`를 준다. 관문은 `mcp__<server>__*` 호출을 그 목록으로만 허락한다.
+
+## 이어서 하기 (`engine/workers/base.py`, `engine/orbit.py`)
+- 작업자에게 총 시간 제한은 없다. 출력·관문 기록·결과 파일이 `timeout_sec` 동안 하나도 바뀌지 않을 때만 멈춘 것으로 본다.
+- 멈춤(`worker_stalled`)이나 중간 종료(`worker_failed`)는 실패로 끝내지 않는다. 같은 칸을 같은 사본에서 원래 지시 + 이미 바뀐 파일 목록과 함께 다시 돌린다. 세 번 뒤에도 안 되면 `needs_owner`(`worker_stuck`).
+- `WorkerConfig.budget_usd`·`max_turns`는 기본 없음(설정한 경우에만 CLI에 넘김).

@@ -24,11 +24,11 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from engine.config import WorkerConfig
+from engine.config import McpServerConfig, WorkerConfig
 from engine.procs import is_alive
 
 # Matches EngineConfig.worker_env_passthrough's default exactly. Runners
@@ -74,6 +74,17 @@ class WorkerSpec:
     # original config file sits on the host. None for a runner that
     # needs no gate.
     gate_config_path: Path | None = None
+    # name -> launch info for the mcp servers THIS request is allowed
+    # (engine.plan.tools_for_station's "mcp" list for this station,
+    # intersected with EngineConfig.station_mcp_allow by whoever builds
+    # this spec -- engine.steps.station). Empty (default): no MCP
+    # servers for this worker -- ClaudeRunner then passes no
+    # --mcp-config at all, byte-identical to before this field existed.
+    # The gate hook enforces the SAME allowed names independently via
+    # gate_facts.json's own "mcp_allow" (see engine.gate/engine.policy)
+    # -- this field only controls what the CLI is launched *able* to
+    # call; the gate is what actually blocks an unlisted one.
+    mcp_servers: dict[str, McpServerConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -240,6 +251,40 @@ def parse_cli_shaped_verdict(stdout_path: Path) -> WorkerResult:
         ok=True, summary="scripted_review", cost_usd=cost, turns=turns,
         requests=(), verdict=block,
     )
+
+
+def _progress_mark(paths: "tuple[Path, ...]") -> tuple[tuple[int, int], ...]:
+    marks = []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            marks.append((-1, -1))
+            continue
+        marks.append((st.st_size, st.st_mtime_ns))
+    return tuple(marks)
+
+
+def wait_while_progressing(pid: int, stall_sec: float,
+                           progress_paths: "tuple[Path, ...]") -> int | None:
+    """Wait for `pid` to exit for as long as it keeps making progress.
+    Progress = any of `progress_paths` (the worker's stdout, its gate log
+    of tool calls, ...) changed size or mtime. There is no total time
+    limit: a worker that keeps working is never cut off. Returns the exit
+    code, or None only when nothing changed for `stall_sec` in a row
+    (the worker is stuck, e.g. waiting on input it will never get)."""
+    last_mark = _progress_mark(progress_paths)
+    last_change = time.time()
+    while True:
+        code = wait_for_exit(pid, 1.0)
+        if code is not None:
+            return code
+        mark = _progress_mark(progress_paths)
+        if mark != last_mark:
+            last_mark = mark
+            last_change = time.time()
+        elif time.time() - last_change >= stall_sec:
+            return None
 
 
 def wait_for_exit(pid: int, timeout_sec: float) -> int | None:

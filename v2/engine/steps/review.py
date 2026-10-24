@@ -80,7 +80,7 @@ from engine import evidence, fixup, ids, procs, sandbox
 from engine.gitutil import git_argv
 from engine.ledger import Event
 from engine.processor import StepContext, StepDef, StepFailed
-from engine.workers.base import WorkerSpec, wait_for_exit
+from engine.workers.base import WorkerSpec, wait_while_progressing
 from engine.workers.prompts import review_prompt
 
 _CHUNK_MAX_CHARS = 60_000
@@ -342,6 +342,11 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     diff_text, coverage_sent = _prepare_diff_for_prompt(_diff_text(ctx, fp))
     full_task = review_prompt(base_spec, original_task, changed_files,
                               diff_text, coverage_sent)
+    # The review station's own injected context (its skills, library
+    # items), sent by the orbit separately from the task being judged.
+    review_context = ctx.request.payload.get("context")
+    if isinstance(review_context, str) and review_context.strip():
+        full_task = f"{full_task}\n\n{review_context.strip()}"
     spec = dataclasses.replace(base_spec, task=full_task)
     return spec, worker, runner, coverage_sent
 
@@ -447,10 +452,10 @@ def _spawned_pid(ctx: StepContext) -> int:
 def _run_await_reviewer(ctx: StepContext) -> dict[str, object]:
     spec, worker, _runner, _coverage_sent = _full_spec(ctx)
     pid = _spawned_pid(ctx)
-    code = wait_for_exit(pid, worker.timeout_sec)
+    code = wait_while_progressing(pid, worker.timeout_sec, (_stdout_path(ctx),))
     if code is None:
         procs.close_station(ctx.ledger, ctx.project, ctx.attempt_id, spec.station)
-        raise StepFailed("worker_timeout")
+        raise StepFailed("worker_stalled")
     if code != 0:
         raise StepFailed("worker_failed")
     return {"returncode": code}

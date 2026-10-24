@@ -18,11 +18,14 @@ spawn_worker    build this role's WorkerSpec (copy_root = the role's own
                 request_id exists AND (the pid is still alive OR the
                 stdout file exists) -- either means the spawn already
                 happened, so a resume must not spawn a second worker.
-await_worker    wait up to worker.timeout_sec for the pid to exit
-                (engine.workers.base.wait_for_exit). Timeout ->
+await_worker    wait for the pid to exit for as long as it keeps making
+                progress (engine.workers.base.wait_while_progressing: its
+                stdout, gate log or result file changed within
+                worker.timeout_sec). No total time limit. Stuck ->
                 procs.close_station(...) (kills the whole process group,
-                including a detached grandchild -- Review Focus 1) then
-                StepFailed("worker_timeout"). Non-zero exit ->
+                including a detached grandchild) then
+                StepFailed("worker_stalled"); the orbit then continues the
+                same work on the same copy. Non-zero exit ->
                 StepFailed("worker_failed"). reconcile: no live process
                 group left for this station AND the stdout file exists.
 record_station  runner.parse_result(stdout, spec) for the worker's own
@@ -54,12 +57,12 @@ from pathlib import Path
 from engine import ids, procs, sandbox
 from engine.config import to_json_dict
 from engine.ledger import Event, LedgerError
-from engine.policy import ProjectFacts
+from engine.policy import ProjectFacts, _owns_within_prefixes
 from engine.processor import StepContext, StepDef, StepFailed
 from engine.steps.open_job import copy_git_config_matches_recorded
 from engine.steps.open_job import copy_root as _role_copy_root
 from engine.steps.open_job import dirty_paths
-from engine.workers.base import WorkerSpec, wait_for_exit
+from engine.workers.base import WorkerSpec, wait_while_progressing
 from engine.workers.prompts import build_prompt
 
 
@@ -194,7 +197,23 @@ def _touch_no_symlink(path: Path) -> None:
     os.close(fd)
 
 
-def _build_project_facts(ctx: StepContext) -> ProjectFacts:
+def _task_owns(ctx: StepContext) -> tuple[str, ...] | None:
+    """The optional "owns" entry of this run_station request's payload
+    (engine.full_orbit's build loop: a per-task narrowing of the
+    build station's own configured write prefixes -- see
+    engine.policy.ProjectFacts' own docstring). None if the payload
+    carries no such key (every run_station caller that predates this
+    field, and every non-build station) -- unchanged, unnarrowed
+    behavior."""
+    raw = ctx.request.payload.get("owns")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+        raise StepFailed("invalid_owns")
+    return tuple(raw)
+
+
+def _build_project_facts(ctx: StepContext, owns: tuple[str, ...] | None = None) -> ProjectFacts:
     """A ProjectFacts snapshot taken HERE (the engine process, real
     ledger access) for the gate hook (no ledger access at all, see
     engine.gate's module docstring) to decide with instead."""
@@ -208,7 +227,7 @@ def _build_project_facts(ctx: StepContext) -> ProjectFacts:
     return ProjectFacts(
         project=ctx.project, registered=True, state=row.state,
         generation=row.generation, attempt_id=row.current_attempt_id,
-        attempt_active=attempt_active,
+        attempt_active=attempt_active, owns=owns,
     )
 
 
@@ -233,7 +252,7 @@ def _write_gate_facts(ctx: StepContext) -> None:
     Serializing the resolved, absolute-path config instead means the
     copy means the same thing regardless of which directory it is
     loaded from."""
-    facts = _build_project_facts(ctx)
+    facts = _build_project_facts(ctx, owns=_task_owns(ctx))
     gate_ro = _mkdir_chain_no_symlink(
         ctx.config.home, "jobs", ids.attempt_dirname(ctx.attempt_id),
         "gate-ro", ctx.request.request_id,
@@ -242,6 +261,7 @@ def _write_gate_facts(ctx: StepContext) -> None:
         "project": facts.project, "registered": facts.registered,
         "state": facts.state, "generation": facts.generation,
         "attempt_id": facts.attempt_id, "attempt_active": facts.attempt_active,
+        "owns": (list(facts.owns) if facts.owns is not None else None),
     }).encode("utf-8")
     _write_new_file_no_symlink(gate_ro / "gate_facts.json", data, allow_replace_plain=True)
     if ctx.config.config_path is not None:
@@ -291,6 +311,17 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
         raise StepFailed("no_config_path")
 
     prefixes = ctx.config.station_owners.get(station, {}).get(role, ())
+    owns = _task_owns(ctx)
+    if owns is not None:
+        # Fail fast, before a worker is ever spawned: engine.plan.
+        # validate_plan already checked this at plan-approval time,
+        # but a payload reaching run_station is never trusted a
+        # second time without re-verifying (ENGINE.md
+        # 「자기신고를 믿지 않는다」) -- the live gate (engine.policy,
+        # via gate_facts.json) re-checks the same thing again while
+        # the worker is actually running.
+        if not owns or not _owns_within_prefixes(owns, prefixes):
+            raise StepFailed("owns_escapes_station_prefixes")
     patterns = ctx.config.station_terminal_allow.get(station, {}).get(role, ())
     generation = ctx.ledger.attempt(ctx.attempt_id).generation
 
@@ -595,8 +626,12 @@ def _spawned_pid(ctx: StepContext) -> int:
 def _run_await_worker(ctx: StepContext) -> dict[str, object]:
     spec, worker, _runner = _full_spec(ctx)
     pid = _spawned_pid(ctx)
-    code = wait_for_exit(pid, worker.timeout_sec)
+    code = wait_while_progressing(
+        pid, worker.timeout_sec,
+        (_stdout_path(ctx), _gate_log_path(ctx), _result_path(ctx)))
     if code is None:
+        # Stuck (no output, no tool call for timeout_sec): stop it so the
+        # orbit can start a continuation run on the same copy.
         procs.close_station(ctx.ledger, ctx.project, ctx.attempt_id, spec.station)
         # record_station, where this import normally happens, is never
         # reached once this raises -- StepFailed ends the request right
@@ -605,7 +640,7 @@ def _run_await_worker(ctx: StepContext) -> dict[str, object]:
         # process group above, so this always runs AFTER it is dead.
         if not _gate_log_already_imported(ctx):
             _import_gate_log(ctx, spec)
-        raise StepFailed("worker_timeout")
+        raise StepFailed("worker_stalled")
     if code != 0:
         # wait_for_exit only reaps the LEADER pid -- a descendant the
         # leader spawned (e.g. a background tool call) can still be

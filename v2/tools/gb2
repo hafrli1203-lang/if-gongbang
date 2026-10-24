@@ -3,6 +3,28 @@
 (engine.cli/engine.orbit) for a single Node/Vitest app.
 
     tools/gb2 init <app>                 create the engine workspace
+    tools/gb2 new <app> "<요구사항>"      scaffold a brand-new app repo
+                                          from tools/templates/new-app/
+                                          (refuses if the app folder
+                                          already exists), set up its
+                                          engine workspace, then run the
+                                          full orbit end to end
+                                          (engine.full_orbit.run_full_job:
+                                          facts -> plan -> [design] ->
+                                          build loop -> acceptance ->
+                                          report)
+    tools/gb2 change <app> "<변경 요청>"  same full orbit as `new`,
+                                          against an app `init`/`new`
+                                          already set up
+    tools/gb2 approve-design <app>       TTY-only: type "승인 <job>" to
+                                          append a design.approved
+                                          ledger event, then resume with
+                                          engine.full_orbit
+                                          .continue_full_job
+    tools/gb2 continue <app>             resume the app's current job
+                                          with engine.full_orbit
+                                          .continue_full_job (e.g. after
+                                          an install approval)
     tools/gb2 run <app> "<task>"         run one job end to end
     tools/gb2 run <app> --task-file f    same, task text from a file
     tools/gb2 fix <app> ["extra"]        continue the current job's
@@ -78,6 +100,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import re
 import subprocess
 import sys
@@ -244,6 +267,31 @@ def substitute_deploy_script(config_dict: dict[str, object],
     return rendered
 
 
+def fill_context(config_dict: dict[str, object], app: str,
+                 source_repo: Path | None) -> dict[str, object]:
+    """Fill the template's "context" block for this app: the company
+    library MCP server from env GB2_LIBRARY_MCP (a command line; absent
+    -> no library lookups), this app's lessons, and its own
+    docs/ai/CURRENT_DECISIONS.md when the source repo has one. Host
+    paths come from the environment and the repo, never the template."""
+    context = config_dict.get("context")
+    if not isinstance(context, dict):
+        return config_dict
+    filled = dict(context)
+    library = os.environ.get("GB2_LIBRARY_MCP", "").strip()
+    if library:
+        filled["library_mcp"] = {"command": shlex.split(library), "timeout_sec": 20}
+    filled["lessons_app"] = {app: app}
+    direction = os.environ.get("GB2_DIRECTION_FILE", "").strip()
+    if direction:
+        filled["direction_path"] = direction
+    if source_repo is not None:
+        decisions = source_repo / "docs" / "ai" / "CURRENT_DECISIONS.md"
+        if decisions.is_file():
+            filled["decisions_paths"] = {app: str(decisions)}
+    return {**config_dict, "context": filled}
+
+
 def app_workspace(app: str) -> Path:
     """GB2_WORKSPACE/apps/<app> -- raises ValueError for an app name
     that is not a single safe path component, or that would somehow
@@ -354,18 +402,27 @@ def _ensure_worktree(source_repo: Path, repo_dir: Path) -> None:
              "commit", "-q", "-m", "test: gb2 negative control"], cwd=repo_dir)
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    _validate_app_name(args.app)  # app_workspace() below re-checks too
-    source_repo = (_apps_root() / args.app).resolve()
-    workspace = app_workspace(args.app)
+def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
+    """Shared by `cmd_init` and `cmd_new`: write this app's engine
+    workspace (config.json rendered from the node-vitest template,
+    bench_cases.json, the gb2/work worktree, project registration) for
+    a source repo that must ALREADY exist at GB2_APPS_ROOT/<app> with a
+    package.json -- `cmd_init` expects an app the owner built by hand;
+    `cmd_new` calls `_scaffold_new_app_repo` first so this is always
+    true by the time this runs. Returns the loaded EngineConfig. Raises
+    ValueError (nothing written yet) for the workspace/source-repo
+    coincide-or-nest misconfiguration or a missing package.json -- same
+    checks `cmd_init` always made, now shared instead of duplicated."""
+    source_repo = (_apps_root() / app).resolve()
+    workspace = app_workspace(app)
     if source_repo == workspace or _is_within(workspace, source_repo) \
             or _is_within(source_repo, workspace):
-        return _err_json(
+        raise ValueError(
             f"workspace {workspace} and source repo {source_repo} must not "
-            "coincide or nest -- check GB2_WORKSPACE/GB2_APPS_ROOT", 1,
+            "coincide or nest -- check GB2_WORKSPACE/GB2_APPS_ROOT"
         )
     if not (source_repo / "package.json").exists():
-        return _err_json(f"no package.json under {source_repo}", 1)
+        raise ValueError(f"no package.json under {source_repo}")
     repo_dir = workspace / "repo"
     if repo_dir.exists():
         # Verify BEFORE writing anything: an existing repo/ that turns
@@ -379,20 +436,21 @@ def cmd_init(args: argparse.Namespace) -> int:
     (workspace / "secrets").mkdir(exist_ok=True)
 
     template = load_template(TEMPLATES_DIR / "node-vitest.json")
-    config_dict = render_config(template, args.app)
+    config_dict = render_config(template, app)
     config_dict = substitute_deploy_script(config_dict, _deploy_script_path(_apps_root()))
-    if args.with_release:
+    config_dict = fill_context(config_dict, app, source_repo)
+    if with_release:
         # The real original repo (never the gb2/work worktree) is the
         # fast-forward target -- `engine.release`'s advance_master step
         # merges this project's own repo's HEAD into it. `target` is
         # the deploy name the top-level `publisher` argv's "{target}"
         # substitutes in.
-        config_dict["projects"][args.app]["release"] = {
-            "master_repo": str(source_repo), "target": args.app,
+        config_dict["projects"][app]["release"] = {
+            "master_repo": str(source_repo), "target": app,
         }
     # The source repo holds the app's real environment files; code the
     # workers or the tests run must never see it, only the worktree.
-    config_dict["projects"][args.app]["hidden_paths"] = [str(source_repo.resolve())]
+    config_dict["projects"][app]["hidden_paths"] = [str(source_repo.resolve())]
     config_path = workspace / "config.json"
     config_path.write_text(json.dumps(config_dict, ensure_ascii=False, indent=1),
                            encoding="utf-8")
@@ -414,10 +472,299 @@ def cmd_init(args: argparse.Namespace) -> int:
             ledger.register_project(name)
     finally:
         ledger.close()
+    return config
 
-    print(json.dumps({"ok": True, "app": args.app, "workspace": str(workspace)},
+
+def cmd_init(args: argparse.Namespace) -> int:
+    _validate_app_name(args.app)  # app_workspace() below re-checks too
+    try:
+        _setup_app_workspace(args.app, args.with_release)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
+    print(json.dumps({"ok": True, "app": args.app, "workspace": str(app_workspace(args.app))},
                      ensure_ascii=False))
     return 0
+
+
+# --------------------------------------------------------------------
+# new / change / approve-design / continue (full orbit: engine.full_orbit
+# .run_full_job/continue_full_job -- facts -> plan -> [design] -> build
+# loop -> acceptance -> report, see
+# (the full-orbit contract)
+# --------------------------------------------------------------------
+
+# Skeleton files `gb2 new` seeds a brand-new app repo with (relative to
+# tools/templates/new-app/). Listed explicitly, never discovered via
+# glob, so a dotfile like .gitignore is never silently skipped by a
+# glob pattern that happens not to match leading dots on some Python
+# version, and so adding a new skeleton file is a deliberate one-line
+# change here, not an accident of what happens to be on disk.
+_NEW_APP_SKELETON_FILES = (
+    "README.md", ".gitignore", "package.json", "tests/scenes/.gitkeep",
+)
+
+
+def _render_skeleton_text(text: str, app_name: str) -> str:
+    """The skeleton's only per-app substitution: a literal "__APP__"
+    token (package.json's "name" field), same placeholder convention
+    as the config template's render_config."""
+    return text.replace("__APP__", app_name)
+
+
+def _scaffold_new_app_repo(source_repo: Path, app: str) -> None:
+    """Create `source_repo` as a brand-new git repository seeded from
+    tools/templates/new-app/ (README, .gitignore, a minimal Node+Vitest
+    package.json with no dependencies installed yet, an empty
+    tests/scenes/ -- the planner role is the only one later allowed to
+    write under tests/scenes/), with one initial commit. Refuses
+    (raises ValueError, nothing created) if `source_repo` already
+    exists -- callers must check that themselves before calling this,
+    so a caller can distinguish "already exists" from any other
+    failure before touching disk at all."""
+    if source_repo.exists():
+        raise ValueError(f"app_exists: {source_repo}")
+    skeleton_dir = TEMPLATES_DIR / "new-app"
+    if not skeleton_dir.is_dir():
+        raise ValueError(f"missing skeleton template dir: {skeleton_dir}")
+    source_repo.mkdir(parents=True)
+    for rel in _NEW_APP_SKELETON_FILES:
+        src = skeleton_dir / rel
+        dest = source_repo / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(_render_skeleton_text(src.read_text(encoding="utf-8"), app),
+                        encoding="utf-8")
+    _git(["init", "-q", "-b", WORKTREE_BASE], cwd=source_repo)
+    _git(["add", "-A"], cwd=source_repo)
+    _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
+         "commit", "-q", "-m", f"chore: scaffold {app} via gb2 new"], cwd=source_repo)
+
+
+def _exit_code_for_full_outcome(status: str) -> int:
+    if status == "done":
+        return 0
+    if status == "needs_owner":
+        return 2
+    return 3
+
+
+def _summarize_full_outcome(config: EngineConfig, ledger: Ledger, app: str,
+                            outcome: object, wall_sec: float) -> dict[str, object]:
+    """Same shape of summary as `_summarize` (JobOutcome), for a
+    FullOutcome (engine.full_orbit): status/reason plus, only when the
+    outcome carries an attempt_id (it may be None if the job never got
+    as far as opening one), the commit it left and a changed-files
+    diff against that attempt's base_head. report_path is passed
+    through as-is -- engine.full_orbit/engine.handoff.write_handoff
+    already decided where report.md lives."""
+    attempt_id = getattr(outcome, "attempt_id", None)
+    commit_hash = None
+    changed_files: list[str] = []
+    if attempt_id is not None:
+        project = config.projects[app]
+        try:
+            commit_hash = _git(["rev-parse", "HEAD"], cwd=project.repo)
+        except subprocess.CalledProcessError:
+            pass
+        try:
+            base_head = None
+            for _seq, event in ledger.events(app, "job.opened"):
+                if event.payload.get("attempt_id") == attempt_id:
+                    base_head = event.payload.get("base_head")
+                    break
+            if base_head and commit_hash and base_head != commit_hash:
+                out = _git(["diff", "--name-only", f"{base_head}..{commit_hash}"],
+                          cwd=project.repo)
+                changed_files = [line for line in out.splitlines() if line]
+        except subprocess.CalledProcessError:
+            pass
+    return {
+        "app": app, "attempt_id": attempt_id, "status": getattr(outcome, "status"),
+        "reason": getattr(outcome, "reason", None), "commit": commit_hash,
+        "changed_files": changed_files, "minutes": round(wall_sec / 60.0, 2),
+        "report_path": getattr(outcome, "report_path", None),
+    }
+
+
+def _progress_printer(kind: str) -> None:
+    print(f"[{kind}] done", file=sys.stderr)
+
+
+def _run_full_job_and_report(args: argparse.Namespace, config: EngineConfig,
+                             job_name: str, request: str) -> int:
+    """Shared tail of cmd_new/cmd_change: engine.full_orbit.run_full_job
+    against this app's workspace, then the same summarize/log/print/
+    exit-code handling `cmd_run` gives an ordinary `run_station`+review+
+    bench job. Imported lazily (not at module import time) since
+    engine.full_orbit is a separate module landing in parallel with
+    this file -- a module that never calls `gb2 new`/`gb2 change` (e.g.
+    `gb2 run`) must keep working even before engine.full_orbit exists."""
+    from engine import full_orbit
+
+    def fakes_for(attempt_id: str):
+        return _build_fakes(config, args.app, attempt_id, None)
+
+    ledger = Ledger.open(config.ledger_path)
+    start = time.monotonic()
+    try:
+        outcome = full_orbit.run_full_job(
+            config, ledger, fakes_for, args.app, job_name, request,
+            on_progress=_progress_printer,
+        )
+        wall_sec = time.monotonic() - start
+        summary = _summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    return _exit_code_for_full_outcome(str(summary["status"]))
+
+
+def _read_requirement(args: argparse.Namespace) -> str | None:
+    if args.task_file:
+        return Path(args.task_file).read_text(encoding="utf-8")
+    return args.task
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    """`gb2 new <app> "요구사항"`: refuse if the app folder already
+    exists, else scaffold it from tools/templates/new-app/ (one initial
+    commit), set up its engine workspace exactly like `gb2 init`, then
+    run the full orbit (engine.full_orbit.run_full_job) end to end:
+    facts -> plan -> [design, if the plan is a UI job] -> the task
+    loop -> acceptance -> report."""
+    try:
+        _validate_app_name(args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
+    request = _read_requirement(args)
+    if not request:
+        return _err_json("requirement text (or --task-file) required", 1)
+    source_repo = (_apps_root() / args.app).resolve()
+    if source_repo.exists():
+        return _err_json(f"app_exists: {source_repo}", 1)
+
+    try:
+        _scaffold_new_app_repo(source_repo, args.app)
+        config = _setup_app_workspace(args.app, args.with_release)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
+
+    job_name = args.job_name or f"gb2-new-{int(time.time())}"
+    return _run_full_job_and_report(args, config, job_name, request)
+
+
+def cmd_change(args: argparse.Namespace) -> int:
+    """`gb2 change <app> "변경 요청"`: same full orbit as `gb2 new`,
+    against an app `gb2 init`/`gb2 new` already set up -- never
+    scaffolds or touches the repo's git history itself."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(
+            f"not initialized: run `gb2 new {args.app} \"...\"` or "
+            f"`gb2 init {args.app}` first", 1,
+        )
+    _verify_app_repo_identity(args.app)
+    request = _read_requirement(args)
+    if not request:
+        return _err_json("change request text (or --task-file) required", 1)
+    config = EngineConfig.from_json(config_path)
+
+    job_name = args.job_name or f"gb2-change-{int(time.time())}"
+    return _run_full_job_and_report(args, config, job_name, request)
+
+
+def cmd_approve_design(args: argparse.Namespace) -> int:
+    """`gb2 approve-design <app>`: the owner's TTY-only approval gate
+    for engine.gates.check_design_approved -- requires the owner to
+    TYPE the exact "승인 <job>" line (never accepted non-interactively,
+    refused with exit 4 before anything is read from stdin, same
+    convention as `gb2 ship`'s release approval), appends a
+    `design.approved` ledger event carrying {"job": job_name}, then
+    resumes the job with engine.full_orbit.continue_full_job -- which
+    only makes progress past the design station once that event is
+    there for this job (engine.gates.check_design_approved)."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
+    if not sys.stdin.isatty():
+        return _err_json("refused: non-interactive shell, approve-design requires a TTY", 4)
+    config = EngineConfig.from_json(config_path)
+
+    from engine import full_orbit
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        project_row = ledger.project(args.app)
+        attempt_id = project_row.current_attempt_id
+        if attempt_id is None:
+            return _err_json("no_active_job", 1)
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+
+        owner_text = input(f'type the approval line exactly ("승인 {job_name}"): ')
+        if owner_text != f"승인 {job_name}":
+            return _err_json("refused: approval line did not match, nothing changed", 1)
+
+        ledger.append(Event(
+            project=args.app, kind="design.approved", actor_kind="owner",
+            actor_id="owner", attempt_id=attempt_id, payload={"job": job_name},
+        ))
+
+        def fakes_for(attempt_id_: str):
+            return _build_fakes(config, args.app, attempt_id_, None)
+
+        start = time.monotonic()
+        outcome = full_orbit.continue_full_job(
+            config, ledger, fakes_for, args.app, job_name, on_progress=_progress_printer,
+        )
+        wall_sec = time.monotonic() - start
+        summary = _summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    return _exit_code_for_full_outcome(str(summary["status"]))
+
+
+def cmd_continue(args: argparse.Namespace) -> int:
+    """`gb2 continue <app>`: resume the app's current job with
+    engine.full_orbit.continue_full_job -- used after the owner has
+    cleared whatever `needs_owner` reason stopped it last (an install
+    approval, a release approval, anything other than the design-
+    approval gate, which has its own `gb2 approve-design`)."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
+    config = EngineConfig.from_json(config_path)
+
+    from engine import full_orbit
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        project_row = ledger.project(args.app)
+        attempt_id = project_row.current_attempt_id
+        if attempt_id is None:
+            return _err_json("no_active_job", 1)
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+
+        def fakes_for(attempt_id_: str):
+            return _build_fakes(config, args.app, attempt_id_, None)
+
+        start = time.monotonic()
+        outcome = full_orbit.continue_full_job(
+            config, ledger, fakes_for, args.app, job_name, on_progress=_progress_printer,
+        )
+        wall_sec = time.monotonic() - start
+        summary = _summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    return _exit_code_for_full_outcome(str(summary["status"]))
 
 
 # --------------------------------------------------------------------
@@ -600,6 +947,62 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_log(args: argparse.Namespace) -> int:
     runs = _read_run_log(args.app)[-5:]
     print(json.dumps({"runs": runs}, ensure_ascii=False, indent=1))
+    return 0
+
+
+def _discover_apps() -> list[str]:
+    """Every app under GB2_WORKSPACE/apps/ that has a config.json --
+    used by `gb2 board` with no <app> argument. A directory without a
+    config.json (e.g. left over from a failed `init`) is skipped, not
+    an error; `board` must still render the rest of the workspace."""
+    if not APPS_DIR.exists():
+        return []
+    return sorted(
+        entry.name for entry in APPS_DIR.iterdir()
+        if entry.is_dir() and (entry / "config.json").exists()
+    )
+
+
+def cmd_board(args: argparse.Namespace) -> int:
+    """`gb2 board [<app>] --out <file.html>`: a static, read-only HTML
+    dashboard (engine.board.build_board) over one app's ledger, or
+    every app's ledger when <app> is omitted. See engine/board.py's own
+    module docstring for what the page shows and why it reads the
+    ledger sqlite file directly instead of through engine.ledger.Ledger.
+
+    `--lessons-export`/`--queue` are plain file paths (not engine
+    config keys): engine/config.py is outside this file's owned scope
+    for this task, so the optional lessons-export JSON and
+    WORK_QUEUE-like markdown the plan describes are passed as CLI
+    flags here instead of new EngineConfig fields -- same information,
+    no edit to a file this change does not own."""
+    from engine.board import build_board
+
+    app_names = [args.app] if args.app else _discover_apps()
+    app_ledgers: dict[str, tuple[Path, str]] = {}
+    skipped: list[str] = []
+    for app in app_names:
+        config_path = app_workspace(app) / "config.json"
+        if not config_path.exists():
+            skipped.append(app)
+            continue
+        config = EngineConfig.from_json(config_path)
+        if app not in config.projects:
+            skipped.append(app)
+            continue
+        app_ledgers[app] = (config.ledger_path, app)
+
+    lessons_path = Path(args.lessons_export) if args.lessons_export else None
+    queue_path = Path(args.queue) if args.queue else None
+    page = build_board(app_ledgers, lessons_path=lessons_path, queue_path=queue_path)
+
+    out_path = Path(args.out) if args.out else (GB2_WORKSPACE / "board.html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(page, encoding="utf-8")
+    print(json.dumps(
+        {"ok": True, "out": str(out_path), "apps": sorted(app_ledgers), "skipped": skipped},
+        ensure_ascii=False,
+    ))
     return 0
 
 
@@ -1016,6 +1419,8 @@ _HANDLERS = {
     "init": cmd_init, "run": cmd_run, "fix": cmd_fix, "status": cmd_status,
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
     "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
+    "new": cmd_new, "change": cmd_change, "approve-design": cmd_approve_design,
+    "continue": cmd_continue, "board": cmd_board,
 }
 
 
@@ -1060,6 +1465,41 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_resolve = sub.add_parser("resolve")
     p_resolve.add_argument("app")
+
+    p_new = sub.add_parser("new")
+    p_new.add_argument("app")
+    p_new.add_argument("task", nargs="?", default=None)
+    p_new.add_argument("--task-file", default=None)
+    p_new.add_argument("--job-name", default=None)
+    p_new.add_argument("--with-release", action="store_true",
+                       help="turn on the release track: this app's "
+                            "publish requests target its own original "
+                            "repo (never its gb2/work worktree)")
+
+    p_change = sub.add_parser("change")
+    p_change.add_argument("app")
+    p_change.add_argument("task", nargs="?", default=None)
+    p_change.add_argument("--task-file", default=None)
+    p_change.add_argument("--job-name", default=None)
+
+    p_approve_design = sub.add_parser("approve-design")
+    p_approve_design.add_argument("app")
+
+    p_continue = sub.add_parser("continue")
+    p_continue.add_argument("app")
+
+    p_board = sub.add_parser("board")
+    p_board.add_argument("app", nargs="?", default=None,
+                         help="omit to build one page across every app")
+    p_board.add_argument("--out", default=None,
+                         help="output HTML path (default: "
+                              "$GB2_WORKSPACE/board.html)")
+    p_board.add_argument("--lessons-export", default=None,
+                         help="path to a JSON file holding a list of "
+                              "lesson records (optional)")
+    p_board.add_argument("--queue", default=None,
+                         help="path to a WORK_QUEUE-like markdown file "
+                              "(optional)")
 
     return parser
 

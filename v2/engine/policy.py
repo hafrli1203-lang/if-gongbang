@@ -29,9 +29,19 @@ Rules (first match wins) — see plan §4:
     os.path.realpath so symlinks cannot escape; a worker's write-target
     must also resolve to somewhere under its own copy_root, never outside
     it (a swapped-in symlink for a station prefix cannot escape the copy).
- 5. write-like tools (write/mcp/browser with a path): allowed only if the
+ 5. write-like tools (write/browser with a path): allowed only if the
     resolved path is under one of config.station_owners[station][role]
     prefixes joined to the worker copy.
+ 5c. mcp (a tool named mcp__<server>__<tool>, engine.gate parses `server`
+    into action.target, no path): no target -> denied
+    ("mcp_requires_target"); `server` not in facts.mcp_allow (the
+    per-request allow list, set by whoever writes gate_facts.json from
+    engine.plan.tools_for_station) -> denied ("mcp_not_in_request_allow");
+    `server` not in config.station_mcp_allow[station] (the project-wide
+    upper bound) -> denied ("mcp_not_in_station_allow"); else the
+    configured hooks are consulted same as rule 5, then allowed
+    ("mcp_allowed"). A plan's own tool table can only narrow a
+    station's mcp access, never widen it past station_mcp_allow.
  5b. worker terminal actions (a path-less tool with a command): command
     None/empty -> denied ("terminal_requires_command"); command containing
     any shell metacharacter (; & | ` $ newline > <, note: any "$", not
@@ -106,13 +116,33 @@ class ProjectFacts:
     back by engine.gate; `registered`/`attempt_id`/`attempt_active`
     are carried for completeness/audit even where Policy's current
     rules do not consult them directly (only `state` and `generation`
-    are read today -- rules 2 and 3)."""
+    are read today -- rules 2 and 3).
+
+    `owns`, when not None, is a per-task narrowing of this worker's
+    configured station/role write prefixes (engine.full_orbit's build
+    loop: a task's own `owns`, already checked a subset of the
+    project's build prefixes by engine.plan.validate_plan before the
+    job ever spawns a worker for it) -- see rule 5's own
+    _decide_station_prefix for how it narrows the allowed prefix list,
+    and engine.steps.station for how it reaches gate_facts.json."""
     project: str
     registered: bool
     state: str
     generation: int
     attempt_id: str | None
     attempt_active: bool
+    owns: tuple[str, ...] | None = None
+    # The mcp server NAMES this one request's run_station payload was
+    # actually given (engine.plan.tools_for_station's "mcp" list for
+    # this station, as resolved by whoever wrote gate_facts.json) --
+    # NOT the config-wide mcp_servers table. _decide_mcp requires a
+    # server be in BOTH this list and config.station_mcp_allow[station]
+    # (the upper bound) before allowing an mcp__<server>__* tool call;
+    # absent (default empty tuple) denies every mcp call for this
+    # request, same fail-closed default as `owns=None` leaving write
+    # prefixes unnarrowed is NOT this field's behavior -- there is no
+    # "unnarrowed" mcp allowance, only an explicit list or none.
+    mcp_allow: tuple[str, ...] = ()
 
 
 class DecisionSink(Protocol):
@@ -197,6 +227,33 @@ def _is_ledger_companion(real: Path, ledger_path: Path) -> bool:
     files too, so they must be as protected as the ledger file itself."""
     ledger_real = Path(os.path.realpath(ledger_path))
     return real.parent == ledger_real.parent and real.name.startswith(ledger_real.name)
+
+
+def _normalize_rel(path: str) -> str:
+    """Trim a trailing-slash prefix / leading-"./" the same way a
+    directory prefix is compared elsewhere -- used only by
+    _owns_within_prefixes' own string-level containment check, never
+    for the resolved-path check _within_allowed_prefix already does."""
+    stripped = path.rstrip("/")
+    return stripped[2:] if stripped.startswith("./") else stripped
+
+
+def _prefix_covers(prefix: str, entry: str) -> bool:
+    e = _normalize_rel(entry)
+    if prefix.endswith("/"):
+        base = _normalize_rel(prefix)
+        return e == base or e.startswith(base + "/")
+    return e == _normalize_rel(prefix)
+
+
+def _owns_within_prefixes(owns: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
+    """True iff every entry of `owns` is at or under one of `prefixes`
+    (same trailing-slash directory-vs-exact-file convention as
+    EngineConfig.station_owners) -- a defense-in-depth re-check of
+    what engine.plan.validate_plan already enforced at plan-approval
+    time, done again here against a tampered or malformed gate facts
+    file, never trusted a second time without re-verifying."""
+    return all(any(_prefix_covers(p, entry) for p in prefixes) for entry in owns)
 
 
 def _within_allowed_prefix(copy_root: Path, prefixes: tuple[str, ...], path: Path) -> bool:
@@ -416,6 +473,13 @@ class Policy:
         if action.tool == "terminal":
             return self._decide_terminal(project, actor, action)
 
+        # mcp has no path either (action.target carries the server
+        # name) -- decided by the request's own gate-facts allow list
+        # intersected with the station's configured upper bound,
+        # instead of rule 4/5's path-prefix check.
+        if action.tool == "mcp":
+            return self._decide_mcp(project, actor, action)
+
         # Rule 4: protected paths.
         if action.path is None:
             return Decision(False, "write_like_requires_path")
@@ -448,15 +512,57 @@ class Policy:
             return hook_denial
         return Decision(True, "terminal_pattern")
 
+    def _decide_mcp(self, project: str, actor: Actor, action: Action) -> Decision:
+        """A tool named mcp__<server>__<tool> (engine.gate parses the
+        server name into action.target). Allowed only if `server` is
+        in BOTH the per-request allow list (self.facts.mcp_allow --
+        None when this Policy is built straight from a ledger, no
+        facts snapshot at all, which fails closed the same as an empty
+        tuple) AND config.station_mcp_allow[actor.station] (the
+        project-wide upper bound on what that station may ever be
+        handed) -- a plan's own tool table can only narrow a station's
+        access, never widen it past what the operator configured."""
+        server = action.target
+        if not server:
+            return Decision(False, "mcp_requires_target")
+        request_allow = self.facts.mcp_allow if self.facts is not None else ()
+        if server not in (request_allow or ()):
+            return Decision(False, "mcp_not_in_request_allow")
+        station_allow = self.config.station_mcp_allow.get(actor.station or "", ())
+        if server not in station_allow:
+            return Decision(False, "mcp_not_in_station_allow")
+
+        hook_denial = self._run_hooks(project, actor, action)
+        if hook_denial is not None:
+            return hook_denial
+        return Decision(True, "mcp_allowed")
+
     def _decide_station_prefix(self, project: str, actor: Actor, action: Action) -> Decision:
         """Rule 5: within the actor's station/role allowed prefixes, plus
-        the hook consultation that follows an otherwise-allowed write."""
+        the hook consultation that follows an otherwise-allowed write.
+
+        If this decision is being made from a ProjectFacts snapshot
+        carrying a per-task `owns` (engine.full_orbit's build loop --
+        see ProjectFacts' own docstring), the configured prefixes are
+        narrowed to `owns` for this check: a builder may then only
+        write under its OWN task's owns, never the full set of paths
+        every task in the plan is collectively allowed to touch.
+        `owns` escaping the configured prefixes (it should never, by
+        construction -- engine.plan.validate_plan already refused
+        such a plan, and engine.steps.station re-checks before ever
+        spawning the worker) is denied outright rather than silently
+        falling back to the wider, un-narrowed prefix list."""
         station_table = self.config.station_owners.get(actor.station or "", {})
         prefixes = station_table.get(actor.role)
         if not prefixes:
             return Decision(False, "station_role_not_authorized")
         if actor.copy_root is None:
             return Decision(False, "no_copy_root")
+        if self.facts is not None and self.facts.owns is not None:
+            owns = tuple(self.facts.owns)
+            if not owns or not _owns_within_prefixes(owns, prefixes):
+                return Decision(False, "owns_escapes_station_prefixes")
+            prefixes = owns
         if not _within_allowed_prefix(actor.copy_root, prefixes, action.path):
             return Decision(False, "outside_allowed_path")
 

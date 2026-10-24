@@ -59,7 +59,14 @@ Tool-name to Action mapping:
   Edit/Write/MultiEdit/NotebookEdit   -> write, path = file_path
                                                         (missing -> deny)
   Bash                                -> terminal, command = command
-  anything else (WebFetch, Task, mcp__*, ...) -> deny "tool_not_allowed"
+  mcp__<server>__<tool>               -> mcp, target = <server> (the
+                                          bit between the first and
+                                          second "__"); malformed (no
+                                          second "__") -> deny
+                                          "tool_not_allowed" without
+                                          calling Policy, same as any
+                                          other unrecognized tool.
+  anything else (WebFetch, Task, ...)  -> deny "tool_not_allowed"
                                                   without calling Policy,
                                                   recorded as a
                                                   'gate.denied' event
@@ -107,6 +114,7 @@ from engine.policy import Action, Actor, FileSink, Policy, ProjectFacts
 
 _READ_TOOLS = ("Read", "Glob", "Grep", "LS", "NotebookRead")
 _WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_MCP_PREFIX = "mcp__"
 
 
 class _GateInputMissing(Exception):
@@ -210,6 +218,21 @@ def _check_pattern_field(raw: object) -> None:
             raise _AmbiguousPath("pattern_escapes")
 
 
+def _mcp_server_name(tool_name: str) -> str | None:
+    """"mcp__<server>__<tool>" -> "<server>"; None if `tool_name` does
+    not have the "mcp__" prefix followed by a second "__" (so the
+    server name is never empty or ambiguous -- a malformed name is
+    treated as an unrecognized tool, not as some server with an empty
+    name)."""
+    if not tool_name.startswith(_MCP_PREFIX):
+        return None
+    rest = tool_name[len(_MCP_PREFIX):]
+    server, sep, _tool = rest.partition("__")
+    if not sep or not server:
+        return None
+    return server
+
+
 def _load_facts(path_str: str | None, *, expected_project: str) -> ProjectFacts:
     """Loads and validates the ProjectFacts snapshot, refusing (same
     fail-closed deny as a missing file) anything that does not match
@@ -233,6 +256,16 @@ def _load_facts(path_str: str | None, *, expected_project: str) -> ProjectFacts:
         generation_raw = raw["generation"]
         if isinstance(generation_raw, bool) or not isinstance(generation_raw, int):
             raise ValueError("generation is not an int")
+        owns_raw = raw.get("owns")
+        if owns_raw is not None:
+            if not isinstance(owns_raw, list) or not all(isinstance(v, str) for v in owns_raw):
+                raise ValueError("owns is not a list of strings")
+            owns: tuple[str, ...] | None = tuple(owns_raw)
+        else:
+            owns = None
+        mcp_allow_raw = raw.get("mcp_allow", [])
+        if not isinstance(mcp_allow_raw, list) or not all(isinstance(v, str) for v in mcp_allow_raw):
+            raise ValueError("mcp_allow is not a list of strings")
         facts = ProjectFacts(
             project=str(raw["project"]),
             registered=bool(raw["registered"]),
@@ -240,6 +273,8 @@ def _load_facts(path_str: str | None, *, expected_project: str) -> ProjectFacts:
             generation=generation_raw,
             attempt_id=(str(raw["attempt_id"]) if raw.get("attempt_id") is not None else None),
             attempt_active=bool(raw["attempt_active"]),
+            owns=owns,
+            mcp_allow=tuple(mcp_allow_raw),
         )
     except (KeyError, TypeError, ValueError):
         raise _GateInputMissing("gate_facts_missing") from None
@@ -316,6 +351,8 @@ def decide(hook_input: dict[str, object], env: Mapping[str, str]) -> dict[str, o
             command = tool_input.get("command")
             action = Action(tool="terminal",
                              command=(str(command) if command is not None else None))
+        elif isinstance(tool_name, str) and _mcp_server_name(tool_name) is not None:
+            action = Action(tool="mcp", target=_mcp_server_name(tool_name))
         else:
             sink.record(Event(
                 project=project, kind="gate.denied", actor_kind="worker",

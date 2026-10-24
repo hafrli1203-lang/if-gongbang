@@ -666,3 +666,56 @@ def test_release_job_keeps_main_stage_durations_across_the_ship_stop(
     assert "report" in durations  # this call's own stage (metrics are
     # recorded exactly when "report" completes, before "close" runs --
     # same as the non-release case, unaffected by this fix)
+
+
+def _stall_then_finish_steps(stalls: int, tasks_seen: list[str]):
+    """run_station stub: the first `stalls` runs fail with worker_stalled,
+    then it finishes. Records the task text each run received."""
+    from engine.processor import StepFailed
+
+    def _run(ctx: StepContext) -> dict[str, object]:
+        tasks_seen.append(str(ctx.request.payload["task"]))
+        if len(tasks_seen) <= stalls:
+            raise StepFailed("worker_stalled")
+        return _station_finished_steps([])(ctx)[0].run(ctx)
+
+    return lambda ctx: [StepDef("record_station", _run, lambda ctx: False)]
+
+
+def _stall_factory(stalls: int, tasks_seen: list[str]):
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", _stall_then_finish_steps(stalls, tasks_seen))
+        return proc
+    return factory
+
+
+def test_stalled_station_continues_on_same_copy(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "keep-going",
+                          "full", ("builder",))
+    tasks_seen: list[str] = []
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station", {"station": "build", "role": "builder", "task": "do it"})],
+        processor_factory=_stall_factory(2, tasks_seen),
+    )
+    assert outcome.status == "done"
+    assert len(tasks_seen) == 3
+    assert tasks_seen[0] == "do it"
+    assert "[이어서 하기 1]" in tasks_seen[1] and tasks_seen[1].startswith("do it")
+    assert "[이어서 하기 2]" in tasks_seen[2] and "[이어서 하기 1]" not in tasks_seen[2]
+
+
+def test_station_stuck_after_max_continues_asks_owner(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "stuck",
+                          "full", ("builder",))
+    tasks_seen: list[str] = []
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station", {"station": "build", "role": "builder", "task": "do it"})],
+        processor_factory=_stall_factory(99, tasks_seen),
+    )
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "worker_stuck"
+    assert len(tasks_seen) == 1 + orbit.MAX_STATION_CONTINUES

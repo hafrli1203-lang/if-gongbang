@@ -46,7 +46,20 @@ def _builder(workspace: Workspace, attempt_id: str, suffix: str) -> tuple[Actor,
     return actor, copy_root
 
 
-@pytest.mark.parametrize("tool", ["write", "mcp", "browser"])
+def test_mcp_is_decided_by_granted_server_not_by_path(workspace: Workspace) -> None:
+    # An MCP call carries a server name, not a path: it is allowed only
+    # for a server granted to this request and station, and a call with
+    # no server, or for a server nobody granted, is always denied.
+    attempt_id = _open_alpha(workspace)
+    policy = Policy(workspace.config, workspace.ledger)
+    actor, copy_root = _builder(workspace, attempt_id, "mcp")
+    no_server = policy.check("alpha", actor, Action(tool="mcp", path=copy_root / "src" / "new.py"))
+    assert no_server.allowed is False
+    ungranted = policy.check("alpha", actor, Action(tool="mcp", target="playwright"))
+    assert ungranted.allowed is False
+
+
+@pytest.mark.parametrize("tool", ["write", "browser"])
 def test_protected_paths_denied_for_every_write_like_tool(
     workspace: Workspace, tool: str,
 ) -> None:

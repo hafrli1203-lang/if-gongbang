@@ -195,6 +195,34 @@ def continue_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
                        processor_factory, on_progress)
 
 
+# A station worker that stalled or exited early is not "failed": its copy
+# still holds what it already did, so the same station runs again on that
+# copy with the original task plus a note listing the files already
+# changed. Only after MAX_STATION_CONTINUES such runs in a row does the job
+# stop -- as needs_owner ("worker_stuck"), not as a failure.
+CONTINUABLE_REASONS = frozenset({"worker_stalled", "worker_failed", "worker_timeout"})
+MAX_STATION_CONTINUES = 3
+
+
+def _continuation_payload(config: EngineConfig, attempt_id: str,
+                          payload: dict[str, object], n: int) -> dict[str, object]:
+    from engine.steps.open_job import copy_root, dirty_paths
+
+    original = str(payload.get("original_task", payload["task"]))
+    role = str(payload["role"])
+    try:
+        changed = dirty_paths(copy_root(config, attempt_id, role), ())
+    except Exception:  # noqa: BLE001 - the note is best-effort context
+        changed = ()
+    listed = "\n".join(f"- {p}" for p in changed) or "- (none yet)"
+    note = (
+        f"\n\n[이어서 하기 {n}] 앞선 실행이 끝나기 전에 멈췄다. "
+        "처음부터 다시 하지 말고, 이미 바뀐 아래 파일을 먼저 읽은 뒤 남은 일을 끝내라.\n"
+        f"{listed}"
+    )
+    return {**payload, "task": original + note, "original_task": original, "continue_n": n}
+
+
 def _classify(request: RequestRow) -> tuple[str, str | None] | None:
     """None iff `request` is 'done'. Otherwise the (status, reason) a
     JobOutcome should report: ("failed", reason) for 'failed'/'unknown',
@@ -344,6 +372,22 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
         )
         request = ledger.request(rid)
         error = _classify(request)
+        if (error is not None and stage.kind == "run_station"
+                and error[1] in CONTINUABLE_REASONS):
+            n = int(stage.payload.get("continue_n", 0)) + 1
+            if n <= MAX_STATION_CONTINUES:
+                stages[idx] = Stage("run_station",
+                                    _continuation_payload(config, attempt_id, stage.payload, n))
+                continue
+            _record_job_metrics_failure(
+                ledger, project, attempt_id, durations_ms,
+                git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                "needs_owner", stage.kind,
+            )
+            return JobOutcome(
+                attempt_id=attempt_id, status="needs_owner", failed_request=rid,
+                reason="worker_stuck", completed=tuple(completed),
+            )
         if error is not None:
             status, reason = error
             _record_job_metrics_failure(
