@@ -581,6 +581,156 @@ def test_fix_cancels_any_pending_publish_for_the_attempt_it_replaces(
     assert calls == [(ws.ledger, "alpha", attempt1, "superseded_by_fix")]
 
 
+# ---------------------------------------------------------------------
+# resuming an interrupted fix() transition itself (journal)
+# ---------------------------------------------------------------------
+
+def test_fix_resumes_after_a_crash_right_after_closing_the_old_attempt(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash inside open_job (simulated here) happens AFTER
+    close_failed_attempt has already closed+archived the old attempt --
+    the project is left CLOSED with nothing find_fix_target could ever
+    accept (it requires state OPEN). fix() called again must resume
+    from the journal instead of raising "not OPEN", open exactly ONE new
+    attempt (never a second, orphaned one), and finish normally --
+    never losing the first change or the owner's own pre-existing dirty
+    file."""
+    ws = _sample_workspace(workspace, variant=2)
+    owner_dirty = ws.alpha / "OWNER_DIRTY.txt"
+    owner_dirty.write_text("owner's own in-progress edit\n", encoding="utf-8")
+
+    attempt1 = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                        "full", ("builder", "reviewer"))
+    stages1 = orbit.default_stages(
+        ws.config, attempt1, "builder", "reviewer",
+        "investigate the initials bug", "fix-initials",
+    )
+    outcome1 = orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt1, stages1,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+    assert outcome1.status == "failed"
+    assert outcome1.completed == ("run_station", "merge", "review")
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes()
+
+    calls = {"n": 0}
+    real_open_job = fixup.open_job
+
+    def _crashing_open_job(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated crash in open_job")
+        return real_open_job(*args, **kwargs)
+
+    monkeypatch.setattr(fixup, "open_job", _crashing_open_job)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                 processor_factory=_processor_factory(review_passed=True))
+
+    # exactly the broken state the external review described: CLOSED,
+    # old attempt already closed+archived, no new attempt yet.
+    assert ws.ledger.project("alpha").state == "CLOSED"
+    assert len(ws.ledger.events("alpha", "fix.started")) == 1
+    assert len(ws.ledger.events("alpha", "fix.closed_old")) == 1
+    assert not ws.ledger.events("alpha", "fix.opened_new")
+    assert not ws.ledger.events("alpha", "fix.finished")
+    with pytest.raises(fixup.FixupError, match="not OPEN"):
+        fixup.find_fix_target(ws.ledger, "alpha")
+
+    result = fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                       processor_factory=_processor_factory(review_passed=True))
+
+    assert calls["n"] == 2  # open_job itself was retried, never silently skipped
+    assert result.old_attempt_id == attempt1
+    assert result.outcome.status == "done"
+    assert ws.ledger.project("alpha").state == "CLOSED"
+    # exactly ONE new attempt was ever opened for this fix -- the crash
+    # must never have forked a second, orphaned one.
+    assert len(ws.ledger.events("alpha", "fix.opened_new")) == 1
+    assert len(ws.ledger.events("alpha", "fix.closed_old")) == 1
+
+    notes = ws.alpha / "docs" / "notes.md"
+    assert notes.read_text(encoding="utf-8") == "investigating the bug\n"
+    fixed_src = (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
+    assert fixed_src == _INIT_PY_FIXED
+    assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
+
+
+def test_fix_resumes_after_a_crash_right_after_opening_the_new_attempt(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash in the archive overlay (simulated here) happens AFTER
+    open_job has already created the new attempt -- the project is left
+    OPEN with a brand-new attempt that has no failed request at all
+    (find_fix_target would refuse it outright, with nothing to find).
+    fix() called again must resume from the journal, reuse that SAME
+    new attempt rather than opening a second one, and finish normally."""
+    ws = _sample_workspace(workspace, variant=2)
+    owner_dirty = ws.alpha / "OWNER_DIRTY.txt"
+    owner_dirty.write_text("owner's own in-progress edit\n", encoding="utf-8")
+
+    attempt1 = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                        "full", ("builder", "reviewer"))
+    stages1 = orbit.default_stages(
+        ws.config, attempt1, "builder", "reviewer",
+        "investigate the initials bug", "fix-initials",
+    )
+    outcome1 = orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt1, stages1,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+    assert outcome1.status == "failed"
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes()
+
+    calls = {"n": 0}
+    real_overlay = fixup._overlay_archive_into_builder_copy
+
+    def _crashing_overlay(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated crash in overlay")
+        return real_overlay(*args, **kwargs)
+
+    monkeypatch.setattr(fixup, "_overlay_archive_into_builder_copy", _crashing_overlay)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                 processor_factory=_processor_factory(review_passed=True))
+
+    assert ws.ledger.project("alpha").state == "OPEN"
+    opened_events = ws.ledger.events("alpha", "fix.opened_new")
+    assert len(opened_events) == 1
+    assert not ws.ledger.events("alpha", "fix.restored")
+    assert not ws.ledger.events("alpha", "fix.finished")
+    attempt2 = str(opened_events[0][1].payload["new_attempt_id"])
+    assert ws.ledger.attempt(attempt2).status == "active"
+    # the project's own current attempt has no failed (or any) request
+    # at all yet -- find_fix_target has nothing to accept here.
+    with pytest.raises(fixup.FixupError):
+        fixup.find_fix_target(ws.ledger, "alpha")
+
+    result = fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                       processor_factory=_processor_factory(review_passed=True))
+
+    assert calls["n"] == 2
+    assert result.new_attempt_id == attempt2  # no duplicate attempt opened
+    assert len(ws.ledger.events("alpha", "fix.opened_new")) == 1
+    assert result.outcome.status == "done"
+    assert ws.ledger.project("alpha").state == "CLOSED"
+
+    notes = ws.alpha / "docs" / "notes.md"
+    assert notes.read_text(encoding="utf-8") == "investigating the bug\n"
+    fixed_src = (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
+    assert fixed_src == _INIT_PY_FIXED
+    assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
+
+
 def test_original_task_returns_the_run_station_task_text() -> None:
     """The after-install resume path rebuilds its stage list without the
     caller holding the task; original_task must recover it so the

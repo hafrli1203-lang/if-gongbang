@@ -404,6 +404,125 @@ def test_skip_ship_abandons_publish_without_deploy_and_closes(
 
 
 # ---------------------------------------------------------------------------
+# P0 regression: a publish request left 'running' by an interrupt BEFORE
+# the deploy was ever dispatched (e.g. a KeyboardInterrupt during
+# record_source, strictly before call_publisher's own journal entry
+# exists) must not be left for report -> close's own queue processing to
+# silently RESUME and deploy -- `gb2 skip-ship` must either cancel it
+# outright (safe: never dispatched) or refuse and point at `gb2 resolve`
+# (unsafe: may already be mid-dispatch).
+# ---------------------------------------------------------------------------
+
+def test_skip_ship_cancels_a_publish_interrupted_before_dispatch_and_closes(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approval granted, then a KeyboardInterrupt lands inside
+    record_source (strictly before call_publisher's own journal entry
+    is ever written) -- the request is left 'running' with no
+    call_publisher entry at all and no receipt on disk. `gb2 skip-ship`
+    must recognize this as safe to cancel outright and still finish
+    report -> close, WITHOUT ever calling the real deploy script."""
+    import engine.steps.publish as publish_steps
+
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    ledger = Ledger.open(job["config"].ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+
+    original_record = publish_steps.record
+    state = {"raised": False}
+
+    def fake_record(*args, **kwargs):
+        if not state["raised"]:
+            state["raised"] = True
+            raise KeyboardInterrupt()
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(publish_steps, "record", fake_record)
+
+    fakes = gb2._build_fakes(job["config"], "demo", job["attempt_id"], None)
+    proc = Processor(job["config"], ledger, fakes)
+    proc.register_defaults()
+    with pytest.raises(KeyboardInterrupt):
+        proc.run_once("demo")
+
+    req = ledger.request(job["request_id"])
+    assert req.status == "running"  # interrupt escaped uncaught
+    steps = ledger.steps(job["request_id"])
+    assert steps["record_source"].status == "started"  # never reached 'done'
+    assert "call_publisher" not in steps  # dispatch step never even started
+    ledger.close()
+
+    code = gb2.main(["skip-ship", "demo"])
+
+    assert code == 0
+    assert not job["deploy_log"].exists()  # the real deploy script never ran
+    ledger = Ledger.open(job["config"].ledger_path)
+    req = ledger.request(job["request_id"])
+    assert req.status == "failed"
+    assert req.result == {"reason": "cancelled_before_dispatch"}
+    assert ledger.project("demo").state == "CLOSED"
+    ledger.close()
+
+
+def test_skip_ship_refuses_a_publish_interrupted_after_dispatch_started(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same setup, but the KeyboardInterrupt instead lands while
+    ShellPublisher.publish is actually waiting on the real deploy
+    command -- call_publisher's own journal entry exists ('started')
+    and a receipt is already on disk (status "unknown", engine.
+    publishers.ShellPublisher's own interrupt handling). `gb2
+    skip-ship` must refuse outright (never force-cancel this) and
+    point the owner at `gb2 resolve` instead -- and must never call
+    the real deploy script a second time."""
+    import subprocess as subprocess_module
+
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    ledger = Ledger.open(job["config"].ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+
+    original_communicate = subprocess_module.Popen.communicate
+    deploy_marker = str(job["config"].publisher_argv[1])
+    state = {"interrupted": False}
+
+    def fake_communicate(self, *args, **kwargs):
+        argv = [str(a) for a in self.args] if isinstance(self.args, (list, tuple)) else []
+        if not state["interrupted"] and deploy_marker in argv:
+            state["interrupted"] = True
+            self.wait(timeout=1)  # let the near-instant fake script actually finish
+            raise KeyboardInterrupt()
+        return original_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess_module.Popen, "communicate", fake_communicate)
+
+    fakes = gb2._build_fakes(job["config"], "demo", job["attempt_id"], None)
+    proc = Processor(job["config"], ledger, fakes)
+    proc.register_defaults()
+    with pytest.raises(KeyboardInterrupt):
+        proc.run_once("demo")
+
+    req = ledger.request(job["request_id"])
+    assert req.status == "running"
+    assert ledger.steps(job["request_id"])["call_publisher"].status == "started"
+    receipt_path = job["config"].home / "publish" / f"{job['request_id']}.json"
+    assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "unknown"
+    ledger.close()
+    deploy_log_text = job["deploy_log"].read_text(encoding="utf-8")  # ran exactly once
+
+    code = gb2.main(["skip-ship", "demo"])
+
+    assert code == 3
+    ledger = Ledger.open(job["config"].ledger_path)
+    req = ledger.request(job["request_id"])
+    assert req.status == "running"  # untouched -- never force-cancelled
+    assert ledger.project("demo").state == "OPEN"  # never closed
+    ledger.close()
+    # never redeployed -- the deploy log is byte-for-byte what the one
+    # real dispatch already wrote.
+    assert job["deploy_log"].read_text(encoding="utf-8") == deploy_log_text
+
+
+# ---------------------------------------------------------------------------
 # P0 regression: a ship whose full test suite fails must leave NOTHING a
 # later `gb2 skip-ship`/`gb2 fix` queue drain could ever dispatch and
 # deploy -- the exact ordering bug engine.release.approve_and_run used to

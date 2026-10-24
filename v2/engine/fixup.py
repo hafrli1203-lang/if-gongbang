@@ -62,6 +62,32 @@ archive that DOES hold merged work (_latest_merged_archive walks back
 past any number of empty archives to find it); FixTarget.carried_archive
 names that directory, and fix() overlays it instead of the failing
 attempt's own (empty) one. See find_fix_target's own docstring.
+
+Resuming an interrupted fix() transition itself: fix() does several
+non-idempotent things in sequence (close the old attempt, open a new
+one, overlay the archive, submit the new run_station request) before
+ever handing off to orbit.continue_job -- whose OWN crash-safety (the
+existing "fix after a failed fix" story above, plus every step's own
+reconcile()) only covers what happens AFTER that hand-off. A crash
+between any two of those four steps used to leave the project stuck:
+closed-but-not-reopened refuses the next fix with "not OPEN", and
+opened-but-not-submitted leaves no failed request for find_fix_target to
+find at all. fix() now journals its own progress through this one
+transition as a small sequence of ledger events -- "fix.started"
+(everything find_fix_target computed, BEFORE the old attempt is even
+closed, so none of it needs recomputing after the old attempt no longer
+looks the way find_fix_target saw it), "fix.closed_old" {archive_dir},
+"fix.opened_new" {new_attempt_id}, "fix.restored", "fix.submitted"
+{request_id}, "fix.finished" -- and _find_unfinished_fix_cycle looks for
+a "fix.started" with no later "fix.finished" at the very top of fix(),
+resuming from whichever of those events already exist instead of
+calling find_fix_target (which the CLOSED-but-not-reopened case could
+never satisfy) or redoing a step that already ran (which the
+not-yet-submitted case would otherwise duplicate -- a second open_job
+call would silently fork a second, orphaned attempt). Once
+"fix.finished" is written (right before orbit.continue_job is ever
+called), this journal's job is done -- any later crash is the job's own
+ordinary, already-resumable machinery, not this module's concern.
 """
 from __future__ import annotations
 
@@ -74,7 +100,7 @@ from typing import Callable
 from engine import evidence, orbit
 from engine import release as release_mod
 from engine.config import EngineConfig
-from engine.ledger import Ledger, RequestRow
+from engine.ledger import Event, Ledger, RequestRow
 from engine.processor import Fakes, Processor, submit
 from engine.steps.open_job import copy_root, open_job
 
@@ -496,6 +522,53 @@ def _overlay_archive_into_builder_copy(config: EngineConfig, attempt_id: str,
 
 
 # ---------------------------------------------------------------------
+# journal: resuming an interrupted fix() transition
+# ---------------------------------------------------------------------
+
+def _append_fix_event(ledger: Ledger, project: str, kind: str, old_attempt_id: str,
+                      payload: dict[str, object]) -> int:
+    """Append one of this module's own journal events (see module
+    docstring) and return its seq -- used by fix.started's own seq to
+    bound which later events belong to the same cycle."""
+    return ledger.append(Event(
+        project=project, kind=kind, actor_kind="owner", actor_id="owner",
+        attempt_id=old_attempt_id, payload=payload,
+    ))
+
+
+def _latest_fix_event_after(ledger: Ledger, project: str, kind: str,
+                            after_seq: int) -> Event | None:
+    """The most recent event of this journal `kind` appended strictly
+    after `after_seq` (the current cycle's own "fix.started" seq) -- any
+    such event belongs to the CURRENT, still-unfinished cycle: a new
+    "fix.started" can only ever be appended once the previous cycle's
+    own "fix.finished" has been (see _find_unfinished_fix_cycle), so
+    nothing from an earlier, already-finished cycle can have a seq past
+    this one's "fix.started"."""
+    matches = [event for seq, event in ledger.events(project, kind) if seq > after_seq]
+    return matches[-1] if matches else None
+
+
+def _find_unfinished_fix_cycle(ledger: Ledger, project: str) -> tuple[int, dict[str, object]] | None:
+    """(fix.started's own seq, its payload) for the most recent fix()
+    transition that started but never reached "fix.finished" -- or None
+    if there isn't one (the common case: either no fix() has ever run
+    for this project, or the last one finished its own transition
+    cleanly, whatever happened to the job afterward). fix() calls this
+    FIRST, before find_fix_target -- which an interrupted transition's
+    CLOSED-but-not-yet-reopened project state can never satisfy ("not
+    OPEN") even though there is very much something to resume."""
+    started_events = ledger.events(project, "fix.started")
+    if not started_events:
+        return None
+    started_seq, started_event = started_events[-1]
+    finished_events = ledger.events(project, "fix.finished")
+    if finished_events and finished_events[-1][0] > started_seq:
+        return None
+    return started_seq, started_event.payload
+
+
+# ---------------------------------------------------------------------
 # top-level entry point
 # ---------------------------------------------------------------------
 
@@ -504,59 +577,123 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
        on_progress: orbit.ProgressCallback | None = None,
        processor_factory: orbit.ProcessorFactory | None = None) -> FixResult:
     """Continue the project's current (failed-at-review-or-bench)
-    attempt instead of starting a fresh job. `fakes_for(attempt_id)`
-    builds the Fakes a Processor needs for that specific attempt_id
-    (mirrors tools/gb2's own `_build_fakes(config, app, attempt_id,
-    None)` -- the installer's marker_dir is attempt-scoped, so closing
-    the old attempt and running the new one each need their own).
-    `processor_factory`, like orbit.continue_job's own parameter of the
-    same name, is forwarded only to the NEW attempt's stage list --
-    closing the old attempt always uses the real default steps (every
-    caller, live or test, needs the real close behavior; nothing stubs
-    "close"). Raises FixupError (no ledger write beyond whatever
-    close_failed_attempt itself already committed) if there is nothing
-    eligible to fix, or if closing the failed attempt does not end
-    'done'."""
-    target = find_fix_target(ledger, project)
+    attempt instead of starting a fresh job -- or, if a PRIOR call to
+    this function was itself interrupted partway through its own
+    close-old/open-new/restore/submit transition, resume exactly that
+    instead (see _find_unfinished_fix_cycle and the module docstring);
+    `extra` is then ignored in favor of whatever was journaled the first
+    time, since the composed task it would have fed into is already
+    fixed by "fix.started". `fakes_for(attempt_id)` builds the Fakes a
+    Processor needs for that specific attempt_id (mirrors tools/gb2's
+    own `_build_fakes(config, app, attempt_id, None)` -- the installer's
+    marker_dir is attempt-scoped, so closing the old attempt and running
+    the new one each need their own). `processor_factory`, like
+    orbit.continue_job's own parameter of the same name, is forwarded
+    only to the NEW attempt's stage list -- closing the old attempt
+    always uses the real default steps (every caller, live or test,
+    needs the real close behavior; nothing stubs "close"). Raises
+    FixupError (no ledger write beyond whatever close_failed_attempt
+    itself already committed, and the "fix.started" this function
+    itself appended first) if there is nothing eligible to fix, or if
+    closing the failed attempt does not end 'done'."""
+    cycle = _find_unfinished_fix_cycle(ledger, project)
+    if cycle is not None:
+        started_seq, payload = cycle
+        old_attempt_id = str(payload["old_attempt_id"])
+        job_name = str(payload["job_name"])
+        task = str(payload["task"])
+        builder_role = str(payload["builder_role"])
+        reviewer_role = str(payload["reviewer_role"])
+        archive_source = payload.get("archive_source")
+    else:
+        target = find_fix_target(ledger, project)
+        old_attempt_id = target.attempt_id
+        job_name = target.job_name
+        task = compose_fix_task(target, extra)
+        builder_role = target.builder_role
+        reviewer_role = target.reviewer_role
+        archive_source = str(target.carried_archive) if target.carried_archive is not None else None
+        started_seq = _append_fix_event(ledger, project, "fix.started", old_attempt_id, {
+            "job_name": job_name, "old_attempt_id": old_attempt_id, "task": task,
+            "extra": extra, "builder_role": builder_role, "reviewer_role": reviewer_role,
+            "archive_source": archive_source,
+        })
 
     # Cancel any publish request still queued for the attempt being
     # replaced BEFORE close_failed_attempt below runs processor.run_once
     # (which drains the WHOLE project queue, including that request) --
     # a fix must never let a stale, now-superseded publish go out just
-    # because closing the old attempt happened to touch the queue.
-    release_mod.cancel_pending_publish(ledger, project, target.attempt_id, "superseded_by_fix")
+    # because closing the old attempt happened to touch the queue. Safe
+    # to redo on a resume too -- cancelling an already-cancelled (or
+    # never-existed) publish request is a no-op.
+    release_mod.cancel_pending_publish(ledger, project, old_attempt_id, "superseded_by_fix")
 
-    old_fakes = fakes_for(target.attempt_id)
-    own_archive_dir = close_failed_attempt(config, ledger, old_fakes, project, target.attempt_id)
+    closed = _latest_fix_event_after(ledger, project, "fix.closed_old", started_seq)
+    if closed is None:
+        old_fakes = fakes_for(old_attempt_id)
+        own_archive_dir = close_failed_attempt(config, ledger, old_fakes, project, old_attempt_id)
+        _append_fix_event(ledger, project, "fix.closed_old", old_attempt_id,
+                          {"archive_dir": str(own_archive_dir)})
+    else:
+        own_archive_dir = Path(str(closed.payload["archive_dir"]))
     # carried_archive (see find_fix_target case (b)) means THIS attempt's
     # own merge never completed, so own_archive_dir is necessarily empty
     # -- the earlier attempt's own archive, found by find_fix_target, is
     # what actually holds merged work to continue from.
-    archive_dir = target.carried_archive if target.carried_archive is not None else own_archive_dir
+    archive_dir = Path(str(archive_source)) if archive_source is not None else own_archive_dir
 
-    # Only the builder role needs a fresh copy -- the reviewer runs
-    # against its own exported snapshot (engine.steps.review._export_
-    # review_snapshot), never a worker copy at all, so making one for
-    # it here would just be an unused checkout cost on every fix.
-    new_attempt_id = open_job(
-        config, ledger, project, target.job_name, "full",
-        (target.builder_role,),
-    )
-    _overlay_archive_into_builder_copy(config, new_attempt_id, target.builder_role, archive_dir)
+    opened = _latest_fix_event_after(ledger, project, "fix.opened_new", started_seq)
+    if opened is None:
+        # Only the builder role needs a fresh copy -- the reviewer runs
+        # against its own exported snapshot (engine.steps.review._export_
+        # review_snapshot), never a worker copy at all, so making one for
+        # it here would just be an unused checkout cost on every fix.
+        new_attempt_id = open_job(config, ledger, project, job_name, "full", (builder_role,))
+        _append_fix_event(ledger, project, "fix.opened_new", old_attempt_id,
+                          {"new_attempt_id": new_attempt_id})
+    else:
+        # NEVER call open_job again here -- a second call would silently
+        # fork a second, orphaned attempt on the same job rather than
+        # resuming the one a prior (interrupted) call already opened.
+        new_attempt_id = str(opened.payload["new_attempt_id"])
 
-    task = compose_fix_task(target, extra)
-    stages = orbit.fix_stages(
-        config, new_attempt_id, target.builder_role, target.reviewer_role,
-        task, target.job_name,
-    )
+    restored = _latest_fix_event_after(ledger, project, "fix.restored", started_seq)
+    if restored is None:
+        _overlay_archive_into_builder_copy(config, new_attempt_id, builder_role, archive_dir)
+        _append_fix_event(ledger, project, "fix.restored", old_attempt_id, {})
+
+    stages = orbit.fix_stages(config, new_attempt_id, builder_role, reviewer_role, task, job_name)
+
+    # Submitted here, deliberately OUTSIDE orbit.continue_job, so this
+    # journal can record the request_id the moment it exists -- submit()
+    # is itself idempotent (same project/attempt/kind/payload always
+    # hashes to the same request_id, see engine.processor.submit's own
+    # docstring), so continue_job's own submit() call for this same
+    # first stage, right after, is simply a no-op lookup of what was
+    # just created here.
+    submitted = _latest_fix_event_after(ledger, project, "fix.submitted", started_seq)
+    if submitted is None:
+        request_id = submit(ledger, project, new_attempt_id, stages[0].kind,
+                            stages[0].payload, "owner")
+        _append_fix_event(ledger, project, "fix.submitted", old_attempt_id,
+                          {"request_id": request_id})
+
+    # This transition itself is done as of here -- whatever continue_job
+    # does next (run the rest of this stage list, including any later
+    # review/bench/... failure) is the job's own ordinary, independently
+    # resumable machinery, not something this journal needs to cover.
+    finished = _latest_fix_event_after(ledger, project, "fix.finished", started_seq)
+    if finished is None:
+        _append_fix_event(ledger, project, "fix.finished", old_attempt_id, {})
+
     new_fakes = fakes_for(new_attempt_id)
     outcome = orbit.continue_job(
         config, ledger, new_fakes, project, new_attempt_id, stages,
         processor_factory=processor_factory, on_progress=on_progress,
     )
     return FixResult(
-        old_attempt_id=target.attempt_id, new_attempt_id=new_attempt_id,
-        job_name=target.job_name, task=task, outcome=outcome,
+        old_attempt_id=old_attempt_id, new_attempt_id=new_attempt_id,
+        job_name=job_name, task=task, outcome=outcome,
     )
 
 

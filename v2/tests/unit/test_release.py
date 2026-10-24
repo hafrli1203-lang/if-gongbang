@@ -559,6 +559,41 @@ def test_call_publisher_rechecks_master_clean_right_before_dispatch(
     assert publisher.calls == []
 
 
+def test_call_publisher_rechecks_full_bench_right_before_dispatch(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Same re-check-right-before-dispatch reasoning as the master-
+    clean/master-advanced checks above: advance_master's own
+    full_bench_missing guard is journaled 'done' well before this
+    point and never re-run, so evidence invalidated (e.g. an install)
+    in the gap between advance_master and call_publisher must not go
+    unnoticed -- never dispatch on stale say-so."""
+    attempt_id = _open(rws, "job-p15-dispatch")
+    sha = _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
+
+    publisher = FakePublisher()
+    proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
+                      faults=Faults(crash_after={"advance_master"}))
+    proc1.register_defaults()
+    with pytest.raises(CrashInjected):
+        proc1.run_once("gamma")
+    assert release.head_sha(rws.master_repo) == sha
+
+    invalidate_after(rws.ledger, "gamma", attempt_id, ("bench",))
+
+    proc2 = _proc(rws, publisher)
+    n = proc2.run_once("gamma")
+
+    assert n == 0
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_missing"}
+    assert publisher.calls == []
+
+
 # ---------------------------------------------------------------------------
 # ensure_full_bench / approve_and_run's full-suite-bench gate: a ship
 # must have a FULL-scope passing bench for the exact released
@@ -809,6 +844,86 @@ def test_cancel_pending_publish_leaves_a_running_request_untouched(
 
     assert cancelled == []
     assert rws.ledger.request(request_id).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# engine.release.cancel_running_publish_before_dispatch
+# ---------------------------------------------------------------------------
+
+def test_cancel_running_publish_before_dispatch_cancels_when_never_started(
+    rws: ReleaseWorkspace,
+) -> None:
+    """A request left 'running' strictly before call_publisher's own
+    journal entry exists at all (e.g. a KeyboardInterrupt during an
+    earlier step like record_source) is safe to cancel outright."""
+    attempt_id = _open(rws, "job-cancel-predispatch")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
+
+    publisher = FakePublisher()
+    proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()))
+    proc.register_defaults()
+    status = proc.run_request("gamma", request_id, stop_after="record_source")
+    assert status == "running"
+    assert rws.ledger.steps(request_id).get("call_publisher") is None
+
+    cancelled = release.cancel_running_publish_before_dispatch(
+        rws.ledger, "gamma", request_id, "cancelled_before_dispatch")
+
+    assert cancelled is True
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "cancelled_before_dispatch"}
+    assert publisher.calls == []
+    approvals = rws.ledger.approvals_for(request_id)
+    assert len(approvals) == 1
+    assert approvals[0].used_seq is not None  # revoked
+
+
+def test_cancel_running_publish_before_dispatch_refuses_once_call_publisher_started(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Once call_publisher's own journal entry exists at all -- even
+    just 'started', the narrow window strictly before its run()
+    actually calls publish() -- this must never touch the request;
+    the caller has to refuse and point the owner at `gb2 resolve`."""
+    attempt_id = _open(rws, "job-cancel-started")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
+
+    publisher = FakePublisher()
+    proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
+                      faults=Faults(crash_before={"call_publisher"}))
+    proc.register_defaults()
+    with pytest.raises(CrashInjected):
+        proc.run_once("gamma")
+    assert rws.ledger.steps(request_id)["call_publisher"].status == "started"
+    assert rws.ledger.request(request_id).status == "running"
+
+    cancelled = release.cancel_running_publish_before_dispatch(
+        rws.ledger, "gamma", request_id, "cancelled_before_dispatch")
+
+    assert cancelled is False
+    assert rws.ledger.request(request_id).status == "running"  # untouched
+    assert publisher.calls == []
+
+
+def test_cancel_running_publish_before_dispatch_refuses_a_non_running_request(
+    rws: ReleaseWorkspace,
+) -> None:
+    from engine.processor import CancelError
+
+    attempt_id = _open(rws, "job-cancel-notrunning")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+
+    with pytest.raises(CancelError):
+        release.cancel_running_publish_before_dispatch(
+            rws.ledger, "gamma", request_id, "x")  # still 'queued', not 'running'
 
 
 def test_ensure_full_bench_reruns_after_evidence_invalidated_instead_of_trusting_old_done_request(

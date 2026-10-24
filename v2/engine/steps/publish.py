@@ -368,6 +368,14 @@ def _run_call_publisher(ctx: StepContext) -> dict[str, object]:
             raise StepFailed("master_not_advanced")
         if not release_mod.master_is_clean(release_config.master_repo):
             raise StepFailed("master_not_clean")
+        # Same re-check-right-before-dispatch reasoning as the two
+        # guards just above: advance_master's own full_bench_missing
+        # check is journaled 'done' well before this point and never
+        # re-run, so evidence invalidated (e.g. an install) in the gap
+        # between advance_master and call_publisher must not go
+        # unnoticed -- never dispatch on stale say-so.
+        if not _full_bench_passed_for_release(ctx):
+            raise StepFailed("full_bench_missing")
 
     key = ctx.request.request_id
     try:

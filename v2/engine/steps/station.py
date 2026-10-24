@@ -63,6 +63,13 @@ from engine.workers.base import WorkerSpec, wait_for_exit
 from engine.workers.prompts import build_prompt
 
 
+ENGINE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def runner_needs_gate(runner: object) -> bool:
+    return bool(getattr(runner, "needs_gate", False))
+
+
 def _stations_dir(ctx: StepContext) -> Path:
     return ctx.config.home / "jobs" / ids.attempt_dirname(ctx.attempt_id) / "stations"
 
@@ -511,6 +518,12 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
         copy_entry = spec.copy_root / entry
         readonly += (copy_entry,)
         writable += tuple(copy_entry / subpath for subpath in subpaths)
+    if runner_needs_gate(runner):
+        # The gate hook imports this engine package inside the sandbox; when
+        # the engine itself lives under a hidden tree (e.g. a checkout under
+        # /tmp, which the sandbox replaces with an empty tmpfs) it must be
+        # re-exposed read-only or every gated tool call fails closed.
+        readonly += (ENGINE_ROOT,)
     if home_env:
         home_path = Path(home_env)
         readonly += (home_path,)

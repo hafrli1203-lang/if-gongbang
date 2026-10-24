@@ -28,7 +28,7 @@ from engine.approvals import ApprovalError, grant, parse_owner_message
 from engine.config import EngineConfig
 from engine.gitutil import git_argv
 from engine.ledger import Event, Ledger, LedgerError
-from engine.processor import Fakes, Processor, cancel_request, submit
+from engine.processor import CancelError, Fakes, Processor, cancel_request, submit
 
 
 def head_sha(repo: Path) -> str:
@@ -444,15 +444,72 @@ def cancel_pending_publish(ledger: Ledger, project: str, attempt_id: str,
         if request.status != "queued":
             continue  # 'running': has an external effect -- not ours to touch
         cancel_request(ledger, project, request.request_id, reason)
-        for approval in ledger.approvals_for(request.request_id):
-            if approval.used_seq is None:
-                ledger.append(Event(
-                    project=project, kind="approval.used",
-                    actor_kind="owner", actor_id="owner", attempt_id=attempt_id,
-                    payload={"approval_id": approval.approval_id},
-                ))
+        _revoke_unused_approvals(ledger, project, attempt_id, request.request_id)
         cancelled.append(request.request_id)
     return cancelled
+
+
+def _revoke_unused_approvals(ledger: Ledger, project: str, attempt_id: str,
+                             request_id: str) -> None:
+    """'approval.used' for every one of `request_id`'s approvals that
+    has not yet been used -- the exact derived effect approvals.check's
+    own successful path records, so a later approvals.check against it
+    reports "used" (refused) rather than ever succeeding. Shared by
+    cancel_pending_publish and cancel_running_publish_before_dispatch."""
+    for approval in ledger.approvals_for(request_id):
+        if approval.used_seq is None:
+            ledger.append(Event(
+                project=project, kind="approval.used",
+                actor_kind="owner", actor_id="owner", attempt_id=attempt_id,
+                payload={"approval_id": approval.approval_id},
+            ))
+
+
+def cancel_running_publish_before_dispatch(ledger: Ledger, project: str,
+                                           request_id: str, reason: str) -> bool:
+    """For a publish request currently 'running': cancel it (status
+    'failed', result {"reason": reason}) and revoke its unused
+    approvals, exactly like cancel_pending_publish does for a queued
+    one -- but ONLY IF this request's own step journal shows
+    call_publisher has no entry AT ALL yet (not even 'started') --
+    the dispatch step that actually calls fakes.publisher.publish().
+    Returns True if cancelled, False (no ledger mutation at all) if
+    call_publisher's journal entry already exists ('started' or
+    'done') -- the caller must then refuse and point the owner at
+    `gb2 resolve` instead, never force this.
+
+    This is a JOURNAL check only. engine.processor._run_steps journals
+    a step 'started' strictly BEFORE that step's own run() executes,
+    so a crash in the narrow window between that journal write and
+    call_publisher's run() actually calling publish() would also show
+    'started' with no receipt on disk yet at all -- deliberately
+    treated here as "might already be dispatching", never as safe to
+    cancel. Callers (tools/gb2's `skip-ship`) are responsible for ALSO
+    confirming, before ever calling this, that no live processor
+    could currently be running this request (the project lock's
+    holder pid is dead or there is no holder) and that no receipt
+    exists for this key at all -- this function checks neither.
+
+    Raises CancelError if the request does not belong to `project` or
+    is not 'running' (same guard cancel_request uses for 'queued')."""
+    request = ledger.request(request_id)
+    if request.project != project:
+        raise CancelError(
+            f"request {request_id} belongs to project {request.project!r}, "
+            f"not {project!r}"
+        )
+    if request.status != "running":
+        raise CancelError(f"request {request_id} is {request.status!r}, not running")
+    if ledger.steps(request_id).get("call_publisher") is not None:
+        return False
+    ledger.append(Event(
+        project=project, kind="request.status", actor_kind="owner",
+        actor_id="owner", attempt_id=request.attempt_id,
+        payload={"request_id": request_id, "status": "failed",
+                 "result": {"reason": reason}},
+    ))
+    _revoke_unused_approvals(ledger, project, request.attempt_id, request_id)
+    return True
 
 
 __all__ = [
@@ -461,4 +518,5 @@ __all__ = [
     "master_is_clean", "merge_range_paths", "incoming_added_paths",
     "overlapping_paths", "ff_merge", "build_summary",
     "prepare", "approve_and_run", "ensure_full_bench", "cancel_pending_publish",
+    "cancel_running_publish_before_dispatch",
 ]

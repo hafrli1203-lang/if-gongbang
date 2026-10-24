@@ -644,20 +644,28 @@ def _find_unknown_publish(ledger: Ledger, project: str) -> tuple[str, str, str, 
     return None
 
 
-def _find_latest_publish_for_attempt(ledger: Ledger, project: str,
-                                      attempt_id: str) -> str | None:
-    """request_id of the most recently SUBMITTED 'publish' request for
-    `attempt_id`, regardless of its current status -- unlike
-    _find_pending_publish/_find_unknown_publish (one particular status
-    bucket each), this also finds one `gb2 ship` already cancelled
-    (failed) after a full-bench failure, so `gb2 skip-ship` can still
-    finish report -> close for that same attempt afterward. None if
-    this attempt never submitted a 'publish' request at all."""
-    latest: str | None = None
+def _publish_request_ids_for_attempt(ledger: Ledger, project: str,
+                                      attempt_id: str) -> list[str]:
+    """Every 'publish' request ever SUBMITTED for `attempt_id`, oldest
+    first, regardless of current status -- unlike _find_pending_publish/
+    _find_unknown_publish (one particular status bucket each, and
+    project-wide rather than scoped to one attempt), this finds EVERY
+    one belonging to this attempt: a `gb2 ship` already cancelled
+    (failed) after a full-bench failure, one still 'queued', one
+    'running'/'unknown' left that way by an interrupt, all of it --
+    `gb2 skip-ship` needs to see all of them to decide whether it is
+    safe to continue at all. [] if this attempt never submitted a
+    'publish' request."""
+    ids: list[str] = []
+    seen: set[str] = set()
     for _seq, event in ledger.events(project, "request.submitted"):
-        if event.attempt_id == attempt_id and event.payload.get("kind") == "publish":
-            latest = str(event.payload["request_id"])
-    return latest
+        if event.attempt_id != attempt_id or event.payload.get("kind") != "publish":
+            continue
+        rid = str(event.payload["request_id"])
+        if rid not in seen:
+            seen.add(rid)
+            ids.append(rid)
+    return ids
 
 
 def _err_json(message: str, code: int) -> int:
@@ -737,39 +745,74 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
 def cmd_skip_ship(args: argparse.Namespace) -> int:
     """Abandon the pending publish request and finish the job with
-    report -> close. Before continuing, release.cancel_pending_publish
-    fails any still-QUEUED publish request of this attempt outright
-    (and revokes any of its unused approvals) -- a belt-and-suspenders
-    guarantee that this attempt's publish request can never be picked
-    up and deployed by anything running later, rather than relying
-    solely on the ordinary queue-drain's check_approval step to fail
-    it "no_approval" on its own. If `gb2 ship` already cancelled this
-    attempt's one publish request itself (its own full-bench-failure
-    path), there is nothing left to cancel here -- this still finds
-    that same attempt (via its now-terminal publish request) and
-    finishes report -> close for it."""
+    report -> close. Before continuing, refuses outright (exit 3, no
+    mutation) if ANY publish request of this attempt is 'unknown' (the
+    owner must run `gb2 resolve` first) or 'running' and NOT safely
+    cancellable -- "safely cancellable" means: no live processor holds
+    the project lock, AND no receipt exists on disk for its key, AND
+    engine.release.cancel_running_publish_before_dispatch confirms
+    call_publisher's own journal entry does not exist at all yet (so
+    the real deploy was genuinely never dispatched -- e.g. a
+    KeyboardInterrupt during an earlier step like record_source).
+    Without this check, report -> close's own queue processing would
+    RESUME that exact 'running' request from wherever its journal left
+    it -- the opposite of "skip": skip-ship abandoning a publish must
+    never itself be what ends up deploying it.
+
+    Once every publish request of this attempt is confirmed either
+    already terminal or just-cancelled, release.cancel_pending_publish
+    fails any still-QUEUED one outright (and revokes its unused
+    approvals) -- belt-and-suspenders, rather than relying solely on
+    the ordinary queue-drain's check_approval step to fail it
+    "no_approval" on its own."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
     config = EngineConfig.from_json(config_path)
-    project_config = config.projects[args.app]
 
     ledger = Ledger.open(config.ledger_path)
     try:
-        pending = _find_pending_publish(ledger, args.app)
-        if pending is not None:
-            request_id, attempt_id, _artifact_hash, _target = pending
-        elif project_config.release is not None:
-            project_row = ledger.project(args.app)
-            attempt_id = project_row.current_attempt_id
-            request_id = (
-                _find_latest_publish_for_attempt(ledger, args.app, attempt_id)
-                if attempt_id is not None else None
-            )
-            if attempt_id is None or request_id is None:
-                return _err_json("no_pending_publish_request", 1)
-        else:
+        project_row = ledger.project(args.app)
+        attempt_id = project_row.current_attempt_id
+        request_ids = (
+            _publish_request_ids_for_attempt(ledger, args.app, attempt_id)
+            if attempt_id is not None else []
+        )
+        if attempt_id is None or not request_ids:
             return _err_json("no_pending_publish_request", 1)
+
+        publisher = None
+        for request_id in request_ids:
+            request = ledger.request(request_id)
+            if request.status == "unknown":
+                return _err_json(
+                    f"refused: publish request {request_id} is 'unknown' -- run "
+                    "`gb2 resolve` first, then `gb2 skip-ship` again", 3,
+                )
+            if request.status != "running":
+                continue
+            if not _project_lock_is_free(ledger, args.app):
+                return _err_json(
+                    "refused: project is locked by a live processor -- wait for it "
+                    "to finish, then try `gb2 skip-ship` again", 3,
+                )
+            if publisher is None:
+                publisher = _build_fakes(config, args.app, attempt_id, None).publisher
+            try:
+                has_receipt = publisher.lookup(request_id) is not None
+            except RuntimeError:
+                has_receipt = True  # can't confirm -- treat as unsafe, never cancel
+            cancelled_before_dispatch = (
+                not has_receipt
+                and release.cancel_running_publish_before_dispatch(
+                    ledger, args.app, request_id, "cancelled_before_dispatch")
+            )
+            if not cancelled_before_dispatch:
+                return _err_json(
+                    f"refused: publish request {request_id} may already be mid-"
+                    "dispatch -- run `gb2 resolve` first, then `gb2 skip-ship` "
+                    "again", 3,
+                )
 
         cancelled = release.cancel_pending_publish(ledger, args.app, attempt_id, "skip_ship")
 
@@ -780,7 +823,7 @@ def cmd_skip_ship(args: argparse.Namespace) -> int:
     finally:
         ledger.close()
     print(json.dumps({
-        "skipped_request_id": request_id, "cancelled_request_ids": cancelled,
+        "skipped_request_id": request_ids[-1], "cancelled_request_ids": cancelled,
         **_outcome_dict(outcome),
     }, ensure_ascii=False))
     return 0 if outcome.status == "done" else 3
