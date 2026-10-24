@@ -323,6 +323,15 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
                 + (time.monotonic() - started) * 1000
             )
             if outcome is not None:
+                failed_stage = (
+                    ledger.request(outcome.failed_request).kind
+                    if outcome.failed_request is not None else None
+                )
+                _record_job_metrics_failure(
+                    ledger, project, attempt_id, durations_ms,
+                    git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                    outcome.status, failed_stage,
+                )
                 return outcome
             idx += 2
             continue
@@ -337,6 +346,11 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
         error = _classify(request)
         if error is not None:
             status, reason = error
+            _record_job_metrics_failure(
+                ledger, project, attempt_id, durations_ms,
+                git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                status, stage.kind,
+            )
             return JobOutcome(
                 attempt_id=attempt_id, status=status, failed_request=rid,
                 reason=reason, completed=tuple(completed),
@@ -372,6 +386,11 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
             idx += 1
             continue
         if pending_from_station:
+            _record_job_metrics_failure(
+                ledger, project, attempt_id, durations_ms,
+                git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                "needs_owner", "run_station",
+            )
             return JobOutcome(
                 attempt_id=attempt_id, status="needs_owner", failed_request=None,
                 reason=None, pending_requests=tuple(pending_from_station),
@@ -444,6 +463,36 @@ def _record_job_metrics(ledger: Ledger, project: str, attempt_id: str,
             "durations_ms": {k: round(v, 1) for k, v in durations_ms.items()},
             "test_runs": _bench_run_counts(ledger, attempt_id),
             "git_calls": git_calls,
+        },
+    ))
+
+
+def _record_job_metrics_failure(ledger: Ledger, project: str, attempt_id: str,
+                                durations_ms: dict[str, float], git_calls: int,
+                                outcome: str, failed_stage: str | None) -> None:
+    """One "job.metrics" event recorded right before _run_stages returns
+    early (a stage failed/stuck pending, or a station asked the owner for
+    something) -- same payload shape _record_job_metrics writes at a
+    normal "report" completion, plus `outcome` ("failed" | "needs_owner"
+    | "pending", mirroring JobOutcome.status for this return) and
+    `failed_stage` (the stage kind that caused the stop). Without this, a
+    job that never reaches "report" -- the common case for a failure --
+    left no job.metrics event at all, silently losing every stage timing
+    it DID complete (run_station, merge, review, bench, ...) from
+    whatever reads this back (`gb2 log`). Never called for the
+    release-approval stop at "commit" (that early return keeps using
+    _record_job_metrics_partial instead, unchanged -- it is a resumable
+    pause, not a failure, and continue_job(release_followup_stages(...))
+    still needs _load_partial_metrics to pick up from it)."""
+    ledger.append(Event(
+        project=project, kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={
+            "durations_ms": {k: round(v, 1) for k, v in durations_ms.items()},
+            "test_runs": _bench_run_counts(ledger, attempt_id),
+            "git_calls": git_calls,
+            "outcome": outcome,
+            "failed_stage": failed_stage,
         },
     ))
 

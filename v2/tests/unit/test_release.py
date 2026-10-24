@@ -26,7 +26,7 @@ from engine.evidence import invalidate_after, record
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.faults import CrashInjected, Faults
-from engine.ledger import Ledger
+from engine.ledger import Event, Ledger
 from engine.processor import Fakes, Processor
 from engine.publishers import ShellPublisher
 from engine.steps.open_job import open_job
@@ -89,6 +89,19 @@ def _commit(repo: Path, rel: str, content: str, message: str) -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
+def _seed_full_bench(rws: ReleaseWorkspace, attempt_id: str) -> None:
+    """Record a passing full-scope bench for rws.repo's CURRENT
+    fingerprint -- advance_master's own defense-in-depth check
+    (_full_bench_passed_for_release) refuses ("full_bench_missing")
+    without one. A test driving advance_master directly via grant() +
+    run_once (bypassing release.approve_and_run's own ensure_full_bench
+    gate entirely) must seed this itself to reach an actual merge,
+    exactly as a real ship would only get here after that gate already
+    passed."""
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    record(rws.ledger, "gamma", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
+
+
 def _proc(rws: ReleaseWorkspace, publisher: FakePublisher | None = None) -> Processor:
     proc = Processor(rws.config, rws.ledger, Fakes(publisher or FakePublisher(), FakeInstaller()))
     proc.register_defaults()
@@ -128,6 +141,7 @@ def test_release_approval_for_different_hash_is_rejected(rws: ReleaseWorkspace) 
     attempt_id = _open(rws, "job2")
     request_id_a, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id_a, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
 
     publisher = FakePublisher()
     proc = _proc(rws, publisher)
@@ -265,6 +279,7 @@ def test_release_advance_master_ignores_gitignored_file_in_master(
     _commit(rws.repo, ".gitignore", "ignored.txt\n", "add gitignore")
     rid0, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", rid0, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
     assert _proc(rws, FakePublisher()).run_once("gamma") == 1
     assert rws.ledger.request(rid0).status == "done"
 
@@ -272,6 +287,7 @@ def test_release_advance_master_ignores_gitignored_file_in_master(
     sha = _commit(rws.repo, "app.py", "v2\n", "advance app.py only")
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
 
     publisher = FakePublisher()
     n = _proc(rws, publisher).run_once("gamma")
@@ -349,6 +365,7 @@ def test_release_advance_master_crash_resume_merges_once(rws: ReleaseWorkspace) 
     sha = _commit(rws.repo, "app.py", "v2\n", "advance")
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
@@ -399,6 +416,7 @@ def test_release_deploy_failure_leaves_master_at_sha(rws: ReleaseWorkspace, tmp_
     sha = _commit(rws.repo, "app.py", "v2\n", "advance")
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
 
     proc = Processor(rws.config, rws.ledger, Fakes(shell_publisher, FakeInstaller()))
     proc.register_defaults()
@@ -519,6 +537,7 @@ def test_call_publisher_rechecks_master_clean_right_before_dispatch(
     sha = _commit(rws.repo, "app.py", "v2\n", "advance")
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
@@ -643,6 +662,153 @@ def test_full_bench_failure_blocks_approve_and_run_before_any_merge(
     assert outcome["bench"]["passed"] is False
     assert release.head_sha(rws.master_repo) == master_before  # never merged
     assert fakes.publisher.calls == []  # never dispatched
+
+
+# ---------------------------------------------------------------------------
+# P0: the full-bench-failure window a later queue drain (`gb2 skip-ship`'s
+# continue_job, or `gb2 fix`'s run_once) could previously walk into and
+# deploy through -- approve_and_run must grant NOTHING when the bench
+# fails, and advance_master must refuse on its own even if something
+# else ever granted one anyway.
+# ---------------------------------------------------------------------------
+
+def test_full_bench_failure_grants_no_approval_so_a_later_drain_cannot_deploy(
+    tmp_path: Path,
+) -> None:
+    """Regression for the ordering bug: approve_and_run used to grant
+    the approval BEFORE calling ensure_full_bench, so a failed full
+    suite left a valid, unused approval sitting next to the still-
+    queued publish request -- a LATER queue drain (this test simulates
+    `gb2 fix`'s own run_once call) would then dispatch it anyway. With
+    ensure_full_bench moved before grant(), no approval is ever
+    created, so that later drain's own check_approval step fails it
+    "no_approval" exactly like it would with no approval attempt at
+    all -- the publisher is never touched and master never advances."""
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-fullbench-no-grant")
+    _commit(rws.repo, "note.txt", "note\n", "advance")
+    master_before = release.head_sha(rws.master_repo)
+    fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+    record(rws.ledger, "gamma", attempt_id, "bench", fp,
+          payload={"passed": True, "scope": "related"})
+
+    failing_project = replace(
+        rws.config.projects["gamma"],
+        test_cmd=(sys.executable, "-c", "import sys; sys.exit(1)"),
+    )
+    failing_config = replace(
+        rws.config, projects={**rws.config.projects, "gamma": failing_project},
+    )
+
+    request_id, summary = release.prepare(failing_config, rws.ledger, "gamma", attempt_id)
+    outcome = release.approve_and_run(
+        failing_config, rws.ledger, Fakes(FakePublisher(), FakeInstaller()),
+        "gamma", request_id, summary["owner_text"])
+    assert outcome["status"] == "rejected"
+    assert outcome["reason"] == "full_bench_failed"
+
+    # No approval was ever granted for this request -- the bug's exact
+    # unused-approval window.
+    assert rws.ledger.approvals_for(request_id) == []
+    assert rws.ledger.request(request_id).status == "queued"
+
+    # Simulate `gb2 fix`'s own drain: a fresh Processor's run_once over
+    # the whole project queue, same call fixup.fix ends up making.
+    publisher = FakePublisher()
+    proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()))
+    proc.register_defaults()
+    n = proc.run_once("gamma")
+
+    assert n == 0
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "no_approval"}
+    assert publisher.calls == []
+    assert release.head_sha(rws.master_repo) == master_before
+
+
+def test_advance_master_refuses_full_bench_missing_even_with_a_valid_approval(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth, independent of approve_and_run's own ordering:
+    even if an approval exists for a request whose fingerprint has no
+    passing full-scope bench at all (the exact state the ordering bug
+    used to produce), advance_master itself refuses
+    ("full_bench_missing") rather than relying solely on
+    ensure_full_bench ever having been called."""
+    rws = _rws_with_real_tests(tmp_path)
+    attempt_id = _open(rws, "job-fullbench-defense")
+    sha = _commit(rws.repo, "note.txt", "note\n", "advance")
+    master_before = release.head_sha(rws.master_repo)
+    # No bench evidence recorded for this fingerprint at all -- grant()
+    # directly, bypassing approve_and_run's ensure_full_bench gate
+    # entirely (simulating that gate having been skipped or reverted).
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+
+    publisher = FakePublisher()
+    n = _proc(rws, publisher).run_once("gamma")
+
+    assert n == 0
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_missing"}
+    assert publisher.calls == []
+    assert release.head_sha(rws.master_repo) == master_before
+
+
+# ---------------------------------------------------------------------------
+# engine.release.cancel_pending_publish
+# ---------------------------------------------------------------------------
+
+def test_cancel_pending_publish_fails_the_request_and_revokes_its_unused_approval(
+    rws: ReleaseWorkspace,
+) -> None:
+    attempt_id = _open(rws, "job-cancel")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+
+    cancelled = release.cancel_pending_publish(rws.ledger, "gamma", attempt_id, "full_bench_failed")
+
+    assert cancelled == [request_id]
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_failed"}
+    approvals = rws.ledger.approvals_for(request_id)
+    assert len(approvals) == 1
+    assert approvals[0].used_seq is not None  # revoked: a later check() reports "used"
+
+    from engine.approvals import check as approvals_check
+    decision = approvals_check(rws.ledger, rws.ledger.request(request_id))
+    assert decision.allowed is False
+    assert decision.reason == "used"
+
+
+def test_cancel_pending_publish_is_a_noop_with_nothing_queued(rws: ReleaseWorkspace) -> None:
+    attempt_id = _open(rws, "job-cancel-noop")
+    assert release.cancel_pending_publish(rws.ledger, "gamma", attempt_id, "x") == []
+
+
+def test_cancel_pending_publish_leaves_a_running_request_untouched(
+    rws: ReleaseWorkspace,
+) -> None:
+    """A publish request already 'running' (mid-dispatch) must never be
+    force-cancelled -- it may already have an external effect that
+    only `gb2 resolve`/retry_unknown can reconcile."""
+    attempt_id = _open(rws, "job-cancel-running")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    rws.ledger.append(Event(
+        project="gamma", kind="request.status", actor_kind="processor",
+        actor_id="p", attempt_id=attempt_id,
+        payload={"request_id": request_id, "status": "running", "result": {}},
+    ))
+
+    cancelled = release.cancel_pending_publish(rws.ledger, "gamma", attempt_id, "x")
+
+    assert cancelled == []
+    assert rws.ledger.request(request_id).status == "running"
 
 
 def test_ensure_full_bench_reruns_after_evidence_invalidated_instead_of_trusting_old_done_request(

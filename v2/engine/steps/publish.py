@@ -206,6 +206,23 @@ def _run_check_artifact(ctx: StepContext) -> dict[str, object]:
     return {"artifact_hash": actual}
 
 
+def _full_bench_passed_for_release(ctx: StepContext) -> bool:
+    """Defense in depth alongside engine.release.approve_and_run's own
+    ensure_full_bench gate (which normally refuses to grant an
+    approval at all until this already holds): true iff the latest
+    non-stale bench evidence for this attempt, bound to the project
+    repo's CURRENT fingerprint, passed with scope "full"/
+    "full(fallback)" (release._latest_full_bench_passed -- same check,
+    same fingerprint computation engine.steps.publish's own
+    record_source step uses). False (never raises) if the fingerprint
+    itself cannot be computed."""
+    try:
+        fp = fingerprint(_repo(ctx), _excludes(ctx))
+    except FingerprintError:
+        return False
+    return release_mod._latest_full_bench_passed(ctx.ledger, ctx.attempt_id, fp)
+
+
 def _run_advance_master(ctx: StepContext) -> dict[str, object]:
     """release.master_repo fast-forward to the approved @HEAD sha -- see
     the module docstring's "advance_master" entry. Runs only when
@@ -214,7 +231,13 @@ def _run_advance_master(ctx: StepContext) -> dict[str, object]:
     sha and the working copy's own HEAD already equals it -- but both
     are journaled 'done' well before this point and never re-run, so
     the approval's binding/expiry is re-checked here too, immediately
-    before this step's own mutation, not only later before dispatch."""
+    before this step's own mutation, not only later before dispatch.
+    Also refuses ("full_bench_missing") unless a passing, non-stale
+    FULL-suite bench already exists for this exact fingerprint --
+    defense in depth should an approval ever exist despite
+    ensure_full_bench never having passed (approve_and_run's own gate
+    is the primary guard; this must not be the only thing standing
+    between a failed suite and a real deploy)."""
     artifact_path = str(ctx.request.payload.get("artifact_path", ""))
     if artifact_path != _HEAD_ARTIFACT_PATH:
         raise StepFailed("release_requires_head_artifact")
@@ -242,6 +265,11 @@ def _run_advance_master(ctx: StepContext) -> dict[str, object]:
     )
     if occupied:
         raise StepFailed("incoming_path_occupied")
+    # Last guard before the mutation itself: every OTHER refusal reason
+    # above is independent of bench status and must still surface as
+    # its own specific reason, not be masked by this one.
+    if not _full_bench_passed_for_release(ctx):
+        raise StepFailed("full_bench_missing")
     release_mod.ff_merge(master_repo, sha)
     return {"master_head": sha}
 

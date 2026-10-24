@@ -27,8 +27,8 @@ from engine import evidence
 from engine.approvals import ApprovalError, grant, parse_owner_message
 from engine.config import EngineConfig
 from engine.gitutil import git_argv
-from engine.ledger import Ledger
-from engine.processor import Fakes, Processor, submit
+from engine.ledger import Event, Ledger, LedgerError
+from engine.processor import Fakes, Processor, cancel_request, submit
 
 
 def head_sha(repo: Path) -> str:
@@ -361,16 +361,20 @@ def approve_and_run(config: EngineConfig, ledger: Ledger, fakes: Fakes, project:
                     max_iterations: int = 50) -> dict[str, object]:
     """Parse `owner_text` (must be exactly "승인 R-..." per
     approvals.parse_owner_message), refuse if it names a different
-    request than `request_id`, grant the approval, then -- BEFORE ever
-    running the publish request forward (so advance_master has not
-    touched master yet) -- require ensure_full_bench to pass; a failed
-    or still-running full bench refuses the whole ship ("reason":
-    "full_bench_failed") without consuming the grant's one-time use
-    (approvals.check, inside the publish request's own check_approval
-    step, is what actually marks it used -- never run here). Only then
-    drives a fresh Processor's run_once in a bounded loop until the
-    publish request leaves queued/running (done/failed/unknown). Never
-    calls the real deploy script itself -- that only happens if
+    request than `request_id`, then -- BEFORE ever granting an
+    approval, so a failed bench never leaves a valid, unused approval
+    sitting next to a still-queued publish request for a LATER `gb2
+    skip-ship`/`gb2 fix` queue-drain to pick up and deploy -- require
+    ensure_full_bench to pass. A failed or still-running full bench
+    refuses the whole ship ("reason": "full_bench_failed") with no
+    approval ever granted; the request itself is left exactly as the
+    caller finds it (callers that must guarantee it can never be
+    dispatched later -- e.g. tools/gb2's `ship` -- call
+    cancel_request/cancel_pending_publish themselves on this outcome).
+    Only once the bench passes is the approval granted, then a fresh
+    Processor's run_once driven in a bounded loop until the publish
+    request leaves queued/running (done/failed/unknown). Never calls
+    the real deploy script itself -- that only happens if
     `fakes.publisher` is wired to a real ShellPublisher by the
     caller."""
     parsed = parse_owner_message(owner_text)
@@ -381,15 +385,20 @@ def approve_and_run(config: EngineConfig, ledger: Ledger, fakes: Fakes, project:
         return {"status": "rejected", "reason": "owner_text_wrong_request",
                 "request_id": request_id}
     try:
-        grant(ledger, project, request_id, ttl_sec=config.approval_ttl_sec)
-    except ApprovalError as exc:
-        return {"status": "rejected", "reason": str(exc), "request_id": request_id}
+        attempt_id = ledger.request(request_id).attempt_id
+    except LedgerError as exc:
+        return {"status": "rejected", "reason": f"unknown_request: {exc}",
+                "request_id": request_id}
 
-    attempt_id = ledger.request(request_id).attempt_id
     bench_check = ensure_full_bench(config, ledger, fakes, project, attempt_id)
     if not bench_check["passed"]:
         return {"status": "rejected", "reason": "full_bench_failed",
                 "request_id": request_id, "bench": bench_check}
+
+    try:
+        grant(ledger, project, request_id, ttl_sec=config.approval_ttl_sec)
+    except ApprovalError as exc:
+        return {"status": "rejected", "reason": str(exc), "request_id": request_id}
 
     processor = Processor(config, ledger, fakes)
     processor.register_defaults()
@@ -405,10 +414,51 @@ def approve_and_run(config: EngineConfig, ledger: Ledger, fakes: Fakes, project:
             "request_id": request_id, "bench": bench_check}
 
 
+def cancel_pending_publish(ledger: Ledger, project: str, attempt_id: str,
+                           reason: str) -> list[str]:
+    """Cancel every still-QUEUED 'publish' request of `attempt_id`
+    (engine.processor.cancel_request -> status 'failed', result
+    {"reason": reason}) and revoke every one of ITS approvals that has
+    not yet been used -- an 'approval.used' event, the exact derived
+    effect approvals.check's own successful path records, so a later
+    approvals.check against it reports "used" (refused) rather than
+    ever succeeding. Defense in depth for the window a full-bench
+    failure used to leave open (approve_and_run now refuses to grant
+    an approval at all until ensure_full_bench passes, so there is
+    normally nothing here left to revoke -- this guards the case
+    where an approval exists anyway, e.g. this function being called
+    again after a partial failure, or a future caller granting one
+    through some other path).
+
+    A publish request that is already 'running'/'done'/'failed'/
+    'unknown' is left completely untouched: it is either already
+    resolved, or (running) has an external effect that must be
+    reconciled through `gb2 resolve`/retry_unknown, never force-
+    cancelled here. Returns the request_ids actually cancelled,
+    oldest-submitted first; [] if this attempt has no queued publish
+    request at all."""
+    cancelled: list[str] = []
+    for request in ledger.queued_requests(project):
+        if request.kind != "publish" or request.attempt_id != attempt_id:
+            continue
+        if request.status != "queued":
+            continue  # 'running': has an external effect -- not ours to touch
+        cancel_request(ledger, project, request.request_id, reason)
+        for approval in ledger.approvals_for(request.request_id):
+            if approval.used_seq is None:
+                ledger.append(Event(
+                    project=project, kind="approval.used",
+                    actor_kind="owner", actor_id="owner", attempt_id=attempt_id,
+                    payload={"approval_id": approval.approval_id},
+                ))
+        cancelled.append(request.request_id)
+    return cancelled
+
+
 __all__ = [
     "head_sha", "is_fast_forwardable", "master_dirty_tracked_paths",
     "master_untracked_paths", "master_untracked_or_ignored_paths",
     "master_is_clean", "merge_range_paths", "incoming_added_paths",
     "overlapping_paths", "ff_merge", "build_summary",
-    "prepare", "approve_and_run", "ensure_full_bench",
+    "prepare", "approve_and_run", "ensure_full_bench", "cancel_pending_publish",
 ]

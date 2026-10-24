@@ -293,6 +293,36 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
     }
 
 
+def _setup_release_job_with_failing_full_bench(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """Builds on _setup_release_job, then invalidates its pre-recorded
+    PASSING "full" bench evidence and reconfigures the project's
+    test_cmd to genuinely fail -- so a later `gb2 ship`'s own
+    ensure_full_bench call cannot trust stale evidence and actually
+    re-runs (and fails) the full suite, the exact precondition the
+    ordering-bug regression tests below need."""
+    from engine.evidence import invalidate_after
+
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    workspace = job["config"].ledger_path.parent
+    failing_project = replace(
+        job["config"].projects["demo"],
+        test_cmd=(sys.executable, "-c", "import sys; sys.exit(1)"),
+    )
+    failing_config = replace(
+        job["config"], projects={**job["config"].projects, "demo": failing_project},
+    )
+    failing_config = write_json(failing_config, workspace / "config.json")
+
+    ledger = Ledger.open(failing_config.ledger_path)
+    invalidate_after(ledger, "demo", job["attempt_id"], ("bench",))
+    ledger.close()
+
+    job["config"] = failing_config
+    return job
+
+
 def _force_tty_approval(monkeypatch: pytest.MonkeyPatch, owner_text: str) -> None:
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": owner_text)
@@ -362,11 +392,84 @@ def test_skip_ship_abandons_publish_without_deploy_and_closes(
     ledger = Ledger.open(job["config"].ledger_path)
     req = ledger.request(job["request_id"])
     assert req.status == "failed"
-    assert req.result == {"reason": "no_approval"}
+    # cancel_pending_publish fails it outright before the queue ever
+    # drains -- "no_approval" would also have been the outcome here
+    # (nothing ever granted an approval), but skip-ship no longer
+    # relies on that happening naturally.
+    assert req.result == {"reason": "skip_ship"}
     assert ledger.project("demo").state == "CLOSED"
     ledger.close()
     assert not job["deploy_log"].exists()
     assert release.head_sha(job["source_repo"]) != job["sha"]
+
+
+# ---------------------------------------------------------------------------
+# P0 regression: a ship whose full test suite fails must leave NOTHING a
+# later `gb2 skip-ship`/`gb2 fix` queue drain could ever dispatch and
+# deploy -- the exact ordering bug engine.release.approve_and_run used to
+# have (grant() before ensure_full_bench).
+# ---------------------------------------------------------------------------
+
+def test_ship_full_bench_failure_then_skip_ship_never_deploys_and_closes(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine import release
+
+    job = _setup_release_job_with_failing_full_bench(gb2, tmp_path, monkeypatch)
+    master_before = release.head_sha(job["source_repo"])
+    _force_tty_approval(monkeypatch, f"승인 {job['request_id']}")
+
+    code_ship = gb2.main(["ship", "demo"])
+
+    assert code_ship == 3
+    assert not job["deploy_log"].exists()
+    ledger = Ledger.open(job["config"].ledger_path)
+    req = ledger.request(job["request_id"])
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_failed"}
+    assert ledger.approvals_for(job["request_id"]) == []  # never granted
+    ledger.close()
+
+    code_skip = gb2.main(["skip-ship", "demo"])
+
+    assert code_skip == 0
+    assert not job["deploy_log"].exists()  # publisher called 0 times, start to finish
+    ledger = Ledger.open(job["config"].ledger_path)
+    assert ledger.request(job["request_id"]).status == "failed"
+    assert ledger.project("demo").state == "CLOSED"
+    ledger.close()
+    assert release.head_sha(job["source_repo"]) == master_before  # master unchanged
+
+
+def test_ship_full_bench_failure_then_simulated_fix_drain_never_deploys(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same scenario, but instead of `gb2 skip-ship`, simulates the
+    queue-drain `gb2 fix` (engine.fixup.fix) ends up performing: a
+    fresh Processor's run_once over the whole project queue."""
+    from engine import release
+
+    job = _setup_release_job_with_failing_full_bench(gb2, tmp_path, monkeypatch)
+    master_before = release.head_sha(job["source_repo"])
+    _force_tty_approval(monkeypatch, f"승인 {job['request_id']}")
+
+    code_ship = gb2.main(["ship", "demo"])
+    assert code_ship == 3
+    assert not job["deploy_log"].exists()
+
+    ledger = Ledger.open(job["config"].ledger_path)
+    fakes = gb2._build_fakes(job["config"], "demo", job["attempt_id"], None)
+    proc = Processor(job["config"], ledger, fakes)
+    proc.register_defaults()
+    n = proc.run_once("demo")
+
+    assert n == 0  # nothing left queued -- `ship` already failed it outright
+    req = ledger.request(job["request_id"])
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_failed"}
+    ledger.close()
+    assert not job["deploy_log"].exists()  # publisher called 0 times
+    assert release.head_sha(job["source_repo"]) == master_before  # master unchanged
 
 
 def test_sync_rebases_worktree_onto_current_master(
@@ -864,6 +967,115 @@ def test_resolve_refuses_while_process_group_still_alive(
     ledger = Ledger.open(job["config"].ledger_path)
     assert ledger.request(job["request_id"]).status == "unknown"
     ledger.close()
+
+
+def test_resolve_handles_a_publish_left_running_by_a_ctrl_c_interrupt(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A KeyboardInterrupt hitting `gb2 ship` while it waits on the
+    deploy (e.g. the owner hitting ctrl-C) leaves the LEDGER's own
+    request status 'running' -- the interrupt escapes run_once/
+    approve_and_run untouched, never caught as a terminal/unknown
+    status -- even though ShellPublisher's own receipt already says
+    "unknown" (engine.publishers.ShellPublisher's own KeyboardInterrupt
+    handling). `gb2 resolve` must still find and resolve this, not
+    just a request the ledger itself already marked 'unknown', and
+    must never re-run the real deploy command."""
+    import subprocess as subprocess_module
+
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    check_log = tmp_path / "check.log"
+    check_script = tmp_path / "logging_check.py"
+    check_script.write_text(
+        f"import sys\nopen({str(check_log)!r}, 'w').write('ran')\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    config = replace(job["config"], publisher_dry_run_argv=(sys.executable, str(check_script)))
+    config = write_json(config, job["config"].ledger_path.parent / "config.json")
+    job["config"] = config
+
+    ledger = Ledger.open(config.ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+
+    # Interrupt only the ONE Popen that is the real deploy dispatch
+    # itself (ShellPublisher.publish's own Popen(argv).communicate())
+    # -- every earlier git subprocess call this run_once also makes
+    # (check_artifact, advance_master, ...) must run normally.
+    original_communicate = subprocess_module.Popen.communicate
+    deploy_marker = str(job["config"].publisher_argv[1])  # the fake deploy script's own path
+    state = {"interrupted": False}
+
+    def fake_communicate(self, *args, **kwargs):
+        argv = [str(a) for a in self.args] if isinstance(self.args, (list, tuple)) else []
+        if not state["interrupted"] and deploy_marker in argv:
+            state["interrupted"] = True
+            # Let the (near-instant) fake deploy script actually finish
+            # writing before the simulated ctrl-C lands -- communicate()
+            # itself is what we're interrupting, not the real subprocess.
+            self.wait(timeout=1)
+            raise KeyboardInterrupt()
+        return original_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess_module.Popen, "communicate", fake_communicate)
+
+    fakes = gb2._build_fakes(config, "demo", job["attempt_id"], None)
+    proc = Processor(config, ledger, fakes)
+    proc.register_defaults()
+    with pytest.raises(KeyboardInterrupt):
+        proc.run_once("demo")
+
+    req = ledger.request(job["request_id"])
+    assert req.status == "running"  # never flipped to a terminal/unknown status
+    receipt_path = config.home / "publish" / f"{job['request_id']}.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "unknown"  # ShellPublisher's own interrupt handling
+    ledger.close()
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "not deployed")
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 0
+    assert check_log.exists()  # the check command DID run (just to inform the owner)
+    ledger = Ledger.open(config.ledger_path)
+    assert ledger.request(job["request_id"]).status == "failed"
+    assert ledger.project("demo").state == "CLOSED"
+    ledger.close()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    # the deploy script ran exactly once in total -- the dispatch
+    # ShellPublisher.publish started before the interrupt -- resolve
+    # never re-ran it.
+    assert job["deploy_log"].read_text(encoding="utf-8") == "demo"
+
+
+def test_resolve_refuses_while_a_live_processor_holds_the_project_lock(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A publish request left 'running' must NOT be treated as
+    resolvable while some OTHER live processor could still be the one
+    mid-dispatching it -- _project_lock_is_free must see a live holder
+    and refuse before ever looking at the receipt's pgid."""
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    ledger = Ledger.open(job["config"].ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+    ledger.append(gb2.Event(
+        project="demo", kind="request.status", actor_kind="processor",
+        actor_id="p", attempt_id=job["attempt_id"],
+        payload={"request_id": job["request_id"], "status": "running", "result": {}},
+    ))
+    assert ledger.acquire_lock("demo", "some-other-live-processor") is True
+    ledger.close()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    code = gb2.main(["resolve", "demo"])
+
+    assert code == 1
+    ledger = Ledger.open(job["config"].ledger_path)
+    assert ledger.request(job["request_id"]).status == "running"  # untouched
+    ledger.close()
+    assert not job["deploy_log"].exists()
 
 
 def test_resolve_deployed_requires_check_command_to_pass(

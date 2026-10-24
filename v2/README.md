@@ -43,7 +43,7 @@ tools/gb2 run <app> "<할 일>"           # 한 건을 궤도 끝까지 (검수�
 tools/gb2 diff <app>                     # 결과 확인
 tools/gb2 fix <app> ["추가 지시"]         # 검수·시험에서 실패한 일을 이어서 고치기(작업 유지)
 tools/gb2 ship <app>                     # 같은 커밋 전체 시험 1회 → 승인 문구 입력 → master 빨리감기 + 배포
-tools/gb2 resolve <app>                  # 배포 결과가 불명확할 때 확인 명령으로 보고 대표가 결과를 기록(재배포 안 함)
+tools/gb2 resolve <app>                  # 배포 결과가 불명확할 때 확인 명령으로 보고 사람이 결과를 기록(재배포 안 함)
 ```
 
 설정 형식과 규칙 전체는 `ENGINE.md`.

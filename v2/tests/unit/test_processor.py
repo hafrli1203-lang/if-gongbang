@@ -648,6 +648,59 @@ def test_retry_unknown_only_for_unknown(workspace) -> None:
     assert ledger.request(rid).status == "running"
 
 
+def test_cancel_request_fails_a_queued_request_without_dispatching_it(workspace) -> None:
+    """cancel_request moves a QUEUED request straight to 'failed' with
+    the given reason -- it never runs process(), so there is nothing
+    for a step's run() to dispatch."""
+    from engine.processor import cancel_request
+
+    ledger = workspace.ledger
+    attempt_id = open_job(workspace.config, ledger, "alpha", "job", "full", roles=())
+    rid = submit(ledger, "alpha", attempt_id, "publish",
+                 {"target": "t", "artifact_hash": "deadbeef"}, "owner")
+    assert ledger.request(rid).status == "queued"
+
+    cancel_request(ledger, "alpha", rid, "full_bench_failed")
+
+    req = ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_failed"}
+
+
+def test_cancel_request_refuses_a_non_queued_request(workspace) -> None:
+    """A 'running' request may already be mid-dispatch (no external-
+    effect dispatch step a plain status flip could safely interrupt),
+    and a terminal one has nothing left to cancel -- either way,
+    cancel_request raises CancelError and appends no event."""
+    from engine.processor import CancelError, cancel_request
+
+    ledger = workspace.ledger
+    attempt_id = open_job(workspace.config, ledger, "alpha", "job", "full", roles=())
+    rid = submit(ledger, "alpha", attempt_id, "publish",
+                 {"target": "t", "artifact_hash": "deadbeef"}, "owner")
+    ledger.append(Event("alpha", "request.status", "processor", "p", attempt_id,
+                        {"request_id": rid, "status": "running", "result": {}}))
+    before = ledger.request(rid)
+
+    with pytest.raises(CancelError):
+        cancel_request(ledger, "alpha", rid, "full_bench_failed")
+
+    assert ledger.request(rid) == before  # no mutation at all
+
+
+def test_cancel_request_refuses_a_request_belonging_to_another_project(workspace) -> None:
+    from engine.processor import CancelError, cancel_request
+
+    ledger = workspace.ledger
+    attempt_id = open_job(workspace.config, ledger, "beta", "job", "full", roles=())
+    rid = submit(ledger, "beta", attempt_id, "report", {"summary": "x"}, "owner")
+
+    with pytest.raises(CancelError):
+        cancel_request(ledger, "alpha", rid, "x")
+
+    assert ledger.request(rid).status == "queued"
+
+
 def test_run_request_rejects_mismatched_project_before_any_mutation(workspace) -> None:
     """run_request(project, request_id) must refuse outright, with no
     ledger mutation and no lock acquired on either project, when

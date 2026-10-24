@@ -256,6 +256,29 @@ class ShellPublisher:
                 "returncode": None, "tail": tail, **self._run_identity(process.pid),
             })
             raise PublisherCrashed(key)
+        except BaseException:
+            # KeyboardInterrupt (an owner hitting ctrl-C while `gb2
+            # ship` is waiting on the deploy), or any other exception
+            # escaping communicate() -- we cannot tell whether the
+            # command already finished (or even already succeeded), so
+            # the receipt must become "unknown", never "failed"/"done".
+            # Best-effort terminate the whole group (same helper the
+            # timeout path uses) so the deploy doesn't keep running
+            # unsupervised, then re-raise so the interrupt still
+            # actually interrupts the caller.
+            _terminate_process_group(process)
+            try:
+                process.communicate(timeout=_KILL_GRACE_SEC)
+            except Exception:  # noqa: BLE001 - best effort only, never swallow re-raise
+                pass
+            self._write_receipt(key, {
+                "key": key, "target": target, "artifact_hash": artifact_hash,
+                "dry_run": self.dry_run, "status": "unknown",
+                "started_ts": started_ts, "ended_ts": time.time(),
+                "returncode": None, "tail": "interrupted",
+                **self._run_identity(process.pid),
+            })
+            raise
 
         self._write_receipt(key, {
             "key": key, "target": target, "artifact_hash": artifact_hash,

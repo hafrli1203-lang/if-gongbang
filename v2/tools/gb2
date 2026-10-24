@@ -82,6 +82,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 _ENGINE_ROOT = Path(__file__).resolve().parent.parent
@@ -91,7 +92,7 @@ from engine import evidence, fixup, orbit, release  # noqa: E402
 from engine.cli import _build_fakes, _drain, _job_name_for_attempt, _outcome_dict  # noqa: E402
 from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
 from engine.config import EngineConfig  # noqa: E402
-from engine.ledger import Ledger  # noqa: E402
+from engine.ledger import Event, Ledger  # noqa: E402
 from engine.processor import retry_unknown  # noqa: E402
 from engine.publishers import ShellPublisher  # noqa: E402
 from engine.steps.open_job import open_job  # noqa: E402
@@ -643,6 +644,22 @@ def _find_unknown_publish(ledger: Ledger, project: str) -> tuple[str, str, str, 
     return None
 
 
+def _find_latest_publish_for_attempt(ledger: Ledger, project: str,
+                                      attempt_id: str) -> str | None:
+    """request_id of the most recently SUBMITTED 'publish' request for
+    `attempt_id`, regardless of its current status -- unlike
+    _find_pending_publish/_find_unknown_publish (one particular status
+    bucket each), this also finds one `gb2 ship` already cancelled
+    (failed) after a full-bench failure, so `gb2 skip-ship` can still
+    finish report -> close for that same attempt afterward. None if
+    this attempt never submitted a 'publish' request at all."""
+    latest: str | None = None
+    for _seq, event in ledger.events(project, "request.submitted"):
+        if event.attempt_id == attempt_id and event.payload.get("kind") == "publish":
+            latest = str(event.payload["request_id"])
+    return latest
+
+
 def _err_json(message: str, code: int) -> int:
     print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
     return code
@@ -658,8 +675,13 @@ def cmd_ship(args: argparse.Namespace) -> int:
     deploy) to a terminal status; only on "done" does this continue the
     job with report -> close (orbit.release_followup_stages). A wrong
     line, a non-TTY shell, or the publish ending anywhere but "done"
-    all leave the job's project OPEN with the request still resolved
-    (or, for a wrong line, still queued) for a later retry."""
+    all leave the job's project OPEN for a later retry. The one
+    exception: if the approval step itself refused because the full
+    test suite failed ("full_bench_failed"), the request is NOT left
+    queued -- release.cancel_pending_publish fails it outright (and
+    revokes any approval, though approve_and_run never grants one in
+    that case) so a later `gb2 skip-ship`/`gb2 fix` queue drain can
+    never pick this exact stale request back up and deploy it."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
@@ -693,6 +715,8 @@ def cmd_ship(args: argparse.Namespace) -> int:
             config, ledger, fakes, args.app, request_id, owner_text,
         )
         if publish_outcome["status"] != "done":
+            if publish_outcome.get("reason") == "full_bench_failed":
+                release.cancel_pending_publish(ledger, args.app, attempt_id, "full_bench_failed")
             print(json.dumps(publish_outcome, ensure_ascii=False))
             return 3
 
@@ -712,22 +736,42 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
 
 def cmd_skip_ship(args: argparse.Namespace) -> int:
-    """Abandon the pending publish request without ever granting it an
-    approval (processing it with none queued simply fails it
-    "no_approval" -- the same check_approval step every publish request
-    goes through, not a separate code path) and finish the job with
-    report -> close."""
+    """Abandon the pending publish request and finish the job with
+    report -> close. Before continuing, release.cancel_pending_publish
+    fails any still-QUEUED publish request of this attempt outright
+    (and revokes any of its unused approvals) -- a belt-and-suspenders
+    guarantee that this attempt's publish request can never be picked
+    up and deployed by anything running later, rather than relying
+    solely on the ordinary queue-drain's check_approval step to fail
+    it "no_approval" on its own. If `gb2 ship` already cancelled this
+    attempt's one publish request itself (its own full-bench-failure
+    path), there is nothing left to cancel here -- this still finds
+    that same attempt (via its now-terminal publish request) and
+    finishes report -> close for it."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
     config = EngineConfig.from_json(config_path)
+    project_config = config.projects[args.app]
 
     ledger = Ledger.open(config.ledger_path)
     try:
         pending = _find_pending_publish(ledger, args.app)
-        if pending is None:
+        if pending is not None:
+            request_id, attempt_id, _artifact_hash, _target = pending
+        elif project_config.release is not None:
+            project_row = ledger.project(args.app)
+            attempt_id = project_row.current_attempt_id
+            request_id = (
+                _find_latest_publish_for_attempt(ledger, args.app, attempt_id)
+                if attempt_id is not None else None
+            )
+            if attempt_id is None or request_id is None:
+                return _err_json("no_pending_publish_request", 1)
+        else:
             return _err_json("no_pending_publish_request", 1)
-        request_id, attempt_id, _artifact_hash, _target = pending
+
+        cancelled = release.cancel_pending_publish(ledger, args.app, attempt_id, "skip_ship")
 
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
         fakes = _build_fakes(config, args.app, attempt_id, None)
@@ -735,8 +779,10 @@ def cmd_skip_ship(args: argparse.Namespace) -> int:
         outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
     finally:
         ledger.close()
-    print(json.dumps({"skipped_request_id": request_id, **_outcome_dict(outcome)},
-                     ensure_ascii=False))
+    print(json.dumps({
+        "skipped_request_id": request_id, "cancelled_request_ids": cancelled,
+        **_outcome_dict(outcome),
+    }, ensure_ascii=False))
     return 0 if outcome.status == "done" else 3
 
 
@@ -744,19 +790,59 @@ def _check_argv(config: EngineConfig, target: str) -> list[str]:
     return [part.format(target=target) for part in config.publisher_dry_run_argv]
 
 
+def _project_lock_is_free(ledger: Ledger, project: str) -> bool:
+    """True iff no LIVE processor currently holds this project's lock.
+    Reuses acquire_lock's own pid-liveness reclaim (a dead holder's row
+    is reclaimed, not just reported busy) instead of reimplementing it,
+    then immediately releases whatever it just (re)acquired -- this
+    check never actually keeps the lock for itself."""
+    probe = f"gb2-resolve-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    if not ledger.acquire_lock(project, probe):
+        return False
+    ledger.release_lock(project, probe)
+    return True
+
+
+def _find_running_publish(ledger: Ledger, project: str,
+                          publisher: "ShellPublisher") -> tuple[str, str, str, str] | None:
+    """Same shape as _find_pending_publish, for a 'publish' request
+    left 'running' -- or still 'queued' with an existing receipt
+    already on disk, which can only happen if call_publisher's run()
+    actually fired before the request's own status flip was ever
+    observed -- by a KeyboardInterrupt (or any other crash) that hit
+    while ShellPublisher.publish was dispatching it. Pure read: never
+    mutates the ledger; `cmd_resolve` only marks a request found this
+    way 'unknown' once it has ALSO confirmed (via _project_lock_is_free
+    and the receipt's own pgid) that nothing could still be running
+    it."""
+    for row in ledger.queued_requests(project):  # queued OR running
+        if row.kind != "publish":
+            continue
+        if row.status == "running" or publisher.lookup(row.request_id) is not None:
+            return (row.request_id, row.attempt_id,
+                    str(row.payload.get("artifact_hash", "")),
+                    str(row.payload.get("target", "")))
+    return None
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     """For a publish request stuck "unknown" (engine.publishers.
     ShellPublisher could not determine whether the deploy actually
-    happened): show the receipt, refuse outright if the receipt's own
-    recorded process group is still alive (never ask the owner to
-    guess while it might still be running), run the publisher's own
-    check command (dry_run_argv, e.g. "deploy.sh <app> --check"), and
-    require the owner -- on a TTY only -- to say "deployed" or "not
-    deployed". "deployed" is accepted only if the check command itself
-    exited 0; "not deployed" is always accepted. Either answer
-    REWRITES THE RECEIPT only (to "done" or "failed") and lets
-    retry_unknown/the ordinary reconcile path take it from there --
-    this never re-runs the real deploy command itself. Once the
+    happened) -- OR one left "running" (or still "queued" with a
+    receipt already on disk) by a KeyboardInterrupt that hit `gb2
+    ship` while it was waiting on the deploy, confirmed by
+    _project_lock_is_free (no live processor still holds the project's
+    lock) that nothing could still be mid-dispatch for it: show the
+    receipt, refuse outright if the receipt's own recorded process
+    group is still alive (never ask the owner to guess while it might
+    still be running), run the publisher's own check command
+    (dry_run_argv, e.g. "deploy.sh <app> --check"), and require the
+    owner -- on a TTY only -- to say "deployed" or "not deployed".
+    "deployed" is accepted only if the check command itself exited 0;
+    "not deployed" is always accepted. Either answer REWRITES THE
+    RECEIPT only (to "done" or "failed") and lets retry_unknown/the
+    ordinary reconcile path take it from there -- this never re-runs
+    the real deploy command itself, and never redeploys. Once the
     request leaves "unknown", the job continues with report -> close
     (orbit.release_followup_stages), same as ship/skip-ship."""
     config_path = app_workspace(args.app) / "config.json"
@@ -771,17 +857,26 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
     ledger = Ledger.open(config.ledger_path)
     try:
-        pending = _find_unknown_publish(ledger, args.app)
-        if pending is None:
-            return _err_json("no_unknown_publish_request", 1)
-        request_id, attempt_id, _artifact_hash, target = pending
-
         publisher = ShellPublisher(
             argv_template=config.publisher_argv,
             dry_run_argv_template=config.publisher_dry_run_argv,
             receipts_dir=config.home / "publish",
             timeout_sec=config.publisher_timeout_sec, dry_run=config.publisher_dry_run,
         )
+
+        pending = _find_unknown_publish(ledger, args.app)
+        already_unknown = pending is not None
+        if pending is None:
+            if not _project_lock_is_free(ledger, args.app):
+                return _err_json(
+                    "refused: project is locked by a live processor -- wait for "
+                    "it to finish, then run `gb2 resolve` again", 1,
+                )
+            pending = _find_running_publish(ledger, args.app, publisher)
+        if pending is None:
+            return _err_json("no_unknown_publish_request", 1)
+        request_id, attempt_id, _artifact_hash, target = pending
+
         receipt = publisher.lookup(request_id)
         if receipt is None:
             return _err_json("no_receipt_for_request", 1)
@@ -800,6 +895,18 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 return _err_json(
                     f"refused: could not confirm process group {pgid} is gone", 1,
                 )
+
+        if not already_unknown:
+            # Confirmed above: no live processor holds the lock, and
+            # the receipt's own process group is gone -- safe to move
+            # this out of 'running' so the rest of this flow (identical
+            # to the ordinary stuck-unknown path) can take it from here.
+            ledger.append(Event(
+                project=args.app, kind="request.status", actor_kind="owner",
+                actor_id="owner", attempt_id=attempt_id,
+                payload={"request_id": request_id, "status": "unknown",
+                         "result": {"reason": "interrupted"}},
+            ))
 
         check_argv = _check_argv(config, target)
         check_result = subprocess.run(check_argv, capture_output=True, text=True)

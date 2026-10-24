@@ -114,6 +114,51 @@ def test_publish_timeout_raises_publisher_crashed(tmp_path: Path) -> None:
     assert receipt["tail"] == "publish_timeout"
 
 
+def test_publish_keyboard_interrupt_during_wait_marks_receipt_unknown_and_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ctrl-C (or any other exception) landing while publish() is
+    blocked in process.communicate() must never leave the receipt
+    claiming "done" or "failed" -- we genuinely don't know whether the
+    deploy already finished. It must become "unknown" (so `gb2
+    resolve` decides the real outcome later), the whole process group
+    must be terminated so the deploy doesn't keep running
+    unsupervised, and the interrupt itself must still propagate (never
+    swallowed)."""
+    import subprocess as subprocess_module
+
+    sleeper = _write_sleeper(tmp_path)
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(sleeper), "5"),
+        dry_run_argv_template=(sys.executable, str(sleeper), "5"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=False, timeout_sec=5,
+    )
+    original_communicate = subprocess_module.Popen.communicate
+    calls = {"n": 0}
+
+    def fake_communicate(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt()
+        return original_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess_module.Popen, "communicate", fake_communicate)
+
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(key="R-int", target="search", artifact_hash="f" * 40)
+
+    receipt = publisher.lookup("R-int")
+    assert receipt is not None
+    assert receipt["status"] == "unknown"
+    assert receipt["tail"] == "interrupted"
+    assert receipt["returncode"] is None
+    pgid = receipt["pgid"]
+    assert isinstance(pgid, int)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)  # confirmed gone -- _terminate_process_group ran
+
+
 def test_lookup_returns_none_before_any_publish(tmp_path: Path) -> None:
     publisher = ShellPublisher(
         argv_template=(), dry_run_argv_template=(), receipts_dir=tmp_path / "receipts",

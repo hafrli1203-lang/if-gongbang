@@ -434,6 +434,153 @@ def test_fix_continues_a_failed_bench_keeping_the_earlier_change_and_adding_the_
     assert bench_rows[-1].payload["passed"] is True
 
 
+# ---------------------------------------------------------------------
+# fix after a failed fix: the new attempt itself crashes before its own
+# merge ever completes, but an earlier attempt's archive still holds
+# real merged work.
+# ---------------------------------------------------------------------
+
+def _crashing_run_station_processor_factory():
+    """A processor_factory whose run_station always fails outright
+    (StepFailed), simulating a builder crash -- never reaching merge."""
+    def _run(ctx: StepContext) -> dict[str, object]:
+        raise StepFailed("builder_crashed")
+
+    def _reconcile(ctx: StepContext) -> bool:
+        return False
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", lambda ctx: [StepDef("record_station", _run, _reconcile)])
+        return proc
+    return factory
+
+
+def test_fix_after_a_failed_fix_continues_from_the_latest_archive(
+    workspace: Workspace,
+) -> None:
+    """attempt1 fails at review (merge already landed docs/notes.md).
+    fix() #1 opens attempt2, seeded from attempt1's archive -- but
+    attempt2's OWN builder crashes before merge ever runs again, so
+    attempt2's own close archives nothing. fix() #2 must still find
+    attempt1's archive (carried forward through attempt2, which never
+    re-merged anything) and continue from it, never losing the first
+    change, keeping the owner's own pre-existing dirty file untouched,
+    and adding the real fix on top."""
+    ws = _sample_workspace(workspace, variant=2)
+    owner_dirty = ws.alpha / "OWNER_DIRTY.txt"
+    owner_dirty.write_text("owner's own in-progress edit\n", encoding="utf-8")
+
+    attempt1 = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                        "full", ("builder", "reviewer"))
+    stages1 = orbit.default_stages(
+        ws.config, attempt1, "builder", "reviewer",
+        "investigate the initials bug", "fix-initials",
+    )
+    findings = [{"severity": "P1", "summary": "missing null check"}]
+    outcome1 = orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt1, stages1,
+        processor_factory=_processor_factory(review_passed=False, review_findings=findings),
+    )
+    assert outcome1.status == "failed"
+    assert outcome1.completed == ("run_station", "merge")
+    notes = ws.alpha / "docs" / "notes.md"
+    assert notes.read_text(encoding="utf-8") == "investigating the bug\n"
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes()
+
+    # fix #1: the new attempt's own builder crashes before merge.
+    result1 = fixup.fix(
+        ws.config, ws.ledger, "alpha", "", fakes_for,
+        processor_factory=_crashing_run_station_processor_factory(),
+    )
+    assert result1.old_attempt_id == attempt1
+    attempt2 = result1.new_attempt_id
+    assert result1.outcome.status == "failed"
+    assert result1.outcome.completed == ()
+    assert ws.ledger.project("alpha").state == "OPEN"
+    assert ws.ledger.attempt(attempt2).status == "active"
+    # attempt1's close already archived+reset the real repo (notes.md is
+    # not expected to be there again until a later merge lands it) --
+    # but its own change did survive, overlaid into attempt2's builder
+    # copy, never discarded.
+    assert (copy_root(ws.config, attempt2, "builder") / "docs" / "notes.md").read_text(
+        encoding="utf-8") == "investigating the bug\n"
+    assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
+
+    # find_fix_target must now accept attempt2 (failed at run_station,
+    # its own merge never completed) by walking back to attempt1's
+    # still-real archive, and must carry attempt1's review findings
+    # forward since attempt2 never got far enough to produce its own.
+    target2 = fixup.find_fix_target(ws.ledger, "alpha")
+    assert target2.attempt_id == attempt2
+    assert target2.failing_kind == "run_station"
+    assert target2.carried_archive is not None
+    assert target2.review_findings == findings
+    assert "investigate the initials bug" in target2.original_task
+
+    # fix #2: a normal, successful fix.
+    result2 = fixup.fix(
+        ws.config, ws.ledger, "alpha", "second extra note", fakes_for,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+    assert result2.old_attempt_id == attempt2
+    assert result2.outcome.status == "done"
+    assert "second extra note" in result2.task
+    assert "missing null check" in result2.task
+    assert ws.ledger.project("alpha").state == "CLOSED"
+
+    # the first change (attempt1's) is still there...
+    assert notes.read_text(encoding="utf-8") == "investigating the bug\n"
+    # ...the real fix landed on top of it...
+    fixed_src = (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
+    assert fixed_src == _INIT_PY_FIXED
+    # ...and the owner's own pre-existing dirty file was never touched.
+    assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
+
+
+def test_fix_cancels_any_pending_publish_for_the_attempt_it_replaces(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """engine.release.cancel_pending_publish is expected to land in a
+    sibling change with this exact signature -- fixup.fix() must call it
+    (guarded via getattr, since this checkout may not have it yet) for
+    the OLD attempt BEFORE close_failed_attempt's own processor.run_once
+    could otherwise dispatch a stale queued publish request as a side
+    effect of just closing that attempt."""
+    import engine.release as release_module
+
+    ws = _sample_workspace(workspace, variant=2)
+    attempt1 = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                        "full", ("builder", "reviewer"))
+    stages1 = orbit.default_stages(
+        ws.config, attempt1, "builder", "reviewer",
+        "investigate the initials bug", "fix-initials",
+    )
+    orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt1, stages1,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+
+    calls: list[tuple[object, str, str, str]] = []
+
+    def _spy(ledger_, project, attempt_id, reason):
+        calls.append((ledger_, project, attempt_id, reason))
+        return []
+
+    monkeypatch.setattr(release_module, "cancel_pending_publish", _spy, raising=False)
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes()
+
+    fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+             processor_factory=_processor_factory(review_passed=True))
+
+    assert calls == [(ws.ledger, "alpha", attempt1, "superseded_by_fix")]
+
+
 def test_original_task_returns_the_run_station_task_text() -> None:
     """The after-install resume path rebuilds its stage list without the
     caller holding the task; original_task must recover it so the

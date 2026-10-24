@@ -66,6 +66,10 @@ class RetryError(Exception):
     """retry_unknown() called on a request that is not 'unknown'."""
 
 
+class CancelError(Exception):
+    """cancel_request() called on a request that is not 'queued'."""
+
+
 class StepFailed(Exception):
     """A step determined the request cannot succeed. str(exc) is the reason
     recorded on the request (status 'failed')."""
@@ -518,6 +522,39 @@ def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
                   "payload": current_payload},
     ))
     return current_rid
+
+
+def cancel_request(ledger: Ledger, project: str, request_id: str, reason: str) -> None:
+    """Move a request straight to 'failed' (result {"reason": reason}),
+    WITHOUT ever letting it dispatch -- the owner-facing counterpart of
+    a step raising StepFailed, used when a request must be taken off
+    the table entirely (e.g. its approval is about to be revoked, or
+    the commit it targets is known bad) rather than left for the
+    ordinary queue drain to resolve on its own.
+
+    Refuses (CancelError, no event appended) unless the request's
+    status is exactly 'queued': a 'running' request may already be
+    mid-dispatch (there is no external-effect dispatch step a plain
+    status flip could safely interrupt -- see
+    engine.publishers.ShellPublisher's own "never redispatch an
+    unresolved outcome" contract), and a request already
+    'done'/'failed'/'unknown' has nothing left to cancel. Also refuses
+    if `request_id` does not actually belong to `project` -- same
+    mismatched-pair guard Processor.run_request applies."""
+    request = ledger.request(request_id)
+    if request.project != project:
+        raise CancelError(
+            f"request {request_id} belongs to project {request.project!r}, "
+            f"not {project!r}"
+        )
+    if request.status != "queued":
+        raise CancelError(f"request {request_id} is {request.status!r}, not queued")
+    ledger.append(Event(
+        project=project, kind="request.status", actor_kind="owner",
+        actor_id="owner", attempt_id=request.attempt_id,
+        payload={"request_id": request_id, "status": "failed",
+                 "result": {"reason": reason}},
+    ))
 
 
 def retry_unknown(ledger: Ledger, request_id: str, actor_id: str) -> None:

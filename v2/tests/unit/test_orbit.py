@@ -582,6 +582,47 @@ def test_job_metrics_recorded_at_report_with_durations_and_bench_counts(
     assert isinstance(payload["git_calls"], int) and payload["git_calls"] > 0
 
 
+def test_bench_failure_records_job_metrics_with_outcome_and_failed_stage(
+    workspace: Workspace,
+) -> None:
+    """A stage failure stops the job before 'report' (the only place
+    _record_job_metrics used to fire) ever runs. Without a job.metrics
+    event recorded at the early return itself, this attempt would end up
+    with NO job.metrics event at all -- losing run_station/merge/
+    review's own timings, not just bench's -- for anything that reads
+    them back (gb2 log). parallel_review_bench is disabled here so
+    review and bench show up as their own separate durations_ms entries
+    (the sequential per-stage path), not merged into one
+    "review+bench(parallel)" bucket."""
+    config = replace(workspace.config, parallel_review_bench=False)
+    ws = _sample_workspace(replace(workspace, config=config), variant=2)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "metrics-on-failure",
+                          "full", ("builder", "reviewer"))
+    stages = orbit.default_stages(
+        ws.config, attempt_id, "builder", "reviewer",
+        "investigate the initials bug", "metrics-on-failure",
+    )
+
+    outcome = orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt_id, stages,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.completed == ("run_station", "merge", "review")
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "job.metrics")
+              if e.attempt_id == attempt_id]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["outcome"] == "failed"
+    assert payload["failed_stage"] == "bench"
+    for stage in ("run_station", "merge", "review", "bench"):
+        assert stage in payload["durations_ms"]
+    assert all(isinstance(v, (int, float)) and v >= 0 for v in payload["durations_ms"].values())
+    assert isinstance(payload["git_calls"], int) and payload["git_calls"] > 0
+
+
 def test_release_job_keeps_main_stage_durations_across_the_ship_stop(
     workspace: Workspace, tmp_path: Path,
 ) -> None:
