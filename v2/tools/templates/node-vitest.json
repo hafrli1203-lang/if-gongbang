@@ -24,7 +24,8 @@
         "npx",
         "vitest",
         "run",
-        "--no-color"
+        "--no-color",
+        "--no-cache"
       ],
       "bench_scope": "related",
       "related_cmd": [
@@ -33,6 +34,7 @@
         "related",
         "--run",
         "--no-color",
+        "--no-cache",
         "{files}"
       ],
       "builder_test_hint": "While editing, run only the tests related to the files you're changing (e.g. `npx vitest related --run <changed files>`), to get fast feedback. Run the full suite (`npx vitest run`) at most once, right before you finish.",

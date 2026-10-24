@@ -99,11 +99,12 @@ jobs:
         run: python -m pip install --upgrade pip pytest
       - name: Build a throwaway node_modules with vitest
         run: |
-          mkdir -p "$RUNNER_TEMP/gb2-node"
-          cd "$RUNNER_TEMP/gb2-node"
+          # Outside HOME and /tmp: both are hidden from sandboxed workers.
+          sudo mkdir -p /opt/gb2-node && sudo chown "$USER" /opt/gb2-node
+          cd /opt/gb2-node
           npm init -y >/dev/null
           npm install --no-audit --no-fund vitest@2
-          echo "GB2_TEST_NODE_MODULES=$RUNNER_TEMP/gb2-node/node_modules" >> "$GITHUB_ENV"
+          echo "GB2_TEST_NODE_MODULES=/opt/gb2-node/node_modules" >> "$GITHUB_ENV"
       - name: Run the real-command Node end-to-end test (must not skip)
         env:
           GB2_REQUIRE_T3: "1"
