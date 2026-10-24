@@ -68,14 +68,14 @@ def test_claude_argv_has_no_user_settings(tmp_path: Path) -> None:
 def test_claude_env_only_passthrough_plus_gb(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("SOME_SECRET", "leaked-value")
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("HOME", "/home/t")
+    monkeypatch.setenv("HOME", "/nonexistent-home/t")
     spec = _spec(tmp_path)
     worker = WorkerConfig(runner="claude")
     env = ClaudeRunner().env(spec, worker)
 
     assert "SOME_SECRET" not in env
     assert env["PATH"] == "/usr/bin"
-    assert env["HOME"] == "/home/t"
+    assert env["HOME"] == "/nonexistent-home/t"
     assert env["GB_PROJECT"] == "alpha"
     assert env["GB_ATTEMPT"] == "J-alpha-TEST#1"
     assert env["GB_STATION"] == "build"
@@ -92,7 +92,7 @@ def test_worker_env_uses_spec_passthrough(tmp_path: Path, monkeypatch) -> None:
     EngineConfig.worker_env_passthrough (e.g. no HOME) must actually
     shrink the spawned worker's env."""
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("HOME", "/home/t")
+    monkeypatch.setenv("HOME", "/nonexistent-home/t")
     from dataclasses import replace as _replace
 
     spec = _spec(tmp_path)

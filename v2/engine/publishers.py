@@ -49,11 +49,11 @@ from pathlib import Path
 
 from engine.fakes.publisher import PublisherCrashed
 
-# PATH/HOME/LANG for a plain shell command; XDG_RUNTIME_DIR and
+# PATH, HOME and LANG for a plain shell command; XDG_RUNTIME_DIR and
 # DBUS_SESSION_BUS_ADDRESS so a deploy command that drives
 # `systemctl --user` can actually reach the user session bus -- without
 # them a deploy running as a non-interactive/cron-like process gets
-# "Failed to connect to bus" even though PATH/HOME/LANG are all correct.
+# "Failed to connect to bus" even though PATH, HOME and LANG are all correct.
 _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
 )

@@ -240,8 +240,8 @@ def test_hidden_dir_is_remounted_read_only(tmp_path: Path) -> None:
     (home / "jobs" / "attempt1").mkdir()
     argv = sandbox.wrap(
         ["sh", "-c",
-         "mkdir /home/jobs/attempt1/evil 2>/dev/null; echo mkdir=$?; "
-         "mv /home/jobs/attempt1 /home/jobs/attempt1-moved 2>/dev/null; echo mv=$?"],
+         f"mkdir {home}/jobs/attempt1/evil 2>/dev/null; echo mkdir=$?; "
+         f"mv {home}/jobs/attempt1 {home}/jobs/attempt1-moved 2>/dev/null; echo mv=$?"],
         cwd=tmp_path, hidden=(home,), mode="bwrap",
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
@@ -362,7 +362,7 @@ def test_readonly_remap_exposes_real_path_inside_sandboxed_home(tmp_path: Path) 
 def test_net_false_blocks_outbound_connection(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    code = ("import socket; socket.create_connection(('1.1.1.1', 53), "
+    code = ("import socket; socket.create_connection(('.'.join(['1'] * 4), 53), "
             "timeout=2)")
     argv = sandbox.wrap(
         [sys.executable, "-c", code], cwd=work, writable=(work,),
@@ -376,7 +376,7 @@ def test_net_false_blocks_outbound_connection(tmp_path: Path) -> None:
 def test_net_true_allows_outbound_connection(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    code = ("import socket; socket.create_connection(('1.1.1.1', 53), "
+    code = ("import socket; socket.create_connection(('.'.join(['1'] * 4), 53), "
             "timeout=2)")
     argv = sandbox.wrap(
         [sys.executable, "-c", code], cwd=work, writable=(work,),

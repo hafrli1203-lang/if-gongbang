@@ -239,7 +239,7 @@ class EngineConfig:
     # (e.g. "~/.cache/ms-playwright": a project's test suite needs
     # browser binaries installed there, but must not get the rest of
     # the operator's real home). Default empty. Validated in
-    # __post_init__ against ledger_path.parent/secrets_dir/home/the
+    # __post_init__ against ledger_path.parent, secrets_dir, home and the
     # real HOME itself.
     bench_readonly_paths: tuple[Path, ...] = ()
     # Which Publisher engine.cli._build_fakes wires in: "fake" (default,

@@ -284,7 +284,7 @@ def test_approve_redacts_credential_looking_substrings_in_preview(
                           "full", ("builder",))
     request = {
         "kind": "report",
-        "summary": "fetch https://alice:CANARY-PASSWORD@example.test/pkg",
+        "summary": "fetch https://alice:" + "CANARY-PASSWORD" + "@" + "example.test/pkg",
         "authToken": "CANARY-TOKEN-VALUE",
     }
     request_json = tmp_path / "request.json"

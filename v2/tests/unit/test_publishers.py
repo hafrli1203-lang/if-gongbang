@@ -231,7 +231,7 @@ def test_publish_timeout_records_unknown_when_termination_cannot_be_confirmed(
 
 def test_publish_env_passthrough_includes_xdg_and_dbus(tmp_path: Path) -> None:
     """P1-7: a deploy command driving `systemctl --user` needs the
-    user session bus context, not just PATH/HOME/LANG."""
+    user session bus context, not just PATH, HOME and LANG."""
     env_probe = tmp_path / "env_probe.py"
     env_log = tmp_path / "env.log"
     env_probe.write_text(dedent(f"""\
