@@ -183,12 +183,13 @@ def _plan_json(job: str) -> str:
 
 
 def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stands in for s10-ops' own engine.app_security module (not yet
+    """Stands in for another change' own engine.app_security module (not yet
     merged into this worktree -- engine.full_orbit imports it lazily by
     name, right after handoff, same as engine.acceptance/engine.handoff
     above). Always reports passed=True here: T1/T2 are about the
     facts->plan->build->accept->handoff flow, not security findings."""
     security_mod = types.ModuleType("engine.app_security")
+    security_mod.record = lambda ledger, project, attempt_id, result: None  # type: ignore[attr-defined]
 
     def check(config, project, attempt_id, plan):
         return types.SimpleNamespace(passed=True, findings=(), ran=())
@@ -371,7 +372,7 @@ def test_new_app_facts_plan_two_tasks_and_handoff(
     report_text = report_path.read_text(encoding="utf-8")
     assert "s1" in report_text and "s2" in report_text
     assert "통과" in report_text
-    # s10 contract item 4: the 대조표 pairs requirement id <-> scene id,
+    # the 대조표 pairs requirement id <-> scene id,
     # not list position -- both requirements' own rows carry the scene
     # that actually covers them.
     assert "R1" in report_text and "scene:s1" in report_text

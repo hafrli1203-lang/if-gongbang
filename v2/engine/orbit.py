@@ -127,16 +127,29 @@ def fix_stages(config: EngineConfig, attempt_id: str, builder_role: str,
 
 def stages_after_install(config: EngineConfig, attempt_id: str, builder_role: str,
                          reviewer_role: str, job_name: str, task: str = "") -> list[Stage]:
-    """review(reviewer, task) -> bench -> commit -> report -> close. The
-    stage list a job resumes on after the owner submits an install a
-    station asked for -- deliberately starting at "review" (not
-    "bench"), since both review and bench evidence are invalidated by
-    an install (engine.steps.install.invalidate_evidence) and must be
-    redone, never resumed from a stale pre-install verdict. `task`
-    (the original request text, shown to the reviewer -- see
-    engine.steps.review) defaults to "" for a caller that resumes an
-    existing attempt without re-reading its own run_station request's
-    original task from the ledger first."""
+    """review(reviewer, task) -> bench -> commit -> report -> close --
+    deliberately starting at "review" (not "bench"), since both review
+    and bench evidence are invalidated by an install (engine.steps.
+    install.invalidate_evidence) and must be redone, never resumed from
+    a stale pre-install verdict.
+
+    This is the fixed TAIL every build-task stage list ends with:
+    default_stages() appends it straight after its own run_station+
+    merge for a fresh task, and engine.full_orbit's own STAGE_TASK_OWNER
+    resume appends it too -- but, once the station's own pending
+    request (e.g. an install) has actually been fulfilled, ONLY after
+    first putting a FRESH run_station (a continuation of the SAME
+    builder task, on the same attempt/copy, with a note that the
+    install is done and to pick up from where it stopped rather than
+    starting over) and its own merge in front of this tail. A builder
+    that stopped mid-task to ask for an install was never actually
+    finished -- merge having already landed whatever it wrote so far
+    (before it asked) does not change that, so jumping straight here
+    used to skip the rest of its own work entirely. `task` (the
+    original request text, shown to the reviewer -- see engine.steps.
+    review) defaults to "" for a caller that resumes an existing
+    attempt without re-reading its own run_station request's original
+    task from the ledger first."""
     return [
         Stage("review", {"role": reviewer_role, "task": task}),
         Stage("bench", {}),
@@ -195,13 +208,20 @@ def continue_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
                        processor_factory, on_progress)
 
 
-# A station worker that stalled or exited early is not "failed": its copy
-# still holds what it already did, so the same station runs again on that
-# copy with the original task plus a note listing the files already
-# changed. Only after MAX_STATION_CONTINUES such runs in a row does the job
-# stop -- as needs_owner ("worker_stuck"), not as a failure.
-CONTINUABLE_REASONS = frozenset({"worker_stalled", "worker_failed", "worker_timeout"})
+# A station worker that stalled, exited early, or reported a result the
+# engine could not parse (StepFailed("worker_reported_failure") -- see
+# engine.steps.station.record_station: the worker's own exit was fine,
+# but runner.parse_result could not derive a usable verdict from its
+# stdout) is not "failed": its copy still holds what it already did, so
+# the same station runs again on that copy with the original task plus a
+# note listing the files already changed. Only after MAX_STATION_CONTINUES
+# such runs in a row does the job stop -- as needs_owner ("worker_stuck"),
+# not as a failure.
+CONTINUABLE_REASONS = frozenset({
+    "worker_stalled", "worker_failed", "worker_timeout", "worker_reported_failure",
+})
 MAX_STATION_CONTINUES = 3
+MAX_REVIEW_STALL_RETRIES = 1
 
 
 def _continuation_payload(config: EngineConfig, ledger: Ledger, project: str,
@@ -274,39 +294,65 @@ def _run_review_then_bench(config: EngineConfig, ledger: Ledger, proc: Processor
     "review"/"bench" to `completed` (in that order) only for whichever
     of the two actually finished 'done'. Returns None to let the caller
     continue the stage list, or the terminal JobOutcome to stop on."""
-    review_payload = _stage_payload(config, project, review_stage)
-    review_rid = submit(ledger, project, attempt_id, "review", review_payload, "owner")
-    review_status = proc.run_request(project, review_rid, stop_after="spawn_reviewer")
-    review_request = ledger.request(review_rid)
-    if review_request.status in ("failed", "unknown"):
-        classified = _classify(review_request)
-        assert classified is not None
-        status, reason = classified
-        return JobOutcome(attempt_id=attempt_id, status=status, failed_request=review_rid,
-                          reason=reason, completed=tuple(completed))
-    if review_request.status == "queued":
-        # Never even reached 'running' (_block_on_unknown refused the
-        # project outright) -- genuinely stuck, not the intended
-        # stop_after pause.
-        return JobOutcome(attempt_id=attempt_id, status="pending", failed_request=review_rid,
-                          reason="request_queued", completed=tuple(completed))
-    # review_request.status is "running" (the intended stop_after pause,
-    # after spawn_reviewer) or "done" (a step list with no step named
-    # "spawn_reviewer" -- e.g. a test stub -- ran to completion in one
-    # call). Either way, bench runs now.
+    # `review_retry_n` (0 = no retry yet) retries the WHOLE review --
+    # spawn through record -- fresh, once, on a worker_stalled stall at
+    # EITHER phase (spawn or the later resume), the same one-time
+    # retry _run_stages' own serial path already gives a stalled
+    # reviewer; see MAX_REVIEW_STALL_RETRIES. It never retries bench --
+    # `bench_rid`/`bench_error` stay None until bench actually runs
+    # (guarded below), and once it has run (pass or fail) a later
+    # review retry never reruns it.
+    review_retry_n = 0
+    bench_rid: str | None = None
+    bench_error: tuple[str, str | None] | None = None
+    while True:
+        review_payload = _stage_payload(config, project, review_stage)
+        if review_retry_n:
+            review_payload = {**review_payload, "review_retry_n": review_retry_n}
+        review_rid = submit(ledger, project, attempt_id, "review", review_payload, "owner")
+        review_status = proc.run_request(project, review_rid, stop_after="spawn_reviewer")
+        review_request = ledger.request(review_rid)
+        if review_request.status in ("failed", "unknown"):
+            classified = _classify(review_request)
+            assert classified is not None
+            status, reason = classified
+            if (status, reason) == ("failed", "worker_stalled") \
+                    and review_retry_n < MAX_REVIEW_STALL_RETRIES:
+                review_retry_n += 1
+                continue
+            return JobOutcome(attempt_id=attempt_id, status=status, failed_request=review_rid,
+                              reason=reason, completed=tuple(completed))
+        if review_request.status == "queued":
+            # Never even reached 'running' (_block_on_unknown refused the
+            # project outright) -- genuinely stuck, not the intended
+            # stop_after pause.
+            return JobOutcome(attempt_id=attempt_id, status="pending", failed_request=review_rid,
+                              reason="request_queued", completed=tuple(completed))
+        # review_request.status is "running" (the intended stop_after pause,
+        # after spawn_reviewer) or "done" (a step list with no step named
+        # "spawn_reviewer" -- e.g. a test stub -- ran to completion in one
+        # call). Either way, bench runs now -- but only on the FIRST pass
+        # through this loop; a review retry after bench already ran must
+        # never rerun bench too.
+        if bench_rid is None:
+            bench_payload = _stage_payload(config, project, bench_stage)
+            bench_rid = submit(ledger, project, attempt_id, "bench", bench_payload, "owner")
+            proc.run_request(project, bench_rid)
+            bench_error = _classify(ledger.request(bench_rid))
 
-    bench_payload = _stage_payload(config, project, bench_stage)
-    bench_rid = submit(ledger, project, attempt_id, "bench", bench_payload, "owner")
-    proc.run_request(project, bench_rid)
-    bench_error = _classify(ledger.request(bench_rid))
+        if review_status == "running":
+            proc.run_request(project, review_rid)
+        review_error = _classify(ledger.request(review_rid))
+        if review_error is not None:
+            status, reason = review_error
+            if (status, reason) == ("failed", "worker_stalled") \
+                    and review_retry_n < MAX_REVIEW_STALL_RETRIES:
+                review_retry_n += 1
+                continue
+            return JobOutcome(attempt_id=attempt_id, status=status, failed_request=review_rid,
+                              reason=reason, completed=tuple(completed))
+        break
 
-    if review_status == "running":
-        proc.run_request(project, review_rid)
-    review_error = _classify(ledger.request(review_rid))
-    if review_error is not None:
-        status, reason = review_error
-        return JobOutcome(attempt_id=attempt_id, status=status, failed_request=review_rid,
-                          reason=reason, completed=tuple(completed))
     completed.append("review")
     if on_progress is not None:
         on_progress("review")
@@ -408,6 +454,19 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
                 attempt_id=attempt_id, status="needs_owner", failed_request=rid,
                 reason="worker_stuck", completed=tuple(completed),
             )
+        if (error is not None and stage.kind == "review" and error[1] == "worker_stalled"):
+            # A stalled reviewer is not "failed" either -- its own snapshot/
+            # fingerprint are per-request (a fresh review-snapshot dir, see
+            # engine.steps.review), so unlike a stalled builder there is no
+            # partial progress worth describing in a continuation note; this
+            # just retries the SAME review, fresh, once, before giving up.
+            # `review_retry_n` busts submit()'s own payload-hash idempotency
+            # (the same payload would otherwise dedupe onto the first,
+            # already-"failed" request and never actually run again).
+            n = int(stage.payload.get("review_retry_n", 0)) + 1
+            if n <= MAX_REVIEW_STALL_RETRIES:
+                stages[idx] = Stage("review", {**stage.payload, "review_retry_n": n})
+                continue
         if error is not None:
             status, reason = error
             _record_job_metrics_failure(

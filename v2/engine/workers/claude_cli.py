@@ -84,12 +84,42 @@ def _mcp_config_json(mcp_servers: dict[str, McpServerConfig]) -> str:
     return json.dumps({"mcpServers": servers})
 
 
+def _mcp_config_dir(spec: WorkerSpec) -> Path:
+    """The engine-only, per-request gate-ro directory (engine.steps.
+    station._gate_ro_dir) -- never spec.result_path's own (worker-
+    writable) stations directory, which would let a worker (via any
+    code it runs, not just its own gated tool calls -- e.g. a
+    project's own test suite, once an allowed Bash command invokes it)
+    read the mcp_servers config's embedded env_passthrough secrets
+    directly off disk. This directory is created by engine.steps.
+    station._write_gate_facts BEFORE ClaudeRunner.argv() is ever
+    called (see _run_spawn_worker's own ordering) and is already
+    mounted read-only into the worker's sandbox as a WHOLE directory
+    (station._sandboxed_argv: `readonly += (spec.gate_facts_path.
+    parent,)`), so writing this file into it needs no separate sandbox
+    mount of its own -- the `claude` CLI can still read it from inside
+    the sandbox via that existing bind.
+
+    Raises ValueError if spec.gate_facts_path is None: ClaudeRunner's
+    own `needs_gate = True` means every real engine.steps.station call
+    site sets this, but a caller building a WorkerSpec some other way
+    (e.g. engine.steps.review, which never sets gate_facts_path at
+    all) has no engine-only directory the sandbox already exposes
+    read-only to fall back to -- silently reusing spec.result_path's
+    directory instead would reintroduce exactly the exposure this
+    function exists to avoid, so this fails closed rather than doing
+    that."""
+    if spec.gate_facts_path is None:
+        raise ValueError(
+            "mcp_servers requires spec.gate_facts_path (an engine-only, "
+            "read-only-mounted directory) -- refusing to fall back to the "
+            "worker-writable stations directory"
+        )
+    return spec.gate_facts_path.parent
+
+
 def _mcp_config_path(spec: WorkerSpec) -> Path:
-    # A sibling of spec.result_path, in the same (worker-writable)
-    # stations dir -- never a new directory of its own, so this file
-    # disappears/gets cleaned up exactly the way every other per-request
-    # station file already does.
-    return spec.result_path.with_name(spec.result_path.name + ".mcp-config.json")
+    return _mcp_config_dir(spec) / "mcp-config.json"
 
 
 def _write_mcp_config_file(spec: WorkerSpec, mcp_servers: dict[str, McpServerConfig]) -> Path:
@@ -102,7 +132,9 @@ def _write_mcp_config_file(spec: WorkerSpec, mcp_servers: dict[str, McpServerCon
     mode down -- an attacker-planted symlink at this path is refused
     outright rather than written through, and the mode is set on the
     open file descriptor itself before any other process could observe
-    a wider one."""
+    a wider one. Lives in _mcp_config_dir(spec) (the engine-only
+    gate-ro directory), not spec.result_path's own worker-writable
+    stations directory -- see that function's docstring."""
     path = _mcp_config_path(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = _mcp_config_json(mcp_servers).encode("utf-8")

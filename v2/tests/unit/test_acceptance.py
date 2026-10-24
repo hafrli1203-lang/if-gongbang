@@ -150,10 +150,19 @@ def test_failing_full_suite_fails_acceptance_even_with_a_passing_scene(
     assert acc.passed is False
 
 
-def test_scene_that_changes_the_tree_fails_acceptance(workspace: Workspace) -> None:
-    """A scene that writes a new file into the repo while it runs must
-    be caught by the before/after fingerprint comparison -- it is never
-    enough for the scene itself to exit 0 and the full suite to pass."""
+def test_scene_mutation_runs_against_a_snapshot_not_the_real_repo(
+    workspace: Workspace,
+) -> None:
+    """Scenes/the full suite run against a disposable snapshot of the
+    tree (engine.acceptance's module docstring), never the real repo --
+    a scene writing a new file lands in the snapshot only. This is the
+    fix for the old loophole: a scene used to run IN the real repo, so
+    a before/after fingerprint comparison around it could be fooled by
+    a scene that mutated a file, ran the test, then restored it before
+    the "after" read -- the restore made that diff look clean. Fixing
+    the tree BEFORE any scene runs and never letting a scene touch the
+    real repo at all closes that: there is nothing left for a scene to
+    usefully "restore" to fool."""
     ws = _sample_workspace(workspace)
     attempt_id = _open(ws)
     plan = Plan(
@@ -168,16 +177,21 @@ def test_scene_that_changes_the_tree_fails_acceptance(workspace: Workspace) -> N
 
     assert acc.scenes[0].passed is True
     assert acc.full_suite_passed is True
-    assert acc.tree_changed is True
-    assert acc.passed is False
+    assert acc.tree_changed is False
+    assert acc.passed is True
+    # The scene's write never reached the real repo.
+    assert not (ws.alpha / "untracked_by_scene.txt").exists()
 
     data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
-    assert data["tree_changed"] is True
-    assert data["passed"] is False
+    assert data["tree_changed"] is False
+    assert data["passed"] is True
+    assert data["fingerprint"] == acc.fingerprint
+    assert len(data["fingerprint"]) == 40
 
     events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
-    assert events[0].payload["tree_changed"] is True
-    assert events[0].payload["reason"] == "tree_changed"
+    assert events[0].payload["tree_changed"] is False
+    assert events[0].payload["fingerprint"] == acc.fingerprint
+    assert events[0].payload["reason"] is None
 
 
 def test_unchanged_tree_keeps_tree_changed_false(workspace: Workspace) -> None:
@@ -194,6 +208,7 @@ def test_unchanged_tree_keeps_tree_changed_false(workspace: Workspace) -> None:
 
     assert acc.tree_changed is False
     assert acc.passed is True
+    assert len(acc.fingerprint) == 40
 
 
 def test_run_probe_scripts_runs_existing_script_and_records_evidence(
@@ -203,7 +218,9 @@ def test_run_probe_scripts_runs_existing_script_and_records_evidence(
     attempt_id = _open(ws)
     probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "stripe.py").write_text(
+    # "t1" -- 1-based position in the targets list (engine.gates.
+    # probe_target_id), never derived from the target's own name.
+    (probe_dir / "t1.py").write_text(
         "print('PROBE OK')\n", encoding="utf-8",
     )
 
@@ -213,6 +230,7 @@ def test_run_probe_scripts_runs_existing_script_and_records_evidence(
     )
 
     assert len(results) == 1
+    assert results[0].id == "t1"
     assert results[0].name == "stripe"
     assert results[0].ok is True
     assert results[0].returncode == 0
@@ -220,6 +238,7 @@ def test_run_probe_scripts_runs_existing_script_and_records_evidence(
 
     events = [e for _seq, e in ws.ledger.events("alpha", "probe.executed")]
     assert len(events) == 1
+    assert events[0].payload["id"] == "t1"
     assert events[0].payload["name"] == "stripe"
     assert events[0].payload["returncode"] == 0
 
@@ -234,6 +253,7 @@ def test_run_probe_scripts_missing_script_is_not_ok(workspace: Workspace) -> Non
     )
 
     assert len(results) == 1
+    assert results[0].id == "t1"
     assert results[0].ok is False
     assert results[0].returncode == -1
     assert results[0].stdout_tail == "script_missing"
@@ -247,7 +267,7 @@ def test_run_probe_scripts_failing_script_is_not_ok(workspace: Workspace) -> Non
     attempt_id = _open(ws)
     probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "slack.sh").write_text("exit 1\n", encoding="utf-8")
+    (probe_dir / "t1.sh").write_text("exit 1\n", encoding="utf-8")
 
     results = run_probe_scripts(
         ws.config, ws.ledger, "alpha", attempt_id, "job1",
@@ -256,6 +276,32 @@ def test_run_probe_scripts_failing_script_is_not_ok(workspace: Workspace) -> Non
 
     assert results[0].ok is False
     assert results[0].returncode == 1
+
+
+def test_run_probe_scripts_colliding_names_get_distinct_ids_and_scripts(
+    workspace: Workspace,
+) -> None:
+    """Regression: "Naver API"/"Naver_API" (and any Korean-only name)
+    used to collapse to the same safe-id under the old name-derived
+    scheme, so one target's script could silently stand in for the
+    other. Position-based ids (t1, t2) never collide."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
+    probe_dir.mkdir(parents=True)
+    (probe_dir / "t1.py").write_text("print('PROBE OK')\n", encoding="utf-8")
+    # t2 has no script at all -- must be reported missing, not silently
+    # covered by t1's passing script.
+
+    results = run_probe_scripts(
+        ws.config, ws.ledger, "alpha", attempt_id, "job1",
+        [("Naver API", "https://a"), ("Naver_API", "https://b")],
+    )
+
+    assert [r.id for r in results] == ["t1", "t2"]
+    assert results[0].ok is True
+    assert results[1].ok is False
+    assert results[1].stdout_tail == "script_missing"
 
 
 def test_no_test_cmd_configured_fails_closed(workspace: Workspace) -> None:

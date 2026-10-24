@@ -19,11 +19,12 @@ import pytest
 from dataclasses import replace
 
 from engine.approvals import grant
+from engine.bootstrap import BootstrapResult
 from engine.config import EngineConfig, ProjectConfig, ReleaseConfig, write_json
 from engine.evidence import fingerprint, record
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
-from engine.ledger import Ledger
+from engine.ledger import Event, Ledger
 from engine.processor import Fakes, Processor
 from engine.steps.open_job import open_job
 
@@ -74,9 +75,50 @@ def _load_gb2() -> ModuleType:
     return module
 
 
+def _fake_install_cmd() -> list[str]:
+    """A local, offline stand-in for a real `npm install`: writes
+    node_modules/.keep and package-lock.json directly in the cwd
+    instead of reaching the real npm registry. These unit tests
+    exercise gb2's own bootstrap/worktree/commit wiring, not a real
+    package manager's network behavior -- that is covered once, for
+    real, by test_installers.py's own (network-independent) checks."""
+    return [
+        sys.executable, "-c",
+        "import pathlib\n"
+        "pathlib.Path('node_modules').mkdir(exist_ok=True)\n"
+        "(pathlib.Path('node_modules') / '.keep').write_text('')\n"
+        "pathlib.Path('package-lock.json').write_text('{}\\n')\n",
+    ]
+
+
+def _patch_fake_install_cmd(module: ModuleType) -> None:
+    """Wrap `module.render_config` so every config a test in this file
+    renders for a fresh app gets `_fake_install_cmd()` in place of the
+    template's real `npm install` -- applied once, in the `gb2`
+    fixture, so every test here that drives `cmd_init` end to end
+    never reaches the network. The original is kept at
+    `module._real_render_config` for the one named exception
+    (test_cmd_init_bootstraps_the_source_repo_and_journals_it) that
+    checks the real npm argv -- it restores this via monkeypatch and
+    pairs it with a fake `npm` on PATH instead, so even that test never
+    reaches the network."""
+    real_render_config = module.render_config
+
+    def _fake_render_config(template: dict[str, object],
+                            app_name: str) -> dict[str, object]:
+        rendered = real_render_config(template, app_name)
+        rendered["projects"][app_name]["install_cmd"] = _fake_install_cmd()
+        return rendered
+
+    module.render_config = _fake_render_config
+    module._real_render_config = real_render_config
+
+
 @pytest.fixture(scope="module")
 def gb2() -> ModuleType:
-    return _load_gb2()
+    module = _load_gb2()
+    _patch_fake_install_cmd(module)
+    return module
 
 
 def test_template_file_has_expected_shape(gb2: ModuleType) -> None:
@@ -275,6 +317,26 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
     fp = fingerprint(repo_dir, config.projects["demo"].excludes)
     record(ledger, "demo", attempt_id, "review", fp, payload={"passed": True})
     record(ledger, "demo", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
+    # another change: engine.release.job_certificate_status now requires a
+    # job-level certificate (acceptance AND app_security, both bound to
+    # this exact fingerprint) before advance_master/call_publisher let a
+    # release through -- this helper simulates a job that already has
+    # one (what a real engine.full_orbit job would have recorded before
+    # ever reaching engine.release.prepare), not the `gb2 run` -> `gb2
+    # ship` bypass path that check exists to close.
+    ledger.append(Event(
+        project="demo", kind="acceptance.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": "job1", "passed": True, "scenes": [],
+                 "full_suite_passed": True, "tree_changed": False,
+                 "reason": None, "fingerprint": fp},
+    ))
+    ledger.append(Event(
+        project="demo", kind="app_security.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"passed": True, "findings": [], "ran": ["secret_scan"],
+                 "fingerprint": fp},
+    ))
 
     fakes = Fakes(FakePublisher(), FakeInstaller())
     outcome = orbit.continue_job(
@@ -869,6 +931,105 @@ def test_cmd_init_hides_the_source_repo_from_every_sandbox(
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap: `_setup_app_workspace` installs the SOURCE repo's own
+# dependencies via engine.bootstrap once the ledger is open, and a
+# failed install stops cold with exit 2 (never continuing on to run a
+# job against a repo whose npm install never actually succeeded).
+# ---------------------------------------------------------------------------
+
+def test_cmd_init_bootstraps_the_source_repo_and_journals_it(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ONE test in this file that checks the config's real npm
+    install_cmd (every other test gets `_fake_install_cmd()` via the
+    `gb2` fixture's render_config patch) -- restores the real
+    render_config here, and pairs it with a fake `npm` on PATH (same
+    technique as test_installers.py's own argv-logging tests) so this
+    still never reaches the real network."""
+    apps_root = tmp_path / "source"
+    source_repo = _make_source_repo(apps_root / "demo")
+    (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
+    monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(gb2, "render_config", gb2._real_render_config)
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_npm = fake_bin / "npm"
+    fake_npm.write_text(
+        "#!/bin/sh\nmkdir -p node_modules\necho '{}' > package-lock.json\n",
+        encoding="utf-8",
+    )
+    fake_npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+
+    calls: list[tuple] = []
+    real_ensure_installed = gb2.ensure_installed
+
+    def _spy_ensure_installed(repo, install_cmd, **kwargs):
+        calls.append((repo, install_cmd))
+        return real_ensure_installed(repo, install_cmd, **kwargs)
+
+    monkeypatch.setattr(gb2, "ensure_installed", _spy_ensure_installed)
+    args = gb2._build_parser().parse_args(["init", "demo"])
+
+    code = gb2.cmd_init(args)
+
+    assert code == 0
+    assert len(calls) == 1
+    called_repo, called_install_cmd = calls[0]
+    assert called_repo == source_repo.resolve()
+    assert called_install_cmd == ("npm", "install", "--no-audit", "--no-fund")
+
+    config = EngineConfig.from_json(tmp_path / "ws" / "apps" / "demo" / "config.json")
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        events = ledger.events("demo", "dependency.installed")
+    finally:
+        ledger.close()
+    assert len(events) == 1
+    assert events[0][1].payload["ok"] is True
+
+
+def test_cmd_init_exits_2_when_bootstrap_install_fails(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed dependency install must stop with exit code 2 (never the
+    generic exit 1 a config mistake gets) -- and still journal the
+    attempt via record_bootstrap before raising, so the ledger shows
+    WHY, not just that nothing ran afterward."""
+    apps_root = tmp_path / "source"
+    source_repo = _make_source_repo(apps_root / "demo")
+    (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
+    monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(gb2, "ensure_installed", lambda repo, install_cmd, **kwargs:
+                        BootstrapResult(ran=True, ok=False, detail="install_failed:boom"))
+    args = gb2._build_parser().parse_args(["init", "demo"])
+
+    code = gb2.cmd_init(args)
+
+    assert code == 2
+    # the workspace config was still written (the failure is reported,
+    # not silently swallowed), but the job itself never ran -- there is
+    # no later caller here at all, by construction (cmd_init never calls
+    # run_full_job); the real "nothing continues on top of a failed
+    # bootstrap" guarantee is exercised by `gb2 new`'s own version of
+    # this test, where a real orbit call would otherwise follow.
+    config = EngineConfig.from_json(tmp_path / "ws" / "apps" / "demo" / "config.json")
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        events = ledger.events("demo", "dependency.installed")
+    finally:
+        ledger.close()
+    assert len(events) == 1
+    assert events[0][1].payload["ok"] is False
+    assert "boom" in events[0][1].payload["detail"]
+
+
+# ---------------------------------------------------------------------------
 # The generated negative control's expected_signature
 # must match what engine.steps.bench_run._case_signature actually
 # returns for a real Vitest assertion failure ("assertion"), never the
@@ -1033,6 +1194,24 @@ def test_doctor_release_apps_lists_only_apps_with_release_configured(
     }), encoding="utf-8")
 
     assert gb2._doctor_release_apps() == ["with-release"]
+
+
+def test_doctor_release_apps_excludes_an_explicit_null_release(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node-vitest template always writes "release": null for an app
+    scaffolded WITHOUT --with-release (tools/templates/node-vitest.json)
+    -- a plain `"release" in p` key-presence check would wrongly count
+    EVERY such app as release-configured and demand a deploy script for
+    it. Only a non-null "release" value counts."""
+    apps_dir = tmp_path / "ws" / "apps"
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    (apps_dir / "no-release").mkdir(parents=True)
+    (apps_dir / "no-release" / "config.json").write_text(json.dumps({
+        "projects": {"no-release": {"repo": "repo", "release": None}},
+    }), encoding="utf-8")
+
+    assert gb2._doctor_release_apps() == []
 
 
 def test_cmd_doctor_exit_1_when_something_required_is_missing(

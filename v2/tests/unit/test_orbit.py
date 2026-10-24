@@ -23,7 +23,7 @@ from engine.config import ReleaseConfig
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
-from engine.processor import Fakes, Processor, StepContext, StepDef, submit
+from engine.processor import Fakes, Processor, StepContext, StepDef, StepFailed, submit
 from engine.steps.open_job import copy_root, open_job
 from tests.conftest import GIT_ENV, Workspace
 from tests.fixtures.sample_app import make_sample
@@ -729,6 +729,205 @@ def test_stalled_station_with_tampered_copy_config_fails_closed(workspace: Works
     assert outcome.status == "failed"
     assert outcome.reason == "copy_git_config_changed"
     assert len(tasks_seen) == 1  # no continuation run was attempted
+
+
+def test_worker_reported_failure_continues_on_same_copy(workspace: Workspace) -> None:
+    """A malformed/missing worker result (StepFailed("worker_reported_
+    failure") -- engine.steps.station.record_station, not the worker's
+    own exit code) must be continuable exactly like worker_stalled/
+    worker_failed, not an immediate "failed" outcome."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "reported-failure",
+                          "full", ("builder",))
+    tasks_seen: list[str] = []
+
+    def _run(ctx: StepContext) -> dict[str, object]:
+        tasks_seen.append(str(ctx.request.payload["task"]))
+        if len(tasks_seen) <= 1:
+            raise StepFailed("worker_reported_failure")
+        return _station_finished_steps([])(ctx)[0].run(ctx)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", lambda ctx: [
+            StepDef("record_station", _run, lambda ctx: False),
+        ])
+        return proc
+
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station", {"station": "build", "role": "builder", "task": "do it"})],
+        processor_factory=factory,
+    )
+    assert outcome.status == "done"
+    assert len(tasks_seen) == 2
+    assert "[이어서 하기 1]" in tasks_seen[1]
+
+
+def _review_stall_then_pass_steps(stalls: int, calls: list[str]):
+    """Stub review step list: the first `stalls` calls fail with
+    worker_stalled, then it records a passing review (same shape as
+    _review_steps(True))."""
+    def _run(ctx: StepContext) -> dict[str, object]:
+        calls.append(ctx.request.request_id)
+        if len(calls) <= stalls:
+            raise StepFailed("worker_stalled")
+        return _review_steps(True)(ctx)[0].run(ctx)
+
+    return lambda ctx: [StepDef("record_review", _run, lambda ctx: False)]
+
+
+def test_review_stall_is_retried_once_then_passes(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "review-stall",
+                          "full", ())
+    calls: list[str] = []
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("review", _review_stall_then_pass_steps(1, calls))
+        return proc
+
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("review", {"role": "reviewer", "task": "do it"})],
+        processor_factory=factory,
+    )
+    assert outcome.status == "done"
+    assert len(calls) == 2  # the stalled attempt, then the one retry
+    assert len(set(calls)) == 2  # the retry was a genuinely NEW request
+
+
+def test_review_stall_past_retry_limit_ends_attempt_failed(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "review-stuck",
+                          "full", ())
+    calls: list[str] = []
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("review", _review_stall_then_pass_steps(99, calls))
+        return proc
+
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("review", {"role": "reviewer", "task": "do it"})],
+        processor_factory=factory,
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "worker_stalled"
+    assert len(calls) == 1 + orbit.MAX_REVIEW_STALL_RETRIES
+
+
+def _review_steps_parallel_stall_then_pass(stalls: int, calls: list[int]):
+    """Same step-name contract as _review_steps_parallel (spawn_reviewer/
+    await_reviewer/record_review), but await_reviewer fails with
+    worker_stalled for the first `stalls` calls across the WHOLE
+    retry loop (spawn_reviewer never stalls here -- the resume phase
+    does) before finally recording a passing review."""
+    def _spawn(ctx: StepContext) -> dict[str, object]:
+        return {"pid": 0}
+
+    def _reconcile_spawn(ctx: StepContext) -> bool:
+        return False
+
+    def _await(ctx: StepContext) -> dict[str, object]:
+        calls.append(len(calls) + 1)
+        if len(calls) <= stalls:
+            raise StepFailed("worker_stalled")
+        return {}
+
+    def _reconcile_await(ctx: StepContext) -> bool:
+        return False
+
+    def _record(ctx: StepContext) -> dict[str, object]:
+        project_config = ctx.config.projects[ctx.project]
+        fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+        evidence.record(
+            ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+            payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+        )
+        return {}
+
+    def _reconcile_record(ctx: StepContext) -> bool:
+        for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+            if row.payload.get("request_id") == ctx.request.request_id:
+                return True
+        return False
+
+    return lambda ctx: [
+        StepDef("spawn_reviewer", _spawn, _reconcile_spawn),
+        StepDef("await_reviewer", _await, _reconcile_await),
+        StepDef("record_review", _record, _reconcile_record),
+    ]
+
+
+def test_parallel_review_bench_retries_a_stalled_reviewer_once_then_passes(
+    workspace: Workspace,
+) -> None:
+    """config.parallel_review_bench (the default) must give a stalled
+    reviewer the same one-time retry the plain serial path gets --
+    _run_review_then_bench's own resume phase (the second
+    proc.run_request call, after bench has already been submitted)."""
+    project_config = replace(workspace.config.projects["alpha"], test_cmd=("true",))
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project_config})
+    attempt_id = open_job(config, workspace.ledger, "alpha", "parallel-stall-once",
+                          "full", ("reviewer",))
+    calls: list[int] = []
+
+    def factory(cfg, ledger, fakes) -> Processor:
+        proc = Processor(cfg, ledger, fakes)
+        proc.register_defaults()
+        proc.register("review", _review_steps_parallel_stall_then_pass(1, calls))
+        return proc
+
+    outcome = orbit.continue_job(
+        config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("review", {"role": "reviewer"}), orbit.Stage("bench", {}),
+         orbit.Stage("close", {})],
+        processor_factory=factory,
+    )
+
+    # bench itself fails ("no_bench_cases" -- 'alpha' has none configured),
+    # but review's own retry-then-pass must still show up as completed and
+    # recorded, exactly like the non-stalled overlap test above.
+    assert outcome.status == "failed"
+    assert outcome.reason == "no_bench_cases"
+    assert outcome.completed == ("review",)
+    assert len(calls) == 2
+    review_evidence = workspace.ledger.evidence(attempt_id, "review")
+    assert len(review_evidence) == 1
+    assert review_evidence[0].payload["passed"] is True
+
+
+def test_parallel_review_bench_past_retry_limit_ends_attempt_failed(
+    workspace: Workspace,
+) -> None:
+    project_config = replace(workspace.config.projects["alpha"], test_cmd=("true",))
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project_config})
+    attempt_id = open_job(config, workspace.ledger, "alpha", "parallel-stuck",
+                          "full", ("reviewer",))
+    calls: list[int] = []
+
+    def factory(cfg, ledger, fakes) -> Processor:
+        proc = Processor(cfg, ledger, fakes)
+        proc.register_defaults()
+        proc.register("review", _review_steps_parallel_stall_then_pass(99, calls))
+        return proc
+
+    outcome = orbit.continue_job(
+        config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("review", {"role": "reviewer"}), orbit.Stage("bench", {}),
+         orbit.Stage("close", {})],
+        processor_factory=factory,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.reason == "worker_stalled"
+    assert outcome.completed == ()
+    assert len(calls) == 1 + orbit.MAX_REVIEW_STALL_RETRIES
 
 
 def test_station_stuck_after_max_continues_asks_owner(workspace: Workspace) -> None:

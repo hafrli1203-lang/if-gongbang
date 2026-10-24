@@ -185,6 +185,27 @@
       "playwright"
     ]
   },
+  "mcp_tool_allow": {
+    "playwright": [
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_take_screenshot",
+      "browser_click",
+      "browser_type",
+      "browser_wait_for",
+      "browser_console_messages",
+      "browser_resize",
+      "browser_close"
+    ]
+  },
+  "security": {
+    "audit_cmd": [
+      "npm",
+      "audit",
+      "--omit=dev",
+      "--json"
+    ]
+  },
   "context": {
     "skill_roots": [
       "~/.claude/skills",

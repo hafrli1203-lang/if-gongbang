@@ -63,6 +63,55 @@ self-test above confirmed for each shape. Every path is resolved with
 os.path.realpath before mounting, so a path that is itself a symlink
 (e.g. into a hidden directory) cannot be used to mount the wrong real
 location.
+
+Known limit, verified (NOT a gap this module can close):
+nesting a second wrap() call's bwrap invocation INSIDE a process that
+is already running under a first bwrap sandbox does not work on a host
+with AppArmor's unprivileged-userns restriction enforced (the common
+case on current Ubuntu: `sysctl kernel.apparmor_restrict_unprivileged_
+userns` = 1). Verified directly on this host: a bare `bwrap ... --
+bwrap ...` (bwrap wrapping a second bwrap) fails with "No permissions
+to create new namespace"; `strace -f` on the same command shows the
+inner process's own `clone(...CLONE_NEWUSER...)` call itself returning
+EPERM, not an application-level refusal inside bwrap. This matches
+`/etc/apparmor.d/bwrap`'s own profile comment on this host ("bwrap is
+allowed access to user namespaces and capabilities within the user
+namespace, but its children do not have capabilities, blocking bwrap
+from being able to be used to arbitrarily by-pass the user namespace
+restrictions"): the `unpriv_bwrap` profile a nested bwrap exec
+transitions into has `allow userns,` but `audit deny capability,`, and
+(separately) plain `unshare --user` by an ordinary unconfined process
+on this host also fails with the same EPERM -- so this is host policy
+applying to ANY attempt at a second layer of unprivileged user-
+namespace creation from inside the first sandbox, not something wrap()
+could work around by building its argv differently (e.g. via a Claude
+Code PreToolUse hook's `updatedInput`, which DOES let a caller rewrite
+a worker's Bash command before it runs -- the CLI feature itself is
+real and present in this host's installed `claude` binary, but the
+nested-bwrap command it would need to wrap that rewritten command in
+cannot actually execute here). A caller wanting to isolate ONE
+subprocess more tightly than the sandbox its own process already runs
+under must therefore do so at the OUTER layer (the first, non-nested
+wrap() call that launches the whole worker/bench process tree), not by
+having code running inside that sandbox invoke wrap() a second time.
+
+ follow-up (the actual mitigation for the OUTER layer, since
+nesting is closed off): engine.steps.station/review now build each
+worker/reviewer's $HOME as a fresh, per-attempt directory (see
+prepare_worker_home below) seeded with ONLY the real CLI's own login/
+credentials file, instead of mounting the real operator HOME wholesale
+read-only. The real HOME is hidden outright. Residual, accepted limit:
+ANY code the worker/reviewer's allowed Bash command runs (same
+unresolved nested-sandbox gap above) can still read that one login
+file inside ITS OWN worker HOME -- e.g. a worker-run test file could
+open $HOME/.claude/.credentials.json -- since it is a real file needed
+for the CLI itself to authenticate and there is no narrower OS-level
+primitive available on this host to hand the CLI process its own
+credential while denying it to a child the CLI spawns. This is a much
+smaller blast radius than before (one CLI's own login file, inside a
+disposable per-attempt directory, instead of the operator's entire
+real HOME -- other apps' configs, other CLIs' credentials, ssh keys),
+not a complete closure.
 """
 from __future__ import annotations
 
@@ -344,4 +393,69 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
     return args
 
 
-__all__ = ["SandboxUnavailable", "available", "exec_env", "launcher_env", "wrap"]
+def prepare_worker_home(dest: Path, real_home: Path | None,
+                         login_files: tuple[str, ...],
+                         writable_subpaths: tuple[str, ...]) -> None:
+    """Build (or complete) a fresh, minimal $HOME at `dest` for a
+    sandboxed CLI worker/reviewer process -- containing ONLY the real
+    CLI's own login/credentials files, never the rest of the real,
+    operator HOME this engine process itself runs under P1
+    fallback: the real HOME used to be mounted read-only wholesale --
+    see engine.steps.station/review's own `_sandboxed_argv` docstrings
+    -- which left every OTHER app's config, other CLIs' credentials
+    and e.g. ssh keys readable to any code a worker's allowed Bash
+    command runs inside the SAME sandbox namespace; a NESTED, stricter
+    bwrap per Bash command was investigated and found impossible on a
+    host with AppArmor's unprivileged-userns restriction enforced --
+    see this module's own "Known limit" note above -- so the fix here
+    is at the one layer that IS adjustable: shrink what the whole
+    worker process tree can reach in the first place).
+
+    `dest` is created if missing. For each `real_home`-relative path in
+    `login_files` (e.g. ".claude/.credentials.json", ".codex/
+    auth.json") that exists as a plain file under `real_home` AND does
+    not already exist under `dest`, a byte-for-byte copy (shutil.
+    copy2, never a symlink -- a symlink back into `real_home` would
+    reopen exactly the path this function exists to close) is made at
+    the same relative path under `dest`, creating parent directories
+    as needed. Already-idempotent: a destination path that already
+    exists (an earlier call's copy, or session state the CLI itself
+    wrote into THIS worker's own, already-isolated home on a previous
+    attempt/retry of the same request) is left untouched -- this runs
+    on every spawn, including a reconciled retry, and must never
+    clobber state the sandboxed CLI already wrote.
+
+    `writable_subpaths` (a runner's own `home_writable_subpaths`, e.g.
+    (".claude", ".claude.json")): any entry with NO filename suffix
+    (".claude", ".codex" -- a directory, by every shape seen in this
+    codebase so far) is created as a real, empty directory under
+    `dest` if it does not already exist, so the caller's own writable
+    mount for it (sandbox.wrap's `writable` -- a nonexistent source is
+    silently skipped there) actually takes effect even when no
+    `login_files` entry happened to create that directory as a side
+    effect of its own parent-mkdir. An entry WITH a suffix (e.g.
+    ".claude.json") is left alone -- a single top-level FILE the CLI
+    itself creates on its own first write if `login_files` did not
+    already seed it from `real_home`; this function never invents a
+    config file's content."""
+    dest.mkdir(parents=True, exist_ok=True)
+    if real_home is not None:
+        for rel in login_files:
+            target = dest / rel
+            if target.exists():
+                continue
+            source = real_home / rel
+            if not source.is_file():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    for rel in writable_subpaths:
+        if Path(rel).suffix:
+            continue
+        (dest / rel).mkdir(parents=True, exist_ok=True)
+
+
+__all__ = [
+    "SandboxUnavailable", "available", "exec_env", "launcher_env",
+    "prepare_worker_home", "wrap",
+]

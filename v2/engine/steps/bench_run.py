@@ -125,7 +125,8 @@ def _bench_home_dir(ctx: StepContext) -> Path:
 
 
 def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
-                        env: dict[str, str], *, net: bool = False) -> tuple[list[str], dict[str, str]]:
+                        env: dict[str, str], *, net: bool = False,
+                        extra_readonly: tuple[Path, ...] = ()) -> tuple[list[str], dict[str, str]]:
     """Bench sandbox policy: writable = the repo itself (test runners
     write __pycache__/coverage/etc there). readonly = repo/.git,
     mounted AFTER the repo's own writable bind (deeper path wins) so
@@ -147,6 +148,23 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     -- a project's test suite has no business making outbound network
     calls as part of this engine's trust checks.
 
+    extra_readonly: additional read-only mounts beyond repo/.git -- every
+    existing caller passes `repo` itself as THIS function's `repo` (so it
+    is always re-exposed, since it is also `writable`'s own entry); a
+    caller that runs `argv` somewhere else entirely (engine.acceptance's
+    disposable snapshot, built under config.home and therefore itself
+    already hidden-then-re-exposed the same way _bench_home_dir() is)
+    still needs the REAL project repo visible, read-only, for any
+    on-disk content (e.g. a copy_links entry like node_modules) the
+    snapshot only symlinks BACK into -- config.ledger_path.parent (see
+    `hidden` below) is that real repo's own parent directory, so without
+    this it stays hidden under that tmpfs with nothing to re-expose it
+    (confirmed empirically: a snapshot-side symlink into an unlisted real
+    repo resolved to nothing inside the sandbox, hanging `npx vitest run`
+    trying to fetch the package it could not resolve locally, over a
+    net=False sandbox, until it timed out). Defaults to `()`, so every
+    pre-existing caller's mount list is unchanged.
+
     config.bench_readonly_paths (e.g. "~/.cache/ms-playwright", expanded
     at config load against the ENGINE process's own HOME) re-exposes
     each existing entry read-only at its real host path -- and, if it
@@ -158,7 +176,7 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     bench_home = _bench_home_dir(ctx)
     child_env = {**env, "HOME": str(bench_home)}
     writable = (repo,)
-    readonly: tuple[Path, ...] = (repo / ".git",)
+    readonly: tuple[Path, ...] = (repo / ".git",) + extra_readonly
     readonly_remap: tuple[tuple[Path, Path], ...] = ()
     if ctx.config.bench_home_writable:
         writable += (bench_home,)

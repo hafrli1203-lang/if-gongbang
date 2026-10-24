@@ -39,10 +39,15 @@ Rules (first match wins) — see plan §4:
     gate_facts.json from engine.plan.tools_for_station) -> denied
     ("mcp_not_in_request_allow"); `server` not in
     config.station_mcp_allow[station] (the project-wide upper bound) ->
-    denied ("mcp_not_in_station_allow"); `server` has a
-    config.mcp_tool_allow entry and `action.mcp_tool` is not in it ->
-    denied ("mcp_tool_not_in_allow") -- absent entirely for that
-    server, this check is skipped; else the configured hooks are
+    denied ("mcp_not_in_station_allow"); `server`'s own
+    config.mcp_tool_allow entry does not list `action.mcp_tool` ->
+    denied ("mcp_tool_not_in_allow") -- default deny: a server with NO
+    mcp_tool_allow entry at all denies every tool
+    ("mcp_tool_allow_not_configured"), the same way station_owners
+    with no entry for a role denies every write (rule 5) -- granting a
+    server access is not itself permission to call every tool it
+    exposes; a server's operator config must explicitly enumerate which
+    of its tools a worker may call. Otherwise the configured hooks are
     consulted same as rule 5, then allowed ("mcp_allowed"). A plan's
     own tool table can only narrow a station's mcp access, never widen
     it past station_mcp_allow.
@@ -530,11 +535,14 @@ class Policy:
         config.station_mcp_allow[actor.station] (the project-wide
         upper bound on what that station may ever be handed) -- a
         plan's own tool table can only narrow a station's access,
-        never widen it past what the operator configured -- AND, if
-        config.mcp_tool_allow names `server` at all, `action.mcp_tool`
-        is in that server's own list (a server absent from
-        mcp_tool_allow keeps the server-level checks as the whole
-        story)."""
+        never widen it past what the operator configured -- AND
+        `action.mcp_tool` is named in config.mcp_tool_allow[server].
+        Default deny: a server ABSENT from mcp_tool_allow entirely
+        denies every tool for it (same shape as rule 5's
+        station_role_not_authorized) -- granting a server to a station
+        is never, by itself, permission to call every tool it exposes;
+        the operator config must explicitly enumerate the allowed
+        tools for each granted server."""
         server = action.target
         if not server:
             return Decision(False, "mcp_requires_target")
@@ -545,13 +553,14 @@ class Policy:
         if server not in station_allow:
             return Decision(False, "mcp_not_in_station_allow")
 
-        # Optional per-server tool allow list (operator config, never a
-        # request's own gate facts): absent for this server leaves the
-        # server-level checks above as the whole story, same as before
-        # this field existed. Present: a tool name not in it is denied
-        # outright, on top of (never instead of) those checks.
+        # Per-server tool allow list (operator config, never a request's
+        # own gate facts): a server with no entry here denies every
+        # tool call, same default-deny shape as an unconfigured
+        # station/role in rule 5.
         tool_allow = self.config.mcp_tool_allow.get(server)
-        if tool_allow is not None and action.mcp_tool not in tool_allow:
+        if tool_allow is None:
+            return Decision(False, "mcp_tool_allow_not_configured")
+        if action.mcp_tool not in tool_allow:
             return Decision(False, "mcp_tool_not_in_allow")
 
         hook_denial = self._run_hooks(project, actor, action)

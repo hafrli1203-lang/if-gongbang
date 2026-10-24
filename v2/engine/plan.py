@@ -59,10 +59,12 @@ class Task:
     detail: str
     owns: tuple[str, ...]
     depends_on: tuple[str, ...]
-    # requirement ids this task implements but that have no scene of
-    # their own (e.g. a "security" requirement with no automated
-    # pass/fail scene) -- counts as covered once this task's own
-    # attempt reaches "done" (see engine.full_orbit._uncovered_requirement_ids).
+    # requirement ids this task implements -- tracking only (e.g. the
+    # handoff report's own "도구표 대 실제 사용"-style section). This
+    # task reaching "done" never counts as covering a requirement on
+    # its own; completion requires at least one PASSING scene for it
+    # (see validate_plan and engine.full_orbit._uncovered_requirement_
+    # ids).
     covers: tuple[str, ...] = ()
 
 
@@ -322,8 +324,16 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
         references a file that actually exists in `repo` (the planner
         owns writing that file)
       - every scene/task `covers` entry names a real requirement id,
-        and every requirement is covered by at least one scene or task
-        (requirement_coverers)
+        and every requirement is covered by at least one SCENE
+        (requirement_coverers) -- a task-only `covers` is kept for
+        tracking (the handoff report's own "도구표 대 실제 사용"-style
+        section) but is never sufficient on its own: a task finishing
+        "done" only means its own review/bench passed, never that any
+        scene actually exercised the requirement's real behavior. A requirement with ONLY a task coverer
+        would otherwise pass this static check yet never be able to
+        pass engine.full_orbit's own runtime completion gate
+        (_uncovered_requirement_ids), which only ever counts a PASSING
+        scene -- so this is checked here too, not only there.
     Schema-level problems (missing/mistyped fields) are not re-checked
     here -- load_plan already raised PlanError for those before a Plan
     object could exist."""
@@ -354,8 +364,12 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
                 problems.append(f"task {task.id}: covers unknown requirement {rid!r}")
     coverers = requirement_coverers(plan)
     for requirement in plan.requirements:
-        if not coverers.get(requirement.id):
-            problems.append(f"requirement {requirement.id}: not covered by any scene or task")
+        pairs = coverers.get(requirement.id, ())
+        if not any(kind == "scene" for kind, _cid in pairs):
+            problems.append(
+                f"requirement {requirement.id}: not covered by any scene "
+                "(a task-only `covers` is kept for tracking but is never enough)"
+            )
     return problems
 
 

@@ -48,13 +48,41 @@ def _load_gb2() -> ModuleType:
     return module
 
 
+def _patch_fake_install_cmd(module: ModuleType) -> None:
+    """Same patch as test_gb2.py's own helper (duplicated, not shared --
+    each file loads its own fresh gb2 module instance): wrap
+    `module.render_config` so a config this file renders for a fresh
+    app gets a local, offline install_cmd (writes node_modules/.keep +
+    package-lock.json) instead of the template's real `npm install`,
+    so `gb2 new`'s end-to-end tests here never reach the network. No
+    test in this file checks the real npm argv (contrast test_gb2.py's
+    one named exception), so there is no opt-out here."""
+    real_render_config = module.render_config
+
+    def _fake_render_config(template: dict[str, object],
+                            app_name: str) -> dict[str, object]:
+        rendered = real_render_config(template, app_name)
+        rendered["projects"][app_name]["install_cmd"] = [
+            sys.executable, "-c",
+            "import pathlib\n"
+            "pathlib.Path('node_modules').mkdir(exist_ok=True)\n"
+            "(pathlib.Path('node_modules') / '.keep').write_text('')\n"
+            "pathlib.Path('package-lock.json').write_text('{}\\n')\n",
+        ]
+        return rendered
+
+    module.render_config = _fake_render_config
+
+
 @pytest.fixture()
 def gb2() -> ModuleType:
     # function-scoped (not module-scoped like test_gb2.py's fixture):
     # each test here installs its own fake engine.full_orbit via
     # sys.modules, and a fresh module instance keeps that from leaking
     # between tests that use different fakes.
-    return _load_gb2()
+    module = _load_gb2()
+    _patch_fake_install_cmd(module)
+    return module
 
 
 @dataclass(frozen=True)
@@ -66,28 +94,43 @@ class _FakeFullOutcome:
 
 
 def _install_fake_full_orbit(monkeypatch: pytest.MonkeyPatch, *, run_result=None,
-                             continue_result=None):
+                             continue_result=None, pending_requests: tuple = ()):
     """Inject a stub `engine.full_orbit` module into sys.modules (the
     real one does not exist yet -- worker A's own file, landing in
     parallel per the full-orbit contract) and return the two call-log
     lists `run_calls`/`continue_calls` tools/gb2's lazy
-    `from engine import full_orbit` will resolve to."""
+    `from engine import full_orbit` will resolve to. `pending_requests`
+    is this stub's own fixed answer for `pending_owner_requests` (used
+    by `gb2 approve-install` -- the real function's own tracking is
+    covered separately by tests/unit/test_full_orbit.py, so here it is
+    just a test-controlled list, not recomputed from the ledger)."""
     run_calls: list[tuple] = []
     continue_calls: list[tuple] = []
+    pending_calls: list[tuple] = []
     stub = types.ModuleType("engine.full_orbit")
 
     def run_full_job(config, ledger, fakes, project, job_name, request, *,
                      max_fix_rounds=2, on_progress=None):
         run_calls.append((config, ledger, fakes, project, job_name, request,
                           max_fix_rounds, on_progress))
+        # The real run_full_job's own FIRST action is always open_job --
+        # this stub does the same, so a caller's own "did the engine's
+        # first stage actually start" check (gb2 cmd_new's marker
+        # lifecycle, _job_has_started) sees a real attempt here too.
+        open_job(config, ledger, project, job_name, "full", roles=())
         return run_result if run_result is not None else _FakeFullOutcome(status="done")
 
     def continue_full_job(config, ledger, fakes, project, job_name, *, on_progress=None):
         continue_calls.append((config, ledger, fakes, project, job_name, on_progress))
         return continue_result if continue_result is not None else _FakeFullOutcome(status="done")
 
+    def pending_owner_requests(ledger, project, job_name):
+        pending_calls.append((project, job_name))
+        return pending_requests
+
     stub.run_full_job = run_full_job  # type: ignore[attr-defined]
     stub.continue_full_job = continue_full_job  # type: ignore[attr-defined]
+    stub.pending_owner_requests = pending_owner_requests  # type: ignore[attr-defined]
     stub.FullOutcome = _FakeFullOutcome  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine.full_orbit", stub)
     # `from engine import full_orbit` reads the package attribute first,
@@ -180,7 +223,11 @@ def test_cmd_new_scaffolds_repo_workspace_and_calls_run_full_job(
     assert (source_repo / "README.md").exists()
     assert (source_repo / ".gitignore").exists()
     assert (source_repo / "tests" / "scenes" / ".gitkeep").exists()
-    assert _rgit(source_repo, "log", "--format=%s") == "chore: scaffold demo via gb2 new"
+    # the skeleton commit is always the OLDEST -- bootstrap (and its own
+    # lockfile commit, if the install actually wrote one) runs after it,
+    # never before, so a lockfile commit may sit on top but never under it.
+    commits = _rgit(source_repo, "log", "--format=%s").splitlines()
+    assert commits[-1] == "chore: scaffold demo via gb2 new"
     package = json.loads((source_repo / "package.json").read_text(encoding="utf-8"))
     assert package["name"] == "demo"
 
@@ -212,6 +259,32 @@ def test_cmd_new_scaffolds_repo_workspace_and_calls_run_full_job(
     assert built.installer is not None
 
 
+def test_cmd_new_exits_2_and_never_calls_run_full_job_when_bootstrap_fails(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed dependency install (engine.bootstrap.ensure_installed)
+    must stop `gb2 new` cold -- exit code 2, and run_full_job must never
+    be called on top of a repo whose npm install never actually
+    succeeded. The marker stays (the engine's first stage never
+    started) so a retry resumes instead of refusing app_exists."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    from engine.bootstrap import BootstrapResult
+    monkeypatch.setattr(gb2, "ensure_installed", lambda repo, install_cmd, **kwargs:
+                        BootstrapResult(ran=True, ok=False, detail="install_failed:boom"))
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 2
+    assert run_calls == []
+    source_repo = source_root / "demo"
+    assert gb2._new_app_marker_path(source_repo).exists()
+
+
 def test_cmd_new_resumes_an_interrupted_init_via_its_marker(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -237,7 +310,10 @@ def test_cmd_new_resumes_an_interrupted_init_via_its_marker(
     assert code == 0
     assert len(run_calls) == 1
     assert (source_repo / "package.json").exists()
-    assert _rgit(source_repo, "log", "--format=%s") == "chore: scaffold demo via gb2 new"
+    # same ordering invariant as test_cmd_new_scaffolds_repo_workspace_...:
+    # the skeleton commit is always the OLDEST.
+    commits = _rgit(source_repo, "log", "--format=%s").splitlines()
+    assert commits[-1] == "chore: scaffold demo via gb2 new"
     assert not gb2._new_app_marker_path(source_repo).exists()
     workspace = apps_dir / "demo"
     assert (workspace / "config.json").exists()
@@ -394,6 +470,122 @@ def test_cmd_new_with_scripted_workers_env_refuses_when_a_role_file_is_missing(
     assert run_calls == []
 
 
+def test_cmd_new_leaves_the_marker_when_the_engine_never_actually_started(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GB2_SCRIPTED_WORKERS config error (a missing role script) is
+    caught by `_fakes_builder` BEFORE `run_full_job` ever runs -- the
+    engine's first stage (facts) never started. `_new_app_marker_path`'s
+    marker must stay in place so the NEXT `gb2 new demo ...` call
+    resumes this same init instead of refusing "app_exists", once the
+    environment problem is fixed."""
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "facts.json").write_text("[]", encoding="utf-8")
+    # builder.json/reviewer.json/... deliberately missing
+    monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(scripts_dir))
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 1
+    assert run_calls == []
+    source_repo = source_root / "demo"
+    assert gb2._new_app_marker_path(source_repo).exists()
+    # the workspace/scaffold themselves were already set up (that part
+    # ran fine) -- only the orbit call itself never started.
+    assert (apps_dir / "demo" / "config.json").exists()
+
+    # fix the environment (every role's script now present) and retry:
+    # must RESUME, not refuse app_exists.
+    for role in ("prober", "planner", "designer", "builder", "reviewer"):
+        (scripts_dir / f"{role}.json").write_text("[]", encoding="utf-8")
+
+    code2 = gb2.main(["new", "demo", "요구사항"])
+
+    assert code2 == 0
+    assert len(run_calls) == 1
+    assert not gb2._new_app_marker_path(source_repo).exists()
+
+
+# ---------------------------------------------------------------------------
+# gb2 doctor pre-flight (gb2 new / gb2 change)
+# ---------------------------------------------------------------------------
+
+def test_cmd_new_refuses_before_touching_anything_when_a_required_tool_is_missing(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    source_root = tmp_path / "source"
+    monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "codex" else "/usr/bin/" + name)
+    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+
+    code = gb2.main(["new", "demo", "요구사항"])
+
+    assert code == 1
+    assert run_calls == []
+    assert not (source_root / "demo").exists()
+
+
+def test_doctor_checks_skip_claude_codex_when_scripted_workers_set(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GB2_SCRIPTED_WORKERS set -> claude/codex are not in the checks
+    at all (so a missing claude/codex CLI never fails `_require_doctor_
+    ok`), while every other check (here: node) is still required."""
+    monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(tmp_path / "scripts"))
+    monkeypatch.setattr(
+        gb2.shutil, "which",
+        lambda name: None if name in ("claude", "codex", "node") else "/usr/bin/" + name,
+    )
+    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+
+    checks = gb2._doctor_checks()
+
+    names = [name for name, _ok, _detail in checks]
+    assert "claude" not in names
+    assert "codex" not in names
+    node_check = next(c for c in checks if c[0] == "node")
+    assert node_check[1] is False
+
+
+def test_doctor_checks_require_claude_codex_when_scripted_workers_unset(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GB2_SCRIPTED_WORKERS", raising=False)
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "claude" else "/usr/bin/" + name)
+    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+
+    checks = gb2._doctor_checks()
+
+    claude_check = next(c for c in checks if c[0] == "claude")
+    assert claude_check[1] is False
+
+
+def test_cmd_change_refuses_when_a_required_tool_is_missing(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps_dir = _init_demo_app(gb2, tmp_path, monkeypatch)
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+    monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "claude" else "/usr/bin/" + name)
+    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+
+    code = gb2.main(["change", "demo", "뭔가 바꿔줘"])
+
+    assert code == 1
+    assert run_calls == []
+    assert apps_dir  # the already-initialized app itself is untouched
+
+
 # ---------------------------------------------------------------------------
 # gb2 change
 # ---------------------------------------------------------------------------
@@ -538,6 +730,107 @@ def test_cmd_approve_design_appends_event_and_calls_continue_full_job(
 
 
 # ---------------------------------------------------------------------------
+# gb2 approve-install
+# ---------------------------------------------------------------------------
+
+def _make_install_harmless(config: EngineConfig, config_path: Path) -> EngineConfig:
+    """Swaps this app's real `npm install` for a trivial, deterministic
+    command -- engine.owner.approve_pending drives the REAL
+    engine.installers.RealInstaller (never a fake/stub) through
+    engine.cli._drain, so a test that exercises it for real must not
+    actually shell out to npm."""
+    from dataclasses import replace as _replace
+
+    project_config = _replace(config.projects["demo"], install_cmd=(sys.executable, "-c", "pass"))
+    new_config = _replace(config, projects={**config.projects, "demo": project_config})
+    return write_json(new_config, config_path)
+
+
+def test_cmd_approve_install_refuses_without_a_tty(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    _run_calls, continue_calls = _install_fake_full_orbit(
+        monkeypatch, pending_requests=(install_request,))
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert code == 4
+    assert continue_calls == []
+
+
+def test_cmd_approve_install_refuses_when_nothing_pending(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    _run_calls, continue_calls = _install_fake_full_orbit(monkeypatch, pending_requests=())
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert code == 1
+    assert continue_calls == []
+
+
+def test_cmd_approve_install_refuses_wrong_approval_line(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    _force_tty_approval(monkeypatch, "yes")
+    _run_calls, continue_calls = _install_fake_full_orbit(
+        monkeypatch, pending_requests=(install_request,))
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert code == 1
+    assert continue_calls == []
+
+
+def test_cmd_approve_install_approves_runs_install_then_continues(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, attempt_id = _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    config_path = config.ledger_path.parent / "config.json"
+    config = _make_install_harmless(config, config_path)
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    _force_tty_approval(monkeypatch, "승인 gb2-new-1000")
+    _run_calls, continue_calls = _install_fake_full_orbit(
+        monkeypatch, pending_requests=(install_request,))
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert code == 0
+    assert len(continue_calls) == 1
+    (_cfg, _ledger, fakes_for, project, job_name, _on_progress) = continue_calls[0]
+    assert project == "demo"
+    assert job_name == "gb2-new-1000"
+    assert fakes_for(attempt_id).installer is not None
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        recorded = [
+            event for _seq, event in ledger.events("demo", "install.recorded")
+            if event.attempt_id == attempt_id
+        ]
+        approved = [
+            event for _seq, event in ledger.events("demo", "owner.approved")
+            if event.attempt_id == attempt_id
+        ]
+    finally:
+        ledger.close()
+    assert len(recorded) == 1
+    assert recorded[0].payload["manifest"] == "package.json"
+    assert recorded[0].payload["change"] == install_request["change"]
+    assert len(approved) == 1
+
+
+# ---------------------------------------------------------------------------
 # gb2 continue
 # ---------------------------------------------------------------------------
 
@@ -566,3 +859,17 @@ def test_cmd_continue_refuses_when_no_active_job(
 
     assert code == 1
     assert continue_calls == []
+
+
+# ---------------------------------------------------------------------------
+# gb2 new/init: bootstrap (engine.bootstrap) + doctor-first
+# ---------------------------------------------------------------------------
+
+def _make_source_repo_with_package_json(source_root: Path, app: str) -> Path:
+    source_repo = source_root / app
+    source_repo.mkdir(parents=True)
+    _rgit(source_repo, "init", "-q", "-b", "master")
+    (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
+    _rgit(source_repo, "add", "-A")
+    _rgit(source_repo, "commit", "-q", "-m", "init")
+    return source_repo

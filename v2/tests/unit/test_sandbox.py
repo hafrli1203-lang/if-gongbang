@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine import sandbox
+from engine import ids, sandbox
 from engine.config import WorkerConfig
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -22,6 +22,8 @@ from engine.processor import submit as submit_request
 from engine.steps import bench_run, review, station
 from engine.steps.open_job import copy_root, open_job
 from engine.workers.base import WorkerSpec
+from engine.workers.claude_cli import ClaudeRunner
+from engine.workers.codex_cli import CodexRunner
 from engine.workers.scripted import ScriptedRunner
 from tests.conftest import Workspace
 from tests.fixtures.sample_app import make_sample
@@ -508,10 +510,6 @@ class _NoHomeWritableRunner:
     home_writable_subpaths: tuple[str, ...] = ()
 
 
-class _ClaudeLikeRunner:
-    home_writable_subpaths: tuple[str, ...] = (".claude",)
-
-
 @_needs_bwrap
 def test_station_sandbox_hides_sibling_copy_secrets_and_ledger(
     workspace: Workspace,
@@ -624,11 +622,24 @@ def test_station_sandbox_argv_has_no_ledger_dir_bind(workspace: Workspace) -> No
 def test_station_sandbox_home_writable_only_under_runner_subpaths(
     workspace: Workspace, tmp_path: Path,
 ) -> None:
-    """HOME is bound read-only; only a runner's own declared
+    """ P1 fallback: $HOME inside the sandbox is no longer the
+    real operator HOME at all (not even read-only) -- it is a fresh,
+    per-attempt directory (engine.sandbox.prepare_worker_home) seeded
+    with ONLY the real CLI's own login file. A runner's own declared
     home_writable_subpaths (e.g. ClaudeRunner's ".claude") are rebound
-    writable on top of it."""
+    writable on top of that fresh directory, never on top of the real
+    one. The real HOME's OWN path is hidden outright: a sentinel file
+    there (standing in for an ssh key, another app's config, ...) is
+    unreadable from a worker-run command, by its real absolute path OR
+    via $HOME -- $HOME simply does not resolve there any more."""
     fake_home = tmp_path / "fakehome"
     (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".claude" / ".credentials.json").write_text(
+        "REAL-CLAUDE-CREDENTIALS\n", encoding="utf-8")
+    (fake_home / ".claude.json").write_text("REAL-CLAUDE-JSON\n", encoding="utf-8")
+    sentinel = fake_home / ".ssh"
+    sentinel.mkdir()
+    (sentinel / "id_rsa").write_text("SENTINEL-SSH-KEY\n", encoding="utf-8")
 
     attempt_id = "J-alpha-TEST02#1"
     own_copy = workspace.config.home / "copies" / attempt_id / "builder"
@@ -643,24 +654,124 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
         result_path=stations_dir / "r.json", config_path=None,
     )
     ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
-    env = {"HOME": str(fake_home)}
 
     def wrapped(argv: list[str]) -> list[str]:
-        return station._sandboxed_argv(ctx, spec, argv, env, _ClaudeLikeRunner())
+        # A FRESH env dict per call, matching real usage
+        # (engine.steps.station._run_spawn_worker calls runner.env(...)
+        # -- always a new dict -- exactly once per _sandboxed_argv call)
+        # -- _sandboxed_argv overwrites env["HOME"] in place to this
+        # worker's own fresh home dir, so reusing one dict across
+        # several calls would feed call N+1 call N's OWN worker home as
+        # if it were the real HOME to hide, which is not a real
+        # production shape and would self-conflict (home_dir requested
+        # as both hidden and readonly).
+        return station._sandboxed_argv(
+            ctx, spec, argv, {"HOME": str(fake_home)}, ClaudeRunner())
 
-    outside = subprocess.run(
+    # The real HOME's own path is invisible outright, not merely
+    # read-only -- writing OR reading it by its real absolute path fails.
+    outside_write = subprocess.run(
         wrapped(["sh", "-c", f"echo hi > {fake_home}/some_new_file"]),
         capture_output=True, text=True, timeout=10,
     )
-    assert outside.returncode != 0
+    assert outside_write.returncode != 0
     assert not (fake_home / "some_new_file").exists()
 
+    sentinel_read = subprocess.run(
+        wrapped(["sh", "-c", f"cat {sentinel}/id_rsa"]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert sentinel_read.returncode != 0
+    assert "SENTINEL-SSH-KEY" not in sentinel_read.stdout
+
+    # $HOME itself now resolves to a FRESH directory -- never fake_home.
+    home_check = subprocess.run(
+        wrapped(["sh", "-c", f'test "$HOME" != {fake_home} && echo DIFFERENT_HOME']),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert home_check.returncode == 0
+    assert "DIFFERENT_HOME" in home_check.stdout
+
+    # The real CLI's own login files WERE copied into that fresh $HOME
+    # (ClaudeRunner's .claude/.credentials.json and .claude.json).
+    login_read = subprocess.run(
+        wrapped(["sh", "-c",
+                 'cat "$HOME/.claude/.credentials.json" && cat "$HOME/.claude.json"']),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert login_read.returncode == 0
+    assert "REAL-CLAUDE-CREDENTIALS" in login_read.stdout
+    assert "REAL-CLAUDE-JSON" in login_read.stdout
+
+    # Everything else under the real HOME (not a login file) was NOT
+    # copied in -- unreachable via $HOME either.
+    sentinel_via_home = subprocess.run(
+        wrapped(["sh", "-c", 'cat "$HOME/.ssh/id_rsa" 2>&1']),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert sentinel_via_home.returncode != 0
+    assert "SENTINEL-SSH-KEY" not in sentinel_via_home.stdout
+
+    # home_writable_subpaths (".claude") is writable under the fresh HOME.
     inside = subprocess.run(
-        wrapped(["sh", "-c", f"echo hi > {fake_home}/.claude/session.json"]),
+        wrapped(["sh", "-c", 'echo hi > "$HOME/.claude/session.json"']),
         capture_output=True, text=True, timeout=10,
     )
     assert inside.returncode == 0
-    assert (fake_home / ".claude" / "session.json").read_text(encoding="utf-8") == "hi\n"
+    worker_home = (workspace.config.home / "jobs" / ids.attempt_dirname(attempt_id)
+                   / "worker-home" / "build" / "builder")
+    assert (worker_home / ".claude" / "session.json").read_text(
+        encoding="utf-8") == "hi\n"
+
+
+@_needs_bwrap
+def test_station_sandbox_codex_auth_not_visible_to_claude_worker(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """Two different roles' worker HOMEs, built from the SAME real HOME
+    (containing both a claude and a codex login file), must each get
+    ONLY their own CLI's login file -- a ClaudeRunner worker must never
+    see codex's auth.json, and (by the same construction) a
+    CodexRunner worker must never see claude's credentials."""
+    fake_home = tmp_path / "fakehome"
+    (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".claude" / ".credentials.json").write_text(
+        "REAL-CLAUDE-CREDENTIALS\n", encoding="utf-8")
+    (fake_home / ".codex").mkdir(parents=True)
+    (fake_home / ".codex" / "auth.json").write_text(
+        "REAL-CODEX-AUTH\n", encoding="utf-8")
+
+    attempt_id = "J-alpha-TEST03#1"
+    config = replace(workspace.config, sandbox="bwrap")
+    env = {"HOME": str(fake_home)}
+
+    def home_for(role: str, runner: object) -> Path:
+        own_copy = workspace.config.home / "copies" / attempt_id / role
+        own_copy.mkdir(parents=True, exist_ok=True)
+        stations_dir = workspace.config.home / "jobs" / attempt_id / "stations"
+        stations_dir.mkdir(parents=True, exist_ok=True)
+        spec = WorkerSpec(
+            project="alpha", attempt_id=attempt_id, generation=1, station="build",
+            role=role, copy_root=own_copy, workdir=own_copy, task="",
+            result_path=stations_dir / f"{role}.json", config_path=None,
+        )
+        ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
+        argv = station._sandboxed_argv(ctx, spec, ["true"], dict(env), runner)
+        result = subprocess.run(argv, capture_output=True, timeout=10)
+        assert result.returncode == 0
+        return (workspace.config.home / "jobs" / ids.attempt_dirname(attempt_id)
+                / "worker-home" / "build" / role)
+
+    claude_home = home_for("builder-claude", ClaudeRunner())
+    codex_home = home_for("builder-codex", CodexRunner())
+
+    assert (claude_home / ".claude" / ".credentials.json").read_text(
+        encoding="utf-8") == "REAL-CLAUDE-CREDENTIALS\n"
+    assert not (claude_home / ".codex" / "auth.json").exists()
+
+    assert (codex_home / ".codex" / "auth.json").read_text(
+        encoding="utf-8") == "REAL-CODEX-AUTH\n"
+    assert not (codex_home / ".claude").exists()
 
 
 @_needs_bwrap

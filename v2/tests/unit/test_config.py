@@ -82,6 +82,22 @@ def test_unknown_top_level_key_rejected(tmp_path: Path) -> None:
         assert "hook" in str(exc)
 
 
+def test_security_key_is_accepted_but_not_parsed(tmp_path: Path) -> None:
+    """engine.app_security.check() reads "security" straight back out of
+    the raw JSON file (see that module's docstring) -- it must not be
+    rejected as an unknown top-level key (that would make any app with
+    an audit_cmd configured fail to load at all), and loading it does
+    not add a dataclass field or attribute for it."""
+    make_repo(tmp_path / "repo", {"src/app.py": "print('x')\n"})
+    config_path = _write_config(tmp_path, {
+        "security": {"audit_cmd": ["npm", "audit", "--omit=dev", "--json"]},
+    })
+    config = EngineConfig.from_json(config_path)
+    assert not hasattr(config, "security")
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["security"] == {"audit_cmd": ["npm", "audit", "--omit=dev", "--json"]}
+
+
 def test_workers_and_terminal_allow_loaded(tmp_path: Path) -> None:
     make_repo(tmp_path / "repo", {"src/app.py": "print('x')\n"})
     config_path = _write_config(tmp_path, {

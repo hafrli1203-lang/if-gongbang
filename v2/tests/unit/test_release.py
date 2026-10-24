@@ -102,6 +102,60 @@ def _seed_full_bench(rws: ReleaseWorkspace, attempt_id: str) -> None:
     record(rws.ledger, "gamma", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
 
 
+def _current_fp(rws: ReleaseWorkspace) -> str:
+    return evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
+
+
+def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None) -> None:
+    """Record a passing acceptance.recorded event for `attempt_id`,
+    bound to `fp` (rws.repo's CURRENT fingerprint by default) --
+    advance_master's job-level certificate check (engine.release.
+    job_certificate_status) requires this, matched against the exact
+    fingerprint of the commit being released. A test driving
+    advance_master directly via grant() + run_once/approve_and_run
+    (never through engine.full_orbit, which would have run engine.
+    acceptance.run_acceptance itself) must seed this the same way it
+    already has to seed a passing full bench. By itself this is only
+    HALF of the job certificate -- see _seed_app_security and
+    _seed_job_certificate below."""
+    rws.ledger.append(Event(
+        project="gamma", kind="acceptance.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": "test-job", "passed": True, "scenes": [],
+                 "full_suite_passed": True, "tree_changed": False, "reason": None,
+                 "fingerprint": fp if fp is not None else _current_fp(rws)},
+    ))
+
+
+def _seed_app_security(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None) -> None:
+    """Record a passing app_security.recorded event for `attempt_id`,
+    bound to `fp` (rws.repo's CURRENT fingerprint by default) -- the
+    OTHER half of the job certificate engine.release.
+    job_certificate_status requires, matching the real
+    engine.app_security.record() payload shape
+    ({"passed","findings","ran","fingerprint"})."""
+    rws.ledger.append(Event(
+        project="gamma", kind="app_security.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"passed": True, "findings": [], "ran": ["secret_scan"],
+                 "fingerprint": fp if fp is not None else _current_fp(rws)},
+    ))
+
+
+def _seed_job_certificate(rws: ReleaseWorkspace, attempt_id: str) -> None:
+    """Both halves of the job certificate (acceptance AND app_security),
+    bound to rws.repo's CURRENT fingerprint -- what a real engine.
+    full_orbit release job would have recorded (once app_security's
+    own .record() call is wired into full_orbit -- see engine.release.
+    job_certificate_status's own docstring for that gap) before ever
+    reaching engine.release.prepare. Every test driving advance_master
+    to an actual, successful merge must seed this the same way it
+    already has to seed a passing full bench."""
+    fp = _current_fp(rws)
+    _seed_acceptance(rws, attempt_id, fp)
+    _seed_app_security(rws, attempt_id, fp)
+
+
 def _proc(rws: ReleaseWorkspace, publisher: FakePublisher | None = None) -> Processor:
     proc = Processor(rws.config, rws.ledger, Fakes(publisher or FakePublisher(), FakeInstaller()))
     proc.register_defaults()
@@ -142,6 +196,7 @@ def test_release_approval_for_different_hash_is_rejected(rws: ReleaseWorkspace) 
     request_id_a, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id_a, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc = _proc(rws, publisher)
@@ -280,6 +335,7 @@ def test_release_advance_master_ignores_gitignored_file_in_master(
     rid0, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", rid0, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
     assert _proc(rws, FakePublisher()).run_once("gamma") == 1
     assert rws.ledger.request(rid0).status == "done"
 
@@ -288,6 +344,7 @@ def test_release_advance_master_ignores_gitignored_file_in_master(
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     n = _proc(rws, publisher).run_once("gamma")
@@ -312,6 +369,7 @@ def test_release_approve_and_run_succeeds(rws: ReleaseWorkspace) -> None:
     # dispatch flow it was written for.
     fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
     record(rws.ledger, "gamma", attempt_id, "bench", fp, payload={"passed": True, "scope": "full"})
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     fakes = Fakes(publisher, FakeInstaller())
@@ -366,6 +424,7 @@ def test_release_advance_master_crash_resume_merges_once(rws: ReleaseWorkspace) 
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
@@ -417,6 +476,7 @@ def test_release_deploy_failure_leaves_master_at_sha(rws: ReleaseWorkspace, tmp_
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     proc = Processor(rws.config, rws.ledger, Fakes(shell_publisher, FakeInstaller()))
     proc.register_defaults()
@@ -538,6 +598,7 @@ def test_call_publisher_rechecks_master_clean_right_before_dispatch(
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
@@ -573,6 +634,7 @@ def test_call_publisher_rechecks_full_bench_right_before_dispatch(
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),
@@ -793,6 +855,188 @@ def test_advance_master_refuses_full_bench_missing_even_with_a_valid_approval(
 
 
 # ---------------------------------------------------------------------------
+# another change: common release gate -- a job-level certificate
+# (engine.release.job_certificate_status) is required before
+# advance_master ever merges, independent of a passing full bench.
+# ---------------------------------------------------------------------------
+
+def test_job_certificate_status_false_without_any_event(
+    rws: ReleaseWorkspace,
+) -> None:
+    attempt_id = _open(rws, "job-cert-none")
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws))
+    assert ok is False
+    assert reason == "release_requires_job_certificate"
+
+
+def test_job_certificate_status_false_when_latest_acceptance_failed(
+    rws: ReleaseWorkspace,
+) -> None:
+    attempt_id = _open(rws, "job-cert-failed")
+    fp = _current_fp(rws)
+    _seed_app_security(rws, attempt_id, fp)
+    rws.ledger.append(Event(
+        project="gamma", kind="acceptance.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": "j", "passed": False, "scenes": [],
+                 "full_suite_passed": False, "tree_changed": False,
+                 "reason": "scenes_or_suite_failed", "fingerprint": fp},
+    ))
+    ok, reason = release.job_certificate_status(rws.ledger, "gamma", attempt_id, rws.repo, fp)
+    assert ok is False
+    assert reason == "release_requires_job_certificate"
+
+
+def test_job_certificate_status_false_when_app_security_missing(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Acceptance alone, passing, is NOT enough -- app_security must
+    also have a passing record (with a fingerprint that, once diffed
+    against the release fingerprint, touches nothing outside
+    .gongbang/)."""
+    attempt_id = _open(rws, "job-cert-nosecurity")
+    fp = _current_fp(rws)
+    _seed_acceptance(rws, attempt_id, fp)
+    ok, reason = release.job_certificate_status(rws.ledger, "gamma", attempt_id, rws.repo, fp)
+    assert ok is False
+    assert reason == "release_requires_job_certificate"
+
+
+def test_job_certificate_status_passes_when_only_gongbang_differs(
+    rws: ReleaseWorkspace,
+) -> None:
+    """The handoff-only case this check exists to tolerate: acceptance/
+    app_security were recorded against the tree BEFORE engine.
+    full_orbit's own handoff commit (write_handoff + _commit_job_trail)
+    added .gongbang/<job>/report.md -- the released commit's own
+    fingerprint differs from the recorded one by EXACTLY that
+    bookkeeping path, nothing else, so this must still pass."""
+    attempt_id = _open(rws, "job-cert-gongbang-only")
+    _seed_job_certificate(rws, attempt_id)  # bound to the pre-handoff fingerprint
+    (rws.repo / ".gongbang" / "job-cert-gongbang-only").mkdir(parents=True)
+    _commit(rws.repo, ".gongbang/job-cert-gongbang-only/report.md",
+           "# report\n", "gongbang: handoff")
+    released_fp = _current_fp(rws)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, released_fp)
+    assert ok is True
+    assert reason == ""
+
+
+def test_job_certificate_status_refuses_when_source_changes_outside_gongbang(
+    rws: ReleaseWorkspace,
+) -> None:
+    """A real source change after acceptance/app_security already ran
+    (e.g. something committing directly into the app repo) must still
+    refuse, with the changed path named in the reason."""
+    attempt_id = _open(rws, "job-cert-src-drift")
+    _seed_job_certificate(rws, attempt_id)
+    _commit(rws.repo, "app.py", "v3-drifted\n", "drift after acceptance")
+    released_fp = _current_fp(rws)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, released_fp)
+    assert ok is False
+    assert reason.startswith("release_requires_job_certificate:")
+    assert "app.py" in reason
+
+
+def test_job_certificate_status_refuses_when_recorded_tree_missing(
+    rws: ReleaseWorkspace,
+) -> None:
+    """A recorded fingerprint that does not resolve as a real tree
+    object in the repo (garbage-collected, or simply never a real
+    fingerprint) must refuse outright -- never diffed against
+    anything, never trusted as a match."""
+    attempt_id = _open(rws, "job-cert-missing-tree")
+    fake_tree = "0" * 40
+    _seed_acceptance(rws, attempt_id, fake_tree)
+    _seed_app_security(rws, attempt_id, fake_tree)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws))
+    assert ok is False
+    assert reason == "release_requires_job_certificate"
+
+
+def test_job_certificate_status_true_after_seeding_both_halves(
+    rws: ReleaseWorkspace,
+) -> None:
+    attempt_id = _open(rws, "job-cert-ok")
+    _seed_job_certificate(rws, attempt_id)
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws))
+    assert ok is True
+    assert reason == ""
+
+
+def test_job_certificate_status_finds_evidence_on_an_earlier_attempt_of_the_same_job(
+    rws: ReleaseWorkspace,
+) -> None:
+    """engine.full_orbit._maybe_release_or_done opens a BRAND NEW
+    attempt for the release itself, strictly after acceptance/
+    app_security already ran and were recorded against an EARLIER
+    attempt of the SAME job (same job_name) -- this must still find
+    them (job-scoped, not attempt_id-equality-scoped). Builds the two
+    job.opened events directly (bypassing engine.steps.open_job.
+    open_job's own project-state machine entirely, which requires
+    closing the project between opens and is irrelevant to what this
+    function reads) -- same job_id/job_name, n=1 and n=2."""
+    import engine.ids as ids_mod
+
+    job_id = ids_mod.new_job_id("gamma")
+    earlier_attempt_id = ids_mod.attempt_id(job_id, 1)
+    release_attempt_id = ids_mod.attempt_id(job_id, 2)
+    for n, aid in ((1, earlier_attempt_id), (2, release_attempt_id)):
+        rws.ledger.append(Event(
+            project="gamma", kind="job.opened", actor_kind="owner", actor_id="owner",
+            attempt_id=aid,
+            payload={"job_id": job_id, "job_name": "job-cert-multiattempt",
+                     "attempt_id": aid, "n": n, "kind": "full", "generation": n,
+                     "dirty_paths": [], "base_head": "0" * 40,
+                     "copy_links_skipped": [], "copy_git_config_sha256": {}},
+        ))
+    _seed_job_certificate(rws, earlier_attempt_id)
+    fp = _current_fp(rws)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", release_attempt_id, rws.repo, fp)
+    assert ok is True
+    assert reason == ""
+
+
+def test_advance_master_refuses_without_job_certificate_even_with_full_bench(
+    rws: ReleaseWorkspace,
+) -> None:
+    """The `gb2 run` -> `gb2 ship` path: engine.orbit.continue_job's own
+    commit-stage handler calls engine.release.prepare() directly once
+    review+bench pass, never running engine.acceptance (that only
+    happens inside engine.full_orbit). A passing full bench alone must
+    no longer be enough to actually merge into master -- this is the
+    scenario the job-level certificate check exists to close."""
+    attempt_id = _open(rws, "job-cert-missing")
+    sha = _commit(rws.repo, "app.py", "v2\n", "advance")
+    master_before = release.head_sha(rws.master_repo)
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
+    # Deliberately NOT seeding acceptance -- this is the exact gap.
+
+    publisher = FakePublisher()
+    n = _proc(rws, publisher).run_once("gamma")
+
+    assert n == 0
+    req = rws.ledger.request(request_id)
+    assert req.status == "failed"
+    assert req.result == {"reason": "release_requires_job_certificate"}
+    assert publisher.calls == []
+    assert release.head_sha(rws.master_repo) == master_before
+    assert sha != master_before  # the commit really was there to ship
+
+
+# ---------------------------------------------------------------------------
 # engine.release.cancel_pending_publish
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1136,7 @@ def test_cancel_running_publish_before_dispatch_cancels_when_never_started(
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()))
@@ -925,6 +1170,7 @@ def test_cancel_running_publish_before_dispatch_refuses_once_call_publisher_star
     request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
     grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
     _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
 
     publisher = FakePublisher()
     proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()),

@@ -93,13 +93,20 @@ def _do_spawn(item: dict[str, object], cwd: str) -> None:
 
 
 def run(argv: list[str]) -> int:
-    script_path = Path(argv[0])
+    inline: str | None = None
+    if argv and argv[0] == "--inline":
+        inline = argv[1]
+        argv = argv[2:]
+        script_path = None
+    else:
+        script_path = Path(argv[0])
     gate_argv: tuple[str, ...] | None = None
     if "--gate" in argv:
         idx = argv.index("--gate")
         gate_argv = tuple(json.loads(argv[idx + 1]))
 
-    items_raw = json.loads(script_path.read_text(encoding="utf-8"))
+    items_raw = json.loads(inline if inline is not None
+                           else script_path.read_text(encoding="utf-8"))
     items = items_raw if isinstance(items_raw, list) else []
     final: dict[str, object] = {"status": "done", "summary": "", "requests": []}
     cwd = os.getcwd()

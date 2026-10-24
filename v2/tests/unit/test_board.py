@@ -219,7 +219,7 @@ def test_load_app_board_works_when_ledger_path_contains_a_question_mark(tmp_path
 
 
 def test_load_app_board_needs_owner_status_includes_stop_reason(tmp_path):
-    """s10 contract item 5: a needs_owner stop recorded with its own
+    """a needs_owner stop recorded with its own
     stop_reason shows it on the board, not just the generic label."""
     project = "alpha"
     ledger_path = tmp_path / "ledger.sqlite"
@@ -273,3 +273,159 @@ def test_render_board_html_shows_failed_badge(tmp_path):
 
     assert "badge-neg" in page
     assert "실패" in page
+
+
+def test_ship_clears_the_stale_release_approval_waiting_status(tmp_path):
+    """`gb2 ship` records a full_orbit.release_decision
+    "shipped" event strictly AFTER the "awaiting_release_approval"
+    progress event that first parked the job -- the board must show the
+    later, real outcome (배포됨), never the now-stale "사람 확인 대기"
+    just because that progress event still exists earlier in the
+    log."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval"},
+    ))
+    ledger.append(Event(
+        project=project, kind="job.handoff_written", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1", payload={"job": "add-login"},
+    ))
+    ledger.append(Event(
+        project=project, kind="full_orbit.release_decision", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "decision": "shipped"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "배포됨"
+
+
+def test_skip_ship_clears_the_stale_release_approval_waiting_status(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval"},
+    ))
+    ledger.append(Event(
+        project=project, kind="full_orbit.release_decision", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "decision": "skipped"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "건너뜀"
+
+
+def test_release_followup_failure_clears_the_stale_release_approval_waiting_status(tmp_path):
+    """If `gb2 ship`'s own report/close followup fails after approval (no
+    full_orbit.release_decision is ever recorded in that case -- see
+    cmd_ship's own docstring), the job.metrics "failed" event it leaves
+    behind must still win over the earlier "awaiting_release_approval"
+    progress event -- a job must never show "사람 확인 대기" once it has
+    plainly already failed."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval"},
+    ))
+    ledger.append(Event(
+        project=project, kind="job.metrics", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"durations_ms": {}, "test_runs": {}, "git_calls": 0,
+                 "outcome": "failed", "failed_stage": "close"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "실패"
+
+
+def test_ship_publish_failure_clears_the_stale_release_approval_waiting_status(tmp_path):
+    """P2: `tools/gb2`'s `ship` drives the pending publish request all
+    the way to a terminal "failed"/"unknown" status and then returns
+    (exit 3) WITHOUT ever journaling report/close, a job.metrics
+    "failed" outcome, or a full_orbit.release_decision -- nothing else
+    on the events table ever supersedes the earlier
+    "awaiting_release_approval" progress event. The board must still
+    derive 실패 straight from that SAME request_id's own CURRENT status
+    in the ledger's requests table, never keep showing "사람 확인 대기"
+    for a publish that will never be approved again."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval",
+                 "request_id": "r-publish-1"},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-publish-1", "kind": "publish",
+                 "content_hash": "h1", "payload": {}},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.status", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r-publish-1", "status": "failed",
+                 "result": {"reason": "deploy_script_failed"}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "실패"
+
+
+def test_ship_approval_refusal_still_shows_waiting_not_failed(tmp_path):
+    """The counterpart to the test above: a request that is still
+    "queued" (e.g. ship's own approval-refused/wrong-approval-text
+    retry path, which never touches the request at all) must keep
+    showing "사람 확인 대기" -- only a REAL terminal failed/unknown
+    request status ever overrides that label."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval",
+                 "request_id": "r-publish-2"},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-publish-2", "kind": "publish",
+                 "content_hash": "h2", "payload": {}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기: release_approval"

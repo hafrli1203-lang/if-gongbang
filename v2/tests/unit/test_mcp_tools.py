@@ -286,6 +286,7 @@ def test_gate_allows_mcp_tool_in_both_request_and_station_allow(tmp_path: Path) 
     config, config_path, attempt_id, copy_root = _setup(tmp_path, {
         "mcp_servers": {"library": {"command": ["python3", "-m", "lib"]}},
         "station_mcp_allow": {"build": ["library"]},
+        "mcp_tool_allow": {"library": ["search"]},
     })
     facts_path, log_path = _write_gate_facts_and_log(tmp_path, mcp_allow=["library"])
     stdin = json.dumps({"tool_name": "mcp__library__search", "cwd": str(copy_root),
@@ -441,10 +442,12 @@ def test_policy_mcp_tool_allow_allows_tool_in_list(tmp_path: Path) -> None:
     assert decision.reason == "mcp_allowed"
 
 
-def test_policy_mcp_tool_allow_absent_server_is_unrestricted(tmp_path: Path) -> None:
-    """A server with no mcp_tool_allow entry at all keeps the
-    server-level checks as the whole story -- any tool name passes
-    this particular check."""
+def test_policy_mcp_tool_allow_absent_server_denies_every_tool(tmp_path: Path) -> None:
+    """Default deny: a server with no mcp_tool_allow entry at all
+    denies every tool call for it -- being granted to a station
+    (station_mcp_allow) is not itself permission to call every tool
+    that server exposes; the operator config must explicitly
+    enumerate the allowed tools."""
     config, config_path, attempt_id, copy_root = _setup(tmp_path, {
         "mcp_servers": {"library": {"command": ["python3"]}},
         "station_mcp_allow": {"build": ["library"]},
@@ -460,7 +463,8 @@ def test_policy_mcp_tool_allow_absent_server_is_unrestricted(tmp_path: Path) -> 
     decision = policy.check("alpha", actor, Action(
         tool="mcp", target="library", mcp_tool="anything_at_all"))
     ledger.close()
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert decision.reason == "mcp_tool_allow_not_configured"
 
 
 def test_gate_passes_mcp_tool_name_through_to_policy(tmp_path: Path) -> None:
@@ -486,11 +490,19 @@ def test_gate_passes_mcp_tool_name_through_to_policy(tmp_path: Path) -> None:
 def _spec(tmp_path: Path, mcp_servers: dict[str, McpServerConfig] | None = None) -> WorkerSpec:
     copy_root = tmp_path / "copy"
     copy_root.mkdir()
+    gate_ro = tmp_path / "gate-ro"
+    gate_ro.mkdir()
     return WorkerSpec(
         project="alpha", attempt_id="J-alpha-TEST#1", generation=1,
         station="build", role="builder", copy_root=copy_root, workdir=copy_root,
         task="do the thing", result_path=tmp_path / "result.json",
         config_path=tmp_path / "engine.json",
+        # another change: ClaudeRunner now writes the mcp-config file into
+        # gate_facts_path's own parent (the engine-only gate-ro dir)
+        # instead of next to result_path -- a real spawn (needs_gate =
+        # True) always has this set; see engine.workers.claude_cli.
+        # _mcp_config_dir's own docstring.
+        gate_facts_path=gate_ro / "gate_facts.json",
         mcp_servers=(mcp_servers or {}),
     )
 

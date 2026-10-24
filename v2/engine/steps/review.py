@@ -406,16 +406,48 @@ def _ledger_hidden_root(ctx: StepContext) -> tuple[Path, ...]:
     return (ctx.config.ledger_path.parent,)
 
 
+# Same table as engine.steps.station._RUNNER_LOGIN_FILES -- the
+# SMALLEST set of real-HOME-relative files each real CLI needs copied
+# into its own fresh, per-attempt reviewer HOME to authenticate, named
+# explicitly by the team lead's own decision. Kept as a
+# separate copy (not imported from engine.steps.station) so this
+# module's own diff stays confined to the functions that build its
+# sandbox mounts/HOME, same restriction engine.steps.station is under.
+_RUNNER_LOGIN_FILES: dict[str, tuple[str, ...]] = {
+    "ClaudeRunner": (".claude/.credentials.json", ".claude.json"),
+    "CodexRunner": (".codex/auth.json",),
+}
+
+
+def _login_files_for(runner: object) -> tuple[str, ...]:
+    return _RUNNER_LOGIN_FILES.get(type(runner).__name__, ())
+
+
+def _reviewer_home_dir(ctx: StepContext, spec: WorkerSpec) -> Path:
+    """A fresh, per-attempt-and-station $HOME for this reviewer's real
+    CLI process -- never the real operator HOME. See engine.sandbox.
+    prepare_worker_home's docstring and engine.steps.station's own
+    identically-shaped _worker_home_dir for why. Keyed by station AND
+    role, same reasoning as station.py's helper (parallel_review_bench
+    can run a builder and a reviewer for the SAME attempt_id
+    concurrently)."""
+    return (ctx.config.home / "jobs" / ids.attempt_dirname(ctx.attempt_id)
+            / "worker-home" / spec.station / spec.role)
+
+
 def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
                      env: dict[str, str], runner: object) -> list[str]:
     """Reviewer sandbox policy: writable = the stations dir (its output
     files) and -- only if the real HOME exists -- the runner's own
-    `home_writable_subpaths` under it (same reasoning as station.py's
-    worker: a real CLI's credential/session state, never the whole
-    HOME). The ledger directory is NOT writable (no gate hook runs for
-    the reviewer, so nothing here ever needed to append to it).
-    readonly = the real HOME itself (the CLI still needs to READ its
-    config/credentials there) AND the per-request review SNAPSHOT
+    `home_writable_subpaths` under THIS REVIEWER'S OWN fresh home
+    directory (_reviewer_home_dir), never under the real HOME (same
+    reasoning as station.py's worker: a real CLI's credential/session
+    state, never the whole real HOME). The ledger directory is NOT
+    writable (no gate hook runs for the reviewer, so nothing here ever
+    needed to append to it). readonly = _reviewer_home_dir(ctx, spec)
+    itself (mounted as $HOME; sandbox.prepare_worker_home seeds it,
+    before this mount, with ONLY the real CLI's own login files named
+    in _RUNNER_LOGIN_FILES) AND the per-request review SNAPSHOT
     directory (spec.workdir -- the extracted, already-fingerprinted
     tree, never the live project repo: see _export_review_snapshot).
     hidden = engine home (minus the stations dir and the snapshot dir,
@@ -425,18 +457,29 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     be observable through any absolute-path reference, only through
     the frozen snapshot), every OTHER project's repo, the project's
     own `hidden_paths`, PLUS the WHOLE directory holding the ledger
-    file (see _ledger_hidden_root). net=True (codex/claude need it)."""
+    file (see _ledger_hidden_root), PLUS the real operator HOME outright
+    (same reasoning as station.py's worker -- read from THIS process's
+    own os.environ via `env.get("HOME")`, never from anything case-
+    controlled). net=True (codex/claude need it). `env["HOME"]` is
+    overwritten in place, here, to _reviewer_home_dir(ctx, spec) -- the
+    SAME dict object the caller (_run_spawn_reviewer) goes on to pass to
+    sandbox.exec_env, so the real HOME value never reaches the spawned
+    process even under sandbox_mode="none"."""
+    home_dir = _reviewer_home_dir(ctx, spec)
     home_env = env.get("HOME")
+    real_home = Path(home_env) if home_env else None
+    login_files = _login_files_for(runner)
+    subpaths = getattr(runner, "home_writable_subpaths", ())
+    sandbox.prepare_worker_home(home_dir, real_home, login_files, subpaths)
+    env["HOME"] = str(home_dir)
     writable = (_stations_dir(ctx),)
-    readonly: tuple[Path, ...] = (spec.workdir,)
-    if home_env:
-        home_path = Path(home_env)
-        readonly += (home_path,)
-        subpaths = getattr(runner, "home_writable_subpaths", ())
-        writable += tuple(home_path / sub for sub in subpaths)
+    readonly: tuple[Path, ...] = (spec.workdir, home_dir)
+    writable += tuple(home_dir / sub for sub in subpaths)
     hidden = ((ctx.config.home, ctx.config.secrets_dir, _repo(ctx))
               + _other_project_repos(ctx) + _ledger_hidden_root(ctx)
               + ctx.config.projects[ctx.project].hidden_paths)
+    if real_home is not None:
+        hidden += (real_home,)
     try:
         return sandbox.wrap(
             argv, cwd=spec.workdir, writable=writable, hidden=hidden,

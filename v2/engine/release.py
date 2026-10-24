@@ -272,6 +272,209 @@ def _latest_full_bench_passed(ledger: Ledger, attempt_id: str, fp: str) -> bool:
     return str(latest.payload.get("scope", "")).startswith("full")
 
 
+_JOB_CERTIFICATE_MISSING_REASON = "release_requires_job_certificate"
+
+
+def _job_name_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> str | None:
+    """The job_name of the 'job.opened' event that created `attempt_id`,
+    or None if no such event exists at all (should not happen for any
+    attempt that ever ran a request, but this function never raises --
+    the caller treats None the same as "no certificate"). Implemented
+    locally (never engine.steps.open_job's own identically-shaped, but
+    private, `_job_opened_payload_for_attempt`) since that module is
+    outside this one's owned scope for this task."""
+    for _seq, event in ledger.events(project, "job.opened"):
+        if event.payload.get("attempt_id") == attempt_id:
+            job_name = event.payload.get("job_name")
+            return str(job_name) if job_name is not None else None
+    return None
+
+
+def _latest_passing_fingerprint(
+    ledger: Ledger, project: str, kind: str, attempt_ids: frozenset[str],
+) -> str | None:
+    """The payload["fingerprint"] of the newest event of `kind` whose
+    attempt_id is one of `attempt_ids` and whose payload["passed"] is
+    True -- None if no such event exists, or if the newest one has no
+    non-"" fingerprint recorded (a run that itself failed to fingerprint
+    the repo at all must never be trusted as a match for anything)."""
+    rows = [
+        (seq, event) for seq, event in ledger.events(project, kind)
+        if event.attempt_id in attempt_ids
+    ]
+    if not rows:
+        return None
+    _seq, latest = max(rows, key=lambda row: row[0])
+    if latest.payload.get("passed") is not True:
+        return None
+    fp = latest.payload.get("fingerprint")
+    return str(fp) if fp else None
+
+
+def _tree_exists(repo: Path, tree_sha: str) -> bool:
+    """True iff `tree_sha` resolves as an actual tree object in `repo`'s
+    own object database (`git cat-file -t` == "tree") -- a recorded
+    fingerprint is never trusted as a real, diffable tree just because
+    some ledger event says so (it could be garbage-collected, or from a
+    repo that no longer exists in this shape)."""
+    try:
+        result = subprocess.run(
+            git_argv(repo, "cat-file", "-t", tree_sha),
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "tree"
+
+
+_GONGBANG_PREFIX = ".gongbang/"
+
+
+def _changed_paths_outside_gongbang(repo: Path, tree_a: str, tree_b: str) -> tuple[str, ...]:
+    """Paths that differ between two tree objects (git diff --name-only,
+    both sides already confirmed to be real tree objects by the caller),
+    excluding anything under ".gongbang/" -- engine.full_orbit's own
+    handoff commit (write_handoff + _commit_job_trail) adds/changes
+    exactly .gongbang/<job>/report.md and .gongbang/<job>/acceptance.json
+    AFTER engine.acceptance.run_acceptance already fingerprinted the
+    tree, so that bookkeeping-only difference must never by itself make
+    a job's certificate look stale. tree_a == tree_b short-circuits to
+    () without ever shelling out (the common case once app_security's
+    own check() -- which engine.full_orbit calls strictly AFTER the
+    handoff commit -- is fingerprinted at the exact released tree)."""
+    if tree_a == tree_b:
+        return ()
+    result = subprocess.run(
+        git_argv(repo, "diff", "--name-only", tree_a, tree_b),
+        check=True, capture_output=True, text=True,
+    )
+    return tuple(
+        p for p in result.stdout.splitlines()
+        if p and p != ".gongbang" and not p.startswith(_GONGBANG_PREFIX)
+    )
+
+
+_MAX_REASON_PATHS = 3
+
+
+def _certificate_reason(changed: tuple[str, ...]) -> str:
+    if not changed:
+        return _JOB_CERTIFICATE_MISSING_REASON
+    shown = ",".join(changed[:_MAX_REASON_PATHS])
+    more = "" if len(changed) <= _MAX_REASON_PATHS else f",+{len(changed) - _MAX_REASON_PATHS} more"
+    return f"{_JOB_CERTIFICATE_MISSING_REASON}:{shown}{more}"
+
+
+def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
+                           repo: Path, fingerprint: str) -> tuple[bool, str]:
+    """(ok, reason) for whether the JOB `attempt_id` belongs to carries
+    the certificate a release of the commit fingerprinted as
+    `fingerprint` is required to have: the newest passing
+    'acceptance.recorded' event AND the newest passing
+    'app_security.recorded' event, among EVERY attempt of that same job
+    (engine.ledger.Ledger.attempts_for_job_name, keyed by the job_name
+    on `attempt_id`'s own 'job.opened' event -- never attempt_id
+    equality alone), must each have a recorded fingerprint that is
+    EITHER exactly `fingerprint`, OR a real tree object in `repo` whose
+    git-diff against `fingerprint` touches nothing outside ".gongbang/".
+    reason is "" when ok, else "release_requires_job_certificate"
+    (optionally suffixed with ":<first few changed paths>" when the
+    refusal is specifically because something outside .gongbang/
+    changed).
+
+    Why an exact fingerprint match is too strict for acceptance's own
+    recorded fingerprint (root cause investigated and reported to the
+    team before this function was changed to tolerate it): engine.
+    acceptance.run_acceptance
+    fingerprints the tree BEFORE engine.full_orbit's own write_handoff
+    + _commit_job_trail commit .gongbang/<job>/report.md (and the
+    already-written .gongbang/<job>/acceptance.json) into the repo --
+    the FIRST commit after that handoff, strictly before engine.
+    app_security.check() ever runs and strictly before engine.release.
+    prepare() ever submits a publish request for @HEAD, is the exact
+    commit actually released. So acceptance's own recorded fingerprint
+    and the released commit's fingerprint can NEVER be bit-identical on
+    the normal engine.full_orbit path -- they differ by EXACTLY the
+    handoff bookkeeping under .gongbang/, which is why this function
+    diffs the two trees and only objects to a difference OUTSIDE
+    .gongbang/ (a real source change, e.g. the owner or something else
+    committing directly into the app repo after acceptance already
+    ran), rather than requiring byte-identical fingerprints.
+    engine.app_security.check() itself runs AFTER the handoff commit
+    (see engine.full_orbit._finish_after_handoff, called after
+    _commit_job_trail), so its own recorded fingerprint is normally
+    bit-identical to the released commit's -- the tree_a == tree_b
+    short-circuit in _changed_paths_outside_gongbang covers that case
+    without ever shelling out to git diff.
+
+    Scoped by JOB, not by attempt_id equality, because engine.full_orbit.
+    _maybe_release_or_done opens a BRAND NEW attempt (via open_job) for
+    the release itself, strictly after acceptance/app_security already
+    ran and were recorded against an EARLIER attempt of the same job --
+    attempt_id equality would make this refuse every legitimate
+    full_orbit release too. engine.orbit.continue_job's own commit-stage
+    handler, which calls release.prepare() directly for the `gb2 run`
+    -> `gb2 ship` path (engine.full_orbit/engine.acceptance/engine.
+    app_security are never invoked there), still opens its OWN job (see
+    tools/gb2's cmd_run -> engine.steps.open_job.open_job) -- so a
+    job_name is always found for that path too, but attempts_for_job_
+    name finds no acceptance.recorded/app_security.recorded event for
+    ANY of that job's attempts at all, so this still refuses it.
+
+    `repo`/`fingerprint` are the caller's responsibility (engine.
+    evidence.fingerprint(repo, excludes), the SAME function engine.
+    steps.publish's own full-bench check already calls, against the
+    project's own repo) -- right when checking, against the repo state
+    check_artifact already confirmed IS the exact commit being
+    released, never trusted from any earlier step's own say-so. A
+    recorded fingerprint that does not resolve as a real tree object in
+    `repo` (_tree_exists) refuses outright, same as a missing event --
+    it is never diffed against anything.
+
+    Until engine.full_orbit (or engine.app_security itself) is changed
+    to call engine.app_security.record() after .check() on the real
+    release path, NO job will ever satisfy this function's app_security
+    half at all -- not a fingerprint problem, there is simply no event
+    yet."""
+    if not fingerprint or not _tree_exists(repo, fingerprint):
+        # The caller's own, just-computed release fingerprint must
+        # itself be a real tree -- defensive only (engine.evidence.
+        # fingerprint() writes the tree into this same repo synchronously
+        # right before any caller ever gets a value back from it, so
+        # this should never actually fire), but a malformed/garbage
+        # value here must still refuse cleanly, never crash the diff
+        # below with a git error.
+        return False, _JOB_CERTIFICATE_MISSING_REASON
+    job_name = _job_name_for_attempt(ledger, project, attempt_id)
+    if job_name is None:
+        return False, _JOB_CERTIFICATE_MISSING_REASON
+    attempt_ids = frozenset(
+        row.attempt_id for row in ledger.attempts_for_job_name(project, job_name)
+    )
+    if not attempt_ids:
+        return False, _JOB_CERTIFICATE_MISSING_REASON
+
+    changed: list[str] = []
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        recorded_fp = _latest_passing_fingerprint(ledger, project, kind, attempt_ids)
+        if recorded_fp is None:
+            return False, _JOB_CERTIFICATE_MISSING_REASON
+        if recorded_fp == fingerprint:
+            continue
+        if not _tree_exists(repo, recorded_fp):
+            return False, _JOB_CERTIFICATE_MISSING_REASON
+        changed.extend(_changed_paths_outside_gongbang(repo, recorded_fp, fingerprint))
+    if changed:
+        # Dedupe while keeping first-seen order (acceptance's own diff
+        # before app_security's), so the reason's truncated path list
+        # never repeats the same path twice.
+        seen: dict[str, None] = {}
+        for p in changed:
+            seen.setdefault(p, None)
+        return False, _certificate_reason(tuple(seen))
+    return True, ""
+
+
 def _ledger_generation(ledger: Ledger, project: str) -> int:
     """A number that strictly increases with every ledger write for
     this project (the seq of its latest event, 0 if none yet) -- used
@@ -538,5 +741,5 @@ __all__ = [
     "master_is_clean", "merge_range_paths", "incoming_added_paths",
     "overlapping_paths", "ff_merge", "build_summary",
     "prepare", "approve_and_run", "ensure_full_bench", "cancel_pending_publish",
-    "cancel_running_publish_before_dispatch",
+    "cancel_running_publish_before_dispatch", "job_certificate_status",
 ]

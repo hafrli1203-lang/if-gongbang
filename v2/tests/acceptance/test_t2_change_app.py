@@ -100,6 +100,13 @@ from greeter.initials import initials
 assert initials("Ada Lovelace") == "AL"
 '''
 
+_SCENE_FAREWELL_PY = '''\
+import sys
+sys.path.insert(0, "src")
+from greeter.farewell import farewell
+assert farewell("World") == "Goodbye, World"
+'''
+
 _FACTS_MD = '''\
 # 사실 확인
 
@@ -128,14 +135,18 @@ def _plan_json(job: str) -> str:
             {"id": "s2", "actor_does": "이름의 이니셜을 구한다",
              "app_shows": "AL", "where": "cli",
              "cmd": [sys.executable, "tests/scenes/s2_initials.py"], "covers": ["R1"]},
+            {"id": "s3", "actor_does": "작별 인사를 받는다",
+             "app_shows": "Goodbye, World", "where": "cli",
+             "cmd": [sys.executable, "tests/scenes/s3_farewell.py"], "covers": ["R2"]},
         ],
         "tasks": [
             {"id": "t1", "title": "initials 추가",
              "detail": "initials()와 그 시험을 만든다",
              "owns": ["src/greeter/initials.py", "tests/test_initials.py"],
              "depends_on": []},
-            # R2 (farewell) has no automated pass/fail scene in this plan
-            # -- covered by this task instead (engine.plan.Task.covers).
+            # task.covers is tracking only (engine.plan.Task.covers) --
+            # R2 (farewell) still needs its own scene (s3) to actually
+            # count as covered for completion.
             {"id": "t2", "title": "farewell 추가",
              "detail": "farewell()과 그 시험을 만든다",
              "owns": ["src/greeter/farewell.py", "tests/test_farewell.py"],
@@ -154,10 +165,11 @@ def _write(path: Path, content: str) -> None:
 
 
 def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stands in for s10-ops' own engine.app_security module (not yet
+    """Stands in for another change' own engine.app_security module (not yet
     merged into this worktree) -- see test_t1_new_app.py's own copy of
     this helper for the full rationale."""
     security_mod = types.ModuleType("engine.app_security")
+    security_mod.record = lambda ledger, project, attempt_id, result: None  # type: ignore[attr-defined]
 
     def check(config, project, attempt_id, plan):
         return types.SimpleNamespace(passed=True, findings=(), ran=())
@@ -198,6 +210,8 @@ def test_change_keeps_pre_existing_test_green_and_adds_two_tasks(
          "content": _SCENE_GREET_REGRESSION_PY},
         {"tool": "Write", "file_path": "tests/scenes/s2_initials.py",
          "content": _SCENE_INITIALS_PY},
+        {"tool": "Write", "file_path": "tests/scenes/s3_farewell.py",
+         "content": _SCENE_FAREWELL_PY},
         {"final": {"status": "done", "summary": "plan", "requests": []}},
     ]))
     # See test_t1_new_app.py's module docstring: one static script for
@@ -269,10 +283,12 @@ def test_change_keeps_pre_existing_test_green_and_adds_two_tasks(
     assert acceptance_path.exists()
     acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
     assert acceptance["passed"] is True
-    assert {s["id"] for s in acceptance["scenes"]} == {"s1", "s2"}
+    assert {s["id"] for s in acceptance["scenes"]} == {"s1", "s2", "s3"}
 
     report_text = (repo / ".gongbang" / "greeter" / "report.md").read_text(encoding="utf-8")
-    # s10 contract item 4: R1 is covered by scene s2 (initials), R2 has
-    # no scene of its own and is covered by task t2 (farewell) instead.
+    # R1 is
+    # covered by scene s2 (initials) and R2 by scene s3 (farewell) --
+    # task t2's own `covers` for R2 is still tracked too, but a scene is
+    # what actually makes the requirement count as satisfied.
     assert "R1" in report_text and "scene:s2" in report_text
-    assert "R2" in report_text and "task:t2" in report_text
+    assert "R2" in report_text and "scene:s3" in report_text and "task:t2" in report_text

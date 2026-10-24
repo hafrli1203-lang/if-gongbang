@@ -21,10 +21,17 @@
                                           ledger event, then resume with
                                           engine.full_orbit
                                           .continue_full_job
+    tools/gb2 approve-install <app>      TTY-only: show the pending
+                                          install request(s) a builder
+                                          station asked for, type "승인
+                                          <job>" to approve+run them
+                                          through engine.owner, then
+                                          resume with engine.full_orbit
+                                          .continue_full_job
     tools/gb2 continue <app>             resume the app's current job
                                           with engine.full_orbit
                                           .continue_full_job (e.g. after
-                                          an install approval)
+                                          a release approval)
     tools/gb2 run <app> "<task>"         run one job end to end
     tools/gb2 run <app> --task-file f    same, task text from a file
     tools/gb2 fix <app> ["extra"]        continue the current job's
@@ -122,6 +129,7 @@ sys.path.insert(0, str(_ENGINE_ROOT))
 from engine import evidence, fixup, orbit, release  # noqa: E402
 from engine.cli import _build_fakes, _drain, _job_name_for_attempt, _outcome_dict  # noqa: E402
 from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
+from engine.bootstrap import ensure_installed, record_bootstrap  # noqa: E402
 from engine.config import EngineConfig, WorkerConfig  # noqa: E402
 from engine.ledger import Event, Ledger  # noqa: E402
 from engine.processor import Fakes, retry_unknown  # noqa: E402
@@ -440,6 +448,22 @@ def _verify_app_repo_identity(app: str) -> None:
     _verify_worktree_identity(source_repo, repo_dir)
 
 
+def _copy_node_modules(source_repo: Path, repo_dir: Path) -> None:
+    """Physically copy source_repo/node_modules into repo_dir, never
+    link -- a worker's Bash runs inside this worktree and must never be
+    able to write back into the source repo's own node_modules through
+    a shared inode/symlink target. node_modules is always gitignored
+    (see the node-vitest template's own .gitignore), so `git worktree
+    add` never brings it along regardless of what is committed in
+    source_repo -- this on-disk copy is the only way the worktree gets
+    it. A no-op if source_repo has no node_modules yet."""
+    source_node_modules = source_repo / "node_modules"
+    if not source_node_modules.exists():
+        return
+    subprocess.run(["cp", "-r", str(source_node_modules),
+                    str(repo_dir / "node_modules")], check=True)
+
+
 def _ensure_worktree(source_repo: Path, repo_dir: Path, base: str) -> None:
     existing_branches = _git(["branch", "--list", WORKTREE_BRANCH], cwd=source_repo)
     if not existing_branches:
@@ -448,13 +472,7 @@ def _ensure_worktree(source_repo: Path, repo_dir: Path, base: str) -> None:
         _verify_worktree_identity(source_repo, repo_dir)
         return
     _git(["worktree", "add", str(repo_dir), WORKTREE_BRANCH], cwd=source_repo)
-    source_node_modules = source_repo / "node_modules"
-    if source_node_modules.exists():
-        # copy, never link -- a worker's Bash runs inside this worktree
-        # and must never be able to write back into the source repo's
-        # own node_modules through a shared inode/symlink target.
-        subprocess.run(["cp", "-r", str(source_node_modules),
-                        str(repo_dir / "node_modules")], check=True)
+    _copy_node_modules(source_repo, repo_dir)
     neg_test = repo_dir / "tests" / "gb2-negative-control.test.ts"
     if not neg_test.exists():
         neg_test.parent.mkdir(parents=True, exist_ok=True)
@@ -462,6 +480,38 @@ def _ensure_worktree(source_repo: Path, repo_dir: Path, base: str) -> None:
         _git(["add", "tests/gb2-negative-control.test.ts"], cwd=repo_dir)
         _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
              "commit", "-q", "-m", "test: gb2 negative control"], cwd=repo_dir)
+
+
+def _commit_generated_lockfile(source_repo: Path) -> None:
+    """After engine.bootstrap.ensure_installed's FIRST install into
+    source_repo, npm has written (or updated) package-lock.json there.
+    That file must be committed in source_repo -- not just left as an
+    uncommitted working-tree change -- because `_ensure_worktree`'s
+    `git worktree add` right after this only brings along what is in a
+    commit; an uncommitted lockfile in source_repo would never reach
+    the worktree. Only this one explicit path is staged, never `git
+    add -A`. A no-op if there is no package-lock.json, or if it is
+    already committed and unchanged (bootstrap found node_modules
+    already installed, so nothing ran this time)."""
+    lockfile = source_repo / "package-lock.json"
+    if not lockfile.exists():
+        return
+    status = _git(["status", "--porcelain", "--", "package-lock.json"], cwd=source_repo)
+    if not status.strip():
+        return
+    _git(["add", "--", "package-lock.json"], cwd=source_repo)
+    _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
+         "commit", "-q", "-m", "chore: bootstrap dependency lockfile"],
+         cwd=source_repo)
+
+
+class BootstrapFailedError(RuntimeError):
+    """Raised by `_setup_app_workspace` when engine.bootstrap
+    .ensure_installed fails for this app's source repo -- kept
+    separate from ValueError (a config mistake) so `cmd_init`/`cmd_new`
+    report it as exit code 2, not the generic exit code 1, and so
+    nothing calls on into the full orbit (a job never even opens) on
+    top of a dependency install that never actually succeeded."""
 
 
 def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
@@ -474,7 +524,12 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
     true by the time this runs. Returns the loaded EngineConfig. Raises
     ValueError (nothing written yet) for the workspace/source-repo
     coincide-or-nest misconfiguration or a missing package.json -- same
-    checks `cmd_init` always made, now shared instead of duplicated."""
+    checks `cmd_init` always made, now shared instead of duplicated.
+    Also bootstraps this app's own dependencies (engine.bootstrap
+    .ensure_installed against the SOURCE repo, never the worktree --
+    see that module's docstring) once the ledger is open and the
+    project is registered; raises BootstrapFailedError if that install
+    fails, after still recording the attempt via record_bootstrap."""
     source_repo = (_apps_root() / app).resolve()
     workspace = app_workspace(app)
     if source_repo == workspace or _is_within(workspace, source_repo) \
@@ -524,18 +579,49 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
             encoding="utf-8",
         )
 
-    base_branch = _detect_default_branch(source_repo)
-    _write_worktree_base(app, base_branch)
-    _ensure_worktree(source_repo, workspace / "repo", base_branch)
-
+    # Bootstrap BEFORE the worktree is created (P1 fix): `_ensure_worktree`
+    # below only copies node_modules into the fresh worktree if source_repo
+    # already has one (_copy_node_modules) -- for a brand-new app it never
+    # does until this install runs. Bootstrapping first means the worktree
+    # created right after this sees a real node_modules to copy, instead of
+    # a worker/bench run against it failing before it can run a single
+    # test. `config` is loaded here (not after _ensure_worktree, as
+    # before) so the sandbox hardening below has it.
     config = EngineConfig.from_json(config_path)
     ledger = Ledger.open(config.ledger_path) if config.ledger_path.exists() \
         else Ledger.create(config.ledger_path)
     try:
         for name in config.projects:
             ledger.register_project(name)
+        install_cmd = config.projects[app].install_cmd
+        # Deliberately NOT config.projects[app].hidden_paths: that list
+        # is exactly [str(source_repo.resolve())] (set above), to hide
+        # the real source from the WORKTREE's own sandboxes -- but this
+        # install runs directly against source_repo itself, so passing
+        # it here would hide the very directory being installed into
+        # (engine.sandbox.wrap rejects a path that is both writable and
+        # hidden).
+        bootstrap_result = ensure_installed(
+            source_repo, tuple(install_cmd),
+            sandbox_mode=config.sandbox,
+            hidden_paths=(config.home, config.secrets_dir,
+                         config.ledger_path.parent),
+        )
+        record_bootstrap(ledger, app, bootstrap_result)
+        if not bootstrap_result.ok:
+            raise BootstrapFailedError(
+                f"dependency install failed for {source_repo}: "
+                f"{bootstrap_result.detail}"
+            )
     finally:
         ledger.close()
+
+    _commit_generated_lockfile(source_repo)
+
+    base_branch = _detect_default_branch(source_repo)
+    _write_worktree_base(app, base_branch)
+    _ensure_worktree(source_repo, workspace / "repo", base_branch)
+
     return config
 
 
@@ -543,6 +629,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     _validate_app_name(args.app)  # app_workspace() below re-checks too
     try:
         _setup_app_workspace(args.app, args.with_release)
+    except BootstrapFailedError as exc:
+        return _err_json(str(exc), 2)
     except ValueError as exc:
         return _err_json(str(exc), 1)
     print(json.dumps({"ok": True, "app": args.app, "workspace": str(app_workspace(args.app))},
@@ -788,14 +876,25 @@ def _fakes_builder(config: EngineConfig, app: str):
 
 
 def _run_full_job_and_report(args: argparse.Namespace, config: EngineConfig,
-                             job_name: str, request: str) -> int:
+                             job_name: str, request: str, *,
+                             new_app_marker: Path | None = None) -> int:
     """Shared tail of cmd_new/cmd_change: engine.full_orbit.run_full_job
     against this app's workspace, then the same summarize/log/print/
     exit-code handling `cmd_run` gives an ordinary `run_station`+review+
     bench job. Imported lazily (not at module import time) since
     engine.full_orbit is a separate module landing in parallel with
     this file -- a module that never calls `gb2 new`/`gb2 change` (e.g.
-    `gb2 run`) must keep working even before engine.full_orbit exists."""
+    `gb2 run`) must keep working even before engine.full_orbit exists.
+
+    `new_app_marker`, when `cmd_new` passes it, is only ever unlinked
+    AFTER `run_full_job` has actually returned an outcome -- i.e. the
+    engine's first stage (facts) genuinely started, since `open_job` is
+    the very first thing `run_full_job` does. If `_fakes_builder` or
+    `run_full_job` itself fails/raises before that point (a scripted-
+    workers config error, an exception mid-ledger-open, ...), the
+    marker is left in place so the NEXT `gb2 new <app>` call resumes
+    this same init instead of refusing "app_exists" -- see
+    `_scaffold_new_app_repo`'s own docstring."""
     from engine import full_orbit
 
     try:
@@ -814,6 +913,9 @@ def _run_full_job_and_report(args: argparse.Namespace, config: EngineConfig,
         summary = _summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
     finally:
         ledger.close()
+
+    if new_app_marker is not None:
+        new_app_marker.unlink(missing_ok=True)
 
     _append_run_log(args.app, {"job_name": job_name, **summary})
     print(json.dumps(summary, ensure_ascii=False))
@@ -836,14 +938,19 @@ def cmd_new(args: argparse.Namespace) -> int:
     report.
 
     Everything is validated BEFORE the app folder is ever created
-    (app name, requirement text, the workspace/source-repo coincide-or-
-    nest check _setup_app_workspace would otherwise only catch after
+    (app name, requirement text, the environment itself via
+    `_require_doctor_ok` -- a missing CLI must never surface partway
+    through scaffolding or mid-job, the workspace/source-repo coincide-
+    or-nest check _setup_app_workspace would otherwise only catch after
     `source_repo` already exists) -- a config mistake must never leave
     a half-made app repo behind. If a PREVIOUS `gb2 new <app>` call left
     `source_repo` with _new_app_marker_path's marker still in it (it
-    crashed somewhere inside scaffolding or workspace setup before ever
-    reaching the orbit run), this resumes that same init instead of
-    refusing "app_exists" -- see _scaffold_new_app_repo's own docstring."""
+    crashed somewhere inside scaffolding, workspace setup, or before
+    the orbit run's first stage actually started), this resumes that
+    same init instead of refusing "app_exists" -- see
+    `_scaffold_new_app_repo`'s own docstring and
+    `_run_full_job_and_report`'s own docstring for when the marker is
+    finally removed."""
     try:
         _validate_app_name(args.app)
     except ValueError as exc:
@@ -851,6 +958,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     request = _read_requirement(args)
     if not request:
         return _err_json("requirement text (or --task-file) required", 1)
+    doctor_error = _require_doctor_ok()
+    if doctor_error:
+        return _err_json(doctor_error, 1)
     source_repo = (_apps_root() / args.app).resolve()
     marker = _new_app_marker_path(source_repo)
     if source_repo.exists() and not marker.exists():
@@ -860,12 +970,15 @@ def cmd_new(args: argparse.Namespace) -> int:
         _validate_workspace_source_repo_disjoint(args.app, source_repo)
         _scaffold_new_app_repo(source_repo, args.app)
         config = _setup_app_workspace(args.app, args.with_release)
+    except BootstrapFailedError as exc:
+        return _err_json(str(exc), 2)
     except ValueError as exc:
         return _err_json(str(exc), 1)
-    marker.unlink(missing_ok=True)
+    # marker stays until _run_full_job_and_report confirms the orbit's
+    # first stage actually started -- see that function's own docstring.
 
     job_name = args.job_name or f"gb2-new-{int(time.time())}"
-    return _run_full_job_and_report(args, config, job_name, request)
+    return _run_full_job_and_report(args, config, job_name, request, new_app_marker=marker)
 
 
 def cmd_change(args: argparse.Namespace) -> int:
@@ -878,10 +991,13 @@ def cmd_change(args: argparse.Namespace) -> int:
             f"not initialized: run `gb2 new {args.app} \"...\"` or "
             f"`gb2 init {args.app}` first", 1,
         )
-    _verify_app_repo_identity(args.app)
     request = _read_requirement(args)
     if not request:
         return _err_json("change request text (or --task-file) required", 1)
+    doctor_error = _require_doctor_ok()
+    if doctor_error:
+        return _err_json(doctor_error, 1)
+    _verify_app_repo_identity(args.app)
     config = EngineConfig.from_json(config_path)
 
     job_name = args.job_name or f"gb2-change-{int(time.time())}"
@@ -968,6 +1084,84 @@ def cmd_continue(args: argparse.Namespace) -> int:
         if attempt_id is None:
             return _err_json("no_active_job", 1)
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+
+        start = time.monotonic()
+        outcome = full_orbit.continue_full_job(
+            config, ledger, fakes_for, args.app, job_name, on_progress=_progress_printer,
+        )
+        wall_sec = time.monotonic() - start
+        summary = _summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    return _exit_code_for_full_outcome(str(summary["status"]))
+
+
+def cmd_approve_install(args: argparse.Namespace) -> int:
+    """`gb2 approve-install <app>`: TTY-only approval for a pending
+    "install" request a builder station asked for (engine.full_orbit.
+    pending_owner_requests -- the station.finished "requests" entry a
+    full-orbit job is currently stopped on, see engine.full_orbit's own
+    STAGE_TASK_OWNER). Shows what manifest/change each one is asking
+    for, requires the owner to TYPE the exact "승인 <job>" line (same
+    TTY convention as `gb2 approve-design`/`gb2 ship`, refused outright
+    on a non-interactive shell), then submits/approves each one through
+    the EXISTING engine.owner.validate_pending/approve_pending gate --
+    never re-implementing that validation here -- and drains the
+    processor queue (engine.cli._drain) so the install actually runs
+    before anything else happens. Only once every pending request is
+    confirmed "done" does this resume the job with engine.full_orbit.
+    continue_full_job, which (since b0c8208) reruns the builder task
+    that stopped from where it left off, rather than skipping straight
+    to review."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    _verify_app_repo_identity(args.app)
+    if not sys.stdin.isatty():
+        return _err_json("refused: non-interactive shell, approve-install requires a TTY", 4)
+    config = EngineConfig.from_json(config_path)
+    try:
+        config, fakes_for = _fakes_builder(config, args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
+
+    from engine import full_orbit
+    from engine import owner as owner_module
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        project_row = ledger.project(args.app)
+        attempt_id = project_row.current_attempt_id
+        if attempt_id is None:
+            return _err_json("no_active_job", 1)
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+
+        pending = [req for req in full_orbit.pending_owner_requests(ledger, args.app, job_name)
+                   if req.get("kind") == "install"]
+        if not pending:
+            return _err_json("no_pending_install_request", 1)
+
+        print(json.dumps({"job_name": job_name, "pending_install_requests": pending},
+                         ensure_ascii=False, indent=1, sort_keys=True), file=sys.stderr)
+
+        owner_text = input(f'type the approval line exactly ("승인 {job_name}"): ')
+        if owner_text != f"승인 {job_name}":
+            return _err_json("refused: approval line did not match, nothing changed", 1)
+
+        for request in pending:
+            try:
+                request_id = owner_module.approve_pending(
+                    config, ledger, args.app, attempt_id, request,
+                    confirm=True, confirm_source="tty",
+                )
+            except ValueError as exc:
+                return _err_json(f"approve_pending_refused: {exc}", 1)
+            status = _drain(config, ledger, args.app, attempt_id, request_id)
+            if status != "done":
+                return _err_json(f"install_request_failed: {request_id} status={status}", 3)
 
         start = time.monotonic()
         outcome = full_orbit.continue_full_job(
@@ -1268,25 +1462,36 @@ def _doctor_release_apps() -> list[str]:
             continue
         projects = raw.get("projects")
         if isinstance(projects, dict) and any(
-            isinstance(p, dict) and "release" in p for p in projects.values()
+            isinstance(p, dict) and p.get("release") is not None for p in projects.values()
         ):
             apps.append(app)
     return apps
 
 
-def cmd_doctor(args: argparse.Namespace) -> int:
-    """Check every external dependency `gb2` itself relies on (never a
+def _doctor_checks() -> list[tuple[str, bool, str]]:
+    """Every external dependency `gb2` itself relies on (never a
     per-app concern, so this never touches an app's own repo/worktree):
     python3.12, git, a bwrap that actually runs, the claude/codex CLIs,
     node/npm (an app's own test_cmd/install_cmd need these, not gb2
     itself, but they are required by tools/install.sh and checked here
     for the same reason), GB2_APPS_ROOT being set, and -- only if some
     app has release configured -- its deploy script existing on disk.
-    Prints one line per check; exit 1 if anything required is missing,
-    0 otherwise."""
+    Shared by `cmd_doctor` (prints every check) and `_require_doctor_ok`
+    (gb2 new/change's own pre-flight, before touching anything).
+
+    When GB2_SCRIPTED_WORKERS is set (the test-only seam described
+    above), the claude/codex entries are left out entirely: a scripted-
+    workers run never invokes either CLI (_apply_scripted_workers
+    rewrites every role's own WorkerConfig.runner to a ScriptedRunner),
+    so requiring them on a host that only has the scripted fakes
+    installed would block a job that can never actually need them.
+    Every other check still runs unconditionally."""
     checks: list[tuple[str, bool, str]] = []
 
-    for name in ("python3.12", "git", "claude", "codex", "node", "npm"):
+    cli_names = ("python3.12", "git", "node", "npm")
+    if _scripted_workers_dir() is None:
+        cli_names = ("python3.12", "git", "claude", "codex", "node", "npm")
+    for name in cli_names:
         ok, detail = _doctor_cmd_present(name)
         checks.append((name, ok, detail))
 
@@ -1307,10 +1512,58 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             exists, detail = False, "GB2_APPS_ROOT not set -- cannot resolve deploy script"
         checks.append(("deploy_script", exists, detail))
 
+    return checks
+
+
+def _require_doctor_ok() -> str | None:
+    """None if every `_doctor_checks` entry passes, else a one-line
+    error message naming the ones that don't. `cmd_new`/`cmd_change`
+    call this FIRST, before `_apps_root()` or anything else that
+    touches disk -- a missing CLI or unset GB2_APPS_ROOT must surface
+    immediately, not as an opaque failure partway through scaffolding
+    or a mid-job worker crash."""
+    missing = [(name, detail) for name, ok, detail in _doctor_checks() if not ok]
+    if not missing:
+        return None
+    detail = "; ".join(f"{name}: {detail}" for name, detail in missing)
+    return f"doctor check failed -- fix the environment first ({detail})"
+
+
+def _doctor_node_modules_status() -> list[tuple[str, bool]]:
+    """(app, node_modules present) for every app `_discover_apps` finds
+    -- only meaningful once GB2_APPS_ROOT is set, same as
+    `_doctor_release_apps`; [] otherwise. Reported by `cmd_doctor` for
+    visibility only (engine.bootstrap already installs this at
+    `gb2 new`/`gb2 init` time, so it missing on an already-set-up app
+    means a previous bootstrap failed or this app predates bootstrap
+    existing) -- it is deliberately NOT part of `_doctor_checks`/
+    `_require_doctor_ok`, since one unrelated app's missing
+    node_modules must never block `gb2 new`/`gb2 change` for a
+    DIFFERENT app."""
+    apps_root_value = os.environ.get("GB2_APPS_ROOT", "")
+    if not apps_root_value:
+        return []
+    apps_root = Path(apps_root_value)
+    return [(app, (apps_root / app / "node_modules").exists()) for app in _discover_apps()]
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Prints one line per `_doctor_checks` entry (exit 1 if anything
+    required there is missing), plus one informational line per app
+    reporting whether its own node_modules is present -- see
+    `_doctor_node_modules_status`; those lines never affect the exit
+    code."""
+    checks = _doctor_checks()
+
     width = max(len(name) for name, _ok, _detail in checks)
     for name, ok, detail in checks:
         mark = "OK" if ok else "MISSING"
         print(f"{mark:7} {name.ljust(width)}  {detail}")
+
+    for app, present in _doctor_node_modules_status():
+        mark = "OK" if present else "MISSING"
+        detail = "node_modules present" if present else "node_modules missing (bootstrap not run or failed)"
+        print(f"{mark:7} {('node_modules:' + app).ljust(width)}  {detail}")
 
     missing = [name for name, ok, _detail in checks if not ok]
     if missing:
@@ -1449,6 +1702,13 @@ def cmd_ship(args: argparse.Namespace) -> int:
         followup = orbit.release_followup_stages(job_name)
         final_outcome = orbit.continue_job(
             config, ledger, fakes, args.app, attempt_id, followup)
+        if final_outcome.status == "done":
+            # The one durable record that the WHOLE full-orbit job (not
+            # just this release attempt's own JobOutcome) reached a
+            # terminal state -- see engine.full_orbit.record_release_
+            # decision's own docstring.
+            from engine import full_orbit
+            full_orbit.record_release_decision(ledger, args.app, attempt_id, job_name, "shipped")
     finally:
         ledger.close()
 
@@ -1537,6 +1797,9 @@ def cmd_skip_ship(args: argparse.Namespace) -> int:
         fakes = _build_fakes(config, args.app, attempt_id, None)
         followup = orbit.release_followup_stages(job_name)
         outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
+        if outcome.status == "done":
+            from engine import full_orbit
+            full_orbit.record_release_decision(ledger, args.app, attempt_id, job_name, "skipped")
     finally:
         ledger.close()
     print(json.dumps({
@@ -1736,6 +1999,7 @@ _HANDLERS = {
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
     "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
     "new": cmd_new, "change": cmd_change, "approve-design": cmd_approve_design,
+    "approve-install": cmd_approve_install,
     "continue": cmd_continue, "board": cmd_board, "doctor": cmd_doctor,
 }
 
@@ -1800,6 +2064,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_approve_design = sub.add_parser("approve-design")
     p_approve_design.add_argument("app")
+
+    p_approve_install = sub.add_parser("approve-install")
+    p_approve_install.add_argument("app")
 
     p_continue = sub.add_parser("continue")
     p_continue.add_argument("app")

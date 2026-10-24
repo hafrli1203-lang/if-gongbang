@@ -403,3 +403,32 @@ def test_build_publisher_shell_from_config(workspace: Workspace) -> None:
     assert publisher.timeout_sec == 120
     assert publisher.dry_run is False
     assert publisher.receipts_dir == workspace.config.home / "publish"
+
+
+def test_build_fakes_installer_hides_engine_roots_and_other_projects(
+    workspace: Workspace,
+) -> None:
+    """`_build_fakes` must construct RealInstaller with hidden_paths: with
+    none, install_cmd could read the engine's
+    own secrets_dir, home, ledger and every other project's repo through
+    sandbox_mode="bwrap"'s own "--ro-bind / /" base mirror. Now it must
+    pass the same fixed set engine.steps.bench_run/station/review
+    already hide for a worker/bench sandbox."""
+    from dataclasses import replace
+
+    from engine.cli import _build_fakes
+
+    config = replace(workspace.config, projects={
+        **workspace.config.projects,
+        "alpha": replace(workspace.config.projects["alpha"],
+                         hidden_paths=(workspace.root / "real-source",)),
+    })
+    fakes = _build_fakes(config, "alpha", "A-alpha-1#1", None)
+
+    hidden = set(fakes.installer.hidden_paths)
+    assert config.home in hidden
+    assert config.secrets_dir in hidden
+    assert config.ledger_path.parent in hidden
+    assert config.projects["beta"].repo in hidden  # the OTHER project's repo
+    assert (workspace.root / "real-source") in hidden  # this project's own
+    assert config.projects["alpha"].repo not in hidden  # the installer's own repo

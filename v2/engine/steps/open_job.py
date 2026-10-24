@@ -68,6 +68,53 @@ def _has_unknown_request(ledger: Ledger, project: str) -> bool:
     return False
 
 
+def _reconcile_pending_open(ledger: Ledger, project: str, job_name: str,
+                            actor_id: str) -> str | None:
+    """None (nothing to do) unless THIS job_name's own PREVIOUS open_job
+    call crashed between appending job.opened and calling
+    state.transition (see the module docstring's "Note on (6)" for the
+    analogous copies-staging fix -- this closes the other half of the
+    same crash-atomicity gap, for the ledger side rather than the
+    filesystem side). job.opened's own handler (engine.ledger.
+    _h_job_opened) sets projects.current_attempt_id/generation and
+    inserts the attempt as 'active' in the SAME transaction as the
+    event itself; state.changed only updates projects.state, in a
+    SEPARATE ledger.append call (there is no cross-event-append
+    transaction API in engine.ledger -- see this module's docstring). A
+    crash in between leaves project.state == 'CLOSED' with a
+    current_attempt_id whose own status is still 'active'.
+
+    That combination is NOT, by itself, proof of a crash -- only that
+    `job_name` matches the recorded attempt's own job_name narrows it
+    to "this exact call's own previous attempt, retried": a bare
+    CLOSED + active-current-attempt can also arise from code (test
+    fixtures included) that transitions a project to CLOSED without
+    ever appending attempt.finished for its current attempt, in which
+    case a DIFFERENT job_name being opened next must get a genuinely
+    new attempt, same as before this reconciliation existed -- it is
+    never this function's job to repair a project left in that shape
+    by something else. Rather than let a retried call for THIS job_name
+    silently start a brand-new attempt (job_id is random, so it would
+    not collide with anything, but the orphaned 'active' attempt row --
+    and its already-made worker copies -- would be left behind forever,
+    looking like a second, phantom active attempt), this finishes the
+    interrupted transition for the SAME attempt and returns its
+    attempt_id, mirroring how recover_job's own
+    _recover_resume_after_interrupted resumes a crash mid-recovery
+    instead of starting over."""
+    project_row = ledger.project(project)
+    if project_row.state != "CLOSED" or project_row.current_attempt_id is None:
+        return None
+    attempt_id = project_row.current_attempt_id
+    attempt = ledger.attempt(attempt_id)
+    if attempt.status != "active":
+        return None
+    if _job_name_for(ledger, project, attempt.job_id) != job_name:
+        return None
+    state.transition(ledger, project, "open_job", actor_id)
+    return attempt_id
+
+
 def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
              kind: str, roles: tuple[str, ...], actor_id: str = "owner") -> str:
     """Return the new attempt_id.
@@ -85,6 +132,9 @@ def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
     if not ledger.acquire_lock(project, holder):
         raise state.TransitionError("open_job refused: project_busy")
     try:
+        reconciled = _reconcile_pending_open(ledger, project, job_name, actor_id)
+        if reconciled is not None:
+            return reconciled
         if ledger.project(project).state != "CLOSED":
             raise state.TransitionError(
                 f"required state in ('CLOSED',), got {ledger.project(project).state!r}"

@@ -46,6 +46,35 @@ def _job_name_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> str:
     raise LedgerError(f"no job.opened event for attempt_id {attempt_id!r}")
 
 
+def _other_project_repos(config: EngineConfig, project: str) -> tuple[Path, ...]:
+    """Every OTHER project's repo path -- same helper engine.steps.
+    bench_run/station/review each keep (StepContext-bound there; this
+    is the same logic against a plain EngineConfig + project name,
+    since _build_fakes has no StepContext)."""
+    return tuple(p.repo for name, p in config.projects.items() if name != project)
+
+
+def _installer_hidden_paths(config: EngineConfig, project: str) -> tuple[Path, ...]:
+    """Absolute host paths install_cmd must never see, for THIS
+    project's RealInstaller -- the same fixed set every worker/bench/
+    reviewer sandbox already hides (engine.steps.bench_run/station/
+    review's own `hidden` construction): the engine's own home,
+    secrets_dir and ledger directory, every OTHER project's repo, and
+    this project's own `hidden_paths` (e.g. gb2's real source repo,
+    hidden from the worktree's own sandboxes -- see tools/gb2's
+    `_setup_app_workspace`). Safe to include unconditionally here:
+    RealInstaller's `repo` below is project_config.repo (the worktree),
+    never the real source repo this project's own `hidden_paths` names
+    -- the two are different paths, so there is no writable/hidden
+    conflict (contrast engine.bootstrap.ensure_installed, which
+    installs INTO the source repo itself and must NOT pass that
+    project's own hidden_paths for exactly that reason)."""
+    project_config = config.projects[project]
+    return ((config.home, config.secrets_dir, config.ledger_path.parent)
+            + _other_project_repos(config, project)
+            + project_config.hidden_paths)
+
+
 def _build_fakes(config: EngineConfig, project: str, attempt_id: str,
                  script_path: str | None, script_read_only: bool = False) -> Fakes:
     """Fakes wired the same way the live acceptance tests build them
@@ -68,6 +97,8 @@ def _build_fakes(config: EngineConfig, project: str, attempt_id: str,
     installer = RealInstaller(
         repo=project_config.repo, install_cmd=project_config.install_cmd,
         marker_dir=config.home / "jobs" / ids.attempt_dirname(attempt_id) / "installs",
+        sandbox_mode=config.sandbox,
+        hidden_paths=_installer_hidden_paths(config, project),
     )
     runners: dict[str, object] = {"claude": ClaudeRunner(), "codex": CodexRunner()}
     if script_path is not None:

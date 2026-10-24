@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from engine import full_orbit, orbit
-from engine.config import ReleaseConfig
+from engine.config import McpServerConfig, ReleaseConfig
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
@@ -179,13 +179,14 @@ class _FakeSecurityResult:
 
 def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch, *,
                                passed: bool = True) -> list[tuple[str, str]]:
-    """Stands in for s10-ops' own engine.app_security module (not yet
+    """Stands in for another change' own engine.app_security module (not yet
     merged into this worktree -- engine.full_orbit imports it lazily by
     name, same pattern as engine.acceptance/engine.handoff above).
     Returns the list `check` calls append (project, attempt_id) to, so
     a test can assert it ran exactly once."""
     calls: list[tuple[str, str]] = []
     security_mod = types.ModuleType("engine.app_security")
+    security_mod.record = lambda ledger, project, attempt_id, result: None  # type: ignore[attr-defined]
 
     def check(config, project, attempt_id, plan):
         calls.append((project, attempt_id))
@@ -220,8 +221,9 @@ def _install_fake_acceptance_and_handoff(
         from types import SimpleNamespace
         repo = config.projects[project].repo
         out = []
-        for name, _url in targets:
-            log = repo / ".gongbang" / job_name / "probe" / f"{name}.log"
+        from engine.gates import probe_target_id
+        for i, (name, _url) in enumerate(targets):
+            log = repo / ".gongbang" / job_name / "probe" / f"{probe_target_id(i)}.log"
             text = log.read_text(encoding="utf-8") if log.exists() else ""
             ok = "PROBE OK" in text and "PROBE FAIL" not in text
             out.append(SimpleNamespace(name=name, script=str(log), returncode=0 if ok else 1,
@@ -424,6 +426,133 @@ def test_acceptance_fails_past_max_fix_rounds_reports_failed(
     assert state.handoff_calls == []
 
 
+# ---- 4b. security fails, then a fix moves the repo HEAD: resume must --
+# rerun acceptance/handoff fresh, never just security on the stale report
+
+def test_security_fix_resume_detects_a_moved_head_and_reruns_acceptance_first(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STAGE_SECURITY_FIX stops needs_owner once; the owner's own
+    correction (modeled here as a plain commit straight to the project
+    repo -- e.g. a direct dependency/source patch, never going through
+    this job's own attempt tracking) moves HEAD past what acceptance
+    and the handoff report already certified. Resuming must detect
+    that and rerun acceptance + the handoff report fresh BEFORE security
+    runs again -- never just rerun security against the now-stale
+    AcceptanceResult/report, which the P2 bug let through."""
+    import os
+
+    ws = _full_orbit_workspace(workspace)
+    job_name = "security-fix-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    state = _install_fake_acceptance_and_handoff(monkeypatch, [
+        _FakeAcceptanceResult(passed=True), _FakeAcceptanceResult(passed=True),
+    ])
+    # Override the app_security fake the helper above just installed
+    # with a SEQUENCE: fails the first time (the needs_owner stop),
+    # passes once rerun after the owner's own fix.
+    security_calls: list[str] = []
+    security_results = [False, True]
+
+    def check(config, project, attempt_id, plan):
+        security_calls.append(attempt_id)
+        return _FakeSecurityResult(passed=security_results.pop(0))
+
+    sys.modules["engine.app_security"].check = check  # type: ignore[attr-defined]
+
+    outcome = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=_processor_factory(stub),
+    )
+    assert outcome.status == "needs_owner"
+    assert str(outcome.reason).startswith("security_failed")
+    assert state.acceptance_calls == 1
+    assert len(state.handoff_calls) == 1
+    assert len(security_calls) == 1
+
+    # The owner's own fix: moves HEAD without opening any new attempt
+    # for this job (a direct repo commit, not engine.fixup -- there is
+    # no failed review/bench attempt here for fixup to find at all).
+    (ws.alpha / "src/greeter/extra1.py").write_text(
+        "VALUE_1 = 1  # security-patched\n", encoding="utf-8")
+    env = {**os.environ, **GIT_ENV}
+    subprocess.run(["git", "add", "-A"], cwd=ws.alpha, check=True,
+                   capture_output=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "security fix"], cwd=ws.alpha, check=True,
+                   capture_output=True, env=env)
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name,
+        processor_factory=_processor_factory(stub),
+    )
+
+    assert resumed.status == "done"
+    assert resumed.report_path is not None
+    # Rerun, not reused -- the stale AcceptanceResult/report from before
+    # the fix must never be trusted again once HEAD has moved.
+    assert state.acceptance_calls == 2
+    assert len(state.handoff_calls) == 2
+    assert len(security_calls) == 2
+
+
+def test_security_fix_resume_without_a_moved_head_just_reruns_security(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain retry of `gb2 continue` with NOTHING changed about the
+    repo (the owner looked at the security findings and decided to
+    retry as-is, or the retry is itself just a flake) must still only
+    rerun security -- acceptance/handoff must not be redone for no
+    reason when the certified source never moved."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "security-retry-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    state = _install_fake_acceptance_and_handoff(monkeypatch, [
+        _FakeAcceptanceResult(passed=True),
+    ])
+    security_calls: list[str] = []
+    security_results = [False, True]
+
+    def check(config, project, attempt_id, plan):
+        security_calls.append(attempt_id)
+        return _FakeSecurityResult(passed=security_results.pop(0))
+
+    sys.modules["engine.app_security"].check = check  # type: ignore[attr-defined]
+
+    outcome = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=_processor_factory(stub),
+    )
+    assert outcome.status == "needs_owner"
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name,
+        processor_factory=_processor_factory(stub),
+    )
+
+    assert resumed.status == "done"
+    # The SAME AcceptanceResult/report from before -- no source moved,
+    # no reason to redo either.
+    assert state.acceptance_calls == 1
+    assert len(state.handoff_calls) == 1
+    assert len(security_calls) == 2
+
+
 # ---- 5. probe station: skipped / succeeds / needs_owner on failure -----
 
 def _plan_task_text(ws: Workspace) -> str:
@@ -485,7 +614,7 @@ def test_probe_runs_and_logs_reach_the_planner_as_실측_결과(
     ])
     stub = _RunStationStub({
         "facts": [{f".gongbang/{job_name}/facts.md": facts_md}],
-        "probe": [{f".gongbang/{job_name}/probe/stripe.log":
+        "probe": [{f".gongbang/{job_name}/probe/t1.log":
                   "https://docs.stripe.com/api\nPROBE OK\n{\"status\": 200}\n"}],
         "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
         "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
@@ -499,7 +628,7 @@ def test_probe_runs_and_logs_reach_the_planner_as_실측_결과(
 
     assert outcome.status == "done"
     assert ("probe", "prober") in stub.calls
-    assert (ws.alpha / f".gongbang/{job_name}/probe/stripe.log").exists()
+    assert (ws.alpha / f".gongbang/{job_name}/probe/t1.log").exists()
     plan_text = _plan_task_text(ws)
     assert "실측 결과" in plan_text
     assert "PROBE OK" in plan_text
@@ -521,7 +650,7 @@ def test_probe_failure_stops_needs_owner_without_crashing(
         # The prober's own station.finished reports ok=True (it ran),
         # but the log it wrote never says PROBE OK -- check_probe, not
         # the worker's own self-report, is what the job trusts.
-        "probe": [{f".gongbang/{job_name}/probe/stripe.log":
+        "probe": [{f".gongbang/{job_name}/probe/t1.log":
                   "https://docs.stripe.com/api\nPROBE FAIL\nconnection refused\n"}],
     })
     _install_fake_acceptance_and_handoff(monkeypatch, [])
@@ -535,7 +664,7 @@ def test_probe_failure_stops_needs_owner_without_crashing(
     assert outcome.reason == "probe_failed:stripe"
     # The prober's own log trail already landed/committed -- the owner
     # looks at a real log, not a promise.
-    assert (ws.alpha / f".gongbang/{job_name}/probe/stripe.log").exists()
+    assert (ws.alpha / f".gongbang/{job_name}/probe/t1.log").exists()
     # The job never reached "plan" -- no run_station call for it.
     assert ("plan", "planner") not in stub.calls
 
@@ -767,9 +896,9 @@ def test_continue_after_probe_failed_reruns_probe_then_finishes(
     stub = _RunStationStub({
         "facts": [{f".gongbang/{job_name}/facts.md": facts_md}],
         "probe": [
-            {f".gongbang/{job_name}/probe/stripe.log":
+            {f".gongbang/{job_name}/probe/t1.log":
              "https://docs.stripe.com/api\nPROBE FAIL\nconnection refused\n"},
-            {f".gongbang/{job_name}/probe/stripe.log":
+            {f".gongbang/{job_name}/probe/t1.log":
              "https://docs.stripe.com/api\nPROBE OK\n{\"status\": 200}\n"},
         ],
         "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
@@ -877,3 +1006,636 @@ def test_continue_after_plan_review_failed_reruns_plan_and_review(
     # the resume starts straight at "plan", not "probe".
     assert ("probe", "prober") not in stub.calls
     assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
+# ---- 12. _run_tasks([]) must never discard an already-known attempt_id --
+
+def test_run_tasks_with_empty_list_preserves_passed_in_attempt_id() -> None:
+    """A STAGE_TASK_OWNER resume that drops the just-finished task off the
+    front of `remaining_task_ids` can end up calling _run_tasks([]) when
+    that task was the LAST one in the plan. Before this fix, _run_tasks
+    always overwrote its own `last_attempt_id` local from the loop (which
+    never runs for an empty list), silently turning the caller's real
+    attempt_id into None -- which then crashed engine.acceptance.
+    run_acceptance on the resume path (masked in the scripted tests above
+    by a fake run_acceptance that ignores its attempt_id argument
+    entirely). None of config/ledger/fakes/plan is ever touched when
+    `tasks` is empty, so they can stay unused placeholders here."""
+    outcome, attempt_id = full_orbit._run_tasks(
+        None, None, None, "alpha", "some-job", None, [], None, None,
+        last_attempt_id="attempt-already-known",
+    )
+    assert outcome is None
+    assert attempt_id == "attempt-already-known"
+
+
+# ---- 13. owner_request resume must verify the request was fulfilled, ---
+# ---- then rerun the builder (never skip straight to review) -----------
+
+def test_owner_request_resume_reruns_builder_after_install_then_reviews(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "owner-request-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+    })
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    build_calls = {"n": 0}
+    build_task_texts: list[str] = []
+
+    def _build_steps(ctx: StepContext) -> list[StepDef]:
+        if str(ctx.request.payload.get("station")) != "build":
+            return stub.steps(ctx)
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            build_calls["n"] += 1
+            build_task_texts.append(str(ctx.request.payload.get("task")))
+            copy = copy_root(ctx.config, ctx.attempt_id, "builder")
+            target = copy / "src/greeter/extra1.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if build_calls["n"] == 1:
+                # First attempt: write the first half of the file, then
+                # stop to ask the owner for an install -- the real-world
+                # case this fix targets (a builder that is not actually
+                # finished yet).
+                target.write_text("VALUE_1 = 1\n", encoding="utf-8")
+                requests: list[dict[str, object]] = [install_request]
+            else:
+                # Resumed after the install was approved: finishes the
+                # rest of the task, with no further request.
+                target.write_text("VALUE_1 = 1\nVALUE_2 = 2\n", encoding="utf-8")
+                requests = []
+            changed = dirty_paths(copy, ())
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={
+                    "request_id": ctx.request.request_id, "station": "build",
+                    "role": "builder", "ok": True, "summary": "stub", "cost_usd": 0.0,
+                    "turns": 1, "changed_paths": list(changed), "requests": requests,
+                },
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                if event.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", _build_steps)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    state = _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("pending_requests") == [install_request]
+    # The builder's own file change already merged (same as always) --
+    # only the owner-asked-for install is still outstanding.
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+    # Resuming before the install is actually recorded must NOT jump
+    # straight to review/bench -- it must still report needs_owner.
+    still_waiting = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert still_waiting.status == "needs_owner"
+    assert still_waiting.reason == "owner_request"
+    assert state.acceptance_calls == 0
+
+    # Now the owner actually fulfills it (the real flow: a submitted
+    # "install" ledger request runs to completion and journals
+    # install.recorded with this exact manifest+change).
+    ws.ledger.append(Event(
+        project="alpha", kind="install.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=first.attempt_id,
+        payload={"request_id": "r-install-1", "manifest": "package.json",
+                 "change": install_request["change"]},
+    ))
+
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert done.status == "done", done
+    assert state.acceptance_calls == 1
+    # The builder was rerun (not skipped straight to review) and actually
+    # finished the rest of its task.
+    assert build_calls["n"] == 2
+    assert (ws.alpha / "src/greeter/extra1.py").read_text(
+        encoding="utf-8") == "VALUE_1 = 1\nVALUE_2 = 2\n"
+    # The rerun's own task text carries the continuation note, not a
+    # from-scratch request.
+    assert "[의존성 설치 완료]" in build_task_texts[1]
+    assert "src/greeter/extra1.py" in build_task_texts[1]
+
+
+# ---- 13b. a resumed owner-request task stops AGAIN on a second,       --
+# different install -- the journal must show that new request, not the
+# first (already-fulfilled) one forever.
+
+def test_owner_request_resume_that_stops_again_updates_pending_requests(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "owner-request-twice-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+    })
+    install_request_1 = {"kind": "install", "manifest": "package.json",
+                         "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    install_request_2 = {"kind": "install", "manifest": "package.json",
+                         "change": {"dependencies": {"right-pad": "^2.0.0"}}}
+    build_calls = {"n": 0}
+
+    def _build_steps(ctx: StepContext) -> list[StepDef]:
+        if str(ctx.request.payload.get("station")) != "build":
+            return stub.steps(ctx)
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            build_calls["n"] += 1
+            copy = copy_root(ctx.config, ctx.attempt_id, "builder")
+            target = copy / "src/greeter/extra1.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if build_calls["n"] == 1:
+                target.write_text("VALUE_1 = 1\n", encoding="utf-8")
+                requests: list[dict[str, object]] = [install_request_1]
+            elif build_calls["n"] == 2:
+                # Resumed after the FIRST install -- asks for a SECOND,
+                # different one, still not actually finished.
+                target.write_text("VALUE_1 = 1\nVALUE_2 = 2\n", encoding="utf-8")
+                requests = [install_request_2]
+            else:
+                target.write_text("VALUE_1 = 1\nVALUE_2 = 2\nVALUE_3 = 3\n", encoding="utf-8")
+                requests = []
+            changed = dirty_paths(copy, ())
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={
+                    "request_id": ctx.request.request_id, "station": "build",
+                    "role": "builder", "ok": True, "summary": "stub", "cost_usd": 0.0,
+                    "turns": 1, "changed_paths": list(changed), "requests": requests,
+                },
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                if event.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", _build_steps)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    state = _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("pending_requests") == [install_request_1]
+
+    ws.ledger.append(Event(
+        project="alpha", kind="install.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=first.attempt_id,
+        payload={"request_id": "r-install-1", "manifest": "package.json",
+                 "change": install_request_1["change"]},
+    ))
+
+    second = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    # The resumed build asked for ANOTHER install -- must stop needs_owner
+    # again, with the journal updated to the NEW request, not stuck
+    # showing the first (already-fulfilled) one forever (the P2 bug this
+    # test guards against).
+    assert second.status == "needs_owner"
+    progress_2 = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress_2 is not None
+    assert progress_2.get("pending_requests") == [install_request_2]
+    assert progress_2.get("stop_reason") != "release_approval"
+    assert build_calls["n"] == 2
+
+    # The FIRST install's own request is no longer what gates this job --
+    # recording it AGAIN (a stale approve) must not be mistaken for the
+    # second (current) one.
+    ws.ledger.append(Event(
+        project="alpha", kind="install.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=first.attempt_id,
+        payload={"request_id": "r-install-1-again", "manifest": "package.json",
+                 "change": install_request_1["change"]},
+    ))
+    still_waiting = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert still_waiting.status == "needs_owner"
+    assert build_calls["n"] == 2  # not rerun again -- still waiting on request 2
+
+    # Fulfilling the SECOND (current) request is what actually resumes
+    # the build -- content match, not stale journal state.
+    ws.ledger.append(Event(
+        project="alpha", kind="install.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=first.attempt_id,
+        payload={"request_id": "r-install-2", "manifest": "package.json",
+                 "change": install_request_2["change"]},
+    ))
+    assert full_orbit._pending_requests_fulfilled(
+        ws.ledger, "alpha", progress_2["pending_requests"])
+
+
+# ---- 14. the review stage always carries the plan's own tools table ----
+
+def test_review_payload_carries_tools_for_station(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    ws = replace(ws, config=replace(
+        ws.config, mcp_servers={"library": McpServerConfig(command=("true",))},
+    ))
+    job_name = "review-tools-job"
+    plan_json = json.dumps({
+        "goal": "작은 기능 추가", "ui": False, "scenes": [],
+        "tasks": [{"id": "t1", "title": "첫 파일", "detail": "",
+                   "owns": ["src/greeter/extra1.py"], "depends_on": []}],
+        "acceptance": ["요구사항대로 동작한다"],
+        "tools": [{"kind": "mcp", "name": "library", "stations": ["review"],
+                   "why": "검수에 자료 참조"}],
+    })
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    seen_review_payloads: list[dict[str, object]] = []
+
+    def _review_steps(ctx: StepContext) -> list[StepDef]:
+        seen_review_payloads.append(dict(ctx.request.payload))
+        return _review_always_passes_steps(ctx)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", _review_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    outcome = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert outcome.status == "done", outcome
+    assert seen_review_payloads, "review never ran"
+    for payload in seen_review_payloads:
+        assert payload.get("tools") == {"skill": [], "mcp": ["library"]}
+
+
+# ---- 15. STAGE_EARLY_STATION: facts/probe/plan/design owner-request --
+# ---- stops must record progress and resume, not crash (Codex ③) ------
+
+_EARLY_INSTALL_REQUEST = {"kind": "install", "manifest": "package.json",
+                         "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+
+
+def _station_stub_with_one_owner_request(queues: dict[str, list[dict[str, str]]],
+                                         target_station: str, install_request: dict):
+    """A _RunStationStub whose FIRST call for `target_station` reports
+    `install_request` (no files written yet -- the station asked
+    before writing anything) instead of popping from `queues`; every
+    later call (any station, including a resumed `target_station`)
+    behaves exactly like the plain stub."""
+    stub = _RunStationStub(queues)
+    base_steps = stub.steps
+    calls = {"n": 0}
+
+    def steps(ctx: StepContext) -> list[StepDef]:
+        station = str(ctx.request.payload.get("station"))
+        if station != target_station:
+            return base_steps(ctx)
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return base_steps(ctx)
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            role = str(ctx.request.payload.get("role"))
+            stub.calls.append((station, role))
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={
+                    "request_id": ctx.request.request_id, "station": station, "role": role,
+                    "ok": True, "summary": "stub", "cost_usd": 0.0, "turns": 1,
+                    "changed_paths": [], "requests": [install_request],
+                },
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                if event.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    return stub, steps
+
+
+def _approve_early_install(ws: Workspace, attempt_id: str) -> None:
+    ws.ledger.append(Event(
+        project="alpha", kind="install.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"request_id": "r-install-early", "manifest": "package.json",
+                 "change": _EARLY_INSTALL_REQUEST["change"]},
+    ))
+
+
+def test_facts_owner_request_resumes_to_done(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "early-facts-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_owner_request(queues, "facts", _EARLY_INSTALL_REQUEST)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
+    assert progress.get("station") == "facts"
+
+    # Before approval: must stay needs_owner, never crash with
+    # FullOrbitError("no pending stop recorded").
+    still_waiting = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert still_waiting.status == "needs_owner"
+    assert still_waiting.reason == "owner_request"
+
+    _approve_early_install(ws, first.attempt_id)
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert done.status == "done", done
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
+def test_probe_owner_request_resumes_to_done(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "early-probe-job"
+    facts_md = (
+        "# 사실확정\n- 요청 확인: 통과 (출처: request)\n\n"
+        "## 외부 대상\n- stripe: https://docs.stripe.com/api\n"
+    )
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": facts_md}],
+        "probe": [{f".gongbang/{job_name}/probe/t1.log":
+                   "https://docs.stripe.com/api\nPROBE OK\n{\"status\": 200}\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_owner_request(queues, "probe", _EARLY_INSTALL_REQUEST)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "stripe 결제 붙여줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
+    assert progress.get("station") == "probe"
+
+    _approve_early_install(ws, first.attempt_id)
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert done.status == "done", done
+
+
+def test_plan_owner_request_resumes_to_done(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "early-plan-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_owner_request(queues, "plan", _EARLY_INSTALL_REQUEST)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
+    assert progress.get("station") == "plan"
+
+    _approve_early_install(ws, first.attempt_id)
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert done.status == "done", done
+
+
+def test_design_owner_request_resumes_to_design_approval(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "early-design-job"
+    plan_json = _plan_json(ui=True, tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "design": [{f".gongbang/{job_name}/design/design.md": "디자인\n"}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_owner_request(queues, "design", _EARLY_INSTALL_REQUEST)
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "화면 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
+    assert progress.get("station") == "design"
+
+    _approve_early_install(ws, first.attempt_id)
+    next_stop = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    # Proceeds PAST the owner-request stop to the next real stage
+    # (design was merged, now waiting on the owner's design approval) --
+    # never "done" directly, since nobody approved the design itself.
+    assert next_stop.status == "needs_owner", next_stop
+    assert next_stop.reason == "design_approval"
+
+
+# ---- 16. requirement completion needs a PASSING scene, never a task --
+# ---- alone ------------------------------------
+
+def test_uncovered_requirement_ids_ignores_task_only_coverage() -> None:
+    """A requirement covered by a TASK's own `covers` (tracking only)
+    but no scene at all must still read as uncovered -- a task
+    reaching "done" only means its own review/bench passed, never that
+    any scene actually exercised the requirement's real behavior."""
+    from types import SimpleNamespace
+
+    from engine.plan import Plan, Requirement, Task
+
+    plan = Plan(
+        goal="g", ui=False, scenes=(), acceptance=("ok",),
+        requirements=(Requirement(id="R1", text="입력 검증", kind="security"),),
+        tasks=(Task(id="t1", title="t", detail="", owns=("src/",), depends_on=(),
+                    covers=("R1",)),),
+    )
+    acc = SimpleNamespace(scenes=())
+    assert full_orbit._uncovered_requirement_ids(plan, acc) == ("R1",)
+
+
+def test_uncovered_requirement_ids_requires_the_scene_to_have_passed() -> None:
+    from types import SimpleNamespace
+
+    from engine.plan import Plan, Requirement, Scene
+
+    plan = Plan(
+        goal="g", ui=False, acceptance=("ok",), tasks=(),
+        requirements=(Requirement(id="R1", text="입력 검증", kind="function"),),
+        scenes=(Scene(id="s1", actor_does="클릭", app_shows="결과", where="home",
+                     cmd=("true",), covers=("R1",)),),
+    )
+    failed_scene = SimpleNamespace(id="s1", passed=False)
+    assert full_orbit._uncovered_requirement_ids(plan, SimpleNamespace(scenes=(failed_scene,))) \
+        == ("R1",)
+
+    passed_scene = SimpleNamespace(id="s1", passed=True)
+    assert full_orbit._uncovered_requirement_ids(plan, SimpleNamespace(scenes=(passed_scene,))) \
+        == ()
+
+
+def test_uncovered_requirement_ids_passing_scene_covers_it_even_with_a_task_too() -> None:
+    from types import SimpleNamespace
+
+    from engine.plan import Plan, Requirement, Scene, Task
+
+    plan = Plan(
+        goal="g", ui=False, acceptance=("ok",),
+        requirements=(Requirement(id="R1", text="입력 검증", kind="function"),),
+        scenes=(Scene(id="s1", actor_does="클릭", app_shows="결과", where="home",
+                     cmd=("true",), covers=("R1",)),),
+        tasks=(Task(id="t1", title="t", detail="", owns=("src/",), depends_on=(),
+                    covers=("R1",)),),
+    )
+    acc = SimpleNamespace(scenes=(SimpleNamespace(id="s1", passed=True),))
+    assert full_orbit._uncovered_requirement_ids(plan, acc) == ()

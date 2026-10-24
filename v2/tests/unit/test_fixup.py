@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import evidence, fixup, orbit
+from engine import evidence, fixup, orbit, state
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
@@ -660,6 +660,75 @@ def test_fix_resumes_after_a_crash_right_after_closing_the_old_attempt(
     assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
 
 
+def test_fix_never_adopts_an_unrelated_reopen_of_the_same_job_name(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash hits BEFORE fix() ever reaches its own open_job() call (no
+    "fix.opening_new" marker was ever journaled), leaving the project
+    CLOSED with the old attempt already closed+archived. Before fix() is
+    retried, an UNRELATED caller independently reopens the exact same
+    job_name (an owner's own `gb2 change`, in practice) -- a legitimate
+    action once the project is CLOSED, with its own job.opened event
+    landing strictly after "fix.started" (and after "fix.closed_old").
+    Retrying fix() must never mistake that unrelated attempt for its own
+    open_job() result just because the job_name matches and the seq
+    ordering alone would pass -- it must call open_job() itself, which
+    then correctly raises (the project is OPEN, not CLOSED, by then)
+    instead of silently overlaying this fix's archived files onto an
+    attempt it never opened."""
+    ws = _sample_workspace(workspace, variant=2)
+
+    attempt1 = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                        "full", ("builder", "reviewer"))
+    stages1 = orbit.default_stages(
+        ws.config, attempt1, "builder", "reviewer",
+        "investigate the initials bug", "fix-initials",
+    )
+    outcome1 = orbit.continue_job(
+        ws.config, ws.ledger, _fakes(), "alpha", attempt1, stages1,
+        processor_factory=_processor_factory(review_passed=True),
+    )
+    assert outcome1.status == "failed"
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes()
+
+    calls = {"n": 0}
+    real_open_job = fixup.open_job
+
+    def _crashing_open_job(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated crash before the marker's own open_job call")
+        return real_open_job(*args, **kwargs)
+
+    monkeypatch.setattr(fixup, "open_job", _crashing_open_job)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                 processor_factory=_processor_factory(review_passed=True))
+
+    assert ws.ledger.project("alpha").state == "CLOSED"
+    assert not ws.ledger.events("alpha", "fix.opened_new")
+
+    # An unrelated reopen of the SAME job_name, landing after both
+    # "fix.started" and "fix.closed_old" -- exactly the candidate the old
+    # (seq-ordering-only) check would have wrongly adopted.
+    monkeypatch.setattr(fixup, "open_job", real_open_job)
+    unrelated_attempt = open_job(ws.config, ws.ledger, "alpha", "fix-initials",
+                                 "full", ("builder", "reviewer"))
+
+    with pytest.raises(state.TransitionError, match="CLOSED"):
+        fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
+                 processor_factory=_processor_factory(review_passed=True))
+
+    # The unrelated attempt was never touched by the fix's archive
+    # overlay, and no "fix.opened_new" was ever wrongly journaled for it.
+    assert not ws.ledger.events("alpha", "fix.opened_new")
+    assert ws.ledger.project("alpha").current_attempt_id == unrelated_attempt
+    assert ws.ledger.attempt(unrelated_attempt).status == "active"
+
+
 def test_fix_resumes_after_a_crash_right_after_opening_the_new_attempt(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -798,6 +867,60 @@ def test_fix_resumes_after_a_crash_between_open_job_and_its_own_journal_write(
     fixed_src = (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
     assert fixed_src == _INIT_PY_FIXED
     assert owner_dirty.read_text(encoding="utf-8") == "owner's own in-progress edit\n"
+
+
+def test_already_opened_new_attempt_requires_the_opened_event_after_this_cycle_started() -> None:
+    """A candidate attempt that matches the job_name but whose own
+    job.opened event landed BEFORE this cycle's own fix id (its
+    "fix.opening_new" marker seq -- see fix()'s own call order and
+    _already_opened_new_attempt's docstring for why that marker, not
+    "fix.started", is the right bound) must never be adopted just
+    because attempts_for_job_name would list it -- matching job_name
+    alone is not proof it belongs to THIS fix cycle. Only a candidate
+    whose own job.opened happened strictly after that fix id is this
+    cycle's genuine open_job() result."""
+    from types import SimpleNamespace
+
+    from engine import fixup
+
+    project_row = SimpleNamespace(state="OPEN", current_attempt_id="job-x#9")
+
+    # The candidate's own job.opened landed at seq 5 -- BEFORE this
+    # cycle's fix_id_seq=10, so it cannot be this cycle's own open_job
+    # call. Must not be adopted.
+    stale_ledger = SimpleNamespace(
+        project=lambda project: project_row,
+        events=lambda project, kind: (
+            [(5, SimpleNamespace(payload={"attempt_id": "job-x#9", "job_name": "job-x"}))]
+            if kind == "job.opened" else []
+        ),
+    )
+    assert fixup._already_opened_new_attempt(
+        stale_ledger, "p", "job-x", "job-x#8", fix_id_seq=10) is None
+
+    # The candidate's own job.opened landed at seq 15 -- AFTER
+    # fix_id_seq=10 -- this cycle's own genuine open_job() result.
+    fresh_ledger = SimpleNamespace(
+        project=lambda project: project_row,
+        events=lambda project, kind: (
+            [(15, SimpleNamespace(payload={"attempt_id": "job-x#9", "job_name": "job-x"}))]
+            if kind == "job.opened" else []
+        ),
+    )
+    assert fixup._already_opened_new_attempt(
+        fresh_ledger, "p", "job-x", "job-x#8", fix_id_seq=10) == "job-x#9"
+
+    # Same timing, but the opened event's own job_name does not match --
+    # never adopt across jobs even if the seq ordering alone would pass.
+    wrong_job_ledger = SimpleNamespace(
+        project=lambda project: project_row,
+        events=lambda project, kind: (
+            [(15, SimpleNamespace(payload={"attempt_id": "job-x#9", "job_name": "job-y"}))]
+            if kind == "job.opened" else []
+        ),
+    )
+    assert fixup._already_opened_new_attempt(
+        wrong_job_ledger, "p", "job-x", "job-x#8", fix_id_seq=10) is None
 
 
 def test_original_task_returns_the_run_station_task_text() -> None:

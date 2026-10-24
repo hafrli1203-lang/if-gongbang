@@ -116,7 +116,7 @@ def test_open_items_empty_when_everything_passed(workspace: Workspace) -> None:
 
 
 def test_scene_table_pairs_by_requirement_id_not_position(workspace: Workspace) -> None:
-    """s10 contract item 4: the 대조표 pairs a requirement with whatever
+    """the 대조표 pairs a requirement with whatever
     scene/task actually covers its id -- not with whatever happens to
     sit at the same list index."""
     from engine.plan import Plan as RealPlan

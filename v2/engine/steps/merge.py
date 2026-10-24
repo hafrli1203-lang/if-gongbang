@@ -98,9 +98,18 @@ import subprocess
 from pathlib import Path
 
 from engine.ledger import Event
-from engine.policy import Policy
+from engine.policy import Policy, _owns_within_prefixes
 from engine.processor import StepContext, StepDef, StepFailed
 from engine.steps.open_job import copy_root, dirty_paths
+
+# Reserved for the planner role ONLY (engine.plan's own module docstring:
+# "a builder station must never touch tests/scenes/") -- enforced here as
+# a hard, config-independent floor, never trusted to station_owners alone:
+# an operator config that (by mistake or overlap) gives some other role a
+# prefix wide enough to also cover this path must still never let that
+# role's merge actually land a write under it.
+_PLANNER_ONLY_PREFIX = "tests/scenes/"
+_PLANNER_ROLE = "planner"
 
 
 def steps(ctx: StepContext) -> list[StepDef]:
@@ -137,12 +146,30 @@ def _is_under(path: Path, base: Path) -> bool:
 
 
 def _owner_prefixes(ctx: StepContext, copy: dict[str, object]) -> tuple[str, ...]:
+    """The configured station_owners prefixes for this copy's role,
+    narrowed to this copy's own `owns` entry when present (engine.
+    full_orbit's per-task narrowing -- the same `owns` run_station's own
+    gate already enforced while the worker was running, see engine.
+    steps.station._task_owns; merge's own re-check of it must never be
+    weaker than that, or a task's build could land a change under a
+    sibling task's own file via the broader, unnarrowed station prefix).
+    `owns`, when given, must itself be a non-empty subset of the
+    configured prefixes -- never a way to WIDEN them."""
     station = str(copy.get("station", ""))
     role = str(copy.get("role", ""))
     prefixes = ctx.config.station_owners.get(station, {}).get(role)
     if not prefixes:
         raise StepFailed("unknown_owner")
-    return tuple(prefixes)
+    prefixes = tuple(prefixes)
+    owns = copy.get("owns")
+    if owns is None:
+        return prefixes
+    if not isinstance(owns, list) or not all(isinstance(v, str) for v in owns):
+        raise StepFailed("invalid_owns")
+    owns_t = tuple(owns)
+    if not owns_t or not _owns_within_prefixes(owns_t, prefixes):
+        raise StepFailed("owns_escapes_station_prefixes")
+    return owns_t
 
 
 def _validate_copy_path(ctx: StepContext, copy_path: Path, role: str) -> None:
@@ -158,7 +185,29 @@ def _validate_copy_path(ctx: StepContext, copy_path: Path, role: str) -> None:
         raise StepFailed("copy_path_mismatch")
 
 
-def _validate_rel(ctx: StepContext, repo: Path, policy: Policy, rel: str) -> None:
+def _deny_if_planner_reserved(ctx: StepContext, role: str, rel: str) -> None:
+    """StepFailed("tests_scenes_reserved_for_planner") for any role other
+    than the planner touching tests/scenes/ -- journaled first (a denial
+    worth seeing, not a silent path_rejected) so it is distinguishable
+    from an ordinary out-of-repo/protected-path rejection. See
+    _owner_prefixes' own docstring: this is the config-independent floor
+    underneath whatever station_owners happens to say."""
+    if role == _PLANNER_ROLE:
+        return
+    normalized = rel.rstrip("/")
+    if normalized != _PLANNER_ONLY_PREFIX.rstrip("/") and not rel.startswith(_PLANNER_ONLY_PREFIX):
+        return
+    ctx.ledger.append(Event(
+        project=ctx.project, kind="merge.denied", actor_kind="processor",
+        actor_id="processor", attempt_id=ctx.attempt_id,
+        payload={"request_id": ctx.request.request_id, "role": role, "path": rel,
+                 "reason": "tests_scenes_reserved_for_planner"},
+    ))
+    raise StepFailed("tests_scenes_reserved_for_planner")
+
+
+def _validate_rel(ctx: StepContext, repo: Path, policy: Policy, rel: str, role: str) -> None:
+    _deny_if_planner_reserved(ctx, role, rel)
     rel_path = Path(rel)
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise StepFailed("path_rejected")
@@ -277,7 +326,7 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
                 # gone from the copy's working tree now -- handled by
                 # the base_head walk below instead of read here.
                 continue
-            _validate_rel(ctx, repo, policy, rel)
+            _validate_rel(ctx, repo, policy, rel, role)
             base_bytes = _ref_bytes(repo, base_head, rel)
             copy_bytes = target.read_bytes()
             if base_bytes is None:
@@ -287,7 +336,7 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
         for prefix in prefixes:
             for rel in _ref_rels_under_prefix(repo, base_head, prefix):
                 if not (copy_path / rel).exists():
-                    _validate_rel(ctx, repo, policy, rel)
+                    _validate_rel(ctx, repo, policy, rel, role)
                     role_changes[rel] = "deleted"
         changes[key] = role_changes
     return changes
@@ -331,23 +380,51 @@ def _frozen_plan(ctx: StepContext) -> dict[str, dict[str, str | None]]:
 
 # ---- shared: destination must still match base for every touched path ---
 
+def _attempt_already_applied_paths(ctx: StepContext) -> set[str]:
+    """Every relative path an EARLIER merge.recorded event on THIS SAME
+    attempt_id already applied -- a destination mismatch against
+    base_head for one of these paths is this attempt's OWN earlier,
+    intentional change (e.g. a builder task re-merged, on the same
+    attempt/copy, after an owner-approved install -- see engine.
+    full_orbit._rerun_build_task_stages), never "someone else's
+    committed change landed there since this copy's base"
+    (merge_conflict_with_head's own reason for existing). This is safe
+    specifically because only ONE attempt per project is ever active at
+    a time (engine.state's own transitions) and nothing but merge
+    itself writes under these prefixes while an attempt is active --
+    so any destination drift from base_head that this attempt's own
+    history already accounts for cannot have come from anywhere else."""
+    applied: set[str] = set()
+    for _seq, event in ctx.ledger.events(ctx.project, "merge.recorded"):
+        if event.attempt_id == ctx.attempt_id:
+            applied.update(str(p) for p in event.payload.get("paths", ()))
+    return applied
+
+
 def _verify_destinations_unchanged(ctx: StepContext, rels: set[str]) -> None:
-    """For every rel a copy touches (outside dirty_paths), the destination
-    file as it stands in the repo right NOW must still equal base_head's
-    content for that path. If it does not, someone else's committed
-    change landed there since this copy's base -> StepFailed
-    ("merge_conflict_with_head") (stage 1 has no 3-way merge). Called both
-    at check time and again immediately before apply writes anything, so
-    a commit landing on the destination during the gap between the two is
-    still caught (#10/#11 remainder)."""
+    """For every rel a copy touches (outside dirty_paths and outside
+    this SAME attempt's own already-applied paths -- see
+    _attempt_already_applied_paths), the destination file as it stands
+    in the repo right NOW must still equal base_head's content for
+    that path. If it does not, someone else's committed change landed
+    there since this copy's base -> StepFailed("merge_conflict_with_
+    head") (stage 1 has no 3-way merge). Called both at check time and
+    again immediately before apply writes anything, so a commit
+    landing on the destination during the gap between the two is still
+    caught (#10/#11 remainder)."""
     repo = _repo(ctx)
     base_head = _base_head(ctx)
     dirty = set(ctx.ledger.project(ctx.project).dirty_paths)
+    already_applied: set[str] | None = None
     for rel in rels:
         if rel in dirty:
             continue
         base_content = _ref_bytes(repo, base_head, rel)
         if _dest_bytes(repo, rel) != base_content:
+            if already_applied is None:
+                already_applied = _attempt_already_applied_paths(ctx)
+            if rel in already_applied:
+                continue
             raise StepFailed("merge_conflict_with_head")
 
 

@@ -206,6 +206,22 @@ def _run_check_artifact(ctx: StepContext) -> dict[str, object]:
     return {"artifact_hash": actual}
 
 
+def _release_fingerprint(ctx: StepContext) -> str | None:
+    """The project repo's CURRENT fingerprint (engine.evidence.
+    fingerprint, same computation engine.steps.publish's own
+    record_source step uses), or None if it cannot be computed.
+    Shared by every release-path check that needs to bind to "the
+    exact commit being released" -- by the time advance_master/
+    call_publisher call this, check_artifact has already confirmed
+    `git rev-parse HEAD` equals the approved sha AND the tree is
+    clean, so this fingerprint IS that commit's, not merely "whatever
+    the repo happens to contain right now"."""
+    try:
+        return fingerprint(_repo(ctx), _excludes(ctx))
+    except FingerprintError:
+        return None
+
+
 def _full_bench_passed_for_release(ctx: StepContext) -> bool:
     """Defense in depth alongside engine.release.approve_and_run's own
     ensure_full_bench gate (which normally refuses to grant an
@@ -216,11 +232,24 @@ def _full_bench_passed_for_release(ctx: StepContext) -> bool:
     same fingerprint computation engine.steps.publish's own
     record_source step uses). False (never raises) if the fingerprint
     itself cannot be computed."""
-    try:
-        fp = fingerprint(_repo(ctx), _excludes(ctx))
-    except FingerprintError:
+    fp = _release_fingerprint(ctx)
+    if fp is None:
         return False
     return release_mod._latest_full_bench_passed(ctx.ledger, ctx.attempt_id, fp)
+
+
+def _job_certificate_ok_for_release(ctx: StepContext) -> tuple[bool, str]:
+    """(ok, reason) for engine.release.job_certificate_status, bound to
+    the SAME current-fingerprint computation _release_fingerprint uses
+    -- never a stale or caller-supplied fingerprint. A fingerprint that
+    cannot be computed at all is treated as "no certificate"
+    (release_requires_job_certificate), same failure shape as every
+    other reason this gate can refuse with."""
+    fp = _release_fingerprint(ctx)
+    if fp is None:
+        return False, "release_requires_job_certificate"
+    return release_mod.job_certificate_status(ctx.ledger, ctx.project, ctx.attempt_id,
+                                              _repo(ctx), fp)
 
 
 def _run_advance_master(ctx: StepContext) -> dict[str, object]:
@@ -270,6 +299,22 @@ def _run_advance_master(ctx: StepContext) -> dict[str, object]:
     # its own specific reason, not be masked by this one.
     if not _full_bench_passed_for_release(ctx):
         raise StepFailed("full_bench_missing")
+    # Common release gate: a release-configured project may
+    # only actually merge into master_repo once this JOB carries a
+    # certificate -- acceptance AND app_security, both bound to the
+    # exact fingerprint being released (see engine.release.
+    # job_certificate_status's own docstring for exactly what this
+    # checks and what it deliberately does NOT yet achieve on the
+    # current full_orbit wiring). This is what closes engine.orbit.
+    # continue_job's own commit-stage handler calling engine.release.
+    # prepare() directly for a job that never ran engine.acceptance/
+    # engine.app_security at all (the `gb2 run` -> `gb2 ship` path) --
+    # engine.release.prepare() itself is left free to submit (building/
+    # queuing a publish request must keep working for that path); only
+    # this step, the one that actually fast-forwards master, refuses.
+    ok, reason = _job_certificate_ok_for_release(ctx)
+    if not ok:
+        raise StepFailed(reason)
     release_mod.ff_merge(master_repo, sha)
     return {"master_head": sha}
 
@@ -376,6 +421,14 @@ def _run_call_publisher(ctx: StepContext) -> dict[str, object]:
         # unnoticed -- never dispatch on stale say-so.
         if not _full_bench_passed_for_release(ctx):
             raise StepFailed("full_bench_missing")
+        # Same re-check-right-before-dispatch reasoning as the bench
+        # guard just above, for the job certificate advance_master
+        # already required (see that step's own comment and engine.
+        # release.job_certificate_status) -- never dispatch on stale
+        # say-so if evidence was invalidated in the gap since.
+        ok, reason = _job_certificate_ok_for_release(ctx)
+        if not ok:
+            raise StepFailed(reason)
 
     key = ctx.request.request_id
     try:

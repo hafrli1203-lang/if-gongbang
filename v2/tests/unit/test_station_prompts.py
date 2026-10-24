@@ -25,7 +25,7 @@ def test_planner_prompt_asks_for_requirements_and_covers() -> None:
 
     assert '"requirements"' in text
     assert '"covers"' in text
-    assert "덮이지 않은" in text
+    assert "장면이 없는 requirement" in text
 
 
 def test_fix_task_text_with_failing_scenes_names_them() -> None:

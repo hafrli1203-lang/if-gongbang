@@ -13,18 +13,40 @@ check_design_approved   True iff the ledger has a 'design.approved'
               station's own output and said yes.
 check_probe_targets  facts.md's optional "## 외부 대상" section ->
               [(name, url), ...] -- the external APIs/CLIs/file formats
-              this job depends on, each with its own official-doc URL.
-              [] (no such section, or facts.md missing) means the probe
-              station is skipped entirely (engine.full_orbit). A line in
-              that section that is neither "(없음)" (explicitly "no
-              targets") nor a well-formed "- name: url" bullet raises
-              ProbeTargetsError -- a malformed line is never silently
-              dropped, since a target engine.full_orbit never saw is a
-              target it never ran a probe script for.
+              this job depends on, each with its own official-doc URL,
+              in the exact order the section lists them (callers that
+              need a stable per-target id -- engine.acceptance.
+              run_probe_scripts, this module's own check_probe --
+              derive it from POSITION in this list, 1-based ("t1",
+              "t2", ...), never from the target's own name: a name-
+              derived id (the old scheme) collapses every Korean-only
+              name to the same fallback id and "Naver API"/"Naver_API"
+              to the same id too, since both get lowercased and every
+              character outside [a-z0-9-] collapsed to "-" -- letting
+              one probe script silently stand in for several distinct
+              targets). [] (no such section, or facts.md missing) means
+              the probe station is skipped entirely (engine.full_orbit).
+              A line in that section that is neither "(없음)"
+              (explicitly "no targets") nor a well-formed "- name: url"
+              bullet raises ProbeTargetsError -- a malformed line is
+              never silently dropped, since a target engine.full_orbit
+              never saw is a target it never ran a probe script for.
+              A section that mixes "(없음)" with one or more real
+              target bullets also raises ProbeTargetsError
+              ("probe_targets_mixed_empty_marker") -- "no targets" and
+              "here are the targets" are contradictory, never resolved
+              by quietly picking one.
 check_probe   [] iff every target in a check_probe_targets() list has
-              its own .gongbang/<job>/probe/<name>.log containing
+              its own .gongbang/<job>/probe/t<N>.log (1-based position
+              in the SAME list, see check_probe_targets) containing
               "PROBE OK" -- a missing log or one without that marker is
-              a problem, never a crash.
+              a problem, never a crash. Legacy/unused by the live
+              orbit flow today (engine.full_orbit calls
+              engine.acceptance.run_probe_scripts instead, which
+              actually re-executes each script rather than trusting a
+              worker-written log; see that module's own docstring) --
+              kept here, and fixed to the same id scheme, for whatever
+              still calls it directly.
 """
 from __future__ import annotations
 
@@ -186,13 +208,15 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         return []
     section = _heading_section(text.splitlines(), _PROBE_TARGETS_HEADER)
     targets: list[tuple[str, str]] = []
+    saw_empty_mark = False
     for line in section:
         stripped = line.strip()
         if not stripped:
             continue
         bare = stripped.lstrip("-").strip()
         if bare in (f"({_PROBE_EMPTY_MARK})", _PROBE_EMPTY_MARK):
-            return []
+            saw_empty_mark = True
+            continue
         if not stripped.startswith("-"):
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
         body = stripped[1:].strip()
@@ -201,20 +225,37 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         if not sep or not name or not url:
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
         targets.append((name, url))
+    if saw_empty_mark and targets:
+        # "(없음)" and one or more real target bullets both appeared in
+        # the same section -- contradictory, never resolved by quietly
+        # picking one side.
+        raise ProbeTargetsError("probe_targets_mixed_empty_marker")
+    if saw_empty_mark:
+        return []
     return targets
 
 
+def probe_target_id(index: int) -> str:
+    """The stable, collision-free id for the target at `index` (0-based
+    position in a check_probe_targets() list) -- "t1", "t2", ... in
+    1-based list order. See check_probe_targets' own docstring for why
+    this replaced deriving an id from the target's own name."""
+    return f"t{index + 1}"
+
+
 def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[str]:
-    """[] iff every (name, url) in `targets` has its own
-    .gongbang/<job>/probe/<name>.log whose content contains "PROBE OK".
-    A missing log or one without that marker becomes a plain problem
-    string naming the target, never an exception -- engine.full_orbit
-    turns a non-empty result into a needs_owner stop
-    ("probe_failed:<names>"), not a crash."""
+    """[] iff every target in `targets` has its own
+    .gongbang/<job>/probe/t<N>.log (probe_target_id(i), i = its
+    position in `targets`) whose content contains "PROBE OK". A
+    missing log or one without that marker becomes a plain problem
+    string naming the target (by its real name, for a human reading
+    the result -- only the FILE is looked up by id), never an
+    exception -- engine.full_orbit turns a non-empty result into a
+    needs_owner stop ("probe_failed:<names>"), not a crash."""
     probe_dir = repo / ".gongbang" / job / "probe"
     problems: list[str] = []
-    for name, _url in targets:
-        log_path = probe_dir / f"{name}.log"
+    for i, (name, _url) in enumerate(targets):
+        log_path = probe_dir / f"{probe_target_id(i)}.log"
         try:
             text = log_path.read_text(encoding="utf-8")
         except OSError:
@@ -227,5 +268,5 @@ def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[st
 
 __all__ = [
     "check_facts", "check_design_approved", "check_probe_targets", "check_probe",
-    "ProbeTargetsError",
+    "probe_target_id", "ProbeTargetsError",
 ]

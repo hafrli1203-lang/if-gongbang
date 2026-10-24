@@ -327,12 +327,13 @@ class EngineConfig:
     station_mcp_allow: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # mcp server name -> the specific tool names (the <tool> of
     # mcp__<server>__<tool>) that server may ever be called with,
-    # regardless of station_mcp_allow/the request's own gate facts. A
-    # server ABSENT from this table keeps today's behavior unchanged --
-    # every tool that server's own station/request allow lists permit.
-    # A server PRESENT here denies any tool call not named in its list
-    # (engine.policy._decide_mcp), on top of (never instead of) the
-    # existing server-level checks.
+    # regardless of station_mcp_allow/the request's own gate facts.
+    # Default deny (engine.policy._decide_mcp): a server ABSENT from
+    # this table denies every tool call for it -- granting a server to
+    # a station (station_mcp_allow) is not itself permission to call
+    # every tool that server exposes; every mcp_servers entry a
+    # station may ever be granted needs its own mcp_tool_allow list
+    # naming the specific tools it may call.
     mcp_tool_allow: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # The skill library's own index file (e.g. "~/.claude/skills-library/
     # INDEX.md") the planner prompt is given so it only ever asks for a
@@ -437,6 +438,15 @@ class EngineConfig:
 # Every key from_json/​_from_dict understands. An unrecognized top-level
 # key is a typo (e.g. "hook" instead of "hooks") that would otherwise
 # silently load with the field's default — fail closed instead.
+#
+# "security" is listed here but deliberately has NO corresponding
+# EngineConfig field and no parsing below: engine.app_security.check()
+# reads it straight back out of the raw JSON at config.config_path
+# itself (see that module's own docstring for why -- it is read
+# fresh per check() call, never cached on EngineConfig). Omitting
+# "security" from this set would make a config file that sets it
+# unloadable at all ("unknown config key(s): ['security']"), which is
+# worse than not validating its shape here.
 _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "ledger_path", "home", "secrets_dir", "projects", "station_owners",
     "protected_paths", "hooks", "hook_timeout_sec", "approval_ttl_sec",
@@ -444,6 +454,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "worker_env_passthrough", "sandbox", "bench_home_writable",
     "bench_readonly_paths", "publisher", "parallel_review_bench",
     "mcp_servers", "station_mcp_allow", "mcp_tool_allow", "skill_index_path", "context",
+    "security",
 })
 
 _KNOWN_MCP_SERVER_KEYS = frozenset({"command", "args", "env_passthrough"})

@@ -1,11 +1,19 @@
 """Unit tests for engine.procs: process groups, spawn/close_station."""
 from __future__ import annotations
 
+import os
+import signal
 import time
 from pathlib import Path
 
-from engine import procs
+import pytest
+
+from engine import procs, sandbox
 from tests.conftest import Workspace
+
+_needs_bwrap = pytest.mark.skipif(
+    not sandbox.available(), reason="bwrap not available on this host",
+)
 
 
 def test_spawn_and_close_station_kills_child(workspace: Workspace) -> None:
@@ -88,3 +96,77 @@ def test_close_station_kills_survivor_left_behind_by_dead_leader(
 
     events = workspace.ledger.events("alpha", "proc.ended")
     assert any(e.payload["pid"] == leader.pid for _, e in events)
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    """Every live pid whose ppid chain leads back to `root_pid`, found by
+    scanning /proc/*/stat's own ppid field (never pgrep -f, whose
+    command-line substring matching is easy to get spurious matches
+    from -- e.g. a test's OWN source text happening to contain the
+    argv words being searched for)."""
+    children_of: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            stat = Path("/proc", entry, "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # comm is "(...)", which may itself contain ')' -- ppid is the
+        # first field after comm's own closing ')'.
+        after_comm = stat.rsplit(")", 1)[-1].split()
+        ppid = int(after_comm[1])
+        children_of.setdefault(ppid, []).append(pid)
+
+    found: set[int] = set()
+    frontier = [root_pid]
+    while frontier:
+        pid = frontier.pop()
+        for child in children_of.get(pid, ()):
+            if child not in found:
+                found.add(child)
+                frontier.append(child)
+    return found
+
+
+@_needs_bwrap
+def test_sandboxed_spawn_dies_with_parent_through_the_sh_exit_wrapper(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """another change item 2: engine.procs.spawn's unsandboxed `sh` exit-code
+    wrapper (see engine.procs.spawn's own docstring) sits BETWEEN this
+    process and the bwrap invocation engine.sandbox.wrap builds --
+    bwrap's own --die-with-parent ties the sandboxed tree's life to
+    THAT immediate parent (the `sh` process), not to this test process
+    directly. Killing only the direct Popen child (`sh`) -- never
+    procs.close_station's own explicit process-group kill, which this
+    test deliberately bypasses to isolate --die-with-parent itself --
+    must still bring down the whole bwrap tree, including the
+    sandboxed `sleep` at the bottom of it, with no survivor left
+    running under init."""
+    argv = sandbox.wrap(
+        ["sleep", "50"], cwd=workspace.alpha, mode="bwrap",
+        writable=(workspace.alpha,),
+        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    exit_file = tmp_path / "exit" / "r.exit"
+    proc = procs.spawn(
+        workspace.ledger, "alpha", "J-alpha-TEST#4", "build", argv,
+        cwd=workspace.alpha, env=sandbox.exec_env("bwrap", {}),
+        exit_file=exit_file, request_id="r1",
+    )
+    time.sleep(1.0)  # let bwrap finish setting up its own process tree
+    descendants = _descendant_pids(proc.pid)
+    assert descendants, "expected at least the bwrap launcher as a descendant"
+
+    os.kill(proc.pid, signal.SIGKILL)  # the direct child only -- not the group
+
+    deadline = time.time() + 5
+    while time.time() < deadline and any(
+        Path("/proc", str(pid)).exists() for pid in descendants
+    ):
+        time.sleep(0.05)
+
+    survivors = [pid for pid in descendants if Path("/proc", str(pid)).exists()]
+    assert survivors == []

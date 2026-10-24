@@ -65,3 +65,40 @@ jobs:
         with:
           name: engine-junit-${{ github.sha }}
           path: v2/engine-junit.xml
+  engine-node-e2e:
+    name: V2 real gb2 CLI + Node template (scripted AI)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install bubblewrap and allow it on this runner
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-all --ro-bind / / true
+      - name: Install Python test deps
+        run: python -m pip install --upgrade pip pytest
+      - name: Build a throwaway node_modules with vitest
+        run: |
+          mkdir -p "$RUNNER_TEMP/gb2-node"
+          cd "$RUNNER_TEMP/gb2-node"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund vitest@2
+          echo "GB2_TEST_NODE_MODULES=$RUNNER_TEMP/gb2-node/node_modules" >> "$GITHUB_ENV"
+      - name: Run the real-command Node end-to-end test (must not skip)
+        env:
+          GB2_REQUIRE_T3: "1"
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci
+          python -m pytest -p no:cacheprovider -rs tests/acceptance/test_t3_gb2_node_e2e.py

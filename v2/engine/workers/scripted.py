@@ -37,8 +37,11 @@ class ScriptedRunner:
         # `engine.gate`) with a copy-planted module of its own. Any
         # gate_argv a caller wires in for real policy enforcement should
         # itself start with the same `sys.executable, "-P"` pair.
+        # The script's content is read here, engine-side, and passed inline:
+        # the sandboxed worker cannot see paths outside its own copy (its
+        # HOME is a fresh per-attempt directory, /tmp is a private tmpfs).
         argv = [sys.executable, "-P", "-m", "engine.fakes.scripted_worker",
-                str(self.script_path)]
+                "--inline", Path(self.script_path).read_text(encoding="utf-8")]
         if self.gate_argv is not None:
             argv += ["--gate", json.dumps(list(self.gate_argv))]
         return argv

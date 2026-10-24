@@ -30,17 +30,20 @@ def facts_prompt(request: str, job: str) -> str:
 
 
 def prober_prompt(request: str, job: str, targets: tuple[tuple[str, str], ...]) -> str:
-    targets_text = "\n".join(f"- {name}: {url}" for name, url in targets)
+    from engine.gates import probe_target_id
+
+    targets_text = "\n".join(
+        f"- {probe_target_id(i)} (이름: {name}, 문서: {url})" for i, (name, url) in enumerate(targets))
     return (
         f"요청: {request}\n\n"
         "이 일이 의존하는 외부 대상(API·CLI·파일 형식)마다 공식 문서를 "
         "열고 실제로 한 번 호출해 본다. 대상:\n"
         f"{targets_text}\n\n"
-        f"대상마다 .gongbang/{job}/probe/<이름>.py (또는 .sh, .js)에 "
-        "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. <이름>은 대상 "
-        "이름을 영어 소문자·숫자·-만 남긴 것이다. 엔진이 이 스크립트를 다시 "
+        f"대상마다 .gongbang/{job}/probe/<번호>.py (또는 .sh, .js)에 "
+        "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. <번호>는 위 목록 "
+        "맨 앞의 t1, t2 같은 값이다. 파일 이름을 대상 이름으로 만들지 않는다. 엔진이 이 스크립트를 다시 "
         "실행해 종료 코드 0이어야 통과로 본다(성공이면 0, 실패면 0이 아닌 값으로 끝낸다). 그다음 "
-        f".gongbang/{job}/probe/<이름>.log 를 쓴다 -- 첫 줄은 그 대상의 "
+        f".gongbang/{job}/probe/<번호>.log 를 쓴다 -- 첫 줄은 그 대상의 이름과 "
         "공식 문서 URL이고, 성공하면 \"PROBE OK\", 실패하면 \"PROBE "
         "FAIL\"과 에러 내용을 적은 뒤 실제 요청·응답 형태도 남긴다. "
         "재사용할 어댑터는 만들지 않는다 -- 호출이 되는지 확인하는 "
@@ -82,10 +85,13 @@ def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = ""
         "depends_on으로 작업 순서를 정한다. 화면이 있는 요청이면 ui를 "
         "true로 둔다.\n\n"
         "requirements에는 이 요청이 실제로 요구하는 것을 하나씩 적는다 "
-        "(기능은 kind \"function\", 보안·검증처럼 통과 장면으로 자동 확인하기 "
-        "어려운 것은 kind \"security\"). requirement 하나는 반드시 장면 "
-        "하나 이상의 covers 또는 작업 하나 이상의 covers에 그 id로 나타나야 "
-        "한다 — 덮이지 않은 requirement가 있으면 이 계획은 통과하지 못한다."
+        "(기능은 kind \"function\", 권한·데이터 분리 같은 보안 요구는 kind "
+        "\"security\"). 모든 requirement는 그것을 실제로 확인하는 장면 하나 "
+        "이상의 covers에 그 id로 나타나야 한다(작업의 covers는 추적용일 뿐 "
+        "충족 근거가 아니다). 보안 요구는 막혀야 할 행동이 실제로 막히는지 "
+        "확인하는 장면으로 쓴다 — 예: A 사용자로 B 사용자의 데이터를 보거나 "
+        "고칠 수 없어야 한다. 장면이 없는 requirement가 있으면 이 계획은 "
+        "통과하지 못한다."
         + tools_part
     )
 

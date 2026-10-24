@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from engine import ids
 from engine.ledger import Event
 from engine.processor import submit
 from engine.state import TransitionError, transition
@@ -39,6 +40,91 @@ def test_reopen_same_job_name_increments_n(workspace: Workspace) -> None:
     job_id = attempt_1.split("#")[0]
     assert attempt_1 == f"{job_id}#1"
     assert attempt_2 == f"{job_id}#2"
+
+
+def test_crash_between_job_opened_and_state_changed_is_reconciled(
+    workspace: Workspace,
+) -> None:
+    """Simulates the exact crash window open_job cannot make atomic
+    without a cross-event-append transaction in engine.ledger (see
+    engine.steps.open_job._reconcile_pending_open's own docstring):
+    job.opened lands (its handler already sets current_attempt_id/
+    generation and inserts the attempt as 'active'), but the matching
+    state.changed never does. The project is left reporting CLOSED
+    with an 'active' current attempt. The next open_job call must
+    finish that interrupted transition and hand back the SAME
+    attempt_id, never silently start a second, phantom attempt
+    alongside the orphaned one."""
+    job_id = ids.new_job_id("alpha")
+    attempt_id = ids.attempt_id(job_id, 1)
+    generation = workspace.ledger.project("alpha").generation + 1
+    workspace.ledger.append(Event(
+        project="alpha", kind="job.opened", actor_kind="owner", actor_id="owner",
+        attempt_id=attempt_id,
+        payload={
+            "job_id": job_id, "job_name": "crashed-job", "attempt_id": attempt_id,
+            "n": 1, "kind": "full", "generation": generation,
+            "dirty_paths": [], "base_head": "0" * 40,
+            "copy_links_skipped": [], "copy_git_config_sha256": {},
+        },
+    ))
+    # state.changed never ran -- the project still reports CLOSED.
+    assert workspace.ledger.project("alpha").state == "CLOSED"
+    assert workspace.ledger.project("alpha").current_attempt_id == attempt_id
+    assert workspace.ledger.attempt(attempt_id).status == "active"
+
+    resumed = open_job(workspace.config, workspace.ledger, "alpha",
+                       "crashed-job", "full", ("builder",))
+
+    assert resumed == attempt_id
+    assert workspace.ledger.project("alpha").state == "OPEN"
+    assert workspace.ledger.project("alpha").current_attempt_id == attempt_id
+    # No second attempt was created for "crashed-job" -- resuming the
+    # interrupted transition is the whole effect, not an extra
+    # job.opened on top of it.
+    assert workspace.ledger.attempts_for_job_name("alpha", "crashed-job") == [
+        workspace.ledger.attempt(attempt_id),
+    ]
+
+
+def test_open_job_for_a_different_job_name_is_unaffected_by_an_unrelated_active_attempt(
+    workspace: Workspace,
+) -> None:
+    """The reconciliation added for the crash window above (job.opened
+    landed, state.changed didn't) must only resume THAT SAME job_name's
+    own attempt -- it must never be mistaken for permission to hand a
+    DIFFERENT job_name request someone else's still-'active' attempt
+    just because the project also happens to read CLOSED (which can
+    arise from something other than a crash, e.g. a caller that moved
+    the project to CLOSED without ever closing its current attempt)."""
+    job_id = ids.new_job_id("alpha")
+    attempt_id = ids.attempt_id(job_id, 1)
+    generation = workspace.ledger.project("alpha").generation + 1
+    workspace.ledger.append(Event(
+        project="alpha", kind="job.opened", actor_kind="owner", actor_id="owner",
+        attempt_id=attempt_id,
+        payload={
+            "job_id": job_id, "job_name": "job1", "attempt_id": attempt_id,
+            "n": 1, "kind": "full", "generation": generation,
+            "dirty_paths": [], "base_head": "0" * 40,
+            "copy_links_skipped": [], "copy_git_config_sha256": {},
+        },
+    ))
+    # Project left CLOSED without ever finishing job1's attempt --
+    # deliberately not the crash shape this reconciliation targets,
+    # since job2 (below) asks for a different job_name.
+    workspace.ledger.append(Event(
+        project="alpha", kind="state.changed", actor_kind="owner", actor_id="owner",
+        payload={"state": "CLOSED", "input": "open_job", "prev": "CLOSED"},
+    ))
+
+    attempt_2 = open_job(workspace.config, workspace.ledger, "alpha",
+                         "job2", "full", ("builder",))
+
+    assert attempt_2 != attempt_id
+    assert workspace.ledger.attempts_for_job_name("alpha", "job1") == [
+        workspace.ledger.attempt(attempt_id),
+    ]
 
 
 def test_dirty_paths_recorded(workspace: Workspace) -> None:

@@ -30,11 +30,20 @@ from engine.workers.scripted import ScriptedRunner
 def _spec(tmp_path: Path, task: str = "do the thing") -> WorkerSpec:
     copy_root = tmp_path / "copy"
     copy_root.mkdir()
+    gate_ro = tmp_path / "gate-ro"
+    gate_ro.mkdir()
     return WorkerSpec(
         project="alpha", attempt_id="J-alpha-TEST#1", generation=1,
         station="build", role="builder", copy_root=copy_root, workdir=copy_root,
         task=task, result_path=tmp_path / "result.json",
         config_path=tmp_path / "engine.json",
+        # Mirrors engine.steps.station._full_spec: ClaudeRunner's own
+        # needs_gate = True means a real spawn always has this set --
+        # ClaudeRunner._write_mcp_config_file writes into its PARENT
+        # directory (the engine-only gate-ro dir), never the worker-
+        # writable stations dir next to result_path. See
+        # engine.workers.claude_cli._mcp_config_dir's own docstring.
+        gate_facts_path=gate_ro / "gate_facts.json",
     )
 
 
@@ -116,6 +125,42 @@ def test_claude_argv_mcp_config_file_never_leaks_secret_onto_argv(
     mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
     config = json.loads(mcp_config_path.read_text(encoding="utf-8"))
     assert config["mcpServers"]["library"]["env"]["LIBRARY_TOKEN"] == "super-secret-value"
+
+
+def test_claude_argv_mcp_config_file_lives_outside_the_worker_writable_stations_dir(
+    tmp_path: Path,
+) -> None:
+    """another change item 3: the mcp-config file (which can carry
+    mcp_servers env_passthrough secrets) must never sit in the SAME
+    worker-writable directory as spec.result_path/stdout -- any code
+    the worker's sandbox runs (not just its own gated tool calls)
+    could otherwise read it straight off disk. It must live in
+    spec.gate_facts_path's own parent directory (the engine-only
+    gate-ro dir engine.steps.station already mounts read-only as a
+    whole), which is NOT result_path's directory in a real spawn."""
+    spec = replace(_spec(tmp_path), mcp_servers={
+        "playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp")),
+    })
+    argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
+
+    mcp_config_path = Path(argv[argv.index("--mcp-config") + 1])
+    assert mcp_config_path.parent == spec.gate_facts_path.parent
+    assert mcp_config_path.parent != spec.result_path.parent
+
+
+def test_claude_argv_mcp_config_requires_gate_facts_path(tmp_path: Path) -> None:
+    """A WorkerSpec with mcp_servers but no gate_facts_path (e.g. built
+    by something other than engine.steps.station._full_spec, which
+    always sets it for ClaudeRunner since needs_gate=True) has no
+    engine-only directory to write the config into -- this must fail
+    closed (ValueError) rather than silently falling back to the
+    worker-writable stations directory next to result_path."""
+    spec = replace(
+        _spec(tmp_path), gate_facts_path=None,
+        mcp_servers={"playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp"))},
+    )
+    with pytest.raises(ValueError):
+        ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
 
 
 def test_claude_env_only_passthrough_plus_gb(tmp_path: Path, monkeypatch) -> None:
@@ -276,8 +321,10 @@ def test_scripted_argv_invokes_module(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     worker = WorkerConfig(runner="scripted")
     script = tmp_path / "script.json"
+    script.write_text('[{"final": {"status": "done"}}]', encoding="utf-8")
     argv = ScriptedRunner(script).argv(spec, worker)
-    assert argv == [sys.executable, "-P", "-m", "engine.fakes.scripted_worker", str(script)]
+    assert argv == [sys.executable, "-P", "-m", "engine.fakes.scripted_worker",
+                    "--inline", script.read_text(encoding="utf-8")]
 
 
 def test_scripted_worker_writes_files_without_gate(tmp_path: Path) -> None:

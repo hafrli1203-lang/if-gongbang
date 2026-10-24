@@ -121,6 +121,18 @@ def load_app_board(app: str, ledger_path: Path, project: str) -> AppBoard:
                 " payload_json FROM events WHERE project=? ORDER BY seq",
                 (project,),
             ).fetchall()
+            # request_id -> status, for deriving a release request's own
+            # CURRENT terminal outcome (see _derive_job_status's own
+            # "awaiting_release_approval" handling) -- a publish that
+            # ended "failed"/"unknown" without `ship` ever reaching its
+            # own report/close followup (a failed
+            # publish must never leave the board showing "사람 확인
+            # 대기" forever) is only visible through this table; nothing
+            # on the events table itself is updated when a request's own
+            # status changes.
+            request_status = dict(conn.execute(
+                "SELECT request_id, status FROM requests WHERE project=?", (project,)
+            ).fetchall())
         except sqlite3.DatabaseError as exc:
             return AppBoard(app=app, project=project, jobs=(), events=(),
                             error=f"원장을 읽지 못했습니다: {exc}")
@@ -146,7 +158,7 @@ def load_app_board(app: str, ledger_path: Path, project: str) -> AppBoard:
     jobs = tuple(
         _derive_job(app, job_id, job_names[job_id],
                    sorted(attempts_by_job.get(job_id, ()), key=lambda a: a.n),
-                   events)
+                   events, request_status)
         for job_id in job_names
     )
     return AppBoard(app=app, project=project, jobs=jobs, events=events)
@@ -168,7 +180,8 @@ _AWAITING_PREFIX = "awaiting_"
 
 
 def _derive_job(app: str, job_id: str, job_name: str,
-                attempts: list[AttemptRow], all_events: tuple[EventRow, ...]) -> JobBoard:
+                attempts: list[AttemptRow], all_events: tuple[EventRow, ...],
+                request_status: dict[str, str]) -> JobBoard:
     attempt_ids = {a.attempt_id for a in attempts}
     job_events = tuple(e for e in all_events if e.attempt_id in attempt_ids)
     timestamps = [e.ts for e in job_events]
@@ -182,7 +195,7 @@ def _derive_job(app: str, job_id: str, job_name: str,
     cost_usd = sum(costs) if costs else None
 
     latest_attempt = attempts[-1] if attempts else None
-    status = _derive_job_status(job_events, latest_attempt)
+    status = _derive_job_status(job_events, latest_attempt, request_status)
     stage = _derive_job_stage(job_events)
 
     return JobBoard(
@@ -192,56 +205,106 @@ def _derive_job(app: str, job_id: str, job_name: str,
     )
 
 
+# engine.full_orbit.record_release_decision's own "decision" values ->
+# this board's display label. "not_configured" is never expected to win
+# a seq race against anything (a project with no release track never
+# records an "awaiting_release_approval" progress event at all -- see
+# _maybe_release_or_done's own docstring), but it still needs a label
+# in case a future caller records it some other way; "완료" matches
+# job.handoff_written's own label since that is exactly what
+# "not_configured" means (nothing left to release, job just finished).
+# "failed" is for a future caller that might record this decision
+# itself; the common case today -- `ship` driving a publish request all
+# the way to "failed"/"unknown" without ever reaching report/close --
+# is instead derived straight from the request's own CURRENT status
+# (see _derive_job_status's own "awaiting_release_approval" handling),
+# since `ship` returns without journaling anything at all on that path.
+_RELEASE_DECISION_LABEL = {
+    "shipped": "배포됨",
+    "skipped": "건너뜀",
+    "not_configured": "완료",
+    "failed": "실패",
+}
+
+
 def _derive_job_status(job_events: tuple[EventRow, ...],
-                       latest_attempt: AttemptRow | None) -> str:
+                       latest_attempt: AttemptRow | None,
+                       request_status: dict[str, str] | None = None) -> str:
     """Best-effort display label from whatever this job's events show --
     not an authoritative engine state (the engine has no single "job
     status" field; full_orbit's own FullOutcome is a return value, not a
-    ledger row). Rule, in priority order:
-    1. the LAST full_orbit.progress event's stage starts with
-       "awaiting_" -> "사람 확인 대기" (plus ": <stop_reason>" when that
-       same progress event carries a "stop_reason" field -- s10 contract
-       item 5; an older progress event recorded before that field
-       existed just reads as the plain label, unchanged).
-    2. a job.handoff_written event exists for one of this job's
-       attempts -> 완료. This is deliberately NOT 'report.written':
-       every attempt's own "report" stage appends that generic event
-       (facts/plan/design/each build task each open their own attempt),
-       so keying off it marked a job 완료 as soon as its very first
-       task's report stage ran, even with many tasks still left --
-       job.handoff_written (engine.handoff.write_handoff) is the one
-       event for the WHOLE job's own final handoff, appended once.
-    3. the LAST "job.metrics" event (engine.orbit's own per-attempt
-       outcome record, written right before a stage-list call returns
-       early) has payload["outcome"] == "failed" -> "실패".
-    4. the latest attempt's own status is abandoned/interrupted -> 중단.
-    5. otherwise -> 진행 중.
+    ledger row).
+
+    Every event below is seq-stamped, and whichever one has the HIGHEST
+    seq (i.e. happened most recently) decides the label -- NOT a fixed
+    priority order. That matters because `tools/gb2`'s `ship`/
+    `skip-ship` (and a release-configured job's report/close followup
+    simply failing on its own) all run strictly AFTER the
+    "awaiting_release_approval" progress event that first parked the
+    job waiting for the owner -- without seq-ordering, that one stale
+    "사람 확인 대기" label would win forever even once the job has
+    plainly moved past it (ship/skip-ship/failure must
+    never leave a stale "release approval waiting" row behind).
+
+    Candidates considered, each from its own seq:
+    - the LAST full_orbit.progress event whose stage starts with
+      "awaiting_" -> "사람 확인 대기" (plus ": <stop_reason>" when that
+      event carries one) -- UNLESS it is this
+      job's release-approval stop AND `request_status` (read straight
+      from the ledger's own requests table, never updated by the
+      progress event itself) shows that SAME request_id already ended
+      "failed"/"unknown": `tools/gb2`'s `ship` drives a publish request
+      to exactly that terminal status and then returns without ever
+      journaling report/close or a release_decision on a real deploy
+      failure -- the board must
+      still show 실패, not keep repeating "사람 확인 대기" for a
+      request that will never be approved again.
+    - a job.handoff_written event (there is at most one per job --
+      engine.handoff.write_handoff -- deliberately NOT 'report.written',
+      which every attempt's own "report" stage appends; keying off that
+      would mark a job 완료 as soon as its very first task's report
+      stage ran) -> 완료.
+    - the LAST "job.metrics" event whose payload["outcome"] == "failed"
+      (engine.orbit's own per-attempt outcome record, written right
+      before a stage-list call returns early -- including a release
+      followup's own report/close simply failing) -> 실패.
+    - the LAST full_orbit.release_decision event (engine.full_orbit.
+      record_release_decision -- `gb2 ship`/`gb2 skip-ship`'s own
+      durable terminal record for a release-configured job) ->
+      _RELEASE_DECISION_LABEL[decision].
+
+    If none of those exist at all, falls back to: the latest attempt's
+    own status is abandoned/interrupted -> 중단; otherwise -> 진행 중.
     """
-    last_progress_stage: str | None = None
-    last_progress_reason: str | None = None
-    last_metrics_outcome: str | None = None
-    has_handoff = False
+    request_status = request_status or {}
+    candidates: list[tuple[int, str]] = []
     for event in job_events:
         if event.kind == "full_orbit.progress":
             stage = event.payload.get("stage")
-            if isinstance(stage, str):
-                last_progress_stage = stage
+            if isinstance(stage, str) and stage.startswith(_AWAITING_PREFIX):
+                request_id = event.payload.get("request_id")
+                if (isinstance(request_id, str)
+                        and request_status.get(request_id) in ("failed", "unknown")):
+                    candidates.append((event.seq, "실패"))
+                    continue
                 reason = event.payload.get("stop_reason")
-                last_progress_reason = reason if isinstance(reason, str) else None
+                label = (f"사람 확인 대기: {reason}" if isinstance(reason, str) and reason
+                        else "사람 확인 대기")
+                candidates.append((event.seq, label))
         elif event.kind == "job.handoff_written":
-            has_handoff = True
+            candidates.append((event.seq, "완료"))
         elif event.kind == "job.metrics":
             outcome = event.payload.get("outcome")
-            if isinstance(outcome, str):
-                last_metrics_outcome = outcome
-    if last_progress_stage and last_progress_stage.startswith(_AWAITING_PREFIX):
-        if last_progress_reason:
-            return f"사람 확인 대기: {last_progress_reason}"
-        return "사람 확인 대기"
-    if has_handoff:
-        return "완료"
-    if last_metrics_outcome == "failed":
-        return "실패"
+            if outcome == "failed":
+                candidates.append((event.seq, "실패"))
+        elif event.kind == "full_orbit.release_decision":
+            decision = event.payload.get("decision")
+            if isinstance(decision, str):
+                candidates.append((event.seq, _RELEASE_DECISION_LABEL.get(decision, "완료")))
+
+    if candidates:
+        candidates.sort(key=lambda pair: pair[0])
+        return candidates[-1][1]
     if latest_attempt is not None and latest_attempt.status in ("abandoned", "interrupted"):
         return "중단"
     return "진행 중"
@@ -379,6 +442,8 @@ tr:last-child td { border-bottom: 1px solid var(--line-strong); }
 
 _STATUS_BADGE = {
     "완료": "badge-pos",
+    "배포됨": "badge-pos",
+    "건너뜀": "badge-soft",
     "사람 확인 대기": "badge-warn",
     "실패": "badge-neg",
     "중단": "badge-neg",
@@ -388,8 +453,7 @@ _STATUS_BADGE = {
 
 def _status_badge_class(status: str) -> str:
     """_STATUS_BADGE, matched by prefix for "사람 확인 대기: <reason>"
-    (s10 contract item 5 -- the badge itself only cares about the fixed
-    label, never the free-text reason after the colon)."""
+    ."""
     if status in _STATUS_BADGE:
         return _STATUS_BADGE[status]
     if status.startswith("사람 확인 대기"):

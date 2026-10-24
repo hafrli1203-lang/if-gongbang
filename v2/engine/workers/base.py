@@ -266,7 +266,8 @@ def _progress_mark(paths: "tuple[Path, ...]") -> tuple[tuple[int, int], ...]:
 
 
 def wait_while_progressing(pid: int, stall_sec: float,
-                           progress_paths: "tuple[Path, ...]") -> int | None:
+                           progress_paths: "tuple[Path, ...]",
+                           exit_file: Path | None = None) -> int | None:
     """Wait for `pid` to exit for as long as it keeps making progress.
     Progress = any of `progress_paths` (the worker's stdout, its gate log
     of tool calls, ...) changed size or mtime. There is no total time
@@ -274,12 +275,18 @@ def wait_while_progressing(pid: int, stall_sec: float,
     code, or None only when nothing changed for `stall_sec` in a row
     (the worker is stuck, e.g. waiting on input it will never get).
 
-    Every call site lists the worker's stdout path first in
-    `progress_paths` (the same path it gave engine.procs.spawn as
-    stdout_path) -- exit_file_for derives the matching exit-code file
-    from it, so wait_for_exit can recover a real exit code after a
-    crash-and-resume with no extra parameter threaded through here."""
-    exit_file = exit_file_for(progress_paths[0]) if progress_paths else None
+    `exit_file` defaults to engine.procs.exit_file_for(progress_paths[0])
+    when not given explicitly (None if progress_paths is empty) --
+    every call site lists the worker's stdout path first in
+    progress_paths (the same path it gave engine.procs.spawn as
+    stdout_path), so this recovers the identical, now engine-only exit
+    record exit_file_for's own docstring describes with no change
+    needed at any existing call site. A caller may still pass its own
+    exit_file explicitly (e.g. one derived some other way, or paired
+    with a spawn() call that was given an explicit exit_file instead
+    of relying on stdout_path at all)."""
+    if exit_file is None and progress_paths:
+        exit_file = exit_file_for(progress_paths[0])
     last_mark = _progress_mark(progress_paths)
     last_change = time.time()
     while True:
@@ -324,8 +331,9 @@ def wait_for_exit(pid: int, timeout_sec: float,
     never its parent (resumed in a different OS process after a crash)
     or because an earlier call already reaped it -- and the process is
     confirmed gone (not is_alive), the real exit code is read from
-    `exit_file` (engine.procs.exit_file_for/spawn's own wrapper writes
-    it there unconditionally). Trusting a bare "process is gone" as
+    `exit_file` (engine.procs.spawn's own wrapper writes it there,
+    refusing to follow a symlink or clobber an existing file -- see
+    engine.exit_writer). Trusting a bare "process is gone" as
     success, the way this used to work, silently turned a crashed or
     killed worker into a reported success; `exit_file` is None's/
     missing/unreadable fallback is `_UNKNOWN_EXIT` (-1), which every

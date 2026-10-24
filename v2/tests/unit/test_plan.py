@@ -210,7 +210,7 @@ def test_ordered_tasks_cycle_raises(tmp_path: Path) -> None:
     assert exc.value.reason.startswith("dependency_cycle")
 
 
-# ---- requirements/covers (s10 contract item 4) ----------------------
+# ---- requirements/covers ----------------------
 
 def test_requirement_covered_by_scene_is_valid(tmp_path: Path) -> None:
     data = _valid_plan_dict(
@@ -235,9 +235,32 @@ def test_requirement_not_covered_by_any_scene_or_task_is_a_problem(tmp_path: Pat
     assert any("R1" in p and "not covered" in p for p in problems)
 
 
-def test_requirement_covered_by_task_only_is_valid(tmp_path: Path) -> None:
+def test_requirement_covered_by_task_only_is_not_enough(tmp_path: Path) -> None:
+    """A task's own `covers` is tracking only -- "done" means its own
+    review/bench passed, never that any scene actually exercised the
+    requirement's real behavior (every
+    requirement kind alike, not just "function"). Without at least one
+    SCENE coverer, the requirement would pass this static check yet
+    never be able to pass engine.full_orbit's own runtime completion
+    gate (_uncovered_requirement_ids) -- so it must already fail here."""
     data = _valid_plan_dict(
         requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
+        tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
+                "depends_on": [], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("R1" in p and "not covered by any scene" in p for p in problems)
+
+
+def test_requirement_covered_by_task_and_scene_is_valid(tmp_path: Path) -> None:
+    """A task MAY still also claim `covers` (kept for tracking), as
+    long as some scene covers the same requirement too."""
+    data = _valid_plan_dict(
+        requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
+        scenes=[{"id": "s1", "actor_does": "입력", "app_shows": "검증 결과", "where": "home",
+                 "cmd": ["true"], "covers": ["R1"]}],
         tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
                 "depends_on": [], "covers": ["R1"]}],
     )

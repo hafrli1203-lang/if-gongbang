@@ -241,7 +241,7 @@ def _screens_section(config: EngineConfig, project: str, job: str) -> str:
 def _scene_table(plan: "Plan", acc: AcceptanceResult) -> str:
     """requirement(plan.requirements) <-> scene/task <-> pass/fail,
     paired by requirement id (engine.plan.requirement_coverers) -- never
-    positionally. A plan with no requirements yet (predates s10's
+    positionally. A plan with no requirements yet (predates the earlier
     requirements/covers fields) falls back to plan.acceptance paired
     positionally with plan.scenes, same as before that field existed."""
     requirements = getattr(plan, "requirements", ())

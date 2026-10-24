@@ -81,6 +81,105 @@ def test_two_disjoint_copies_merge_cleanly(workspace: Workspace) -> None:
     assert (workspace.alpha / "tests" / "bench" / "cases.json").read_text(encoding="utf-8") == "[1]\n"
 
 
+def _scenes_overlap_config(config: EngineConfig) -> EngineConfig:
+    """A config variant that (unlike the shared STATION_OWNERS fixture)
+    deliberately gives "build"/"builder" a prefix wide enough to ALSO
+    cover tests/scenes/ -- the only way to prove merge's own reserved-
+    prefix denial (engine.steps.merge._deny_if_planner_reserved) holds
+    even when an operator's own config would otherwise allow it."""
+    return dataclasses.replace(config, station_owners={
+        **config.station_owners,
+        "build": {"builder": ("tests/",)},
+    })
+
+
+def test_merge_denies_builder_write_under_tests_scenes(workspace: Workspace) -> None:
+    cfg = _scenes_overlap_config(workspace.config)
+    attempt_id = open_job(cfg, workspace.ledger, "alpha", "scenes-grab", "full", ("builder",))
+    copy_a = copy_root(cfg, attempt_id, "builder")
+    (copy_a / "tests" / "scenes" / "evil.py").parent.mkdir(parents=True, exist_ok=True)
+    (copy_a / "tests" / "scenes" / "evil.py").write_text("exit(0)\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace, config=cfg)
+    n = proc.run_once("alpha")
+    assert n == 0
+    req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "tests_scenes_reserved_for_planner"}
+    assert not (workspace.alpha / "tests" / "scenes" / "evil.py").exists()
+    denied = [e for _seq, e in workspace.ledger.events("alpha", "merge.denied")]
+    assert denied and denied[0].payload["role"] == "builder"
+
+
+def test_planner_role_may_still_write_tests_scenes(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "scenes-ok", "full",
+                           ("planner",))
+    copy_a = copy_root(workspace.config, attempt_id, "planner")
+    cfg = dataclasses.replace(workspace.config, station_owners={
+        **workspace.config.station_owners,
+        "plan": {"planner": ("tests/scenes/", "plan.json")},
+    })
+    (copy_a / "tests" / "scenes").mkdir(parents=True, exist_ok=True)
+    (copy_a / "tests" / "scenes" / "scene1.py").write_text("exit(0)\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "planner", "station": "plan", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace, config=cfg)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    assert (workspace.alpha / "tests" / "scenes" / "scene1.py").read_text(
+        encoding="utf-8") == "exit(0)\n"
+
+
+def test_merge_narrows_to_copy_owns_when_given(workspace: Workspace) -> None:
+    """A copy's "owns" entry (engine.full_orbit's per-task narrowing)
+    must shrink merge's own allowed prefixes below the FULL configured
+    "build"/"builder" set ("src/", "lib/", "docs/", "package.json") --
+    a file under an allowed-by-config-but-not-by-owns prefix is simply
+    never a merge candidate at all, even though the broader station
+    prefix would otherwise have accepted it."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "narrow", "full",
+                           ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    (copy_a / "src" / "a.py").write_text("A = 1\n", encoding="utf-8")
+    (copy_a / "docs" / "b.md").parent.mkdir(parents=True, exist_ok=True)
+    (copy_a / "docs" / "b.md").write_text("notes\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a),
+                    "owns": ["src/"]}],
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    assert (workspace.alpha / "src" / "a.py").exists()
+    assert not (workspace.alpha / "docs" / "b.md").exists()
+
+
+def test_merge_rejects_owns_widening_beyond_station_prefixes(workspace: Workspace) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "widen", "full",
+                           ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    (copy_a / "src" / "a.py").write_text("A = 1\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a),
+                    "owns": ["src/", "secrets/"]}],
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 0
+    req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "owns_escapes_station_prefixes"}
+
+
 def test_conflicting_edit_fails_and_writes_nothing(workspace: Workspace) -> None:
     cfg = _overlap_config(workspace.config)
     attempt_id = open_job(cfg, workspace.ledger, "alpha", "conflict", "full",
@@ -280,18 +379,18 @@ def test_validate_rel_rejects_dotdot_absolute_and_protected(workspace: Workspace
     repo = workspace.alpha
 
     with pytest.raises(StepFailed) as exc1:
-        merge._validate_rel(ctx, repo, policy, "../outside.txt")
+        merge._validate_rel(ctx, repo, policy, "../outside.txt", "builder")
     assert exc1.value.reason == "path_rejected"
 
     with pytest.raises(StepFailed) as exc2:
-        merge._validate_rel(ctx, repo, policy, "/etc/passwd")
+        merge._validate_rel(ctx, repo, policy, "/etc/passwd", "builder")
     assert exc2.value.reason == "path_rejected"
 
     with pytest.raises(StepFailed) as exc3:
-        merge._validate_rel(ctx, repo, policy, ".gitignore")
+        merge._validate_rel(ctx, repo, policy, ".gitignore", "builder")
     assert exc3.value.reason == "path_rejected"
 
-    merge._validate_rel(ctx, repo, policy, "src/app.py")  # does not raise
+    merge._validate_rel(ctx, repo, policy, "src/app.py", "builder")  # does not raise
 
 
 def test_symlink_in_copy_is_rejected(workspace: Workspace) -> None:
