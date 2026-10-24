@@ -462,6 +462,9 @@ def test_resolve_runtime_claude_starts_under_a_hidden_real_home() -> None:
     test here") only if this host has no `claude` on PATH at all."""
     if shutil.which("claude") is None:
         pytest.skip("claude not installed on this host")
+    host = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=20)
+    if host.returncode != 0 or not host.stdout.strip():
+        pytest.skip("claude on PATH is a placeholder (prints no version) on this host")
     home = Path(os.environ["HOME"])
     readonly = sandbox.resolve_runtime("claude")
     assert readonly, "claude resolved via PATH but resolve_runtime found no mounts"
@@ -472,7 +475,7 @@ def test_resolve_runtime_claude_starts_under_a_hidden_real_home() -> None:
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0
-    assert result.stdout.strip()
+    assert result.stdout.strip() == host.stdout.strip()
 
 
 @_needs_bwrap
@@ -482,6 +485,9 @@ def test_resolve_runtime_codex_starts_under_a_hidden_real_home() -> None:
     resolve_runtime's interpreter-chasing branch for real."""
     if shutil.which("codex") is None:
         pytest.skip("codex not installed on this host")
+    host = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=20)
+    if host.returncode != 0 or not host.stdout.strip():
+        pytest.skip("codex on PATH is a placeholder (prints no version) on this host")
     home = Path(os.environ["HOME"])
     readonly = sandbox.resolve_runtime("codex")
     assert readonly, "codex resolved via PATH but resolve_runtime found no mounts"
@@ -492,7 +498,7 @@ def test_resolve_runtime_codex_starts_under_a_hidden_real_home() -> None:
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0
-    assert result.stdout.strip()
+    assert result.stdout.strip() == host.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
