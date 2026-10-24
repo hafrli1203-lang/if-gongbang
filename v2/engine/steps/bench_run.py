@@ -56,6 +56,10 @@ record_bench         recompute the fingerprint; if it differs from
                      recorded before raising so the failure (and its
                      signatures) stays visible to three_match/record
                      even though the request itself ends 'failed'.
+                     reconcile: evidence for this request_id already
+                     recorded AND passed=True -- a recorded passed=False
+                     re-raises StepFailed(reason) rather than reading
+                     its own existence as success.
 """
 from __future__ import annotations
 
@@ -556,15 +560,20 @@ def _reconcile_false(ctx: StepContext) -> bool:
 
 
 def _reconcile_record_bench(ctx: StepContext) -> bool:
-    """True iff bench evidence for this request_id was already recorded --
-    a crash between evidence.record and this step's 'done' journal write
-    must not record a second (duplicate) evidence row on resume. Only
-    reachable when the prior run succeeded: a run that raised StepFailed
-    never reaches the journal-'done' write, so its request terminates
-    'failed' before any resume of this step is possible."""
+    """True iff bench evidence for this request_id was already recorded
+    AND it reported passed=True. A crash after _run_record_bench's
+    evidence.record but before its own `raise StepFailed(reason)` is
+    the case this guards: that recorded failure's mere existence must
+    not read back as success on resume -- it re-raises the same
+    reason, so the request still terminates 'failed'. Duplicate
+    evidence rows are still avoided either way: the passed=True branch
+    returns True without a second evidence.record call, same as
+    before."""
     for row in ctx.ledger.evidence(ctx.attempt_id, "bench"):
         if row.payload.get("request_id") == ctx.request.request_id:
-            return True
+            if row.payload.get("passed"):
+                return True
+            raise StepFailed(str(row.payload.get("reason", "tests_failed")))
     return False
 
 

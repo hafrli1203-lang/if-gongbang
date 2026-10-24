@@ -330,28 +330,42 @@ def _tree_exists(repo: Path, tree_sha: str) -> bool:
 _GONGBANG_PREFIX = ".gongbang/"
 
 
-def _changed_paths_outside_gongbang(repo: Path, tree_a: str, tree_b: str) -> tuple[str, ...]:
+def _generated_report_paths(job_name: str) -> frozenset[str]:
+    """Exactly the two paths engine.full_orbit's own handoff commit
+    (write_handoff + _commit_job_trail) adds/changes AFTER engine.
+    acceptance.run_acceptance already fingerprinted the tree -- see
+    _job_certificate's docstring for why that one-commit difference
+    must never by itself make a job's certificate look stale. Scoped
+    to THIS job_name only, and to exactly these two generated outputs
+    -- never the whole ".gongbang/" tree, which also holds plan.json,
+    facts.md, probe scripts/logs and tests/scenes (this job's own, and
+    every other job's under the same repo): a change to any of those
+    after acceptance/security already ran must still refuse release,
+    the same as a real source change outside .gongbang/ would."""
+    return frozenset({
+        f"{_GONGBANG_PREFIX}{job_name}/report.md",
+        f"{_GONGBANG_PREFIX}{job_name}/acceptance.json",
+    })
+
+
+def _changed_paths_outside_gongbang(repo: Path, tree_a: str, tree_b: str,
+                                    job_name: str) -> tuple[str, ...]:
     """Paths that differ between two tree objects (git diff --name-only,
     both sides already confirmed to be real tree objects by the caller),
-    excluding anything under ".gongbang/" -- engine.full_orbit's own
-    handoff commit (write_handoff + _commit_job_trail) adds/changes
-    exactly .gongbang/<job>/report.md and .gongbang/<job>/acceptance.json
-    AFTER engine.acceptance.run_acceptance already fingerprinted the
-    tree, so that bookkeeping-only difference must never by itself make
-    a job's certificate look stale. tree_a == tree_b short-circuits to
-    () without ever shelling out (the common case once app_security's
-    own check() -- which engine.full_orbit calls strictly AFTER the
-    handoff commit -- is fingerprinted at the exact released tree)."""
+    excluding only _generated_report_paths(job_name) -- see that
+    function's docstring for why the exemption is this narrow, not the
+    whole ".gongbang/" prefix. tree_a == tree_b short-circuits to ()
+    without ever shelling out (the common case once app_security's own
+    check() -- which engine.full_orbit calls strictly AFTER the handoff
+    commit -- is fingerprinted at the exact released tree)."""
     if tree_a == tree_b:
         return ()
     result = subprocess.run(
         git_argv(repo, "diff", "--name-only", tree_a, tree_b),
         check=True, capture_output=True, text=True,
     )
-    return tuple(
-        p for p in result.stdout.splitlines()
-        if p and p != ".gongbang" and not p.startswith(_GONGBANG_PREFIX)
-    )
+    exempt = _generated_report_paths(job_name)
+    return tuple(p for p in result.stdout.splitlines() if p and p not in exempt)
 
 
 _MAX_REASON_PATHS = 3
@@ -376,11 +390,15 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
     on `attempt_id`'s own 'job.opened' event -- never attempt_id
     equality alone), must each have a recorded fingerprint that is
     EITHER exactly `fingerprint`, OR a real tree object in `repo` whose
-    git-diff against `fingerprint` touches nothing outside ".gongbang/".
-    reason is "" when ok, else "release_requires_job_certificate"
-    (optionally suffixed with ":<first few changed paths>" when the
-    refusal is specifically because something outside .gongbang/
-    changed).
+    git-diff against `fingerprint` touches nothing beyond this job's
+    own two generated report paths (_generated_report_paths(job_name) --
+    report.md and acceptance.json, never the whole ".gongbang/" tree:
+    plan.json, facts.md, probe scripts/logs and tests/scenes changing
+    after acceptance/security ran still refuses, same as any other
+    source change). reason is "" when ok, else
+    "release_requires_job_certificate" (optionally suffixed with
+    ":<first few changed paths>" when the refusal is specifically
+    because something outside those two generated paths changed).
 
     Why an exact fingerprint match is too strict for acceptance's own
     recorded fingerprint (root cause investigated and reported to the
@@ -463,7 +481,8 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
             continue
         if not _tree_exists(repo, recorded_fp):
             return False, _JOB_CERTIFICATE_MISSING_REASON
-        changed.extend(_changed_paths_outside_gongbang(repo, recorded_fp, fingerprint))
+        changed.extend(_changed_paths_outside_gongbang(repo, recorded_fp, fingerprint,
+                                                       job_name))
     if changed:
         # Dedupe while keeping first-seen order (acceptance's own diff
         # before app_security's), so the reason's truncated path list
@@ -707,32 +726,61 @@ def cancel_running_publish_before_dispatch(ledger: Ledger, project: str,
     call_publisher's run() actually calling publish() would also show
     'started' with no receipt on disk yet at all -- deliberately
     treated here as "might already be dispatching", never as safe to
-    cancel. Callers (tools/gb2's `skip-ship`) are responsible for ALSO
-    confirming, before ever calling this, that no live processor
-    could currently be running this request (the project lock's
-    holder pid is dead or there is no holder) and that no receipt
-    exists for this key at all -- this function checks neither.
+    cancel. This function now holds the project lock itself (see
+    below) for its own status/journal checks and cancellation write,
+    so a caller no longer needs the lock held to make those checks
+    safe -- but callers (tools/gb2's `skip-ship`) are still
+    responsible for confirming, before ever calling this, that no
+    receipt exists for this key at all: the publisher's own receipt
+    is not read here.
 
     Raises CancelError if the request does not belong to `project` or
-    is not 'running' (same guard cancel_request uses for 'queued')."""
-    request = ledger.request(request_id)
-    if request.project != project:
-        raise CancelError(
-            f"request {request_id} belongs to project {request.project!r}, "
-            f"not {project!r}"
-        )
-    if request.status != "running":
-        raise CancelError(f"request {request_id} is {request.status!r}, not running")
-    if ledger.steps(request_id).get("call_publisher") is not None:
-        return False
-    ledger.append(Event(
-        project=project, kind="request.status", actor_kind="owner",
-        actor_id="owner", attempt_id=request.attempt_id,
-        payload={"request_id": request_id, "status": "failed",
-                 "result": {"reason": reason}},
-    ))
-    _revoke_unused_approvals(ledger, project, request.attempt_id, request_id)
-    return True
+    is not 'running' (same guard cancel_request uses for 'queued').
+
+    Holds the project lock (the same one Processor.run_once/run_request
+    and cancel_pending_publish take) for the whole status-check,
+    journal-check and cancellation-write sequence -- cancel_pending_
+    publish's own docstring explains why this matters for a queued
+    request, and the same race exists here for a running one: without
+    the lock, this function's own "journal shows no call_publisher
+    entry yet" read and its "failed" status write are not atomic with
+    a live processor concurrently running THIS SAME request's steps
+    under that lock. A processor that is mid-dispatch when this
+    function reads an empty journal would go on to call
+    Processor._set_status(..., "done", ...) once it finishes --
+    unconditionally overwriting the "failed" cancellation this
+    function just wrote, so the deploy would proceed (and be recorded
+    as done) despite the cancellation. Holding the lock here makes
+    that impossible: a processor cannot even begin draining this
+    project's queue while this function holds it, so a confirmed-empty
+    journal read stays true until this function's own write lands.
+    Raises ProcessorBusy (no ledger write at all) if the lock is
+    already held by a live processor -- callers must retry rather
+    than proceed as if nothing needed cancelling."""
+    holder = f"cancel-running-publish-{uuid.uuid4().hex[:8]}"
+    if not ledger.acquire_lock(project, holder):
+        raise ProcessorBusy(f"project {project!r} locked by another processor")
+    try:
+        request = ledger.request(request_id)
+        if request.project != project:
+            raise CancelError(
+                f"request {request_id} belongs to project {request.project!r}, "
+                f"not {project!r}"
+            )
+        if request.status != "running":
+            raise CancelError(f"request {request_id} is {request.status!r}, not running")
+        if ledger.steps(request_id).get("call_publisher") is not None:
+            return False
+        ledger.append(Event(
+            project=project, kind="request.status", actor_kind="owner",
+            actor_id="owner", attempt_id=request.attempt_id,
+            payload={"request_id": request_id, "status": "failed",
+                     "result": {"reason": reason}},
+        ))
+        _revoke_unused_approvals(ledger, project, request.attempt_id, request_id)
+        return True
+    finally:
+        ledger.release_lock(project, holder)
 
 
 __all__ = [

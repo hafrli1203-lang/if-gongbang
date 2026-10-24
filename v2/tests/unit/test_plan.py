@@ -369,3 +369,90 @@ def test_symlinked_core_skill_escaping_root_is_not_available(tmp_path) -> None:
 
     catalog = skill_catalog_text(config)
     assert "숨은-스킬" not in catalog
+
+
+# ---------------------------------------------------------------------------
+# validate_tools / skill_catalog_text: an mcp tool for a station whose
+# configured runner cannot take mcp (codex, or anything other than
+# "claude" -- engine.workers.claude_cli is the only runner that writes
+# --mcp-config at all; engine.steps.review's own "reviewer_mcp_unsupported"
+# is the runtime symptom a codex-reviewed project used to only discover
+# mid-job). Regression: tools/templates/node-vitest.json's own
+# station_mcp_allow used to offer "review" playwright access to exactly
+# such a project (reviewer runner "codex").
+# ---------------------------------------------------------------------------
+
+def _mcp_config(**overrides: object) -> "SimpleNamespace":
+    from types import SimpleNamespace
+
+    base = dict(
+        mcp_servers={"playwright": object()},
+        station_owners={"review": {"reviewer": ("review.md",)},
+                        "build": {"builder": ("src/",)}},
+        workers={"reviewer": SimpleNamespace(runner="codex"),
+                "builder": SimpleNamespace(runner="claude")},
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_validate_tools_rejects_mcp_for_a_station_whose_runner_is_codex() -> None:
+    from types import SimpleNamespace
+
+    from engine.plan import validate_tools
+
+    config = _mcp_config()
+    plan = SimpleNamespace(tools=(
+        SimpleNamespace(kind="mcp", name="playwright", stations=("review",)),
+    ))
+    problems = validate_tools(plan, config)
+    assert len(problems) == 1
+    assert "playwright" in problems[0] and "review" in problems[0]
+
+
+def test_validate_tools_accepts_mcp_for_a_station_whose_runner_is_claude() -> None:
+    from types import SimpleNamespace
+
+    from engine.plan import validate_tools
+
+    config = _mcp_config()
+    plan = SimpleNamespace(tools=(
+        SimpleNamespace(kind="mcp", name="playwright", stations=("build",)),
+    ))
+    assert validate_tools(plan, config) == []
+
+
+def test_validate_tools_accepts_mcp_for_an_unowned_station(
+) -> None:
+    """A station config.station_owners has no entry for at all (nothing
+    to check a runner against) is treated as capable, same as before
+    this check existed -- never a new, surprising hard failure for a
+    config this module cannot see a runner for."""
+    from types import SimpleNamespace
+
+    from engine.plan import validate_tools
+
+    config = _mcp_config(station_owners={})
+    plan = SimpleNamespace(tools=(
+        SimpleNamespace(kind="mcp", name="playwright", stations=("review",)),
+    ))
+    assert validate_tools(plan, config) == []
+
+
+def test_skill_catalog_text_never_lists_a_station_a_codex_runner_cannot_mcp() -> None:
+    """skill_catalog_text's own "쓸 수 있는 칸" (usable stations) row
+    must not offer "review" even if config.station_mcp_allow itself
+    (an operator-authored config, not plan.tools) still names it for a
+    codex-reviewed project -- the planner must never be shown a station
+    it cannot actually use mcp at."""
+    from types import SimpleNamespace
+
+    from engine.plan import skill_catalog_text
+
+    config = _mcp_config(
+        skill_index_path=None, skill_roots=(),
+        station_mcp_allow={"review": ("playwright",), "build": ("playwright",)},
+    )
+    catalog = skill_catalog_text(config)
+    assert "build" in catalog
+    assert "review" not in catalog.split("### MCP 서버")[-1]

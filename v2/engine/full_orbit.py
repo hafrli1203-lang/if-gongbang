@@ -170,14 +170,20 @@ def record_release_decision(ledger: Ledger, project: str, attempt_id: str, job_n
     """Journals a `full_orbit.release_decision` event -- the one durable
     record of how this job's release track ended: "not_configured" (no
     `release` in this project's config -- _maybe_release_or_done's own
-    straight-to-done path), "shipped" (tools/gb2's `ship` command drove
-    the pending publish request to "done" and ran report/close on the
-    release attempt), "skipped" (`skip-ship` abandoned the pending
-    publish and ran report/close instead), or "failed" (`ship` drove the
-    publish request to a terminal non-"done" status -- a real deploy/
-    fast-forward failure, never just a transient one still worth
-    retrying -- and chose not to continue with report/close at all).
-    Without this, a release-
+    straight-to-done path), "shipped" (the pending publish request
+    reached "done"), "skipped" (the owner abandoned it -- `skip-ship`,
+    a full-bench refusal, a cancel-before-dispatch, or a security fix
+    superseding it -- see finalize_release's own _RELEASE_ABANDON_
+    REASONS), or "failed" (the publish request reached a terminal
+    "failed"/"unknown" status for any OTHER reason -- a real deploy/
+    fast-forward failure). `finalize_release` is the one place that
+    decides which of these four applies and is the only caller that
+    should ever invoke this directly; `ship`/`skip-ship`/continue_full_
+    job's own STAGE_RELEASE_APPROVAL resume all go through it rather
+    than calling this themselves, so the decision logic lives in
+    exactly one place. Idempotent in effect (not in storage): callers
+    check `_release_decision_already_recorded` first, since this
+    itself always appends a fresh event. Without this, a release-
     configured job's own completion was only ever visible as engine.
     orbit's own JobOutcome from that one `continue_job` call -- nothing
     on the ledger ever said the WHOLE full-orbit job (not just this one
@@ -189,6 +195,101 @@ def record_release_decision(ledger: Ledger, project: str, attempt_id: str, job_n
         actor_id="processor", attempt_id=attempt_id,
         payload={"job": job_name, "decision": decision},
     ))
+
+
+# Every reason a publish request's own "result" dict carries when it was
+# driven to a terminal non-"done" status by a deliberate owner/engine
+# ABANDON -- `cancel_pending_publish`/`cancel_running_publish_before_
+# dispatch` (engine.release), called with each of these exact strings --
+# never a reason recorded by an actual dispatch failure (e.g.
+# advance_master/call_publisher raising StepFailed with some OTHER
+# reason, like "artifact_mismatch" or a real deploy exit code). Read by
+# finalize_release to tell "the owner chose not to ship this" (decision
+# "skipped") apart from "the release genuinely failed" (decision
+# "failed") -- both reach the SAME terminal request status
+# ("failed"/"unknown"), so the status alone can never tell them apart.
+_RELEASE_ABANDON_REASONS = frozenset({
+    "skip_ship", "full_bench_failed", "cancelled_before_dispatch", "superseded_by_fix",
+})
+
+
+def _release_decision_for_request(request_row: "object") -> str:
+    """"shipped" (status "done"), "skipped" (a terminal non-"done"
+    status whose own result.reason is one of _RELEASE_ABANDON_REASONS),
+    or "failed" (terminal non-"done" for any other reason -- a real
+    deploy/fast-forward failure, e.g. "artifact_mismatch" or a
+    nonzero-exit deploy script)."""
+    if request_row.status == "done":  # type: ignore[attr-defined]
+        return "shipped"
+    result = request_row.result  # type: ignore[attr-defined]
+    reason = result.get("reason") if isinstance(result, dict) else None
+    if reason in _RELEASE_ABANDON_REASONS:
+        return "skipped"
+    return "failed"
+
+
+def _release_decision_already_recorded(ledger: Ledger, project: str, job_name: str,
+                                       attempt_id: str) -> bool:
+    for _seq, event in ledger.events(project, "full_orbit.release_decision"):
+        if event.attempt_id == attempt_id and event.payload.get("job") == job_name:
+            return True
+    return False
+
+
+def finalize_release(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                     attempt_id: str, job_name: str, request_id: str, report_path: str,
+                     on_progress: ProgressCallback | None = None,
+                     processor_factory: "orbit.ProcessorFactory | None" = None) -> FullOutcome:
+    """The ONE place a release-configured job's publish request --
+    shipped (`gb2 ship` drove it to "done"), abandoned (`gb2 skip-ship`,
+    a full-bench refusal, a cancel-before-dispatch, or a security fix
+    superseding it), or genuinely failed (any other terminal non-"done"
+    status) -- is turned into this job's final FullOutcome: report ->
+    close (_close_attempt, idempotent -- engine.processor.submit/
+    run_once's own content-hash idempotency makes a second call on an
+    already-"done" report/close request a no-op) THEN record_release_
+    decision (idempotent in effect: never a second event for the same
+    (project, job_name, attempt_id), see _release_decision_already_
+    recorded), in that fixed order, no matter which of the three ways
+    the request actually ended. `gb2 ship`/`gb2 skip-ship` (tools/gb2)
+    and continue_full_job's own STAGE_RELEASE_APPROVAL resume (a crash
+    between the publish request reaching a terminal status and this
+    function ever running) all call this instead of duplicating the
+    decide-close-record sequence themselves -- before this existed, a
+    crash in that exact window left the project OPEN forever (close
+    never ran) with no release_decision ever recorded, and a ship that
+    ended in a genuine failure (as opposed to "done") skipped report/
+    close and the decision record entirely, the same orphaned-OPEN way.
+
+    request_id's own status not yet terminal (still "queued"/
+    "running") is a plain no-op: returns FullOutcome("needs_owner",
+    "release_approval", attempt_id, None) without touching the ledger
+    at all -- the owner has not finished approving/rejecting yet (a
+    `gb2 ship` call that typed the wrong approval line, for instance,
+    leaves the request exactly like this; calling this function again
+    after the owner fixes that is always safe)."""
+    request_row = ledger.request(request_id)
+    if request_row.status not in ("done", "failed", "unknown"):
+        return FullOutcome("needs_owner", "release_approval", attempt_id, None)
+    decision = _release_decision_for_request(request_row)
+    # _close_attempt's own report/close stages are each individually
+    # idempotent (engine.processor.submit/run_once's content-hash
+    # idempotency), but submitting a NEW request against an attempt
+    # that is no longer "active" (engine.processor.submit's own guard)
+    # raises outright rather than no-opping -- so a second
+    # finalize_release call on a job this function (or a same-process
+    # caller's own earlier _close_attempt) already closed must skip
+    # calling it again entirely, not rely on submit() to no-op.
+    if ledger.attempt(attempt_id).status == "active":
+        close_outcome = _close_attempt(config, ledger, fakes, project, attempt_id, job_name,
+                                       on_progress, processor_factory)
+        if close_outcome.status != "done":
+            return FullOutcome("failed", f"close:{close_outcome.reason}", attempt_id, None)
+    if not _release_decision_already_recorded(ledger, project, job_name, attempt_id):
+        record_release_decision(ledger, project, attempt_id, job_name, decision)
+    if decision == "failed":
+        return FullOutcome("failed", "release_rejected", attempt_id, None)
+    return FullOutcome("done", None, attempt_id, report_path)
 
 
 def _record_progress(ledger: Ledger, project: str, attempt_id: str, job_name: str,
@@ -233,20 +334,22 @@ def pending_owner_requests(ledger: Ledger, project: str, job_name: str) -> tuple
     """The station requests (e.g. {"kind": "install", "manifest": ...,
     "change": ...}) a job's own full_orbit.progress is currently
     stopped on -- () if the job's latest attempt has no pending
-    progress recorded at all, or that progress's own stage is not
-    STAGE_TASK_OWNER, or it carries no "pending_requests" (e.g. a
-    worker_stuck stop, which has nothing to approve -- see
-    engine.full_orbit's own STAGE_TASK_OWNER resume). A thin, PUBLIC
-    read-only wrapper around _load_progress for tools/gb2's own
-    `approve-install` to show the owner what a station is actually
-    waiting on, without reaching into this module's private progress
-    format itself."""
+    progress recorded at all, or that progress's own stage is neither
+    STAGE_TASK_OWNER (a build-task stop) nor STAGE_EARLY_STATION (a
+    facts/probe/plan/design station stop -- see
+    _record_early_station_stop), or it carries no "pending_requests"
+    (e.g. a worker_stuck stop, which has nothing to approve). Both
+    stages record "pending_requests" the same way, so one field read
+    covers either. A thin, PUBLIC read-only wrapper around
+    _load_progress for tools/gb2's own `approve-install` to show the
+    owner what a station is actually waiting on, without reaching into
+    this module's private progress format itself."""
     attempts = ledger.attempts_for_job_name(project, job_name)
     if not attempts:
         return ()
     attempt_id = attempts[-1].attempt_id
     progress = _load_progress(ledger, project, attempt_id, job_name)
-    if progress is None or progress.get("stage") != STAGE_TASK_OWNER:
+    if progress is None or progress.get("stage") not in (STAGE_TASK_OWNER, STAGE_EARLY_STATION):
         return ()
     pending = progress.get("pending_requests")
     if not isinstance(pending, list):
@@ -1408,14 +1511,16 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                                      report_path, max_fix_rounds)
 
     if stage == STAGE_RELEASE_APPROVAL:
+        # finalize_release itself no-ops (no mutation at all) while the
+        # publish request is still queued/running -- a crash exactly
+        # HERE (after the request reached a terminal status but before
+        # report/close/record_release_decision ever ran) is the gap
+        # this resume exists to close; see that function's own
+        # docstring.
         request_id = str(progress.get("request_id", ""))
         report_path = str(progress.get("report_path", ""))
-        request_row = ledger.request(request_id)
-        if request_row.status == "done":
-            return FullOutcome("done", None, attempt_id, report_path)
-        if request_row.status in ("failed", "unknown"):
-            return FullOutcome("failed", "release_rejected", attempt_id, None)
-        return FullOutcome("needs_owner", "release_approval", attempt_id, None)
+        return finalize_release(config, ledger, fakes, project, attempt_id, job_name,
+                                request_id, report_path, on_progress, processor_factory)
 
     if stage == STAGE_TASK_OWNER:
         # The reviewer is always shown the plain base task text (no build-
@@ -1527,7 +1632,7 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
 
 __all__ = [
     "FullOutcome", "FullOrbitError", "run_full_job", "continue_full_job",
-    "record_release_decision", "pending_owner_requests",
+    "record_release_decision", "finalize_release", "pending_owner_requests",
     "FACTS_ROLE", "PROBER_ROLE", "PLANNER_ROLE", "DESIGNER_ROLE", "BUILDER_ROLE",
     "REVIEWER_ROLE",
     "STAGE_DESIGN_APPROVAL", "STAGE_TASK_OWNER", "STAGE_PROBE_RETRY", "STAGE_PLAN_REVIEW",

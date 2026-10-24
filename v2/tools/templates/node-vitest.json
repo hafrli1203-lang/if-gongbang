@@ -180,9 +180,6 @@
     "design": [
       "playwright"
     ],
-    "review": [
-      "playwright"
-    ],
     "build": [
       "playwright"
     ]

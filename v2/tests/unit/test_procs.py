@@ -1,8 +1,11 @@
 """Unit tests for engine.procs: process groups, spawn/close_station."""
 from __future__ import annotations
 
+import json
 import os
 import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -169,4 +172,83 @@ def test_sandboxed_spawn_dies_with_parent_through_the_sh_exit_wrapper(
         time.sleep(0.05)
 
     survivors = [pid for pid in descendants if Path("/proc", str(pid)).exists()]
+    assert survivors == []
+
+
+@_needs_bwrap
+def test_engine_death_leaves_no_survivor_under_bwrap(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """Engine death policy (see procs.spawn's own docstring,
+    "Engine death policy" paragraph, and _die_with_engine's docstring):
+    the test above kills the DIRECT child spawn() itself returns (the
+    `sh` exit-code wrapper), simulating an explicit stop, not an
+    engine crash -- the wrapper's own real OS parent in that test IS
+    the pytest process, so nothing there actually proves what happens
+    if THAT grandparent dies. This test spawns a SEPARATE, real
+    Python process to stand in for "the engine" (it imports
+    engine.procs and calls spawn() ITSELF, so the worker's real OS
+    parent is that stand-in process, never pytest), then SIGKILLs the
+    stand-in directly -- a true simulated engine crash -- and asserts
+    the whole descendant tree (the `sh` wrapper, the bwrap launcher,
+    and the sandboxed `sleep` at the bottom of it) is gone shortly
+    after, with no explicit close_station call anywhere in this test."""
+    standin_script = tmp_path / "engine_standin.py"
+    argv_json = tmp_path / "argv.json"
+    pidfile = tmp_path / "standin.pid"
+    repo_root = str(Path(__file__).resolve().parents[2])
+
+    sandboxed_argv = sandbox.wrap(
+        ["sleep", "50"], cwd=workspace.alpha, mode="bwrap",
+        writable=(workspace.alpha,),
+        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    argv_json.write_text(json.dumps(sandboxed_argv), encoding="utf-8")
+    standin_script.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {repo_root!r})\n"
+        "from engine import procs\n"
+        "from engine.ledger import Ledger\n"
+        "real_argv = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))\n"
+        "ledger = Ledger.create(Path(sys.argv[1]))\n"
+        "ledger.register_project('alpha')\n"
+        "proc = procs.spawn(ledger, 'alpha', 'a1', 'build', real_argv, cwd=Path('/tmp'))\n"
+        "Path(sys.argv[3]).write_text(str(proc.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    standin_ledger = tmp_path / "standin_ledger.sqlite"
+    standin = subprocess.Popen(
+        [sys.executable, str(standin_script), str(standin_ledger), str(argv_json),
+         str(pidfile)],
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 5
+    while not pidfile.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert pidfile.exists(), "engine stand-in never reported its worker's pid"
+    worker_pid = int(pidfile.read_text(encoding="utf-8").strip())
+
+    deadline = time.time() + 2
+    descendants: set[int] = set()
+    while time.time() < deadline:
+        descendants = _descendant_pids(standin.pid)
+        if len(descendants) >= 2:  # the sh wrapper AND at least the bwrap launcher
+            break
+        time.sleep(0.05)
+    assert worker_pid in descendants
+    all_watched = {standin.pid, *descendants}
+
+    os.kill(standin.pid, signal.SIGKILL)  # simulated engine crash
+    standin.wait(timeout=5)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and any(
+        Path("/proc", str(pid)).exists() for pid in all_watched
+    ):
+        time.sleep(0.05)
+
+    survivors = [pid for pid in all_watched if Path("/proc", str(pid)).exists()]
     assert survivors == []

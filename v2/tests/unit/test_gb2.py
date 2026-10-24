@@ -1608,6 +1608,60 @@ def test_resolve_not_deployed_records_failed_and_closes_without_redeploy(
     assert receipt["status"] == "failed"
 
 
+# ---------------------------------------------------------------------------
+# _commit_generated_lockfile: only commits package-lock.json, only when
+# THIS bootstrap call actually changed it, and never sweeps up something
+# else the owner had already staged.
+# ---------------------------------------------------------------------------
+
+def test_commit_generated_lockfile_leaves_a_pre_staged_other_file_staged(
+    gb2: ModuleType, tmp_path: Path,
+) -> None:
+    """Regression: `git commit` with no pathspec commits the WHOLE
+    index, not just package-lock.json -- an owner who had already run
+    `git add some_other_file` before `gb2 init` would find that file
+    silently swept into gb2's own bootstrap commit. Here the lockfile
+    genuinely changed (before != after, as a real `npm install` would
+    leave it) but some_other_file must stay staged and uncommitted."""
+    repo = _make_source_repo(tmp_path / "repo")
+    before = gb2._lockfile_snapshot(repo)
+    assert before is None
+
+    (repo / "some_other_file.txt").write_text("owner's own work\n", encoding="utf-8")
+    _rgit(repo, "add", "some_other_file.txt")
+    (repo / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+
+    gb2._commit_generated_lockfile(repo, before)
+
+    head_files = _rgit(repo, "show", "--name-only", "--pretty=format:", "HEAD").strip().splitlines()
+    assert head_files == ["package-lock.json"]
+    status = _rgit(repo, "status", "--porcelain")
+    assert "A  some_other_file.txt" in status  # still staged, never committed
+
+
+def test_commit_generated_lockfile_is_a_noop_when_bootstrap_did_not_touch_it(
+    gb2: ModuleType, tmp_path: Path,
+) -> None:
+    """ensure_installed found node_modules already installed (nothing
+    ran) -- the lockfile is unchanged from the snapshot taken right
+    before that call, so this must not stage or commit anything, even
+    if the file happens to be sitting there dirty for some unrelated
+    reason."""
+    repo = _make_source_repo(tmp_path / "repo")
+    (repo / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    _rgit(repo, "add", "package-lock.json")
+    _rgit(repo, "commit", "-q", "-m", "lockfile already committed")
+    before = gb2._lockfile_snapshot(repo)
+    head_before = _rgit(repo, "rev-parse", "HEAD")
+
+    # No ensure_installed call ran in between (nothing changed the
+    # file from `before`) -- the exact state after a "node_modules
+    # already installed" bootstrap result.
+    gb2._commit_generated_lockfile(repo, before)
+
+    assert _rgit(repo, "rev-parse", "HEAD") == head_before  # no new commit
+
+
 def test_summarize_includes_job_metrics_for_gb2_log(gb2: ModuleType, tmp_path: Path) -> None:
     """engine.orbit's job.metrics event (durations_ms, test_runs) must
     surface through gb2's own _summarize dict, since cmd_log just
@@ -1642,3 +1696,234 @@ def test_summarize_includes_job_metrics_for_gb2_log(gb2: ModuleType, tmp_path: P
 
     assert summary["durations_ms"] == {"commit": 12.3}
     assert summary["test_runs"] == {"related": 2}
+
+
+# ---------------------------------------------------------------------------
+# approve-install for an EARLY station (facts/probe/plan/design) stop --
+# regression for engine.full_orbit.pending_owner_requests only ever
+# checking STAGE_TASK_OWNER: an install request a facts/probe/plan/design
+# station asked for (engine.full_orbit.STAGE_EARLY_STATION) used to be
+# invisible to `gb2 approve-install` ("no_pending_install_request" even
+# though a request was genuinely pending), so an owner had no way to grant
+# it and `gb2 continue` waited forever. The design station is used here
+# because resuming past its own install request lands on the next real
+# stop (STAGE_DESIGN_APPROVAL) without needing a builder/reviewer script
+# too -- the real `gb2 approve-install` command (TTY-forced) drives the
+# approval/drain/resume itself; only the FIRST run_full_job call (before
+# any owner request exists to approve) is stubbed at the Processor level,
+# the same way tests/unit/test_full_orbit.py's own early-station tests
+# are.
+# ---------------------------------------------------------------------------
+
+_EARLY_DESIGN_INSTALL_REQUEST = {
+    "kind": "install", "manifest": "package.json",
+    "change": {"dependencies": {"left-pad": "^1.0.0"}},
+}
+
+_EARLY_DESIGN_PLAN_JSON = json.dumps({
+    "goal": "화면 하나", "ui": True, "scenes": [],
+    "tasks": [{"id": "t1", "title": "첫 파일", "detail": "",
+              "owns": ["src/extra1.py"], "depends_on": []}],
+    "acceptance": ["요구사항대로 동작한다"],
+})
+
+_EARLY_DESIGN_STATION_OWNERS = {
+    "facts": {"facts": (".gongbang/",)},
+    "probe": {"prober": (".gongbang/",)},
+    "plan": {"planner": (".gongbang/",)},
+    "design": {"designer": (".gongbang/",)},
+    "build": {"builder": ("src/",)},
+    "review": {"reviewer": ("review.md",)},
+}
+
+
+def _setup_early_design_install_job(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """A gb2 "demo" workspace whose only attempt is already stopped at
+    engine.full_orbit.STAGE_EARLY_STATION (station "design") with one
+    pending install request -- the FIRST run_full_job call drives
+    facts/plan/design through a Processor-level stub (no real worker
+    process, same technique as test_full_orbit.py's
+    _station_stub_with_one_owner_request), stopping right after the
+    design station's own "requests" entry is recorded. The resumed
+    design station call (after approval) is left to a REAL run_station
+    via GB2_SCRIPTED_WORKERS (see test_approve_install_... below) --
+    this helper only gets the job to the owner-request stop."""
+    from engine import full_orbit
+    from engine.config import EngineConfig, ProjectConfig, WorkerConfig, write_json
+    from engine.fakes.installer import FakeInstaller
+    from engine.fakes.publisher import FakePublisher
+    from engine.ledger import Event, Ledger
+    from engine.processor import Fakes, Processor, StepContext, StepDef
+    from engine.steps.open_job import copy_root, dirty_paths
+
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    (workspace / "home").mkdir()
+    (workspace / "secrets").mkdir()
+
+    source_repo = _make_source_repo(tmp_path / "source" / "demo")
+    (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
+    repo_dir = _worktree_repo(source_repo, workspace / "repo")
+
+    config = EngineConfig(
+        ledger_path=workspace / "ledger.sqlite",
+        home=workspace / "home",
+        secrets_dir=workspace / "secrets",
+        projects={"demo": ProjectConfig(
+            "demo", repo_dir, install_cmd=tuple(_fake_install_cmd()),
+            manifest="package.json",
+        )},
+        station_owners=_EARLY_DESIGN_STATION_OWNERS,
+        approval_ttl_sec=3600,
+        workers={"designer": WorkerConfig(runner="claude")},
+    )
+    config = write_json(config, workspace / "config.json")
+
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    job_name = "early-design-job"
+
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": _EARLY_DESIGN_PLAN_JSON}],
+    }
+
+    def steps(ctx: StepContext) -> list[StepDef]:
+        station = str(ctx.request.payload.get("station"))
+        role = str(ctx.request.payload.get("role"))
+
+        if station == "design":
+            def _run_design(ctx: StepContext) -> dict[str, object]:
+                ctx.ledger.append(Event(
+                    project=ctx.project, kind="station.finished", actor_kind="processor",
+                    actor_id="processor", attempt_id=ctx.attempt_id,
+                    payload={
+                        "request_id": ctx.request.request_id, "station": "design",
+                        "role": role, "ok": True, "summary": "stub", "cost_usd": 0.0,
+                        "turns": 1, "changed_paths": [],
+                        "requests": [_EARLY_DESIGN_INSTALL_REQUEST],
+                    },
+                ))
+                return {}
+
+            def _reconcile_design(ctx: StepContext) -> bool:
+                for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                    if event.payload.get("request_id") == ctx.request.request_id:
+                        return True
+                return False
+
+            return [StepDef("record_station", _run_design, _reconcile_design)]
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            copy = copy_root(ctx.config, ctx.attempt_id, role)
+            files = queues[station].pop(0)
+            for rel, content in files.items():
+                target = copy / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            changed = dirty_paths(copy, ())
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={
+                    "request_id": ctx.request.request_id, "station": station, "role": role,
+                    "ok": True, "summary": "stub", "cost_usd": 0.0, "turns": 1,
+                    "changed_paths": list(changed), "requests": [],
+                },
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                if event.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    def _review_always_passes(ctx: StepContext) -> list[StepDef]:
+        from engine import evidence
+
+        def _run_review(ctx: StepContext) -> dict[str, object]:
+            project_config = ctx.config.projects[ctx.project]
+            fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile_review(ctx: StepContext) -> bool:
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run_review, _reconcile_review)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps)
+        proc.register("review", _review_always_passes)
+        return proc
+
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller())
+    outcome = full_orbit.run_full_job(
+        config, ledger, fakes, "demo", job_name, "화면 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "owner_request"
+    ledger.close()
+
+    return {"config": config, "source_repo": source_repo, "repo_dir": repo_dir,
+            "job_name": job_name, "attempt_id": outcome.attempt_id}
+
+
+def test_approve_install_finds_and_resumes_an_early_station_request(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _setup_early_design_install_job(gb2, tmp_path, monkeypatch)
+    _force_tty_approval(monkeypatch, f"승인 {job['job_name']}")
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    _write_script = lambda path, actions: path.write_text(  # noqa: E731
+        json.dumps(actions, ensure_ascii=False), encoding="utf-8")
+    _write_script(scripts_dir / "designer.json", [
+        {"tool": "Write", "file_path": f".gongbang/{job['job_name']}/design/design.md",
+         "content": "디자인\n"},
+        {"final": {"status": "done", "summary": "design", "requests": []}},
+    ])
+    monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(scripts_dir))
+
+    code = gb2.main(["approve-install", "demo"])
+
+    # Before the fix, pending_owner_requests never saw a STAGE_EARLY_STATION
+    # stop, so this always failed with "no_pending_install_request" (exit
+    # 1) and the install was never approved. Now it finds the request,
+    # approves it, drains the install, and resumes the design station --
+    # landing on the NEXT real stop (design approval), never "done"
+    # outright (nobody approved the design itself) and never stuck.
+    assert code == 2, code
+
+    ledger = Ledger.open(job["config"].ledger_path)
+    try:
+        install_events = ledger.events("demo", "install.recorded")
+        progress = None
+        for _seq, event in ledger.events("demo", "full_orbit.progress"):
+            if event.payload.get("job") == job["job_name"]:
+                progress = event.payload
+    finally:
+        ledger.close()
+    assert len(install_events) == 1
+    assert install_events[0][1].payload["change"] == _EARLY_DESIGN_INSTALL_REQUEST["change"]
+    assert progress is not None
+    assert progress["stage"] == "awaiting_design_approval"

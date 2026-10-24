@@ -112,6 +112,24 @@ smaller blast radius than before (one CLI's own login file, inside a
 disposable per-attempt directory, instead of the operator's entire
 real HOME -- other apps' configs, other CLIs' credentials, ssh keys),
 not a complete closure.
+
+Same shape, separate instance: a worker/reviewer whose runner carries
+mcp_servers gets its MCP launch config (server names, argv, and any
+embedded env_passthrough secrets such as API keys -- see
+engine.workers.claude_cli._write_mcp_config_file) written to a file
+under the engine's own gate-ro directory and passed to the CLI as
+`--mcp-config <path>`. That directory is mounted read-only into the
+WHOLE worker/reviewer sandbox (so the gate hook, and the CLI itself,
+can read it), not narrowed to the CLI process alone -- there is no OS-
+level primitive on this host (same gap as the credentials-file one
+above) to hand the CLI its own `--mcp-config` file while denying read
+access to a child the CLI's allowed Bash command spawns. Current
+limit, not fixed by anything in this module: ANY code that command
+runs can read that file and recover the MCP servers' own secrets,
+exactly as it could read the CLI's own login file. Closing this would
+need a separate MCP relay process (something standing between the
+sandboxed worker and the real MCP server, holding the secret itself
+rather than handing it to the sandbox at all) -- out of scope here.
 """
 from __future__ import annotations
 
@@ -455,7 +473,120 @@ def prepare_worker_home(dest: Path, real_home: Path | None,
         (dest / rel).mkdir(parents=True, exist_ok=True)
 
 
+def _shebang_interpreter(path: Path) -> str | None:
+    """The interpreter named on `path`'s own `#!` line, or None if the
+    file does not start with one (a native/compiled binary -- e.g.
+    this host's own `claude.exe`, an ELF executable despite the `.exe`
+    name -- or a file that cannot even be opened/read). `env <name>`
+    is unwrapped to `<name>` (the common `#!/usr/bin/env node` shape);
+    any other shape returns the first token on the line verbatim,
+    which may already be an absolute path (shutil.which handles both:
+    see resolve_runtime)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256)
+    except OSError:
+        return None
+    if not head.startswith(b"#!"):
+        return None
+    try:
+        line = head.split(b"\n", 1)[0].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    tokens = line[2:].strip().split()
+    if not tokens:
+        return None
+    if Path(tokens[0]).name == "env" and len(tokens) > 1:
+        return tokens[1]
+    return tokens[0]
+
+
+def _install_dir(resolved: Path) -> Path:
+    """The directory to mount read-only so `resolved` (and whatever it
+    needs alongside it) can actually run: `resolved`'s own parent,
+    UNLESS that parent is literally named "bin" -- the common npm-
+    global-install shape (confirmed on this host for both `claude` and
+    `codex`: each is a thin launcher at `<pkg_root>/bin/<name>` that
+    needs sibling `node_modules`/`package.json` under `<pkg_root>`
+    itself to run, not just the one launcher file) -- in which case
+    the GRANDPARENT (the package root) is returned instead."""
+    parent = resolved.parent
+    if parent.name == "bin":
+        return parent.parent
+    return parent
+
+
+def resolve_runtime(exe_name: str) -> tuple[Path, ...]:
+    """Read-only mounts that must stay visible inside a sandbox whose
+    `hidden` set includes the real operator HOME wholesale (see
+    engine.steps.station/review's own worker/reviewer sandbox policy),
+    so a CLI resolved by bare name through PATH (a runner's argv[0],
+    e.g. "claude"/"codex") can still be found and started, without
+    ever re-exposing the real HOME itself: () if `exe_name` is not
+    found via shutil.which on THIS process's own PATH (same trusted-
+    os.environ reasoning as available()/launcher_env() -- never a
+    worker/case-controlled PATH).
+
+    Otherwise: the PARENT DIRECTORY of the path shutil.which resolved
+    (e.g. ~/.local/bin -- that path itself is usually a symlink, and
+    on every installation shape seen so far, SOMEWHERE under the real
+    HOME, hence invisible once HOME is hidden unless re-mounted
+    explicitly). The symlink's own parent directory, never the
+    symlink path by itself, is what gets mounted here: every other
+    mount this module builds (wrap()'s `readonly`/`writable`/`hidden`,
+    and even `readonly_remap`'s own destination) is keyed by
+    os.path.realpath, which -- run on the HOST, where the symlink
+    genuinely exists -- always follows it fully; asking wrap() to
+    mount "the symlink path" by that path alone therefore mounts its
+    REAL TARGET's location instead, never creating the symlink's own
+    directory entry inside the sandbox at all (confirmed empirically:
+    PATH lookup for the bare command then fails "No such file or
+    directory", even though the install directory below, and the
+    binary it actually points to, are both mounted and present).
+    Mounting the parent directory side-steps this entirely -- the
+    symlink (and anything else directly alongside it) is simply
+    PART of that directory's own content, nothing extra to resolve.
+
+    PLUS _install_dir(realpath(that path)) -- the resolved target's
+    own directory (see _install_dir's docstring for the npm-global
+    "bin" special case). If the resolved target is itself a script
+    with a `#!` shebang (see _shebang_interpreter -- e.g. `codex`'s
+    own `codex.js`, `#!/usr/bin/env node`), the named interpreter is
+    resolved the SAME way (which + realpath) and ITS install
+    directory is mounted too -- one level of shebang-chasing only; an
+    interpreter that is itself another shebang script is not chased
+    further (nothing installed on this host, or described by the team
+    lead, is shaped that way).
+
+    Every returned path is exactly what a caller should add to
+    sandbox.wrap's own `readonly` tuple -- never `writable`: none of
+    this is state the sandboxed CLI needs to modify, only its own
+    installed code, same reasoning as engine.steps.station.
+    ENGINE_ROOT's own readonly mount for this engine's own package.
+
+    Verified directly on this host, under mode="bwrap", with the real
+    operator HOME hidden wholesale: a sandboxed `claude --version` and
+    `codex --version` both start and print their version (rc 0) with
+    exactly these mounts added, while a sentinel file placed elsewhere
+    under the same real HOME stays unreadable."""
+    which_path = shutil.which(exe_name)
+    if which_path is None:
+        return ()
+    symlink_path = Path(which_path)
+    resolved = Path(os.path.realpath(symlink_path))
+    mounts = [symlink_path.parent, _install_dir(resolved)]
+    interp_name = _shebang_interpreter(resolved)
+    if interp_name is not None:
+        interp_which = shutil.which(interp_name)
+        if interp_which is not None:
+            interp_symlink = Path(interp_which)
+            interp_resolved = Path(os.path.realpath(interp_symlink))
+            mounts.append(interp_symlink.parent)
+            mounts.append(_install_dir(interp_resolved))
+    return tuple(mounts)
+
+
 __all__ = [
     "SandboxUnavailable", "available", "exec_env", "launcher_env",
-    "prepare_worker_home", "wrap",
+    "prepare_worker_home", "resolve_runtime", "wrap",
 ]

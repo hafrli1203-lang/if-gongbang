@@ -5,6 +5,8 @@ full run_station/bench integrations through the real engine.gate."""
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -386,6 +388,111 @@ def test_net_true_allows_outbound_connection(tmp_path: Path) -> None:
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# resolve_runtime: a CLI resolved by bare name (argv[0]) through PATH must
+# still be reachable inside a sandbox that hides the real HOME wholesale --
+# the real HOME is where it is usually installed.
+# ---------------------------------------------------------------------------
+
+def test_resolve_runtime_returns_empty_for_unknown_command() -> None:
+    assert sandbox.resolve_runtime("no_such_command_at_all_xyz") == ()
+
+
+@_needs_bwrap
+def test_resolve_runtime_lets_a_home_installed_launcher_start_under_a_hidden_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Team lead's own reproduction shape: a fake HOME with an
+    executable script at HOME/.local/bin/tool, symlinked to a
+    versioned install under HOME/.local/share/tool/v1/tool (the shape
+    described for this host's own claude/codex, even though this
+    host's REAL claude/codex turn out to be laid out as
+    <pkg_root>/bin/<launcher> instead -- see the two "on this host"
+    tests below for that exact, already-installed shape). A sandboxed
+    spawn of "tool" must start and print its version even with the
+    whole fake HOME hidden; a sentinel file placed elsewhere under
+    the same HOME must stay unreadable."""
+    home = tmp_path / "home"
+    bin_dir = home / ".local" / "bin"
+    install_dir = home / ".local" / "share" / "tool" / "v1"
+    bin_dir.mkdir(parents=True)
+    install_dir.mkdir(parents=True)
+    real_tool = install_dir / "tool"
+    real_tool.write_text(
+        f"#!{sys.executable}\nprint('tool-version-1.0')\n", encoding="utf-8",
+    )
+    real_tool.chmod(0o755)
+    (bin_dir / "tool").symlink_to(real_tool)
+    sentinel = home / "sentinel.txt"
+    sentinel.write_text("do not read", encoding="utf-8")
+
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    sandbox._reset_available_cache()
+    try:
+        readonly = sandbox.resolve_runtime("tool")
+        argv = sandbox.wrap(
+            ["tool"], cwd=tmp_path, hidden=(home,), readonly=readonly,
+            net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
+        )
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0
+        assert "tool-version-1.0" in result.stdout
+
+        cat_argv = sandbox.wrap(
+            ["cat", str(sentinel)], cwd=tmp_path, hidden=(home,),
+            readonly=readonly, net=False, mode="bwrap",
+            child_env={"PATH": os.environ["PATH"]},
+        )
+        cat_result = subprocess.run(cat_argv, capture_output=True, text=True, timeout=10)
+        assert cat_result.returncode != 0
+    finally:
+        sandbox._reset_available_cache()
+
+
+@_needs_bwrap
+def test_resolve_runtime_claude_starts_under_a_hidden_real_home() -> None:
+    """On THIS host, `claude` is installed under the real operator
+    HOME (an npm-global-style <pkg_root>/bin/claude.exe launcher) --
+    the actual shape engine.steps.station/review's own worker sandbox
+    needs this for, not just the synthetic fixture above. Skipped
+    (via the assert below, not a pytest.skip, so a regression that
+    silently stops finding `claude` is never mistaken for "nothing to
+    test here") only if this host has no `claude` on PATH at all."""
+    if shutil.which("claude") is None:
+        pytest.skip("claude not installed on this host")
+    home = Path(os.environ["HOME"])
+    readonly = sandbox.resolve_runtime("claude")
+    assert readonly, "claude resolved via PATH but resolve_runtime found no mounts"
+    argv = sandbox.wrap(
+        ["claude", "--version"], cwd=Path("/tmp"), hidden=(home,),
+        readonly=readonly, net=False, mode="bwrap",
+        child_env={"PATH": os.environ.get("PATH", "")},
+    )
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0
+    assert result.stdout.strip()
+
+
+@_needs_bwrap
+def test_resolve_runtime_codex_starts_under_a_hidden_real_home() -> None:
+    """Same as the claude test above, for `codex` -- a `#!/usr/bin/env
+    node` script (see _shebang_interpreter), so this also exercises
+    resolve_runtime's interpreter-chasing branch for real."""
+    if shutil.which("codex") is None:
+        pytest.skip("codex not installed on this host")
+    home = Path(os.environ["HOME"])
+    readonly = sandbox.resolve_runtime("codex")
+    assert readonly, "codex resolved via PATH but resolve_runtime found no mounts"
+    argv = sandbox.wrap(
+        ["codex", "--version"], cwd=Path("/tmp"), hidden=(home,),
+        readonly=readonly, net=False, mode="bwrap",
+        child_env={"PATH": os.environ.get("PATH", "")},
+    )
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0
+    assert result.stdout.strip()
 
 
 # ---------------------------------------------------------------------------

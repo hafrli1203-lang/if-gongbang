@@ -464,6 +464,44 @@ def _frontmatter_description(skill_md: Path) -> str:
     return ""
 
 
+# The only worker runner whose CLI actually accepts an --mcp-config
+# (engine.workers.claude_cli._write_mcp_config_file/argv) -- codex's
+# read-only reviewer CLI has no such flag (engine.steps.review's own
+# "reviewer_mcp_unsupported" check) and a scripted runner has no concept
+# of mcp at all (engine.workers.scripted.ScriptedRunner.argv never reads
+# it). A station whose configured role's runner is not in here can never
+# actually use an mcp tool no matter what plan.tools or
+# config.station_mcp_allow says -- see _station_runner/_mcp_capable.
+_MCP_CAPABLE_RUNNERS = frozenset({"claude"})
+
+
+def _station_runner(config: "EngineConfig", station: str) -> str | None:
+    """The WorkerConfig.runner of whichever role config.station_owners
+    assigns to write at `station` (one role per station, the only shape
+    every config in this codebase uses) -- None if the station has no
+    owner configured, or that role has no entry in config.workers (duck-
+    typed via getattr so a pre-tools config stub without station_owners
+    still works, same convention skill_catalog_text already uses for
+    skill_index_path)."""
+    roles = getattr(config, "station_owners", {}).get(station, {})
+    workers = getattr(config, "workers", {}) or {}
+    for role in roles:
+        worker = workers.get(role)
+        if worker is not None:
+            return worker.runner
+    return None
+
+
+def _mcp_capable(config: "EngineConfig", station: str) -> bool:
+    """True iff `station`'s own runner can actually take an mcp server
+    (_MCP_CAPABLE_RUNNERS) -- an unconfigured station (_station_runner
+    returns None, nothing to check against) is treated as capable, same
+    as before this check existed, so a config this module cannot see a
+    runner for is never silently narrowed."""
+    runner = _station_runner(config, station)
+    return runner is None or runner in _MCP_CAPABLE_RUNNERS
+
+
 def skill_catalog_text(config: "EngineConfig") -> str:
     """What the planner is shown to pick this job's tools from: the
     skills directly under each skill root (name + description), the
@@ -503,7 +541,8 @@ def skill_catalog_text(config: "EngineConfig") -> str:
         allow = getattr(config, "station_mcp_allow", {}) or {}
         rows = []
         for name in sorted(servers):
-            stations = sorted(st for st, names in allow.items() if name in names)
+            stations = sorted(st for st, names in allow.items()
+                              if name in names and _mcp_capable(config, st))
             rows.append(f"- {name}: 쓸 수 있는 칸 {', '.join(stations) or '(없음)'}")
         parts.append("### MCP 서버\n" + "\n".join(rows))
     return "\n\n".join(parts)
@@ -536,9 +575,16 @@ def validate_tools(plan: Plan, config: "EngineConfig") -> list[str]:
     """[] iff every plan.tools "mcp" entry names a key of
     config.mcp_servers -- an mcp server is infrastructure the operator
     configures, never something a planner can simply ask for and get
-    installed, so an unregistered name is a hard job failure. A
-    "skill" entry is deliberately NOT checked here: per the owner's
-    design, a skill the planner asked for that is not in
+    installed, so an unregistered name is a hard job failure -- AND
+    every station that entry lists has a runner that can actually take
+    mcp (_mcp_capable). Without this second check, a plan.tools entry
+    that named "review" for a codex-reviewed project would pass
+    validation and then fail at runtime, mid-job, with engine.steps.
+    review's own "reviewer_mcp_unsupported" (_review_payload's own
+    comment already names this exact failure mode). Catching it here
+    instead means a bad plan never even starts running stations for
+    it. A "skill" entry is deliberately NOT checked here: per the
+    owner's design, a skill the planner asked for that is not in
     config.skill_index_path is "needs_install" (see
     classify_skill_tools), not a reason to fail the whole job -- it is
     just never granted to any station, and is reported as such in the
@@ -547,8 +593,17 @@ def validate_tools(plan: Plan, config: "EngineConfig") -> list[str]:
     concatenate both lists the same way."""
     problems: list[str] = []
     for tool in plan.tools:
-        if tool.kind == "mcp" and tool.name not in config.mcp_servers:
+        if tool.kind != "mcp":
+            continue
+        if tool.name not in config.mcp_servers:
             problems.append(f"tool mcp {tool.name!r}: not in config.mcp_servers")
+            continue
+        for station in tool.stations:
+            if not _mcp_capable(config, station):
+                problems.append(
+                    f"tool mcp {tool.name!r}: station {station!r}'s runner "
+                    f"{_station_runner(config, station)!r} cannot take mcp"
+                )
     return problems
 
 

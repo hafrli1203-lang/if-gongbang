@@ -81,7 +81,7 @@ from engine.config import McpServerConfig
 from engine.gitutil import git_argv
 from engine.ledger import Event
 from engine.processor import StepContext, StepDef, StepFailed
-from engine.workers.base import WorkerSpec, wait_while_progressing
+from engine.workers.base import WorkerSpec, wait_for_exit, wait_while_progressing
 from engine.workers.prompts import review_prompt
 
 _CHUNK_MAX_CHARS = 60_000
@@ -477,6 +477,12 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
 
     # The reviewer may import this engine package inside the sandbox too.
     readonly: tuple[Path, ...] = (spec.workdir, home_dir, ENGINE_ROOT)
+    # Same reasoning as engine.steps.station's own `_sandboxed_argv`: the
+    # runner's own CLI, resolved from argv[0] by PATH, must stay visible
+    # even though the real HOME (where it is usually installed) is hidden
+    # below. See sandbox.resolve_runtime's docstring.
+    if argv:
+        readonly += sandbox.resolve_runtime(argv[0])
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = ((ctx.config.home, ctx.config.secrets_dir, _repo(ctx))
               + _other_project_repos(ctx) + _ledger_hidden_root(ctx)
@@ -546,9 +552,19 @@ def _run_await_reviewer(ctx: StepContext) -> dict[str, object]:
 
 
 def _reconcile_await_reviewer(ctx: StepContext) -> bool:
-    spec, _worker, _runner, _coverage_sent = _full_spec(ctx)
-    live = ctx.ledger.live_procs(ctx.attempt_id, spec.station)
-    return not live and _stdout_path(ctx).exists()
+    """True only once a successful (code 0) exit is positively confirmed
+    via the recorded exit file (engine.procs.exit_file_for) -- see
+    engine.steps.station._reconcile_await_worker's identical reasoning:
+    "no live process group left + stdout exists" also holds right
+    after a worker_stalled close_station(), before run()'s own
+    StepFailed is raised, so a crash in that window must not read back
+    as success. False is always safe here: run() re-polls the same
+    pid/exit file either way."""
+    if not _stdout_path(ctx).exists():
+        return False
+    pid = _spawned_pid(ctx)
+    exit_file = procs.exit_file_for(_stdout_path(ctx))
+    return wait_for_exit(pid, 0.0, exit_file) == 0
 
 
 _VALID_SEVERITIES = frozenset({"P0", "P1", "P2", "P3"})
@@ -648,9 +664,21 @@ def _run_record_review(ctx: StepContext) -> dict[str, object]:
 
 
 def _reconcile_record_review(ctx: StepContext) -> bool:
+    """True iff the already-recorded review evidence for this request_id
+    reported passed=True. A crash after _run_record_review's
+    evidence.record but before its own `raise StepFailed(...)` must not
+    let that recorded failure's existence read back as success -- it
+    re-raises the same failure the run would have raised, so the
+    request still terminates 'failed' on resume."""
     for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
         if row.payload.get("request_id") == ctx.request.request_id:
-            return True
+            if row.payload.get("passed"):
+                return True
+            coverage_sent = row.payload.get("coverage")
+            reviewer_coverage = row.payload.get("reviewer_coverage")
+            if coverage_sent != "full" or reviewer_coverage != "full":
+                raise StepFailed("review_incomplete")
+            raise StepFailed("review_not_passed")
     return False
 
 

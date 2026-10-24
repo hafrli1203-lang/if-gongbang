@@ -878,6 +878,150 @@ def test_release_configured_project_makes_one_publish_request_for_the_whole_job(
     assert len(publish_requests) == 1
 
 
+def _release_stopped_job(workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+                         tmp_path: Path, job_name: str):
+    """A release-configured job, built, accepted, and already stopped
+    needs_owner/release_approval -- the exact state `gb2 ship`/`gb2
+    skip-ship` normally take over from. Returns (config, ws, outcome,
+    request_id)."""
+    ws = _full_orbit_workspace(workspace)
+    config, _master_repo = _release_project(ws, tmp_path)
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": plan_json}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    outcome = full_orbit.run_full_job(
+        config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=_processor_factory(stub),
+    )
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "release_approval"
+    publish_requests = [r for r in ws.ledger.queued_requests("alpha") if r.kind == "publish"]
+    assert len(publish_requests) == 1
+
+    # engine.release.job_certificate_status (advance_master's own
+    # dispatch-time gate) needs a passing 'acceptance.recorded' AND
+    # 'app_security.recorded' event for this job, bound to a fingerprint
+    # it tolerates -- _install_fake_acceptance_and_handoff's own stub
+    # modules never append either (they stand in for worker C's real
+    # acceptance/app_security modules, which do), so this test records
+    # them itself, fingerprinted at the CURRENT tree (right after
+    # run_full_job's own handoff commit) so the certificate check's own
+    # diff-tolerance sees zero changed paths -- same reasoning
+    # tests/unit/test_gb2.py's own _setup_release_job uses.
+    from engine import evidence
+    fp = evidence.fingerprint(ws.alpha, config.projects["alpha"].excludes)
+    ws.ledger.append(Event(
+        project="alpha", kind="acceptance.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=outcome.attempt_id,
+        payload={"job": job_name, "passed": True, "scenes": [],
+                 "full_suite_passed": True, "tree_changed": False,
+                 "reason": None, "fingerprint": fp},
+    ))
+    ws.ledger.append(Event(
+        project="alpha", kind="app_security.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=outcome.attempt_id,
+        payload={"passed": True, "findings": [], "ran": ["secret_scan"], "fingerprint": fp},
+    ))
+    return config, ws, outcome, publish_requests[0].request_id
+
+
+def test_continue_after_a_crash_between_publish_success_and_close_resumes_the_close(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression: STAGE_RELEASE_APPROVAL's own resume used to just read
+    the publish request's status and return FullOutcome("done", ...)
+    directly once it saw "done" -- NEVER actually running report/close
+    or recording full_orbit.release_decision. A crash between `gb2
+    ship`'s own approve_and_run call (which drives the publish request
+    to "done") and the report/close+record_release_decision call right
+    after it, in the SAME process, used to leave the project OPEN
+    forever with no release_decision ever recorded, even though a
+    later `gb2 continue` would happily report "done" again. Simulated
+    here by driving the publish request to "done" directly
+    (engine.release.approve_and_run, exactly what `gb2 ship` itself
+    calls) and then calling continue_full_job WITHOUT ever calling
+    finalize_release in between -- the same gap a real crash leaves."""
+    from engine import release as release_mod
+
+    job_name = "release-crash-job"
+    config, ws, outcome, request_id = _release_stopped_job(
+        workspace, monkeypatch, tmp_path, job_name)
+
+    publish_outcome = release_mod.approve_and_run(
+        config, ws.ledger, _fakes(), "alpha", request_id, f"승인 {request_id}",
+    )
+    assert publish_outcome["status"] == "done", publish_outcome
+    # The crash: nothing else runs. The project is still OPEN, nothing
+    # closed, no release_decision recorded yet.
+    assert ws.ledger.project("alpha").state == "OPEN"
+    assert not any(
+        True for _seq, _event in ws.ledger.events("alpha", "full_orbit.release_decision")
+    )
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name,
+    )
+
+    assert resumed.status == "done", resumed
+    assert ws.ledger.project("alpha").state == "CLOSED"
+    decisions = [event.payload["decision"] for _seq, event in
+                ws.ledger.events("alpha", "full_orbit.release_decision")
+                if event.payload.get("job") == job_name]
+    assert decisions == ["shipped"]
+
+    # Idempotent: calling continue again (the project is already
+    # closed) must not raise and must not record a SECOND decision.
+    again = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name)
+    assert again.status == "done", again
+    decisions_again = [event.payload["decision"] for _seq, event in
+                      ws.ledger.events("alpha", "full_orbit.release_decision")
+                      if event.payload.get("job") == job_name]
+    assert decisions_again == ["shipped"]
+
+
+def test_continue_after_a_recorded_skip_reports_skipped_not_release_rejected(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression: STAGE_RELEASE_APPROVAL's own resume used to treat
+    ANY terminal non-"done" request status ("failed" or "unknown") as
+    FullOutcome("failed", "release_rejected", ...) -- including a
+    publish request the OWNER deliberately abandoned (`gb2 skip-ship`'s
+    own engine.release.cancel_pending_publish, reason "skip_ship"),
+    which is "failed" in STATUS only, never an actual rejection. A
+    crash between that cancellation (skip-ship's first step) and its
+    own report/close+record_release_decision call used to make a later
+    `gb2 continue` report the job as outright REJECTED, not skipped."""
+    from engine import release as release_mod
+
+    job_name = "release-crash-skip-job"
+    config, ws, outcome, request_id = _release_stopped_job(
+        workspace, monkeypatch, tmp_path, job_name)
+
+    release_mod.cancel_pending_publish(ws.ledger, "alpha", outcome.attempt_id, "skip_ship")
+    assert ws.ledger.request(request_id).status == "failed"
+    # The crash: nothing else runs yet.
+    assert ws.ledger.project("alpha").state == "OPEN"
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name,
+    )
+
+    assert resumed.status == "done", resumed  # never "failed"/"release_rejected"
+    assert ws.ledger.project("alpha").state == "CLOSED"
+    decisions = [event.payload["decision"] for _seq, event in
+                ws.ledger.events("alpha", "full_orbit.release_decision")
+                if event.payload.get("job") == job_name]
+    assert decisions == ["skipped"]
+
+
 # ---- 11. resume table: probe_failed/plan_review_failed rerun their station --
 
 def test_continue_after_probe_failed_reruns_probe_then_finishes(

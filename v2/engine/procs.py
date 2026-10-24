@@ -3,6 +3,7 @@ recorded in the ledger so a closed station can kill everything it spawned.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import shlex
 import signal
@@ -18,6 +19,63 @@ from engine.ledger import Event, Ledger
 # invokes by absolute path to actually record the exit code. A sibling
 # of this file, so it is always resolvable regardless of PYTHONPATH.
 _EXIT_WRITER = Path(__file__).resolve().with_name("exit_writer.py")
+
+# Resolved once at import time, NOT inside _die_with_engine() itself --
+# dlopen can take a lock, and a preexec_fn runs in a freshly forked
+# child where only the calling thread was duplicated (see
+# _die_with_engine's own docstring); doing the dlopen here, long before
+# any fork, means the preexec_fn itself only ever makes one plain libc
+# call through an already-resolved function pointer. None on any
+# platform/host where this fails (non-Linux, or no libc.so.6 by that
+# exact name) -- _die_with_engine then does nothing, same as today.
+try:
+    _LIBC: ctypes.CDLL | None = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _LIBC = None
+
+_PR_SET_PDEATHSIG = 1  # Linux prctl(2) option; see _die_with_engine.
+
+
+def _die_with_engine() -> None:
+    """preexec_fn for spawn()'s own Popen call below -- runs in the
+    freshly forked child, after fork but before exec, asking the
+    kernel (Linux prctl, PR_SET_PDEATHSIG) to SIGKILL THIS process the
+    moment its real parent -- THIS engine process, as it existed at
+    the instant spawn() forked -- exits for ANY reason: a clean exit,
+    a crash, an operator SIGKILL of the engine itself.
+
+    start_new_session=True (passed to the same Popen call, as it
+    already was before this existed) only moves the child into its
+    OWN, new process group/session, so a SIGINT/SIGHUP delivered to
+    the engine's controlling terminal does not also reach it -- that
+    is a completely separate concern from the engine process's own
+    death, which it does nothing about: an ordinary Unix child whose
+    parent exits is simply reparented to init (pid 1) and keeps
+    running, orphaned, for however long it likes. PR_SET_PDEATHSIG is
+    the one piece that closes that specific gap, and it tracks the
+    real parent/child relationship, not the session -- setsid() does
+    not reset or retarget it.
+
+    This closes the gap for exactly the immediate child spawn() is
+    about to exec (the unsandboxed `sh` exit-code wrapper, or the raw
+    argv when no exit_file is used at all) -- see spawn()'s own
+    docstring for how that single, closed link is enough to bring
+    down a WHOLE mode="bwrap" sandboxed tree with it (bwrap's own
+    --die-with-parent, built by engine.sandbox.wrap, already ties the
+    sandboxed process to the `sh` wrapper that execs it; this makes
+    the `sh` wrapper itself die the moment the ENGINE does, so the two
+    mechanisms chain together). Under mode="none" there is no bwrap
+    anywhere in the chain, and `sh -c '"$@"; ...'` must fork (not
+    exec) to run "$@" so it can still write the exit code afterward --
+    that forked grandchild has no pdeathsig of its own and is NOT
+    reached by this fix; see spawn()'s own docstring's "Known limit"
+    paragraph for that one, narrower, still-open gap."""
+    if _LIBC is None:
+        return
+    try:
+        _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except OSError:
+        pass
 
 
 def exit_file_for(stdout_path: Path) -> Path:
@@ -106,7 +164,41 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     reaching inside it -- and the wrapper always `exit`s with the REAL
     command's own exit code regardless of whether the writer itself
     succeeded (never the writer's own exit status), so every existing
-    caller of this exit code is unaffected."""
+    caller of this exit code is unaffected.
+
+    Engine death policy: the Popen call below also sets preexec_fn=
+    _die_with_engine, so the immediate child (this `sh` wrapper, or
+    the raw argv when no exit_file is used) is itself killed the
+    moment THIS engine process exits, for any reason -- see
+    _die_with_engine's own docstring for the mechanism
+    (PR_SET_PDEATHSIG) and why start_new_session=True alone does not
+    already provide this. Combined with bwrap's own --die-with-parent
+    (engine.sandbox.wrap, tied to whatever process execs the bwrap
+    invocation -- here, this same `sh` wrapper), a mode="bwrap"
+    sandboxed tree is fully chained to the engine process's own
+    lifetime: engine dies -> `sh` dies (this fix) -> the sandboxed
+    process dies (bwrap's own flag) -> everything bwrap itself spawned
+    inside the sandbox dies with it (bwrap's own guarantee). Verified
+    directly (tests/unit/test_procs.py): spawning a REAL, separate
+    Python process that itself calls this function under mode="bwrap"
+    and then SIGKILLing that process leaves no descendant alive.
+
+    Known limit, NOT closed by the above: under mode="none" (no bwrap
+    anywhere in the chain), `sh -c '"$@"; code=$?; ...'` must FORK
+    (never exec) to run "$@", since it still has to write the exit
+    code afterward -- that forked grandchild is a plain Unix child of
+    `sh` with no pdeathsig of its own, so it is NOT reached by
+    _die_with_engine killing `sh`: if `sh` dies (via this fix, or any
+    other way) while the real, unsandboxed command is still running,
+    that command is simply reparented to init and keeps running,
+    orphaned, same as before this fix existed. Closing this would mean
+    replacing the `sh -c` wrapper itself with a small supervisor
+    process that forks its own child with its OWN pdeathsig pointed at
+    the supervisor (rather than relying on a shell's lack of any such
+    primitive) -- a larger rewrite of this exact wrapping mechanism,
+    out of scope here; mode="bwrap" (where this IS fully closed) is
+    the mode every worker/reviewer/bench sandbox actually runs under
+    in production (engine.config.EngineConfig.sandbox)."""
     if exit_file is None and stdout_path is not None:
         exit_file = exit_file_for(stdout_path)
     stdout_handle = None
@@ -137,6 +229,7 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
             stderr=subprocess.STDOUT if stdout_handle is not None else subprocess.DEVNULL,
             stdin=subprocess.DEVNULL if stdin_devnull else None,
             start_new_session=True,
+            preexec_fn=_die_with_engine,
         )
     finally:
         if stdout_handle is not None:

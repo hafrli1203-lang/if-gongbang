@@ -26,8 +26,12 @@ await_worker    wait for the pid to exit for as long as it keeps making
                 including a detached grandchild) then
                 StepFailed("worker_stalled"); the orbit then continues the
                 same work on the same copy. Non-zero exit ->
-                StepFailed("worker_failed"). reconcile: no live process
-                group left for this station AND the stdout file exists.
+                StepFailed("worker_failed"). reconcile: the stdout file
+                exists AND the station's own exit file (engine.procs.
+                exit_file_for) positively confirms a code-0 exit --
+                never just "no live process group left", which a
+                worker_failed/worker_stalled close_station() also
+                produces before its own StepFailed is raised.
 record_station  runner.parse_result(stdout, spec) for the worker's own
                 claim, but changed_paths is recomputed from the COPY's
                 own `git status --porcelain -z` (engine.steps.open_job.
@@ -43,7 +47,10 @@ record_station  runner.parse_result(stdout, spec) for the worker's own
                 StepFailed("worker_reported_failure") -- the evidence is
                 recorded before the request is failed, exactly like
                 bench_run's record_bench. reconcile: a station.finished
-                event for this request_id already exists.
+                event for this request_id already exists AND reported
+                ok=True -- a recorded ok=False re-raises the same
+                StepFailed rather than reading its own existence as
+                success.
 """
 from __future__ import annotations
 
@@ -62,7 +69,7 @@ from engine.processor import StepContext, StepDef, StepFailed
 from engine.steps.open_job import copy_git_config_matches_recorded
 from engine.steps.open_job import copy_root as _role_copy_root
 from engine.steps.open_job import dirty_paths
-from engine.workers.base import WorkerSpec, wait_while_progressing
+from engine.workers.base import WorkerSpec, wait_for_exit, wait_while_progressing
 from engine.workers.prompts import build_prompt
 
 
@@ -645,6 +652,17 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     # under a hidden tree -- a checkout under the operator's HOME or /tmp --
     # it is re-exposed read-only. The engine's own code is not secret.
     readonly += (ENGINE_ROOT,)
+    # The runner's own CLI, resolved from argv[0] (e.g. "claude"/"codex")
+    # by PATH -- without this, hiding the real HOME wholesale (below) also
+    # hides the CLI's own installed binary whenever it lives under HOME
+    # (confirmed on this host for both: `which claude`/`which codex`
+    # resolve under ~/.local/..., and a sandboxed spawn with HOME hidden
+    # and no mount for this fails "command not found" even though the
+    # unsandboxed PATH lookup finds it fine). See sandbox.resolve_runtime's
+    # own docstring for exactly what gets mounted and why; () for a
+    # command not found via PATH at all (nothing to add).
+    if argv:
+        readonly += sandbox.resolve_runtime(argv[0])
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = _hidden_roots(ctx, repo) + _ledger_hidden_root(ctx)
     if real_home is not None:
@@ -745,9 +763,23 @@ def _run_await_worker(ctx: StepContext) -> dict[str, object]:
 
 
 def _reconcile_await_worker(ctx: StepContext) -> bool:
-    spec, _worker, _runner = _full_spec(ctx)
-    live = ctx.ledger.live_procs(ctx.attempt_id, spec.station)
-    return not live and _stdout_path(ctx).exists()
+    """True only once a successful (code 0) exit is positively confirmed
+    via the recorded exit file (engine.procs.exit_file_for). "no live
+    process group + stdout exists" used to count a worker_failed/
+    worker_stalled close as success too: close_station's proc.ended
+    events land before run()'s own `raise StepFailed`, so a crash in
+    that window made live_procs() empty while the real outcome was
+    still a failure. False here is always safe: run() is idempotent on
+    an already-finished process (wait_for_exit falls back to this same
+    exit file) and on an already-closed station (close_station and
+    _import_gate_log are both no-ops the second time), so letting it
+    run again reproduces the true outcome instead of guessing one from
+    a ledger side effect that failure paths also produce."""
+    if not _stdout_path(ctx).exists():
+        return False
+    pid = _spawned_pid(ctx)
+    exit_file = procs.exit_file_for(_stdout_path(ctx))
+    return wait_for_exit(pid, 0.0, exit_file) == 0
 
 
 def _changed_paths(ctx: StepContext, spec: WorkerSpec) -> tuple[str, ...]:
@@ -1100,8 +1132,16 @@ def _run_record_station(ctx: StepContext) -> dict[str, object]:
 
 
 def _reconcile_record_station(ctx: StepContext) -> bool:
+    """True iff the already-recorded station.finished event for this
+    request_id reported ok=True. A crash after _run_record_station's
+    ledger.append but before its `raise StepFailed("worker_reported_
+    failure")` must not let the recorded failure's own existence read
+    back as success -- it re-raises the same failure the run would have
+    raised, so the request still terminates 'failed' on resume."""
     for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
         if event.payload.get("request_id") == ctx.request.request_id:
+            if not event.payload.get("ok"):
+                raise StepFailed("worker_reported_failure")
             return True
     return False
 

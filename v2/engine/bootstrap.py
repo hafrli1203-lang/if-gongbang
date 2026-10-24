@@ -38,10 +38,24 @@ from engine import sandbox
 from engine.installers import run_install_cmd
 from engine.ledger import Event, Ledger
 
+# Written inside node_modules only once `install_cmd` has actually exited 0
+# -- `ensure_installed`'s own "already installed" check reads for THIS
+# file, never just node_modules/'s own existence. A bare `node_modules/`
+# can exist without this marker (an install that died partway: killed,
+# crashed, offline mid-download, a stale copy left from an earlier
+# attempt) -- such a folder must be treated as NOT installed yet, same as
+# no node_modules at all, so the next call reinstalls into it rather than
+# silently trusting a half-populated directory forever. `npm install`
+# (and `pnpm install`/`yarn install`) are idempotent against an existing
+# partial node_modules, so reinstalling is always safe; this module never
+# deletes node_modules itself either way -- it is the owner's directory
+# from the moment it exists, same as every other project file.
+_INSTALLED_MARKER = ".gongbang-installed"
+
 
 @dataclass(frozen=True)
 class BootstrapResult:
-    ran: bool  # False: node_modules already present (or no install_cmd), nothing run
+    ran: bool  # False: already installed (or no install_cmd), nothing run
     ok: bool  # True iff ran is False, or ran is True and the command exited 0
     detail: str  # "" | "already_installed" | "no_install_cmd" | "install_failed:..."
 
@@ -52,12 +66,16 @@ def ensure_installed(repo: Path, install_cmd: tuple[str, ...], *,
                      sandbox_mode: str = "none",
                      hidden_paths: tuple[Path, ...] = (),
                      net: bool = True) -> BootstrapResult:
-    """Run `install_cmd` inside `repo`, but only iff `repo/node_modules`
-    does not exist yet. Never raises: a failed or unavailable install
-    (offline, npm missing, timed out, sandbox unavailable) is reported
-    in the result, not an exception, so a caller can decide whether to
-    continue (a `gb2 doctor`-style report keeps surfacing node_modules
-    as missing) or treat it as fatal for that one call.
+    """Run `install_cmd` inside `repo`, but only iff `repo/node_modules/
+    _INSTALLED_MARKER` does not exist yet -- NOT just `node_modules`
+    itself, see _INSTALLED_MARKER's own comment: a node_modules left
+    behind by a partial/failed install has no marker, so this reinstalls
+    into it rather than trusting it. Never raises: a failed or
+    unavailable install (offline, npm missing, timed out, sandbox
+    unavailable) is reported in the result, not an exception, so a
+    caller can decide whether to continue (a `gb2 doctor`-style report
+    keeps surfacing it as missing) or treat it as fatal for that one
+    call.
 
     `allow_lifecycle_scripts`/`sandbox_mode`/`hidden_paths`/`net` are
     forwarded to engine.installers.run_install_cmd unchanged -- see its
@@ -65,7 +83,8 @@ def ensure_installed(repo: Path, install_cmd: tuple[str, ...], *,
     suppressed for npm/pnpm/yarn), so an existing caller that passes
     none of them keeps the same no-sandbox behavior, just with the
     hardened env/--ignore-scripts applied."""
-    if (repo / "node_modules").exists():
+    marker = repo / "node_modules" / _INSTALLED_MARKER
+    if marker.exists():
         return BootstrapResult(ran=False, ok=True, detail="already_installed")
     if not install_cmd:
         return BootstrapResult(ran=False, ok=False, detail="no_install_cmd")
@@ -81,6 +100,14 @@ def ensure_installed(repo: Path, install_cmd: tuple[str, ...], *,
             detail=f"install_failed:{type(exc).__name__}: {exc}",
         )
     if result.returncode == 0:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+        except OSError:
+            pass  # best-effort only -- a write failure here just means
+            # the NEXT ensure_installed call reinstalls again (install_cmd
+            # is idempotent), never a reason to report this install itself
+            # as failed when it just exited 0.
         return BootstrapResult(ran=True, ok=True, detail="")
     stdout = (result.stdout or b"").decode("utf-8", "replace")
     stderr = (result.stderr or b"").decode("utf-8", "replace")

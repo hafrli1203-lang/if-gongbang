@@ -482,26 +482,47 @@ def _ensure_worktree(source_repo: Path, repo_dir: Path, base: str) -> None:
              "commit", "-q", "-m", "test: gb2 negative control"], cwd=repo_dir)
 
 
-def _commit_generated_lockfile(source_repo: Path) -> None:
+def _lockfile_snapshot(source_repo: Path) -> bytes | None:
+    """package-lock.json's current bytes, or None if it does not exist
+    yet -- taken right BEFORE engine.bootstrap.ensure_installed runs, so
+    `_commit_generated_lockfile` can tell whether THIS call's own
+    bootstrap actually touched it (see that function's own docstring)."""
+    lockfile = source_repo / "package-lock.json"
+    return lockfile.read_bytes() if lockfile.exists() else None
+
+
+def _commit_generated_lockfile(source_repo: Path, before: bytes | None) -> None:
     """After engine.bootstrap.ensure_installed's FIRST install into
     source_repo, npm has written (or updated) package-lock.json there.
     That file must be committed in source_repo -- not just left as an
     uncommitted working-tree change -- because `_ensure_worktree`'s
     `git worktree add` right after this only brings along what is in a
     commit; an uncommitted lockfile in source_repo would never reach
-    the worktree. Only this one explicit path is staged, never `git
-    add -A`. A no-op if there is no package-lock.json, or if it is
-    already committed and unchanged (bootstrap found node_modules
-    already installed, so nothing ran this time)."""
+    the worktree.
+
+    `before` is `_lockfile_snapshot(source_repo)` taken right before
+    THIS call's own ensure_installed ran -- a no-op unless the file's
+    bytes actually changed from that snapshot (ensure_installed found
+    node_modules already installed, so nothing ran this time; or the
+    file is dirty for some other, unrelated reason -- e.g. the owner
+    edited it by hand -- that has nothing to do with this bootstrap and
+    must never be swept up as if it did).
+
+    Only this one explicit path is ever staged (never `git add -A`) and
+    only this one path is ever committed: `git commit -- <path>` commits
+    exactly that path's staged+worktree change regardless of whatever
+    else the owner may have already staged in their own index before
+    calling this -- that other staged work is left exactly as the owner
+    left it, still staged, never swept into this commit."""
     lockfile = source_repo / "package-lock.json"
     if not lockfile.exists():
         return
-    status = _git(["status", "--porcelain", "--", "package-lock.json"], cwd=source_repo)
-    if not status.strip():
+    if lockfile.read_bytes() == before:
         return
     _git(["add", "--", "package-lock.json"], cwd=source_repo)
     _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
-         "commit", "-q", "-m", "chore: bootstrap dependency lockfile"],
+         "commit", "-q", "-m", "chore: bootstrap dependency lockfile",
+         "--", "package-lock.json"],
          cwd=source_repo)
 
 
@@ -601,6 +622,7 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
         # it here would hide the very directory being installed into
         # (engine.sandbox.wrap rejects a path that is both writable and
         # hidden).
+        lockfile_before = _lockfile_snapshot(source_repo)
         bootstrap_result = ensure_installed(
             source_repo, tuple(install_cmd),
             sandbox_mode=config.sandbox,
@@ -616,7 +638,7 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
     finally:
         ledger.close()
 
-    _commit_generated_lockfile(source_repo)
+    _commit_generated_lockfile(source_repo, lockfile_before)
 
     base_branch = _detect_default_branch(source_repo)
     _write_worktree_base(app, base_branch)
@@ -1101,11 +1123,12 @@ def cmd_continue(args: argparse.Namespace) -> int:
 
 def cmd_approve_install(args: argparse.Namespace) -> int:
     """`gb2 approve-install <app>`: TTY-only approval for a pending
-    "install" request a builder station asked for (engine.full_orbit.
-    pending_owner_requests -- the station.finished "requests" entry a
-    full-orbit job is currently stopped on, see engine.full_orbit's own
-    STAGE_TASK_OWNER). Shows what manifest/change each one is asking
-    for, requires the owner to TYPE the exact "승인 <job>" line (same
+    "install" request a station asked for -- a build task (engine.
+    full_orbit.STAGE_TASK_OWNER) or an earlier facts/probe/plan/design
+    station (STAGE_EARLY_STATION) -- found via engine.full_orbit.
+    pending_owner_requests, the station.finished "requests" entry a
+    full-orbit job is currently stopped on. Shows what manifest/change
+    each one is asking for, requires the owner to TYPE the exact "승인 <job>" line (same
     TTY convention as `gb2 approve-design`/`gb2 ship`, refused outright
     on a non-interactive shell), then submits/approves each one through
     the EXISTING engine.owner.validate_pending/approve_pending gate --
@@ -1650,16 +1673,20 @@ def cmd_ship(args: argparse.Namespace) -> int:
     refused with exit 4 before anything is read from stdin). On a
     correct line: engine.release.approve_and_run grants the approval
     and drives the publish (fast-forward master + the configured
-    deploy) to a terminal status; only on "done" does this continue the
-    job with report -> close (orbit.release_followup_stages). A wrong
-    line, a non-TTY shell, or the publish ending anywhere but "done"
-    all leave the job's project OPEN for a later retry. The one
-    exception: if the approval step itself refused because the full
-    test suite failed ("full_bench_failed"), the request is NOT left
-    queued -- release.cancel_pending_publish fails it outright (and
-    revokes any approval, though approve_and_run never grants one in
-    that case) so a later `gb2 skip-ship`/`gb2 fix` queue drain can
-    never pick this exact stale request back up and deploy it."""
+    deploy) to a terminal status. If the approval step itself refused
+    because the full test suite failed ("full_bench_failed"), the
+    request is NOT left queued -- release.cancel_pending_publish fails
+    it outright (and revokes any approval, though approve_and_run never
+    grants one in that case) so a later `gb2 skip-ship`/`gb2 fix` queue
+    drain can never pick this exact stale request back up and deploy
+    it. Every outcome from here -- shipped, that cancellation, or any
+    other terminal failure (e.g. "artifact_mismatch") -- then goes
+    through engine.full_orbit.finalize_release, the one place report ->
+    close and the release decision actually happen (see its own
+    docstring); only a request STILL left queued (a wrong approval
+    line, malformed owner text, an unused-approval error -- never
+    touched at all) leaves the job's project OPEN for a later retry,
+    since finalize_release itself no-ops for that case too."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
@@ -1692,32 +1719,60 @@ def cmd_ship(args: argparse.Namespace) -> int:
         publish_outcome = release.approve_and_run(
             config, ledger, fakes, args.app, request_id, owner_text,
         )
-        if publish_outcome["status"] != "done":
+        if publish_outcome["status"] == "rejected":
+            # approve_and_run's own EARLY bail-outs -- a wrong approval
+            # line, malformed owner text, an unused-approval error, or
+            # the full-bench pre-check refusing before ever granting an
+            # approval. The request was either never touched at all
+            # (still "queued" -- a later retry with the right line must
+            # still see it pending) or, for "full_bench_failed"
+            # specifically, just cancelled -- but a cancelled-for-bench
+            # request is deliberately left for the owner's OWN later
+            # decision (`gb2 skip-ship`, or `gb2 fix` + a fresh ship),
+            # never auto-finalized here: test_ship_full_bench_failure_
+            # then_skip_ship_never_deploys_and_closes pins exactly this
+            # -- skip-ship must still be able to act on this same
+            # attempt afterward, which finalize_release's own report ->
+            # close would have already closed out from under it.
             if publish_outcome.get("reason") == "full_bench_failed":
                 release.cancel_pending_publish(ledger, args.app, attempt_id, "full_bench_failed")
             print(json.dumps(publish_outcome, ensure_ascii=False))
             return 3
 
+        # "done", or a genuine terminal "failed"/"unknown" reached by
+        # actually running the publish (e.g. "artifact_mismatch", or a
+        # real deploy exit code) -- both go through the SAME finalizer:
+        # report/close and the release decision happen either way (see
+        # engine.full_orbit.finalize_release's own docstring), not only
+        # on success.
+        from engine import full_orbit
+        from engine import handoff
+
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
-        followup = orbit.release_followup_stages(job_name)
-        final_outcome = orbit.continue_job(
-            config, ledger, fakes, args.app, attempt_id, followup)
-        if final_outcome.status == "done":
-            # The one durable record that the WHOLE full-orbit job (not
-            # just this release attempt's own JobOutcome) reached a
-            # terminal state -- see engine.full_orbit.record_release_
-            # decision's own docstring.
-            from engine import full_orbit
-            full_orbit.record_release_decision(ledger, args.app, attempt_id, job_name, "shipped")
+        report_path = str(handoff.report_path(config, args.app, job_name))
+        full_outcome = full_orbit.finalize_release(
+            config, ledger, fakes, args.app, attempt_id, job_name, request_id, report_path,
+        )
     finally:
         ledger.close()
+
+    if publish_outcome["status"] != "done":
+        # A genuine terminal failure (not the early "rejected" case
+        # above, already returned) -- report/close + the release
+        # decision already ran; the printed shape is still exactly
+        # `publish_outcome` itself (its own "status"/"result" carry
+        # what actually happened), matching every caller that already
+        # parses this exact shape for this case.
+        print(json.dumps(publish_outcome, ensure_ascii=False))
+        return 3
 
     receipt_path = config.home / "publish" / f"{request_id}.json"
     print(json.dumps({
         "publish": publish_outcome, "receipt_path": str(receipt_path),
-        **_outcome_dict(final_outcome),
+        "attempt_id": full_outcome.attempt_id, "status": full_outcome.status,
+        "reason": full_outcome.reason,
     }, ensure_ascii=False))
-    return 0 if final_outcome.status == "done" else 3
+    return 0 if full_outcome.status == "done" else 3
 
 
 def cmd_skip_ship(args: argparse.Namespace) -> int:
@@ -1793,20 +1848,31 @@ def cmd_skip_ship(args: argparse.Namespace) -> int:
 
         cancelled = release.cancel_pending_publish(ledger, args.app, attempt_id, "skip_ship")
 
+        # Same finalizer `gb2 ship` goes through (engine.full_orbit.
+        # finalize_release's own docstring) -- report/close + the
+        # release decision, idempotent, no matter which caller reached
+        # this terminal state. `request_ids[-1]` (the same one reported
+        # below as "skipped_request_id") is representative: every
+        # request this just cancelled carries the identical reason
+        # ("skip_ship"), so any of them decides the same "skipped"
+        # outcome.
+        from engine import full_orbit
+        from engine import handoff
+
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
         fakes = _build_fakes(config, args.app, attempt_id, None)
-        followup = orbit.release_followup_stages(job_name)
-        outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
-        if outcome.status == "done":
-            from engine import full_orbit
-            full_orbit.record_release_decision(ledger, args.app, attempt_id, job_name, "skipped")
+        report_path = str(handoff.report_path(config, args.app, job_name))
+        full_outcome = full_orbit.finalize_release(
+            config, ledger, fakes, args.app, attempt_id, job_name, request_ids[-1], report_path,
+        )
     finally:
         ledger.close()
     print(json.dumps({
         "skipped_request_id": request_ids[-1], "cancelled_request_ids": cancelled,
-        **_outcome_dict(outcome),
+        "attempt_id": full_outcome.attempt_id, "status": full_outcome.status,
+        "reason": full_outcome.reason,
     }, ensure_ascii=False))
-    return 0 if outcome.status == "done" else 3
+    return 0 if full_outcome.status == "done" else 3
 
 
 def _check_argv(config: EngineConfig, target: str) -> list[str]:

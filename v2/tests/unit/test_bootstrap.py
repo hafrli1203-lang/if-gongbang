@@ -20,12 +20,69 @@ def _repo_with_package_json(tmp_path: Path) -> Path:
 def test_already_installed_does_not_run_anything(tmp_path: Path) -> None:
     repo = _repo_with_package_json(tmp_path)
     (repo / "node_modules").mkdir()
+    (repo / "node_modules" / ".gongbang-installed").write_text("", encoding="utf-8")
 
     result = ensure_installed(repo, ("false",))
 
     assert result.ran is False
     assert result.ok is True
     assert result.detail == "already_installed"
+
+
+def test_a_bare_node_modules_with_no_marker_is_not_trusted_and_reinstalls(
+    tmp_path: Path,
+) -> None:
+    """Regression: a node_modules left behind by a partial/failed install
+    (killed, crashed, offline mid-download, a stale copy from an
+    earlier attempt) used to be trusted as "already_installed" just
+    because the directory existed -- so a retry after such a failure
+    never actually reinstalled anything. Only the completion marker
+    (written exactly once, right after install_cmd exits 0) means
+    "trust this"."""
+    repo = _repo_with_package_json(tmp_path)
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "some-half-downloaded-pkg").mkdir()
+    ran_marker = repo / "ran.marker"
+
+    result = ensure_installed(
+        repo, ("sh", "-c", f"touch {ran_marker}"),
+    )
+
+    assert ran_marker.exists(), "install_cmd must actually run against a markerless node_modules"
+    assert result.ran is True
+    assert result.ok is True
+    assert (repo / "node_modules" / ".gongbang-installed").exists()
+    # the earlier partial content is still there -- this never deletes
+    # the user's node_modules, only reinstalls into it.
+    assert (repo / "node_modules" / "some-half-downloaded-pkg").exists()
+
+
+def test_retry_after_a_failed_install_actually_reinstalls(tmp_path: Path) -> None:
+    """The exact partial-then-retry sequence a real `gb2 init` can hit:
+    a first install dies partway (node_modules exists but incomplete,
+    no marker, ok=False), then a second call for the same repo must
+    run install_cmd again -- never short-circuit to "already_installed"
+    just because node_modules is now sitting there from the failed
+    attempt."""
+    repo = _repo_with_package_json(tmp_path)
+    attempt_log = repo / "attempts.log"
+    # First call: creates a partial node_modules, then fails.
+    first = ensure_installed(
+        repo, ("sh", "-c", f"mkdir -p node_modules && echo 1 >> {attempt_log}; exit 1"),
+    )
+    assert first.ran is True
+    assert first.ok is False
+    assert not (repo / "node_modules" / ".gongbang-installed").exists()
+
+    # Second call, same repo, now a command that succeeds.
+    second = ensure_installed(
+        repo, ("sh", "-c", f"echo 2 >> {attempt_log}; exit 0"),
+    )
+
+    assert second.ran is True
+    assert second.ok is True
+    assert attempt_log.read_text(encoding="utf-8").splitlines() == ["1", "2"]
+    assert (repo / "node_modules" / ".gongbang-installed").exists()
 
 
 def test_no_install_cmd_configured_fails_closed(tmp_path: Path) -> None:
@@ -49,6 +106,7 @@ def test_successful_install_creates_node_modules(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.detail == ""
     assert (repo / "node_modules").exists()
+    assert (repo / "node_modules" / ".gongbang-installed").exists()
 
 
 def test_failing_install_command_is_reported_not_raised(tmp_path: Path) -> None:

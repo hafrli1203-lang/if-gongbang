@@ -40,12 +40,26 @@ and a difference (tree_changed=True, passed forced False, same as
 before) means something unexpected happened to touch the real repo
 during this call at all.
 
+The snapshot itself still stays writable to every scene (a scene
+creating a new, untracked scratch/output file is legitimate -- see
+test_scene_mutation_runs_against_a_snapshot_not_the_real_repo), so
+fixing the snapshot's fingerprint once up front is not by itself
+enough: nothing stopped a scene from PATCHING a tracked implementation
+file inside the snapshot and having that edit stick for every later
+scene and the full suite, which would then certify code the fixed
+fingerprint never covered. run_acceptance checks the snapshot's own
+`git status` for any HEAD-tracked (not bare-untracked) change after
+EVERY scene and after the full suite (_tracked_mutated_paths); the
+first stage that trips it stops the run right there (snapshot_mutated=
+True, passed=False, reason "snapshot_mutated") -- no scene or the full
+suite ever runs again against a snapshot a prior stage is known to
+have altered.
+
 run_probe_scripts runs each probe target's own script from
-.gongbang/<job>/probe/<id>.(py|sh|js) inside the SAME bench sandbox
-scenes/the full suite run in -- the engine executes the script
-itself; a worker's "PROBE OK" text in some log is never trusted as
-the evidence (see engine.gates' check_probe docstring for the
-compatibility path this replaces). `<id>` is engine.gates.
+.gongbang/<job>/probe/<id>.(py|sh|js) -- the engine executes the
+script itself; a worker's "PROBE OK" text in some log is never
+trusted as the evidence (see engine.gates' check_probe docstring for
+the compatibility path this replaces). `<id>` is engine.gates.
 probe_target_id(i), the target's 1-based POSITION in the targets list
 (see that function's own docstring) -- never derived from the
 target's own name: a name-derived id (the old scheme here, since
@@ -54,6 +68,18 @@ and "Naver API"/"Naver_API" to the same id too, letting one passing
 script silently stand in for several distinct targets. Each run
 appends one probe.executed ledger event ({id, name, script,
 returncode, stdout_tail}) regardless of outcome.
+
+Like run_acceptance's own scenes/full suite, every probe script runs
+against a disposable snapshot of the repo's fingerprinted tree (see
+_make_snapshot/_link_snapshot_deps), never the real project repo --
+the bench sandbox this reuses always mounts its `repo` argument
+writable (test runners write __pycache__/coverage there), so running
+a probe script directly against the real repo (the previous shape of
+this function) gave an external-API probe script -- not reviewed the
+way a build worker's own commit is -- direct write access to the
+project's real working tree. The real repo is still mounted read-only
+alongside the snapshot (extra_readonly), so a copy_links symlink the
+snapshot only points back into it (e.g. node_modules) still resolves.
 """
 from __future__ import annotations
 
@@ -108,6 +134,16 @@ class AcceptanceResult:
     # "the empty tree"; callers (release/handoff) must treat it the same
     # as passed=False.
     fingerprint: str = ""
+    # True iff a scene (or the full suite) left the snapshot's own
+    # HEAD-tracked content different from what _make_snapshot committed
+    # -- a scene is still free to write a new, untracked scratch/output
+    # file (test_scene_mutation_runs_against_a_snapshot_not_the_real_repo),
+    # but patching an existing tracked file inside the snapshot must not
+    # let a LATER scene or the full suite run against that silently
+    # altered tree and still certify it. Always False when passed is
+    # True. run_acceptance stops at the first scene/full-suite stage
+    # that trips this -- every scenes entry after it never ran.
+    snapshot_mutated: bool = False
 
 
 @dataclass(frozen=True)
@@ -326,7 +362,7 @@ def _write_acceptance_json(
     config: EngineConfig, project: str, job_name: str, passed: bool,
     full_suite_passed: bool, full_suite_returncode: int, full_suite_tail: str,
     scenes: tuple[SceneResult, ...], tree_changed: bool = False,
-    fingerprint: str = "",
+    fingerprint: str = "", snapshot_mutated: bool = False,
 ) -> Path:
     path = acceptance_path(config, project, job_name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +370,7 @@ def _write_acceptance_json(
         "job": job_name,
         "passed": passed,
         "tree_changed": tree_changed,
+        "snapshot_mutated": snapshot_mutated,
         "fingerprint": fingerprint,
         "full_suite": {
             "passed": full_suite_passed,
@@ -346,6 +383,38 @@ def _write_acceptance_json(
         ],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def _tracked_mutated_paths(snapshot: Path) -> tuple[str, ...]:
+    """Relative paths in `snapshot`'s own `git status --porcelain -z
+    --untracked-files=all` that are NOT a bare untracked addition
+    (status "??") -- a scene creating a new scratch/output file is not
+    a mutation of the certified tree; a scene that edits, stages,
+    deletes or renames a path HEAD already tracks (_make_snapshot's
+    own commit) is. Same call/rename-pair handling as
+    engine.steps.open_job.dirty_paths, filtered down to tracked
+    changes only."""
+    out = subprocess.run(
+        git_argv(snapshot, "status", "--porcelain", "-z", "--untracked-files=all"),
+        check=True, capture_output=True,
+    ).stdout
+    tokens = out.decode("utf-8", "surrogateescape").split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if not entry:
+            continue
+        status, rel = entry[:2], entry[3:]
+        tracked = status != "??"
+        if tracked:
+            paths.append(rel)
+        if status[0] in ("R", "C") and i < len(tokens) and tokens[i]:
+            if tracked:
+                paths.append(tokens[i])
+            i += 1
+    return tuple(paths)
 
 
 def _fingerprint_or_none(repo: Path, excludes: tuple[str, ...]) -> str | None:
@@ -408,13 +477,26 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     # back into `repo` (e.g. node_modules) would resolve to nothing
     # inside this sandbox -- read-only, so scenes still cannot write
     # back into the real repo through it.
-    scenes = tuple(
-        _run_scene(config, project, attempt_id, snapshot, env, timeout_sec, scene,
-                  extra_readonly=(repo,))
-        for scene in plan.scenes
-    )
-    full_suite_passed, full_suite_returncode, full_suite_tail = _run_full_suite(
-        config, project, attempt_id, snapshot, env, timeout_sec, extra_readonly=(repo,))
+    scenes: list[SceneResult] = []
+    snapshot_mutated = False
+    full_suite_passed, full_suite_returncode, full_suite_tail = False, -1, "not_run"
+    for scene in plan.scenes:
+        scenes.append(_run_scene(config, project, attempt_id, snapshot, env,
+                                 timeout_sec, scene, extra_readonly=(repo,)))
+        # Fail fast the instant a scene leaves the snapshot's own
+        # HEAD-tracked content mutated: a scene that patches an
+        # implementation file must never let a LATER scene or the full
+        # suite run (and pass) against that altered tree instead of the
+        # one before_fp certified. Remaining scenes/the full suite never
+        # run once this trips.
+        if _tracked_mutated_paths(snapshot):
+            snapshot_mutated = True
+            break
+    if not snapshot_mutated:
+        full_suite_passed, full_suite_returncode, full_suite_tail = _run_full_suite(
+            config, project, attempt_id, snapshot, env, timeout_sec, extra_readonly=(repo,))
+        if _tracked_mutated_paths(snapshot):
+            snapshot_mutated = True
 
     # Second, independent guard: the REAL repo's own fingerprint, which
     # nothing above ever ran against, should be unchanged. A difference
@@ -422,17 +504,22 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     after_fp = _fingerprint_or_none(repo, project_cfg.excludes)
     tree_changed = after_fp is None or before_fp != after_fp
 
-    passed = full_suite_passed and all(s.passed for s in scenes) and not tree_changed
+    passed = (not snapshot_mutated and full_suite_passed
+              and all(s.passed for s in scenes) and not tree_changed)
+    scenes_t = tuple(scenes)
     acc = AcceptanceResult(
-        passed=passed, scenes=scenes, full_suite_passed=full_suite_passed,
+        passed=passed, scenes=scenes_t, full_suite_passed=full_suite_passed,
         full_suite_returncode=full_suite_returncode, full_suite_tail=full_suite_tail,
         tree_changed=tree_changed, fingerprint=before_fp,
+        snapshot_mutated=snapshot_mutated,
     )
     _write_acceptance_json(config, project, job_name, passed, full_suite_passed,
-                           full_suite_returncode, full_suite_tail, scenes, tree_changed,
-                           fingerprint=before_fp)
+                           full_suite_returncode, full_suite_tail, scenes_t, tree_changed,
+                           fingerprint=before_fp, snapshot_mutated=snapshot_mutated)
     if passed:
         reason = None
+    elif snapshot_mutated:
+        reason = "snapshot_mutated"
     elif tree_changed:
         reason = "tree_changed"
     else:
@@ -452,6 +539,7 @@ def _record(ledger: Ledger, project: str, attempt_id: str, job_name: str,
             "scenes": [{"id": s.id, "passed": s.passed} for s in acc.scenes],
             "full_suite_passed": acc.full_suite_passed,
             "tree_changed": acc.tree_changed,
+            "snapshot_mutated": acc.snapshot_mutated,
             "fingerprint": acc.fingerprint,
             "reason": reason,
         },
@@ -479,6 +567,17 @@ def _probe_argv(script: Path) -> list[str]:
     return [*_PROBE_INTERPRETERS[script.suffix], str(script)]
 
 
+def _probe_snapshot_dir(config: EngineConfig, attempt_id: str) -> Path:
+    """Scratch location for the disposable probe-run snapshot -- a
+    sibling of _snapshot_dir's own acceptance snapshot (same `config.
+    home`-rooted, never-under-any-repo placement), kept at its own
+    "probe" leaf so a job that runs both run_probe_scripts and
+    run_acceptance for the same attempt_id never has one call's
+    shutil.rmtree(dest) (see _make_snapshot) race or clobber the
+    other's snapshot directory."""
+    return config.home / "acceptance" / ids.attempt_dirname(attempt_id) / "probe"
+
+
 def _record_probe_executed(ledger: Ledger, project: str, attempt_id: str,
                            probe_id: str, name: str, script: str, returncode: int,
                            stdout_tail: str) -> None:
@@ -495,24 +594,50 @@ def run_probe_scripts(
     job_name: str, targets: list[tuple[str, str]],
 ) -> tuple["ProbeEvidence", ...]:
     """Runs each target's own probe script (see module docstring) inside
-    the bench sandbox and appends one probe.executed ledger event per
-    target, in order. Each target's script/log id is
-    engine.gates.probe_target_id(i) -- its 1-based POSITION in
-    `targets`, never derived from its name -- so two targets can never
-    collide onto the same id/script/log regardless of how similar or
-    non-ASCII their names are (see module docstring). A target with no
-    script at any of the known extensions gets returncode=-1,
-    stdout_tail="script_missing", ok=False -- never raises, so one
-    missing script does not stop the rest of the targets from being
-    probed and recorded."""
+    a disposable snapshot of the repo's current fingerprinted tree, and
+    appends one probe.executed ledger event per target, in order. Each
+    target's script/log id is engine.gates.probe_target_id(i) -- its
+    1-based POSITION in `targets`, never derived from its name -- so
+    two targets can never collide onto the same id/script/log
+    regardless of how similar or non-ASCII their names are (see module
+    docstring). A target with no script at any of the known extensions
+    gets returncode=-1, stdout_tail="script_missing", ok=False -- never
+    raises, so one missing script does not stop the rest of the
+    targets from being probed and recorded.
+
+    The snapshot is rebuilt fresh from whatever the repo's own
+    fingerprinted tree is RIGHT NOW (never a tree recorded earlier by
+    some other step) -- the caller (engine.full_orbit) always commits
+    the prober's own changes to the repo before calling this, so the
+    snapshot always contains the just-committed probe scripts. A
+    fingerprint that cannot be computed at all (_fingerprint_or_none)
+    fails every target closed, the same "script_missing"-shaped,
+    never-raising outcome, under its own stdout_tail reason
+    "no_fingerprint", rather than running anything against an
+    unreadable tree."""
     project_cfg = config.projects[project]
     repo = project_cfg.repo
     env = _bench_env(_bench_ctx(config, project, attempt_id))
     timeout_sec = project_cfg.test_timeout_sec
     results: list[ProbeEvidence] = []
+    fp = _fingerprint_or_none(repo, project_cfg.excludes)
+    if fp is None:
+        for i, (name, _url) in enumerate(targets):
+            probe_id = gates.probe_target_id(i)
+            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
+                                   "", -1, "no_fingerprint")
+            results.append(ProbeEvidence(
+                id=probe_id, name=name, script="", returncode=-1,
+                stdout_tail="no_fingerprint", ok=False))
+        return tuple(results)
+
+    snapshot = _probe_snapshot_dir(config, attempt_id)
+    _make_snapshot(repo, snapshot, fp)
+    _link_snapshot_deps(project_cfg, repo, snapshot)
+
     for i, (name, _url) in enumerate(targets):
         probe_id = gates.probe_target_id(i)
-        script = _probe_script_path(repo, job_name, probe_id)
+        script = _probe_script_path(snapshot, job_name, probe_id)
         if script is None:
             _record_probe_executed(ledger, project, attempt_id, probe_id, name,
                                    "", -1, "script_missing")
@@ -521,7 +646,8 @@ def run_probe_scripts(
                 stdout_tail="script_missing", ok=False))
             continue
         returncode, tail = _run_in_bench_sandbox(
-            config, project, attempt_id, repo, _probe_argv(script), env, timeout_sec, net=True)
+            config, project, attempt_id, snapshot, _probe_argv(script), env, timeout_sec,
+            net=True, extra_readonly=(repo,))
         ok = returncode == 0 and script.exists()
         _record_probe_executed(ledger, project, attempt_id, probe_id, name,
                                str(script), returncode, tail)

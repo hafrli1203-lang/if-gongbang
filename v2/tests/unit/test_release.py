@@ -925,6 +925,30 @@ def test_job_certificate_status_passes_when_only_gongbang_differs(
     assert reason == ""
 
 
+def test_job_certificate_status_refuses_when_a_non_report_gongbang_file_changes(
+    rws: ReleaseWorkspace,
+) -> None:
+    """The exemption is exactly the two generated report paths
+    (report.md, acceptance.json), never the whole .gongbang/ tree: a
+    change to this job's own plan.json after acceptance/app_security
+    already ran must still refuse, the same as a real source change
+    would -- otherwise a later edit to the approved plan, requirements
+    or executable probe scripts could ride through on a stale
+    certificate."""
+    attempt_id = _open(rws, "job-cert-plan-drift")
+    _seed_job_certificate(rws, attempt_id)
+    (rws.repo / ".gongbang" / "job-cert-plan-drift").mkdir(parents=True)
+    _commit(rws.repo, ".gongbang/job-cert-plan-drift/plan.json",
+           '{"scenes": []}\n', "plan.json changed after acceptance")
+    released_fp = _current_fp(rws)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, released_fp)
+    assert ok is False
+    assert reason.startswith("release_requires_job_certificate:")
+    assert "plan.json" in reason
+
+
 def test_job_certificate_status_refuses_when_source_changes_outside_gongbang(
     rws: ReleaseWorkspace,
 ) -> None:
@@ -1187,6 +1211,54 @@ def test_cancel_running_publish_before_dispatch_refuses_once_call_publisher_star
     assert cancelled is False
     assert rws.ledger.request(request_id).status == "running"  # untouched
     assert publisher.calls == []
+
+
+def test_cancel_running_publish_before_dispatch_refuses_while_a_processor_holds_the_lock(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Same race cancel_pending_publish's own lock-holding test proves,
+    for a request already 'running' instead of 'queued': without
+    holding the project lock for its whole status/journal-check-then-
+    cancel sequence, a live processor could dispatch call_publisher
+    (and overwrite this function's own "failed" write with "done")
+    between this function's journal read and its cancellation write.
+    Proven here the same way: hold the lock externally first, assert
+    ProcessorBusy and no ledger write."""
+    from engine.processor import ProcessorBusy
+
+    attempt_id = _open(rws, "job-cancel-running-busy")
+    _commit(rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(rws.config, rws.ledger, "gamma", attempt_id)
+    grant(rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench(rws, attempt_id)
+    _seed_job_certificate(rws, attempt_id)
+
+    publisher = FakePublisher()
+    proc = Processor(rws.config, rws.ledger, Fakes(publisher, FakeInstaller()))
+    proc.register_defaults()
+    status = proc.run_request("gamma", request_id, stop_after="record_source")
+    assert status == "running"
+    assert rws.ledger.steps(request_id).get("call_publisher") is None
+    # The approval was already consumed by the earlier, real run_request
+    # dispatch above (not by anything this test calls) -- captured here
+    # so the busy refusal below can be shown to leave it exactly as is,
+    # rather than asserting the wrong baseline (unused).
+    used_seq_before = rws.ledger.approvals_for(request_id)[0].used_seq
+    assert used_seq_before is not None
+
+    assert rws.ledger.acquire_lock("gamma", "other-processor") is True
+    try:
+        with pytest.raises(ProcessorBusy):
+            release.cancel_running_publish_before_dispatch(
+                rws.ledger, "gamma", request_id, "cancelled_before_dispatch")
+    finally:
+        rws.ledger.release_lock("gamma", "other-processor")
+
+    # refused outright -- the request is untouched, approvals unchanged.
+    req = rws.ledger.request(request_id)
+    assert req.status == "running"
+    approvals = rws.ledger.approvals_for(request_id)
+    assert approvals[0].used_seq == used_seq_before
 
 
 def test_cancel_running_publish_before_dispatch_refuses_a_non_running_request(

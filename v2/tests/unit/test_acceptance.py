@@ -194,6 +194,49 @@ def test_scene_mutation_runs_against_a_snapshot_not_the_real_repo(
     assert events[0].payload["reason"] is None
 
 
+def test_scene_patching_a_tracked_file_fails_acceptance_and_stops_the_run(
+    workspace: Workspace,
+) -> None:
+    """A scene is free to create a new, untracked scratch file (previous
+    test), but patching a file the snapshot's own HEAD already tracks
+    must not be allowed to stick for a later scene or the full suite:
+    this would certify code the fixed-before-any-scene fingerprint
+    never actually covered. The second scene and the full suite must
+    never run once the first scene mutates a tracked path."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "open('src/greeter/__init__.py', 'w').write("
+                      "'def greet(name): return \"WRONG\"')")),
+            Scene(id="s2", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c", "pass")),
+        ),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.snapshot_mutated is True
+    assert acc.passed is False
+    assert len(acc.scenes) == 1  # s2 never ran
+    assert acc.full_suite_passed is False  # the full suite never ran either
+    # The real repo's own tracked file was never touched.
+    assert "Hello" in (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
+
+    data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
+    assert data["snapshot_mutated"] is True
+    assert data["passed"] is False
+    assert len(data["scenes"]) == 1
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
+    assert events[0].payload["snapshot_mutated"] is True
+    assert events[0].payload["reason"] == "snapshot_mutated"
+
+
 def test_unchanged_tree_keeps_tree_changed_false(workspace: Workspace) -> None:
     ws = _sample_workspace(workspace)
     attempt_id = _open(ws)
