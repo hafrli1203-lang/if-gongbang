@@ -14,13 +14,15 @@ from typing import TYPE_CHECKING
 
 from engine.acceptance import AcceptanceResult, acceptance_path
 from engine.config import EngineConfig
-from engine.ledger import Ledger
+from engine.ledger import Event, Ledger
 from engine.plan import classify_skill_tools
 
 if TYPE_CHECKING:
     from engine.plan import Plan
 
 _RUN_SCRIPT_CANDIDATES = ("dev", "start", "build", "test")
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+_SCREEN_SUBDIRS = ("screens", "design")
 
 
 @dataclass(frozen=True)
@@ -63,17 +65,46 @@ def _job_attempt_ids(ledger: Ledger, project: str, job: str) -> set[str]:
 def reconcile_tools(ledger: Ledger, project: str, job: str, plan: "Plan", *,
                     needs_install: "frozenset[str] | None" = None) -> ToolReconciliation:
     """Count actual tool use for this job's own attempts against
-    plan.tools: imported gate decisions (the ledger's own
-    'policy.decided' events, action.tool == "mcp") for mcp calls, and
+    plan.tools: imported gate decisions for mcp calls, and
     'context.injected' events (W1's engine.context, kind="skill") for
     which stations actually received each planned skill. Never trusts
     any OTHER project's/job's events -- only attempts
-    ledger.attempts_for_job_name(project, job) itself returns."""
+    ledger.attempts_for_job_name(project, job) itself returns (plus,
+    for context.injected events recorded before their own attempt
+    existed yet -- see the attempt_id=None note below).
+
+    A worker's own mcp calls never reach the ledger as a literal
+    'policy.decided' event: engine.gate (the PreToolUse hook, run
+    inside the worker sandbox) has no ledger access at all and records
+    through engine.policy.FileSink into the station's own gate.log
+    instead; engine.steps.station._import_gate_log is what turns each
+    line of that log into a ledger event, and it always does so as
+    kind='gate_log.decision' with the original kind preserved as that
+    event's own payload["orig_kind"] (see _validate_gate_log_payload).
+    So an mcp call is counted here from 'gate_log.decision' events
+    whose orig_kind is 'policy.decided' and whose tool is 'mcp' -- the
+    literal 'policy.decided' kind is never actually written to the
+    ledger by anything in this codebase.
+
+    A context.injected event's own attempt_id is None for the "build"
+    and "review" stations (engine.full_orbit._prompt_with_context is
+    called with attempt_id=None there: "build" builds a task's prompt
+    text before that task's own attempt is opened; "review" is
+    deliberately given no attempt_id of its own even though one
+    already exists, by the same design). Those events carry no job
+    identifier either, so they are attributed to whichever job's own
+    'job.opened' event was the most recently seen one in ledger seq
+    order at the point they were appended -- correct as long as a
+    project never runs two jobs' attempts interleaved (true here: every
+    job runs its attempts one at a time, each one opened then run to
+    completion before the next)."""
     attempt_ids = _job_attempt_ids(ledger, project, job)
 
     mcp_calls: dict[str, int] = {}
-    for _seq, event in ledger.events(project, "policy.decided"):
+    for _seq, event in ledger.events(project, "gate_log.decision"):
         if event.attempt_id not in attempt_ids:
+            continue
+        if event.payload.get("orig_kind") != "policy.decided":
             continue
         if event.payload.get("tool") != "mcp":
             continue
@@ -82,8 +113,18 @@ def reconcile_tools(ledger: Ledger, project: str, job: str, plan: "Plan", *,
             mcp_calls[target] = mcp_calls.get(target, 0) + 1
 
     skill_stations: dict[str, set[str]] = {}
-    for _seq, event in ledger.events(project, "context.injected"):
-        if event.attempt_id not in attempt_ids:
+    current_job: str | None = None
+    for _seq, event in ledger.events(project):
+        if event.kind == "job.opened":
+            name = event.payload.get("job_name")
+            if isinstance(name, str):
+                current_job = name
+            continue
+        if event.kind != "context.injected":
+            continue
+        if event.attempt_id not in attempt_ids and not (
+            event.attempt_id is None and current_job == job
+        ):
             continue
         station = str(event.payload.get("station", ""))
         names = event.payload.get("skills", [])
@@ -175,6 +216,28 @@ def _how_to_run(config: EngineConfig, project: str) -> str:
     return "\n".join(lines)
 
 
+def _screens_section(config: EngineConfig, project: str, job: str) -> str:
+    """Every image file (png/jpg/jpeg/webp) under
+    .gongbang/<job>/screens/ and .gongbang/<job>/design/, as markdown
+    image links with paths relative to the repo -- "화면 없음" plainly
+    (not hidden/skipped) when neither directory holds one, so a job
+    with no actual screenshot evidence reads as missing, not as a
+    section that was simply left out."""
+    repo = config.projects[project].repo
+    job_dir = repo / ".gongbang" / job
+    images: list[Path] = []
+    for sub in _SCREEN_SUBDIRS:
+        base = job_dir / sub
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_file() and path.suffix.lower() in _IMAGE_EXTENSIONS:
+                images.append(path.relative_to(repo))
+    if not images:
+        return "화면 없음"
+    return "\n".join(f"![{p.name}]({p.as_posix()})" for p in images)
+
+
 def _scene_table(plan: "Plan", acc: AcceptanceResult) -> str:
     """requirement(plan.acceptance) <-> scene <-> pass/fail. plan.acceptance
     and plan.scenes are two separate lists with no id linking one entry
@@ -239,6 +302,9 @@ attempt: {attempt_id}
 ## 실행 방법
 {_how_to_run(config, project)}
 
+## 화면
+{_screens_section(config, project, job)}
+
 ## 도구표 대 실제 사용
 {_tool_table(reconciliation)}
 
@@ -246,4 +312,15 @@ attempt: {attempt_id}
 {_open_items(plan, acc)}
 """
     path.write_text(body, encoding="utf-8")
+    # The only ledger signal that the WHOLE job (not just one of its
+    # many attempts -- facts/plan/design/each task each open their own)
+    # is actually finished: every attempt's own "report" stage appends
+    # a generic 'report.written' event (engine.steps.report), so that
+    # kind alone cannot tell a job's final handoff apart from an
+    # in-progress task's per-attempt report. engine.board keys its
+    # "완료" status off this event instead.
+    ledger.append(Event(
+        project=project, kind="job.handoff_written", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id, payload={"job": job},
+    ))
     return path

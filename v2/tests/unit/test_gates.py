@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from engine.gates import check_design_approved, check_facts
+from engine.gates import check_design_approved, check_facts, check_probe, check_probe_targets
 from engine.ledger import Event, Ledger
 
 
@@ -132,3 +132,78 @@ def test_facts_table_source_column_counts_as_source(tmp_path) -> None:
         "| 주장 | 판정 | 출처 |\n|---|---|---|\n| a | 통과 | 요구사항 원문 |\n| b | 통과 |  |\n",
         encoding="utf-8")
     assert check_facts(tmp_path, "j") == ["line 4: 통과 without 출처"]
+
+
+# ---- check_probe_targets / check_probe ---------------------------------
+
+def test_check_probe_targets_empty_without_section(tmp_path: Path) -> None:
+    _write_facts(tmp_path, "job", "- 요청 사항 요약: 통과 (출처: request)\n")
+    assert check_probe_targets(tmp_path, "job") == []
+
+
+def test_check_probe_targets_empty_without_facts_file(tmp_path: Path) -> None:
+    assert check_probe_targets(tmp_path, "job") == []
+
+
+def test_check_probe_targets_parses_name_and_url(tmp_path: Path) -> None:
+    text = (
+        "# 사실확정\n"
+        "- 요청 사항 요약: 통과 (출처: request)\n\n"
+        "## 외부 대상\n"
+        "- stripe: https://docs.stripe.com/api\n"
+        "- slack: https://api.slack.com/web\n\n"
+        "## 코드에 넣는 값\n"
+        "(없음)\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [
+        ("stripe", "https://docs.stripe.com/api"),
+        ("slack", "https://api.slack.com/web"),
+    ]
+
+
+def test_check_probe_targets_skips_unparseable_lines(tmp_path: Path) -> None:
+    text = (
+        "## 외부 대상\n"
+        "- stripe: https://docs.stripe.com/api\n"
+        "- 이름만 있고 콜론이 없는 줄\n"
+        "그냥 글 (불릿 아님)\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [
+        ("stripe", "https://docs.stripe.com/api"),
+    ]
+
+
+def _write_probe_log(repo: Path, job: str, name: str, content: str) -> None:
+    path = repo / ".gongbang" / job / "probe" / f"{name}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def test_check_probe_passes_when_every_log_has_probe_ok(tmp_path: Path) -> None:
+    targets = [("stripe", "https://docs.stripe.com/api")]
+    _write_probe_log(tmp_path, "job", "stripe",
+                     "https://docs.stripe.com/api\nPROBE OK\n{...}\n")
+    assert check_probe(tmp_path, "job", targets) == []
+
+
+def test_check_probe_reports_missing_log(tmp_path: Path) -> None:
+    targets = [("stripe", "https://docs.stripe.com/api")]
+    assert check_probe(tmp_path, "job", targets) == ["stripe: log missing"]
+
+
+def test_check_probe_reports_log_without_probe_ok(tmp_path: Path) -> None:
+    targets = [("stripe", "https://docs.stripe.com/api")]
+    _write_probe_log(tmp_path, "job", "stripe",
+                     "https://docs.stripe.com/api\nPROBE FAIL\nboom\n")
+    problems = check_probe(tmp_path, "job", targets)
+    assert len(problems) == 1
+    assert "stripe" in problems[0]
+
+
+def test_check_probe_reports_each_failing_target(tmp_path: Path) -> None:
+    targets = [("stripe", "https://a"), ("slack", "https://b")]
+    _write_probe_log(tmp_path, "job", "stripe", "https://a\nPROBE OK\n")
+    problems = check_probe(tmp_path, "job", targets)
+    assert problems == ["slack: log missing"]

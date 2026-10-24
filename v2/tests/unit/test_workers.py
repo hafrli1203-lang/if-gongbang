@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ def _subprocess_env() -> dict[str, str]:
     engine.workers.base.worker_env)."""
     return {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)}
 
-from engine.config import WorkerConfig
+from engine.config import McpServerConfig, WorkerConfig
 from engine.workers.base import WorkerSpec, worker_env
 from engine.workers.claude_cli import ClaudeRunner
 from engine.workers.codex_cli import CodexRunner
@@ -63,6 +64,35 @@ def test_claude_argv_has_no_user_settings(tmp_path: Path) -> None:
     assert "onFailure" not in hook
     assert hook["command"] == f"sh -c 'timeout -s KILL 20 {sys.executable} -P -m engine.gate || exit 2'"
     assert hook["timeout"] == 30
+
+
+def test_claude_argv_has_no_mcp_config_when_spec_has_no_mcp_servers(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
+    assert "--mcp-config" not in argv
+    assert "--strict-mcp-config" not in argv
+    tools = argv[argv.index("--tools") + 1]
+    assert not tools.startswith("mcp__") and ",mcp__" not in tools
+
+
+def test_claude_argv_mcp_config_has_only_the_spec_servers(tmp_path: Path) -> None:
+    """spec.mcp_servers is whatever engine.steps.station._full_spec
+    (or review._full_spec) already narrowed to station_mcp_allow (never
+    the whole config.mcp_servers table) -- ClaudeRunner's own job is
+    just to turn exactly that dict into --mcp-config, nothing wider."""
+    spec = replace(_spec(tmp_path), mcp_servers={
+        "playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp")),
+    })
+    argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
+
+    assert "--strict-mcp-config" in argv
+    tools = argv[argv.index("--tools") + 1]
+    assert "mcp__playwright__*" in tools.split(",")
+
+    mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert list(mcp_config["mcpServers"]) == ["playwright"]
+    assert mcp_config["mcpServers"]["playwright"]["command"] == "npx"
+    assert mcp_config["mcpServers"]["playwright"]["args"] == ["-y", "@playwright/mcp"]
 
 
 def test_claude_env_only_passthrough_plus_gb(tmp_path: Path, monkeypatch) -> None:
@@ -344,3 +374,5 @@ def test_claude_argv_has_no_budget_cap_by_default(tmp_path: Path) -> None:
     argv = ClaudeRunner().argv(_spec(tmp_path), WorkerConfig(runner="claude"))
     assert "--max-budget-usd" not in argv
     assert "--max-turns" not in argv
+
+

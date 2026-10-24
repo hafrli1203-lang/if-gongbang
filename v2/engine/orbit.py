@@ -38,7 +38,7 @@ from engine import release as release_mod
 from engine.config import EngineConfig
 from engine.ledger import Event, Ledger, RequestRow
 from engine.processor import Fakes, Processor, submit
-from engine.steps.open_job import copy_root
+from engine.steps.open_job import copy_git_config_matches_recorded, copy_root, dirty_paths
 from engine.steps.open_job import open_job as _open_job
 
 ProcessorFactory = Callable[[EngineConfig, Ledger, Fakes], Processor]
@@ -204,14 +204,23 @@ CONTINUABLE_REASONS = frozenset({"worker_stalled", "worker_failed", "worker_time
 MAX_STATION_CONTINUES = 3
 
 
-def _continuation_payload(config: EngineConfig, attempt_id: str,
-                          payload: dict[str, object], n: int) -> dict[str, object]:
-    from engine.steps.open_job import copy_root, dirty_paths
-
+def _continuation_payload(config: EngineConfig, ledger: Ledger, project: str,
+                          attempt_id: str, payload: dict[str, object],
+                          n: int) -> dict[str, object] | None:
+    """None iff the copy's own .git/config no longer matches what
+    _make_copy recorded at creation -- same integrity guard
+    station._changed_paths applies before its own dirty_paths call. A
+    worker that stalls right after planting a clean/smudge filter (or
+    other config tampering) in its copy must not get a continuation
+    run that trusts a further git call against that copy; the caller
+    treats None as "stop the job failed", not as a reason to retry."""
     original = str(payload.get("original_task", payload["task"]))
     role = str(payload["role"])
+    root = copy_root(config, attempt_id, role)
+    if not copy_git_config_matches_recorded(ledger, project, attempt_id, role, root):
+        return None
     try:
-        changed = dirty_paths(copy_root(config, attempt_id, role), ())
+        changed = dirty_paths(root, ())
     except Exception:  # noqa: BLE001 - the note is best-effort context
         changed = ()
     listed = "\n".join(f"- {p}" for p in changed) or "- (none yet)"
@@ -376,8 +385,19 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
                 and error[1] in CONTINUABLE_REASONS):
             n = int(stage.payload.get("continue_n", 0)) + 1
             if n <= MAX_STATION_CONTINUES:
-                stages[idx] = Stage("run_station",
-                                    _continuation_payload(config, attempt_id, stage.payload, n))
+                continuation = _continuation_payload(
+                    config, ledger, project, attempt_id, stage.payload, n)
+                if continuation is None:
+                    _record_job_metrics_failure(
+                        ledger, project, attempt_id, durations_ms,
+                        git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                        "failed", stage.kind,
+                    )
+                    return JobOutcome(
+                        attempt_id=attempt_id, status="failed", failed_request=rid,
+                        reason="copy_git_config_changed", completed=tuple(completed),
+                    )
+                stages[idx] = Stage("run_station", continuation)
                 continue
             _record_job_metrics_failure(
                 ledger, project, attempt_id, durations_ms,

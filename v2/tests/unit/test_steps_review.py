@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from engine.config import WorkerConfig
+from engine.config import McpServerConfig, WorkerConfig
 from engine.evidence import fingerprint
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -73,6 +73,37 @@ def _submit_review(ws: Workspace, task: str = "do the task") -> tuple[str, str]:
 def _verdict_script(passed: bool, findings: list[dict[str, object]] | None = None,
                     coverage: str = "full") -> list[dict[str, object]]:
     return [{"final": {"passed": passed, "coverage": coverage, "findings": findings or []}}]
+
+
+def test_allowed_mcp_servers_intersects_payload_station_allow_and_config(
+    workspace: Workspace,
+) -> None:
+    """review._allowed_mcp_servers narrows this request's payload
+    "tools"."mcp" names to BOTH config.station_mcp_allow["review"] and
+    config.mcp_servers -- same contract as engine.steps.station's own
+    helper, keyed to the fixed "review" station rather than a payload
+    "station" field (review requests have no such field)."""
+    ws = _review_workspace(workspace)
+    config = replace(
+        ws.config,
+        mcp_servers={
+            "playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp")),
+            "other": McpServerConfig(command=("x",)),
+        },
+        station_mcp_allow={"review": ("playwright",)},
+    )
+    attempt_id = open_job(config, ws.ledger, "alpha", "review-mcp-job", "full", ())
+    rid = submit_request(
+        ws.ledger, "alpha", attempt_id, "review",
+        {"role": "reviewer", "task": "do the task",
+         "tools": {"mcp": ["playwright", "other", "not_configured"]}},
+        "owner",
+    )
+    request = ws.ledger.request(rid)
+    ctx = StepContext(config=config, ledger=ws.ledger, fakes=None,
+                      request=request, project="alpha", attempt_id=attempt_id)
+
+    assert list(review._allowed_mcp_servers(ctx)) == ["playwright"]
 
 
 def test_review_records_evidence_bound_to_fingerprint(workspace: Workspace) -> None:

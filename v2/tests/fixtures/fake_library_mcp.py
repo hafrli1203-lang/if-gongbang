@@ -12,11 +12,17 @@ Supported tools:
 Run standalone (no args) for the success path. `--crash-after-init`
 exits right after the initialize response, before ever answering a
 tools/call, so a test can exercise engine.context's McpClientError /
-`failed=True` path."""
+`failed=True` path. `--hang-on-call` accepts a tools/call request but
+never answers it (sleeps well past any sane test timeout), so a test
+can exercise the client's own read-timeout path. `--notify-before-reply`
+writes one id-less JSON-RPC notification before each tools/call's real
+reply, so a test can exercise the client's id-matching (a notification
+must never be mistaken for the reply it is waiting on)."""
 from __future__ import annotations
 
 import json
 import sys
+import time
 
 
 def _write(message: dict[str, object]) -> None:
@@ -46,6 +52,8 @@ _LESSON_RESULTS = [
 
 def main() -> None:
     crash_after_init = "--crash-after-init" in sys.argv[1:]
+    hang_on_call = "--hang-on-call" in sys.argv[1:]
+    notify_before_reply = "--notify-before-reply" in sys.argv[1:]
     while True:
         request = _read()
         if request is None:
@@ -59,6 +67,11 @@ def main() -> None:
         elif method == "notifications/initialized":
             continue
         elif method == "tools/call":
+            if hang_on_call:
+                time.sleep(3600)
+                return
+            if notify_before_reply:
+                _write({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
             params = request.get("params", {})
             name = params.get("name")
             if name == "library_search":

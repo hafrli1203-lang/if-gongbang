@@ -415,9 +415,9 @@ def test_argv_mcp_env_only_carries_configured_names(tmp_path: Path, monkeypatch)
 
 def _mcp_decided_event(attempt_id: str, server: str) -> Event:
     return Event(
-        project="alpha", kind="policy.decided", actor_kind="worker", actor_id="builder",
+        project="alpha", kind="gate_log.decision", actor_kind="processor", actor_id="processor",
         attempt_id=attempt_id,
-        payload={"tool": "mcp", "path": None, "target": server, "command": None,
+        payload={"orig_kind": "policy.decided", "tool": "mcp", "target": server,
                  "allowed": True, "reason": "mcp_allowed"},
     )
 

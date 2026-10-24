@@ -72,6 +72,11 @@
         ".gongbang/"
       ]
     },
+    "probe": {
+      "prober": [
+        ".gongbang/"
+      ]
+    },
     "plan": {
       "planner": [
         ".gongbang/",
@@ -92,6 +97,13 @@
     }
   },
   "station_terminal_allow": {
+    "probe": {
+      "prober": [
+        "python3 \\.gongbang/[A-Za-z0-9_./-]+",
+        "node \\.gongbang/[A-Za-z0-9_./-]+",
+        "bash \\.gongbang/[A-Za-z0-9_./-]+"
+      ]
+    },
     "build": {
       "builder": [
         "npx vitest run( [A-Za-z0-9_./\\[\\]-]+)*",
@@ -118,6 +130,11 @@
       "runner": "claude",
       "model": "sonnet",
       "timeout_sec": 600
+    },
+    "prober": {
+      "runner": "claude",
+      "model": "sonnet",
+      "timeout_sec": 900
     },
     "planner": {
       "runner": "claude",

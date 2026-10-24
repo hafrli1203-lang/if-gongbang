@@ -25,10 +25,31 @@ class SkillText:
     body: str | None  # file contents, or None if not found in any root
 
 
+def skill_path_in_root(root: Path, candidate: Path) -> Path | None:
+    """Resolves `candidate` (following symlinks) and returns that
+    resolved path only if it stays inside `root`'s own resolved tree --
+    a symlinked SKILL.md, or an ancestor directory that is itself a
+    symlink, pointing outside the root is rejected the same way a
+    simply-missing file is (callers treat None as "not found"). Never
+    raises."""
+    try:
+        resolved_root = root.resolve()
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return resolved
+
+
 def _skill_md_in(root: Path, name: str) -> Path | None:
     direct = root / name / "SKILL.md"
     if direct.is_file():
-        return direct
+        found = skill_path_in_root(root, direct)
+        if found is not None:
+            return found
     if not root.is_dir():
         return None
     for category in sorted(root.iterdir()):
@@ -36,7 +57,9 @@ def _skill_md_in(root: Path, name: str) -> Path | None:
             continue
         candidate = category / name / "SKILL.md"
         if candidate.is_file():
-            return candidate
+            found = skill_path_in_root(root, candidate)
+            if found is not None:
+                return found
     return None
 
 
@@ -55,4 +78,4 @@ def load_skill(roots: tuple[str, ...], name: str) -> SkillText:
     return SkillText(name=name, path=None, body=None)
 
 
-__all__ = ["SkillText", "load_skill"]
+__all__ = ["SkillText", "load_skill", "skill_path_in_root"]

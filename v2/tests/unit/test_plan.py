@@ -243,3 +243,32 @@ def test_skill_index_reads_library_line_shape_and_pack_listings(tmp_path) -> Non
     usable, needs_install = classify_skill_tools(plan, config)
     assert usable == {"search-first", "systematic-debugging", "크래시-아웃"}
     assert needs_install == {"not-there"}
+
+
+def test_symlinked_core_skill_escaping_root_is_not_available(tmp_path) -> None:
+    """A SKILL.md reachable under a configured skill root only via a
+    symlink that points outside that root must not be treated as an
+    installed skill -- same containment rule as engine.skills.
+    load_skill, applied here because _available_skill_names/
+    skill_catalog_text glob the root directly rather than going
+    through load_skill."""
+    from types import SimpleNamespace
+
+    from engine.plan import classify_skill_tools, skill_catalog_text
+
+    core = tmp_path / "core"
+    core.mkdir()
+    outside = tmp_path / "outside" / "숨은-스킬"
+    outside.mkdir(parents=True)
+    (outside / "SKILL.md").write_text("---\ndescription: 몰래\n---\n", encoding="utf-8")
+    (core / "숨은-스킬").symlink_to(outside)
+    config = SimpleNamespace(skill_index_path=None, skill_roots=(core,))
+
+    plan = SimpleNamespace(tools=(
+        SimpleNamespace(kind="skill", name="숨은-스킬", stations=("build",)),
+    ))
+    _usable, needs_install = classify_skill_tools(plan, config)
+    assert needs_install == {"숨은-스킬"}
+
+    catalog = skill_catalog_text(config)
+    assert "숨은-스킬" not in catalog

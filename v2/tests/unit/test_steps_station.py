@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from engine import procs
-from engine.config import WorkerConfig
+from engine.config import McpServerConfig, WorkerConfig
 from engine.faults import CrashInjected, Faults
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -375,6 +375,74 @@ def test_init_gate_log_refuses_preplanted_symlink(workspace: Workspace) -> None:
 
     with pytest.raises(StepFailed):
         station._init_gate_log(ctx)
+
+
+def test_full_spec_mcp_servers_intersect_station_allow_and_config(
+    workspace: Workspace,
+) -> None:
+    """spec.mcp_servers = this request's payload "tools"."mcp" names,
+    narrowed to BOTH config.station_mcp_allow[station] (the project-
+    wide upper bound a plan's own tool table can never widen past) AND
+    config.mcp_servers (a name the operator never configured launch
+    info for is dropped). "other" is in config.mcp_servers but not in
+    station_mcp_allow["build"]; "not_configured" is in neither --
+    both are dropped, only "playwright" survives."""
+    ws = _station_workspace(workspace)
+    config = replace(
+        ws.config,
+        mcp_servers={
+            "playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp")),
+            "other": McpServerConfig(command=("x",)),
+        },
+        station_mcp_allow={"build": ("playwright",)},
+    )
+    attempt_id = open_job(config, ws.ledger, "alpha", "mcp-job", "full", ("builder",))
+    rid = submit_request(
+        ws.ledger, "alpha", attempt_id, "run_station",
+        {"station": "build", "role": "builder", "task": "do it",
+         "tools": {"mcp": ["playwright", "other", "not_configured"]}},
+        "owner",
+    )
+    request = ws.ledger.request(rid)
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(ws.root / "script.json")})
+    ctx = station.StepContext(config=config, ledger=ws.ledger, fakes=fakes,
+                              request=request, project="alpha", attempt_id=attempt_id)
+
+    spec, _worker, _runner = station._full_spec(ctx)
+
+    assert list(spec.mcp_servers) == ["playwright"]
+
+
+def test_write_gate_facts_mcp_allow_matches_full_spec_mcp_servers(
+    workspace: Workspace,
+) -> None:
+    """gate_facts.json's "mcp_allow" (read back by engine.gate ->
+    policy._decide_mcp) must name exactly the same servers _full_spec
+    granted the worker CLI -- the two are computed from the same
+    payload/config inputs by separate call sites and must not drift."""
+    ws = _station_workspace(workspace)
+    config = replace(
+        ws.config,
+        mcp_servers={"playwright": McpServerConfig(command=("npx", "-y", "@playwright/mcp"))},
+        station_mcp_allow={"build": ("playwright",)},
+        config_path=ws.root / "engine.json",
+    )
+    attempt_id = open_job(config, ws.ledger, "alpha", "mcp-job", "full", ("builder",))
+    rid = submit_request(
+        ws.ledger, "alpha", attempt_id, "run_station",
+        {"station": "build", "role": "builder", "task": "do it",
+         "tools": {"mcp": ["playwright"]}},
+        "owner",
+    )
+    request = ws.ledger.request(rid)
+    ctx = station.StepContext(config=config, ledger=ws.ledger, fakes=None,
+                              request=request, project="alpha", attempt_id=attempt_id)
+
+    station._write_gate_facts(ctx)
+
+    facts_data = json.loads(station._gate_facts_path(ctx).read_text(encoding="utf-8"))
+    assert facts_data["mcp_allow"] == ["playwright"]
 
 
 def test_no_worker_config_fails(workspace: Workspace) -> None:

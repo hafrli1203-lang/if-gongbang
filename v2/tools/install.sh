@@ -40,12 +40,25 @@ if [ ! -x "$ENGINE/.venv/bin/python" ]; then
 fi
 
 mkdir -p "$HOME/.local/bin" "$WORKSPACE"
+# printf %q shell-escapes each value into its own safe literal (e.g. a
+# --library-mcp command that itself has quoted/spaced arguments) --
+# substituted into the heredoc UNQUOTED on purpose: it is already a
+# complete, safe word, and wrapping it in another layer of double
+# quotes here would flatten its own escapes (backslash sequences mean
+# something different inside "..." than bare), corrupting the exact
+# command the launcher re-exports. Assignment RHS (export VAR=...) is
+# not subject to word splitting/globbing even unquoted, so this stays
+# safe even with no quotes at all.
+WORKSPACE_Q="$(printf '%q' "$WORKSPACE")"
+APPS_ROOT_Q="$(printf '%q' "$APPS_ROOT")"
+LIBRARY_MCP_Q="$(printf '%q' "$LIBRARY_MCP")"
+DIRECTION_FILE_Q="$(printf '%q' "$DIRECTION_FILE")"
 cat > "$HOME/.local/bin/gb2" <<EOF
 #!/usr/bin/env bash
-export GB2_WORKSPACE="\${GB2_WORKSPACE:-$WORKSPACE}"
-export GB2_APPS_ROOT="\${GB2_APPS_ROOT:-$APPS_ROOT}"
-export GB2_LIBRARY_MCP="\${GB2_LIBRARY_MCP:-$LIBRARY_MCP}"
-export GB2_DIRECTION_FILE="\${GB2_DIRECTION_FILE:-$DIRECTION_FILE}"
+export GB2_WORKSPACE=\${GB2_WORKSPACE:-$WORKSPACE_Q}
+export GB2_APPS_ROOT=\${GB2_APPS_ROOT:-$APPS_ROOT_Q}
+export GB2_LIBRARY_MCP=\${GB2_LIBRARY_MCP:-$LIBRARY_MCP_Q}
+export GB2_DIRECTION_FILE=\${GB2_DIRECTION_FILE:-$DIRECTION_FILE_Q}
 exec "$ENGINE/.venv/bin/python" -P "$ENGINE/tools/gb2" "\$@"
 EOF
 chmod +x "$HOME/.local/bin/gb2"

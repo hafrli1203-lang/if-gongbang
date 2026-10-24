@@ -6,19 +6,31 @@ resume later.
 
 Stations, in order, each writing only its own files:
   facts    (role "facts")    -> .gongbang/<job>/facts.md
+  probe    (role "prober", only if facts.md's own "## 외부 대상"
+           section lists at least one external API/CLI/file format
+           this job depends on) -> .gongbang/<job>/probe/ -- one real
+           call per target, logged with "PROBE OK"/"PROBE FAIL"
+           (engine.gates.check_probe_targets/check_probe). Skipped
+           entirely (no attempt, just a "probe.skipped" ledger event)
+           when facts.md names no such target.
   planner  (role "planner")  -> .gongbang/<job>/plan.json, tests/scenes/
   designer (role "designer", only if plan.ui) -> .gongbang/<job>/design/
   builder  (role "builder", once per plan.tasks entry, in dependency
            order) -> the task's own `owns` paths, narrowed from the
            project's configured build prefixes (engine.policy,
-           engine.steps.station) -- never tests/scenes/
+           engine.steps.station) -- never tests/scenes/. A UI task
+           additionally gets write access to this one job's own
+           .gongbang/<job>/screens/ (see _config_for_build_task below)
+           to save screenshots of what it built, without widening any
+           other builder-writable path.
   reviewer (role "reviewer") judges each builder task's change, same as
            a plain single-task job (engine.steps.review)
 
-Facts/planner/(designer) share ONE attempt (run_station -> merge ->
-a gate-specific check -- engine.gates / engine.plan -- for each),
+Facts/probe/planner/(designer) share ONE attempt (run_station -> merge
+-> a gate-specific check -- engine.gates / engine.plan -- for each),
 closed once the plan is validated and (if plan.ui) the design is
-approved. facts.md/plan.json/design.md are committed directly (see
+approved. facts.md/probe logs/plan.json/design.md are committed
+directly (see
 _commit_job_trail) right after each one's merge, rather than waiting
 for a worker-gated commit -- nothing a worker wrote is in that diff,
 only files the orchestrator itself just wrote, so there is nothing for
@@ -73,14 +85,14 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from engine import context as context_mod
 from engine import orbit
 from engine.config import EngineConfig
 from engine.gates import _facts_path as _facts_md_path
-from engine.gates import check_design_approved, check_facts
+from engine.gates import check_design_approved, check_facts, check_probe, check_probe_targets
 from engine.gitutil import git_argv
 from engine.ledger import Event, Ledger
 from engine.plan import (
@@ -91,14 +103,21 @@ from engine.plan import (
 from engine.processor import Fakes
 from engine.station_prompts import (
     builder_task_text, designer_prompt, facts_prompt, fix_task_text, planner_prompt,
+    prober_prompt,
 )
 from engine.steps.open_job import copy_root, open_job
 
 FACTS_ROLE = "facts"
+PROBER_ROLE = "prober"
 PLANNER_ROLE = "planner"
 DESIGNER_ROLE = "designer"
 BUILDER_ROLE = "builder"
 REVIEWER_ROLE = "reviewer"
+
+# Characters of one probe log kept for the planner prompt's own "실측
+# 결과" section -- bounds a single huge/looping log from blowing up the
+# planner's prompt budget (same spirit as engine.context's PER_ITEM_CAP).
+PROBE_LOG_CAP = 4000
 
 ProgressCallback = Callable[[str], None]
 
@@ -147,7 +166,25 @@ _ORCHESTRATOR_GIT_IDENTITY = {
 }
 
 
-def _commit_job_trail(config: EngineConfig, project: str, job_name: str, message: str,
+def _latest_merge_paths(ledger: Ledger, project: str, attempt_id: str) -> tuple[str, ...]:
+    """The exact relative paths engine.steps.merge's own "record" step
+    applied in the MOST RECENT merge.recorded event on this attempt
+    (that event's own "paths" payload, engine.steps.merge._record) --
+    not every path under some owned prefix that happens to exist on
+    disk. facts/probe/plan/design all share one attempt (see this
+    module's own docstring), each running its own run_station -> merge
+    in turn, so "most recent" at the moment _commit_job_trail is called
+    right after a merge always means THAT station's own merge, never an
+    earlier sibling's."""
+    latest: tuple[str, ...] = ()
+    for _seq, event in ledger.events(project, "merge.recorded"):
+        if event.attempt_id == attempt_id:
+            latest = tuple(str(p) for p in event.payload.get("paths", ()))
+    return latest
+
+
+def _commit_job_trail(config: EngineConfig, ledger: Ledger, project: str, attempt_id: str | None,
+                      job_name: str, message: str,
                       station: str | None = None, role: str | None = None) -> None:
     """Commit whatever the orchestrator itself (never a worker) just
     wrote under .gongbang/<job>/ -- a merge's own apply_allowed_paths
@@ -159,16 +196,29 @@ def _commit_job_trail(config: EngineConfig, project: str, job_name: str, message
     out. This is a plain, UNGATED engine-side commit -- unlike
     engine.steps.commit, it never checks a review/bench fingerprint,
     because nothing a worker wrote is in this diff; only files the
-    processor itself just wrote are. A no-op (nothing actually changed
-    under .gongbang/<job>/) commits nothing."""
+    processor itself just wrote (plus, when `station`/`role` is given,
+    exactly the paths THIS station's own merge just applied outside
+    .gongbang/ -- see _latest_merge_paths; never every path that
+    happens to exist under the role's whole owned prefix, which could
+    sweep in some unrelated pre-existing uncommitted change under that
+    same prefix, e.g. from the owner's own working tree or a different
+    job's leftover file). A no-op (nothing actually changed under
+    .gongbang/<job>/) commits nothing."""
     repo = config.projects[project].repo
     paths = [f".gongbang/{job_name}"]
     if station and role:
         # Other paths this station's role owns (e.g. the planner's
         # tests/scenes/) were merged by the same gated step; leaving them
-        # uncommitted would let the close stage wipe them.
+        # uncommitted would let the close stage wipe them -- but only the
+        # paths that merge actually touched, not the whole owned prefix.
         owned = config.station_owners.get(station, {}).get(role, ())
-        paths += [p for p in owned if not p.startswith(".gongbang") and (repo / p).exists()]
+        extra_prefixes = tuple(p for p in owned if not p.startswith(".gongbang"))
+        if extra_prefixes:
+            merged = _latest_merge_paths(ledger, project, attempt_id)
+            paths += [
+                p for p in merged
+                if any(p.startswith(prefix) for prefix in extra_prefixes) and (repo / p).exists()
+            ]
     env = {**os.environ, **_ORCHESTRATOR_GIT_IDENTITY}
     subprocess.run(git_argv(repo, "add", "--", *paths), check=True, capture_output=True, env=env)
     status = subprocess.run(
@@ -183,6 +233,46 @@ def _commit_job_trail(config: EngineConfig, project: str, job_name: str, message
 
 def _build_prefixes(config: EngineConfig) -> tuple[str, ...]:
     return tuple(config.station_owners.get("build", {}).get(BUILDER_ROLE, ()))
+
+
+def _probe_logs_text(repo, job_name: str, targets: list[tuple[str, str]]) -> str:
+    """Every target's own probe log (capped at PROBE_LOG_CAP chars
+    each), under one "## 실측 결과" heading -- "" if `targets` is empty
+    or none of the logs can be read (check_probe already gated on
+    them existing and saying PROBE OK before this is ever called, so
+    a read failure here would mean the file vanished in between)."""
+    parts: list[str] = []
+    for name, _url in targets:
+        path = repo / ".gongbang" / job_name / "probe" / f"{name}.log"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parts.append(f"### {name}\n{text[:PROBE_LOG_CAP]}")
+    if not parts:
+        return ""
+    return "## 실측 결과\n" + "\n\n".join(parts)
+
+
+def _config_for_build_task(config: EngineConfig, job_name: str, plan: Plan) -> EngineConfig:
+    """`config`, unchanged, except (only when plan.ui) the build
+    station's builder role additionally owns THIS job's own
+    .gongbang/<job_name>/screens/ -- never the rest of
+    .gongbang/<job_name>/ (facts.md, plan.json, report.md stay out of
+    reach) and never another job's screens/, so a UI task's build
+    attempt can save its own screenshots there without widening any
+    other builder-writable path. Used only for the run_station/merge
+    stages of that one task's own attempt (see _run_task_attempt) --
+    every other stage (review/bench/commit/...) only reads fields this
+    never touches, so passing it there too would be harmless but is
+    avoided for clarity."""
+    if not plan.ui:
+        return config
+    screens_prefix = f".gongbang/{job_name}/screens/"
+    build_owners = dict(config.station_owners.get("build", {}))
+    build_owners[BUILDER_ROLE] = tuple(build_owners.get(BUILDER_ROLE, ())) + (screens_prefix,)
+    station_owners = {**config.station_owners, "build": build_owners}
+    return replace(config, station_owners=station_owners)
 
 
 def _record_context(ledger: Ledger, project: str, attempt_id: str | None, station: str,
@@ -289,10 +379,16 @@ def _close_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: 
 
 
 def _builder_run_station_payload(task: Task, task_text: str, plan: Plan,
-                                 config: EngineConfig) -> dict[str, object]:
+                                 config: EngineConfig, job_name: str) -> dict[str, object]:
     usable_skills, _needs_install = classify_skill_tools(plan, config)
+    owns = list(task.owns)
+    if plan.ui:
+        # The engine's own extra allowance (see _config_for_build_task),
+        # not part of the plan's own owns -- the planner never has to
+        # know or ask for this path.
+        owns.append(f".gongbang/{job_name}/screens/")
     return {"station": "build", "role": BUILDER_ROLE, "task": task_text,
-            "owns": list(task.owns),
+            "owns": owns,
             "tools": tools_for_station(plan, "build", usable_skills=usable_skills)}
 
 
@@ -322,8 +418,10 @@ def _run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     `owns`, which default_stages() has no parameter for."""
     attempt_id = open_job(config, ledger, project, job_name, "full", (BUILDER_ROLE,))
     build_copy = str(copy_root(config, attempt_id, BUILDER_ROLE))
+    build_config = _config_for_build_task(config, job_name, plan)
     stages = [
-        orbit.Stage("run_station", _builder_run_station_payload(task, task_text, plan, config)),
+        orbit.Stage("run_station", _builder_run_station_payload(task, task_text, plan,
+                                                                 build_config, job_name)),
         orbit.Stage("merge", {"copies": [
             {"role": BUILDER_ROLE, "station": "build", "path": build_copy},
         ]}),
@@ -334,8 +432,8 @@ def _run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
         orbit.Stage("report", {"summary": f"gongbang: {job_name} - {task.id}"}),
         orbit.Stage("close", {}),
     ]
-    return orbit.continue_job(config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id, stages,
-                              processor_factory=processor_factory, on_progress=on_progress)
+    return orbit.continue_job(build_config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id,
+                              stages, processor_factory=processor_factory, on_progress=on_progress)
 
 
 def _run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
@@ -351,7 +449,7 @@ def _run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
     continue_full_job to pick up at the task that stopped."""
     last_attempt_id: str | None = None
     for index, task in enumerate(tasks):
-        base_task_text = builder_task_text(task, plan.goal)
+        base_task_text = builder_task_text(task, plan.goal, job_name, plan.ui)
         task_text = _prompt_with_context(config, ledger, project, None, "build",
                                          base_task_text, base_task_text,
                                          _planned_skills(config, plan, "build"))
@@ -367,6 +465,7 @@ def _run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                     ledger, project, outcome.attempt_id, job_name,
                     stage="awaiting_task_owner", remaining_task_ids=remaining,
                     current_task_id=task.id, current_task_text=task_text,
+                    current_base_task_text=base_task_text, stop_reason=outcome.reason,
                 )
             if full is not None:
                 return full, last_attempt_id
@@ -388,7 +487,7 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
         all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
         fix_task = Task(id=f"fix-{rounds + 1}", title="수락 실패 수정", detail="",
                         owns=all_owns, depends_on=())
-        base_task_text = fix_task_text(fix_task, plan.goal, failing)
+        base_task_text = fix_task_text(fix_task, plan.goal, failing, job_name, plan.ui)
         task_text = _prompt_with_context(config, ledger, project, None, "build",
                                          base_task_text, base_task_text,
                                          _planned_skills(config, plan, "build"))
@@ -403,6 +502,7 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
                     ledger, project, outcome.attempt_id, job_name,
                     stage="awaiting_task_owner", remaining_task_ids=[],
                     current_task_id=fix_task.id, current_task_text=task_text,
+                    current_base_task_text=base_task_text, stop_reason=outcome.reason,
                     fix_round=rounds, fixing=True, max_fix_rounds=max_fix_rounds,
                 )
             if full is not None:
@@ -415,7 +515,8 @@ def _run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fak
 
     report_path = handoff_mod.write_handoff(config, ledger, project, last_attempt_id,
                                             job_name, plan, acc)
-    _commit_job_trail(config, project, job_name, f"gongbang: {job_name} - handoff")
+    _commit_job_trail(config, ledger, project, last_attempt_id, job_name,
+                      f"gongbang: {job_name} - handoff")
     return FullOutcome("done", None, last_attempt_id, str(report_path))
 
 
@@ -439,7 +540,7 @@ def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
                  processor_factory: orbit.ProcessorFactory | None = None) -> FullOutcome:
     repo = config.projects[project].repo
     attempt_id = open_job(config, ledger, project, job_name, "full",
-                          (FACTS_ROLE, PLANNER_ROLE, DESIGNER_ROLE))
+                          (FACTS_ROLE, PROBER_ROLE, PLANNER_ROLE, DESIGNER_ROLE))
 
     facts_task_text = _prompt_with_context(config, ledger, project, attempt_id, "facts",
                                            request, facts_prompt(request, job_name))
@@ -449,22 +550,46 @@ def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
     full = _station_outcome_to_full(outcome, "facts")
     if full is not None:
         return full
-    _commit_job_trail(config, project, job_name, f"gongbang: {job_name} - facts")
+    _commit_job_trail(config, ledger, project, attempt_id, job_name, f"gongbang: {job_name} - facts")
     problems = check_facts(repo, job_name)
     if problems:
         return FullOutcome("failed", "facts:" + "; ".join(problems), attempt_id, None)
 
     facts_md = _facts_md_text(repo, job_name)
+    targets = check_probe_targets(repo, job_name)
+    probe_text = ""
+    if not targets:
+        ledger.append(Event(
+            project=project, kind="probe.skipped", actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id, payload={"job": job_name},
+        ))
+    else:
+        probe_task_text = _prompt_with_context(config, ledger, project, attempt_id, "probe",
+                                               request, prober_prompt(request, job_name, targets))
+        outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "probe",
+                                 PROBER_ROLE, probe_task_text, on_progress,
+                                 processor_factory)
+        full = _station_outcome_to_full(outcome, "probe")
+        if full is not None:
+            return full
+        _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                          f"gongbang: {job_name} - probe")
+        probe_problems = check_probe(repo, job_name, targets)
+        if probe_problems:
+            failed_names = ",".join(p.split(":", 1)[0] for p in probe_problems)
+            return FullOutcome("needs_owner", f"probe_failed:{failed_names}", attempt_id, None)
+        probe_text = _probe_logs_text(repo, job_name, targets)
+
     plan_task_text = _prompt_with_context(config, ledger, project, attempt_id, "plan",
-                                          request, planner_prompt(request, job_name, facts_md, skill_catalog_text(config)))
+                                          request, planner_prompt(request, job_name, facts_md,
+                                                                   skill_catalog_text(config),
+                                                                   probe_text))
     outcome = _run_and_merge(config, ledger, fakes, project, attempt_id, "plan",
                              PLANNER_ROLE, plan_task_text,
                              on_progress, processor_factory)
     full = _station_outcome_to_full(outcome, "plan")
     if full is not None:
         return full
-    _commit_job_trail(config, project, job_name, f"gongbang: {job_name} - plan",
-                      station="plan", role=PLANNER_ROLE)
     try:
         plan = load_plan(repo, job_name)
     except PlanError as exc:
@@ -473,6 +598,24 @@ def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
     problems += validate_tools(plan, config)
     if problems:
         return FullOutcome("failed", "plan:" + "; ".join(problems), attempt_id, None)
+
+    # Review the planner's own merged-but-uncommitted change (plan.json +
+    # tests/scenes/) BEFORE it is committed as the orchestrator's own plan
+    # trail -- otherwise it becomes every later reviewer's base_head
+    # (nothing to diff against) and is never judged by anyone (Codex
+    # finding). One plain review Stage on this same attempt; the diff it
+    # sees is exactly base_head..current (this merge's own files, nothing
+    # else has touched the tree yet).
+    plan_review_outcome = orbit.continue_job(
+        config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id,
+        [orbit.Stage("review", _review_payload(config, ledger, project, plan, request))],
+        processor_factory=processor_factory, on_progress=on_progress,
+    )
+    if plan_review_outcome.status != "done":
+        return FullOutcome("needs_owner", "plan_review_failed", attempt_id, None)
+
+    _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                      f"gongbang: {job_name} - plan", station="plan", role=PLANNER_ROLE)
 
     if plan.ui:
         usable_skills, _needs_install = classify_skill_tools(plan, config)
@@ -487,7 +630,8 @@ def run_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
         full = _station_outcome_to_full(outcome, "design")
         if full is not None:
             return full
-        _commit_job_trail(config, project, job_name, f"gongbang: {job_name} - design")
+        _commit_job_trail(config, ledger, project, attempt_id, job_name,
+                          f"gongbang: {job_name} - design")
         if not check_design_approved(ledger, project, job_name):
             _record_progress(ledger, project, attempt_id, job_name,
                              stage="awaiting_design_approval", max_fix_rounds=max_fix_rounds)
@@ -536,11 +680,53 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                                   processor_factory)
 
     if stage == "awaiting_task_owner":
-        task_text = str(progress.get("current_task_text", ""))
-        resume_stages = orbit.stages_after_install(config, attempt_id, BUILDER_ROLE,
-                                                    REVIEWER_ROLE, job_name, task_text)
-        outcome = orbit.continue_job(config, ledger, _fakes_for(fakes, attempt_id), project, attempt_id,
-                                     resume_stages, processor_factory=processor_factory,
+        # The reviewer is always shown the plain base task text (no build-
+        # station skill appendix) -- current_base_task_text falls back to
+        # current_task_text only for a progress event recorded before this
+        # field existed.
+        base_task_text = str(progress.get("current_base_task_text",
+                                          progress.get("current_task_text", "")))
+        current_task_id = str(progress.get("current_task_id", ""))
+        fixing = bool(progress.get("fixing"))
+        if fixing:
+            all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
+            task_obj: Task | None = Task(id=current_task_id, title="수락 실패 수정", detail="",
+                                         owns=all_owns, depends_on=())
+        else:
+            by_id = {t.id: t for t in plan.tasks}
+            task_obj = by_id.get(current_task_id)
+            if task_obj is None:
+                raise FullOrbitError(f"unknown task id for resume: {current_task_id!r}")
+
+        run_config = config
+        if progress.get("stop_reason") == "worker_stuck":
+            # run_station itself stopped (engine.orbit's own continuation
+            # limit, see CONTINUABLE_REASONS/MAX_STATION_CONTINUES) BEFORE
+            # the merge stage after it ever ran -- unlike a station's own
+            # pending owner-request stop (the case stages_after_install's
+            # own docstring describes, where merge already landed the
+            # worker's edits), there is nothing merged yet to resume
+            # reviewing. Rerun this task's build from scratch -- continue_n
+            # reset, since this is a fresh run_station request, not a
+            # continuation of the exhausted one -- on the SAME attempt/copy,
+            # then merge, then review onward.
+            task_text = str(progress.get("current_task_text", base_task_text))
+            run_config = _config_for_build_task(config, job_name, plan)
+            build_copy = str(copy_root(run_config, attempt_id, BUILDER_ROLE))
+            resume_stages = [
+                orbit.Stage("run_station", _builder_run_station_payload(
+                    task_obj, task_text, plan, run_config, job_name)),
+                orbit.Stage("merge", {"copies": [
+                    {"role": BUILDER_ROLE, "station": "build", "path": build_copy},
+                ]}),
+                *orbit.stages_after_install(config, attempt_id, BUILDER_ROLE,
+                                            REVIEWER_ROLE, job_name, base_task_text),
+            ]
+        else:
+            resume_stages = orbit.stages_after_install(config, attempt_id, BUILDER_ROLE,
+                                                        REVIEWER_ROLE, job_name, base_task_text)
+        outcome = orbit.continue_job(run_config, ledger, _fakes_for(fakes, attempt_id), project,
+                                     attempt_id, resume_stages, processor_factory=processor_factory,
                                      on_progress=on_progress)
         if outcome.status != "done" or outcome.pending_requests:
             full = _station_outcome_to_full(outcome, "build")
@@ -562,5 +748,6 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
 
 __all__ = [
     "FullOutcome", "FullOrbitError", "run_full_job", "continue_full_job",
-    "FACTS_ROLE", "PLANNER_ROLE", "DESIGNER_ROLE", "BUILDER_ROLE", "REVIEWER_ROLE",
+    "FACTS_ROLE", "PROBER_ROLE", "PLANNER_ROLE", "DESIGNER_ROLE", "BUILDER_ROLE",
+    "REVIEWER_ROLE",
 ]

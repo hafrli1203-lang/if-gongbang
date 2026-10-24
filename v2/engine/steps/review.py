@@ -77,6 +77,7 @@ import subprocess
 from pathlib import Path
 
 from engine import evidence, fixup, ids, procs, sandbox
+from engine.config import McpServerConfig
 from engine.gitutil import git_argv
 from engine.ledger import Event
 from engine.processor import StepContext, StepDef, StepFailed
@@ -292,6 +293,32 @@ def _prepare_diff_for_prompt(full_diff: str) -> tuple[str, str]:
     return labeled, coverage
 
 
+def _payload_mcp_names(payload: dict[str, object]) -> tuple[str, ...]:
+    """The "mcp" list of this request's optional "tools" payload entry
+    (engine.plan.tools_for_station's shape -- same contract as
+    engine.steps.station's own helper of the same name). () for a
+    payload that carries no "tools" key, including orbit.default_
+    stages()/stages_after_install()'s own review payload today."""
+    tools = payload.get("tools")
+    if not isinstance(tools, dict):
+        return ()
+    raw = tools.get("mcp", [])
+    if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+        raise StepFailed("invalid_tools_mcp")
+    return tuple(raw)
+
+
+def _allowed_mcp_servers(ctx: StepContext) -> dict[str, McpServerConfig]:
+    """This request's payload "mcp" names, narrowed to BOTH
+    config.station_mcp_allow["review"] and config.mcp_servers -- same
+    narrowing engine.steps.station._allowed_mcp_servers applies for a
+    run_station request."""
+    requested = set(_payload_mcp_names(ctx.request.payload))
+    station_allow = set(ctx.config.station_mcp_allow.get("review", ()))
+    names = sorted(requested & station_allow & set(ctx.config.mcp_servers))
+    return {name: ctx.config.mcp_servers[name] for name in names}
+
+
 def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     role = str(ctx.request.payload["role"])
     # The ORIGINAL request text the builder was given -- "" for a
@@ -337,6 +364,7 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
         station="review", role=role, copy_root=snapshot, workdir=snapshot,
         task="", result_path=_result_path(ctx), config_path=ctx.config.config_path,
         env_passthrough=ctx.config.worker_env_passthrough,
+        mcp_servers=_allowed_mcp_servers(ctx),
     )
     changed_files = _changed_files(ctx, fp)
     diff_text, coverage_sent = _prepare_diff_for_prompt(_diff_text(ctx, fp))

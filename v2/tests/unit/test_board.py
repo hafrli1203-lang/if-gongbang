@@ -44,8 +44,8 @@ def test_load_app_board_builds_job_rows_with_status_stage_cost(tmp_path):
                  "changed_paths": [], "requests": []},
     ))
     ledger.append(Event(
-        project=project, kind="report.written", actor_kind="processor",
-        actor_id="processor", attempt_id="job-1.1", payload={},
+        project=project, kind="job.handoff_written", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1", payload={"job": "add-login"},
     ))
     ledger.close()
 
@@ -58,6 +58,29 @@ def test_load_app_board_builds_job_rows_with_status_stage_cost(tmp_path):
     assert job.status == "완료"
     assert job.stage == "build"
     assert job.cost_usd == pytest.approx(1.25)
+
+
+def test_a_per_attempt_report_written_alone_does_not_mark_the_job_완료(tmp_path):
+    """engine.steps.report.write_report appends a generic 'report.written'
+    event for EVERY attempt's own "report" stage -- facts/plan/design
+    and each build task each open their own attempt and each get one.
+    Only engine.handoff.write_handoff's own 'job.handoff_written' event
+    (appended once, for the whole job) may mark 완료; a per-task
+    report.written with no matching handoff event must leave the job
+    reading as still in progress."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="report.written", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1", payload={},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "진행 중"
 
 
 def test_load_app_board_needs_owner_status(tmp_path):
@@ -174,3 +197,22 @@ def test_build_board_reads_lessons_and_queue_when_present(tmp_path):
     )
     assert "배포 실패 원인" in page
     assert "WORK_QUEUE" in page
+
+
+def test_load_app_board_works_when_ledger_path_contains_a_question_mark(tmp_path):
+    """Path.as_posix() does not percent-encode a sqlite URI's reserved
+    characters -- a ledger path containing '?' would otherwise either
+    inject an extra (bogus) URI query parameter after 'mode=ro' or
+    fail to open outright. Path.as_uri() percent-encodes it correctly."""
+    project = "alpha"
+    odd_dir = tmp_path / "weird?dir"
+    odd_dir.mkdir()
+    ledger_path = odd_dir / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.error is None
+    assert len(board.jobs) == 1

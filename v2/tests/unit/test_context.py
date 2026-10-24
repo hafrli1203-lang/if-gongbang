@@ -20,10 +20,13 @@ class _StubConfig:
 
 
 def _library_mcp_config(*, lessons_app: dict[str, str] | None = None,
-                        crash: bool = False) -> ContextConfig:
+                        crash: bool = False, flag: str | None = None,
+                        timeout_sec: float = 5.0) -> ContextConfig:
     argv = (sys.executable, _FAKE_SERVER) + (("--crash-after-init",) if crash else ())
+    if flag:
+        argv = argv + (flag,)
     return ContextConfig(
-        library_mcp=LibraryMcpConfig(command=argv, timeout_sec=5.0),
+        library_mcp=LibraryMcpConfig(command=argv, timeout_sec=timeout_sec),
         lessons_app=lessons_app or {},
     )
 
@@ -63,6 +66,33 @@ def test_gather_client_failure_sets_failed_true_and_does_not_raise() -> None:
     config = _StubConfig(_library_mcp_config(crash=True))
     ctx = gather(config, "alpha", "facts", "질문")
     assert ctx.failed is True
+
+
+def test_gather_server_hang_times_out_and_sets_failed_true() -> None:
+    """A server that accepts a tools/call request but never answers it
+    must not hang gather() forever -- the client enforces its own
+    configured timeout_sec and reports McpClientError/failed=True,
+    same as a crash."""
+    import time
+
+    config = _StubConfig(_library_mcp_config(flag="--hang-on-call", timeout_sec=1.0))
+    started = time.monotonic()
+    ctx = gather(config, "alpha", "facts", "질문")
+    elapsed = time.monotonic() - started
+    assert ctx.failed is True
+    assert elapsed < 10.0  # well under the fake server's own 3600s sleep
+
+
+def test_gather_skips_notification_sent_before_the_real_reply() -> None:
+    """A server that writes an id-less notification before the real
+    tools/call reply must not have that notification mistaken for the
+    reply -- the client only accepts a message whose id matches the
+    request it is waiting on."""
+    config = _StubConfig(_library_mcp_config(flag="--notify-before-reply"))
+    ctx = gather(config, "alpha", "facts", "재주문 기준이 뭐야")
+    assert not ctx.failed
+    titles = [i.title for i in ctx.items]
+    assert "안경원 재주문 기준" in titles
 
 
 def test_decision_item_included_when_path_configured(tmp_path: Path) -> None:

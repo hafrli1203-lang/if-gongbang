@@ -55,7 +55,7 @@ import stat
 from pathlib import Path
 
 from engine import ids, procs, sandbox
-from engine.config import to_json_dict
+from engine.config import McpServerConfig, to_json_dict
 from engine.ledger import Event, LedgerError
 from engine.policy import ProjectFacts, _owns_within_prefixes
 from engine.processor import StepContext, StepDef, StepFailed
@@ -213,7 +213,37 @@ def _task_owns(ctx: StepContext) -> tuple[str, ...] | None:
     return tuple(raw)
 
 
-def _build_project_facts(ctx: StepContext, owns: tuple[str, ...] | None = None) -> ProjectFacts:
+def _payload_mcp_names(payload: dict[str, object]) -> tuple[str, ...]:
+    """The "mcp" list of this request's optional "tools" payload entry
+    (engine.plan.tools_for_station's shape: {"skill": [...], "mcp":
+    [...]}) -- () for a payload that carries no "tools" key at all
+    (every caller that predates this field)."""
+    tools = payload.get("tools")
+    if not isinstance(tools, dict):
+        return ()
+    raw = tools.get("mcp", [])
+    if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+        raise StepFailed("invalid_tools_mcp")
+    return tuple(raw)
+
+
+def _allowed_mcp_servers(ctx: StepContext, station: str) -> dict[str, McpServerConfig]:
+    """This request's payload "mcp" names, narrowed to BOTH
+    config.station_mcp_allow[station] (the project-wide upper bound a
+    plan's own tool table can never widen past) AND config.mcp_servers
+    (a name the operator never configured launch info for is dropped,
+    not trusted). The SAME narrowing engine.policy._decide_mcp repeats
+    independently from gate_facts.json's "mcp_allow" -- this result
+    only controls what the worker CLI is launched *able* to call; the
+    gate is what actually blocks an unlisted one at tool-call time."""
+    requested = set(_payload_mcp_names(ctx.request.payload))
+    station_allow = set(ctx.config.station_mcp_allow.get(station, ()))
+    names = sorted(requested & station_allow & set(ctx.config.mcp_servers))
+    return {name: ctx.config.mcp_servers[name] for name in names}
+
+
+def _build_project_facts(ctx: StepContext, owns: tuple[str, ...] | None = None,
+                         mcp_allow: tuple[str, ...] = ()) -> ProjectFacts:
     """A ProjectFacts snapshot taken HERE (the engine process, real
     ledger access) for the gate hook (no ledger access at all, see
     engine.gate's module docstring) to decide with instead."""
@@ -227,7 +257,7 @@ def _build_project_facts(ctx: StepContext, owns: tuple[str, ...] | None = None) 
     return ProjectFacts(
         project=ctx.project, registered=True, state=row.state,
         generation=row.generation, attempt_id=row.current_attempt_id,
-        attempt_active=attempt_active, owns=owns,
+        attempt_active=attempt_active, owns=owns, mcp_allow=mcp_allow,
     )
 
 
@@ -252,7 +282,9 @@ def _write_gate_facts(ctx: StepContext) -> None:
     Serializing the resolved, absolute-path config instead means the
     copy means the same thing regardless of which directory it is
     loaded from."""
-    facts = _build_project_facts(ctx, owns=_task_owns(ctx))
+    station = str(ctx.request.payload["station"])
+    mcp_allow = tuple(sorted(_allowed_mcp_servers(ctx, station)))
+    facts = _build_project_facts(ctx, owns=_task_owns(ctx), mcp_allow=mcp_allow)
     gate_ro = _mkdir_chain_no_symlink(
         ctx.config.home, "jobs", ids.attempt_dirname(ctx.attempt_id),
         "gate-ro", ctx.request.request_id,
@@ -262,6 +294,7 @@ def _write_gate_facts(ctx: StepContext) -> None:
         "state": facts.state, "generation": facts.generation,
         "attempt_id": facts.attempt_id, "attempt_active": facts.attempt_active,
         "owns": (list(facts.owns) if facts.owns is not None else None),
+        "mcp_allow": list(facts.mcp_allow),
     }).encode("utf-8")
     _write_new_file_no_symlink(gate_ro / "gate_facts.json", data, allow_replace_plain=True)
     if ctx.config.config_path is not None:
@@ -333,6 +366,7 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
         gate_facts_path=(_gate_facts_path(ctx) if runner.needs_gate else None),
         gate_log_path=(_gate_log_path(ctx) if runner.needs_gate else None),
         gate_config_path=(_gate_config_copy_path(ctx) if runner.needs_gate else None),
+        mcp_servers=_allowed_mcp_servers(ctx, station),
     )
     test_cmd = ctx.config.projects[ctx.project].test_cmd
     full_task = build_prompt(base_spec, prefixes, patterns, test_cmd)

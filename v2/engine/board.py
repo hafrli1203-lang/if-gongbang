@@ -86,7 +86,11 @@ class AppBoard:
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection:
-    uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+    # Path.as_uri() percent-encodes the path itself (spaces, '?', '#',
+    # '%', ...) -- as_posix() does not, so a ledger path containing any
+    # of those characters could otherwise inject extra sqlite URI query
+    # parameters or simply fail to open.
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
     return sqlite3.connect(uri, uri=True)
 
 
@@ -196,23 +200,29 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
     ledger row). Rule, in priority order:
     1. the LAST full_orbit.progress event's stage starts with
        "awaiting_" -> 사람 확인 대기 (owner input needed).
-    2. a report.written event exists for one of this job's attempts ->
-       완료.
+    2. a job.handoff_written event exists for one of this job's
+       attempts -> 완료. This is deliberately NOT 'report.written':
+       every attempt's own "report" stage appends that generic event
+       (facts/plan/design/each build task each open their own attempt),
+       so keying off it marked a job 완료 as soon as its very first
+       task's report stage ran, even with many tasks still left --
+       job.handoff_written (engine.handoff.write_handoff) is the one
+       event for the WHOLE job's own final handoff, appended once.
     3. the latest attempt's own status is abandoned/interrupted -> 중단.
     4. otherwise -> 진행 중.
     """
     last_progress_stage: str | None = None
-    has_report = False
+    has_handoff = False
     for event in job_events:
         if event.kind == "full_orbit.progress":
             stage = event.payload.get("stage")
             if isinstance(stage, str):
                 last_progress_stage = stage
-        elif event.kind == "report.written":
-            has_report = True
+        elif event.kind == "job.handoff_written":
+            has_handoff = True
     if last_progress_stage and last_progress_stage.startswith(_AWAITING_PREFIX):
         return "사람 확인 대기"
-    if has_report:
+    if has_handoff:
         return "완료"
     if latest_attempt is not None and latest_attempt.status in ("abandoned", "interrupted"):
         return "중단"

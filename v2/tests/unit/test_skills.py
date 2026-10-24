@@ -43,3 +43,30 @@ def test_missing_skill_returns_none_body(tmp_path: Path) -> None:
 def test_missing_root_does_not_raise(tmp_path: Path) -> None:
     result = load_skill((str(tmp_path / "nope"),), "아무거나")
     assert result.body is None
+
+
+def test_symlinked_skill_md_escaping_root_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    _write_skill(outside, None, "비밀", "root 밖의 비밀 내용")
+    skill_dir = root / "탈출"
+    skill_dir.mkdir(parents=True)
+    # SKILL.md itself is a symlink pointing outside the root.
+    (skill_dir / "SKILL.md").symlink_to(outside / "비밀" / "SKILL.md")
+    result = load_skill((str(root),), "탈출")
+    assert result.body is None
+    assert result.path is None
+
+
+def test_symlinked_category_dir_escaping_root_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    _write_skill(outside, None, "숨은-스킬", "밖에 있다")
+    # A whole category directory under root is itself a symlink to
+    # somewhere outside root -- the ancestor-escape case, not just the
+    # SKILL.md file itself.
+    (root / "카테고리").symlink_to(outside)
+    result = load_skill((str(root),), "숨은-스킬")
+    assert result.body is None
+    assert result.path is None

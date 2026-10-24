@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from engine.skills import skill_path_in_root
+
 if TYPE_CHECKING:
     from engine.config import EngineConfig
 
@@ -354,7 +356,10 @@ def _available_skill_names(config: "EngineConfig") -> set[str]:
     for root in _skill_roots(config):
         base = Path(root).expanduser()
         for pattern in ("*/SKILL.md", "*/*/SKILL.md"):
-            names |= {p.parent.name for p in base.glob(pattern)}
+            names |= {
+                p.parent.name for p in base.glob(pattern)
+                if skill_path_in_root(base, p) is not None
+            }
     return names
 
 
@@ -382,7 +387,10 @@ def skill_catalog_text(config: "EngineConfig") -> str:
     parts: list[str] = []
     core: list[str] = []
     for root in _skill_roots(config):
-        for md in sorted(Path(root).expanduser().glob("*/SKILL.md")):
+        base = Path(root).expanduser()
+        for md in sorted(base.glob("*/SKILL.md")):
+            if skill_path_in_root(base, md) is None:
+                continue
             core.append(f"- {md.parent.name}: {_frontmatter_description(md)}")
     if core:
         parts.append("### 바로 쓰는 스킬\n" + "\n".join(core))

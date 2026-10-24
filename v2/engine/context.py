@@ -24,7 +24,9 @@ already holds it, same as every other engine.full_orbit call)."""
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -148,7 +150,11 @@ class _StdioMcpClient:
         except OSError as exc:
             raise McpClientError(f"spawn failed: {exc}") from exc
         self._next_id = 1
-        self._initialize()
+        try:
+            self._initialize()
+        except McpClientError:
+            self._kill()
+            raise
 
     def _send(self, message: dict[str, object]) -> None:
         if self._proc.stdin is None:
@@ -159,10 +165,45 @@ class _StdioMcpClient:
         except (BrokenPipeError, OSError) as exc:
             raise McpClientError(f"write failed: {exc}") from exc
 
-    def _read_response(self) -> dict[str, object]:
+    def _read_line_with_timeout(self) -> str:
+        """Reads one line off stdout, bounded by `self._timeout` --
+        `readline()` on a pipe blocks indefinitely on its own, so a
+        stuck/slow server would otherwise hang gather()/build() forever.
+        Read happens on a daemon thread; if it has not produced a line
+        within the timeout, the server process is killed and a
+        McpClientError raised. The reader thread itself is left to exit
+        on its own once the killed process's stdout closes (its result,
+        if any, is simply never collected)."""
         if self._proc.stdout is None:
             raise McpClientError("no stdout")
-        line = self._proc.stdout.readline()
+        result: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+        def _reader() -> None:
+            try:
+                result.put(self._proc.stdout.readline())
+            except (OSError, ValueError):
+                result.put("")
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        thread.join(self._timeout)
+        if thread.is_alive():
+            self._kill()
+            raise McpClientError(f"stdio MCP server timed out after {self._timeout}s")
+        return result.get()
+
+    def _kill(self) -> None:
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=self._timeout)
+        except Exception:
+            pass
+
+    def _read_message(self) -> dict[str, object]:
+        line = self._read_line_with_timeout()
         if not line:
             raise McpClientError("stdio MCP server closed stdout")
         try:
@@ -171,17 +212,24 @@ class _StdioMcpClient:
             raise McpClientError(f"bad json from stdio MCP server: {exc}") from exc
         if not isinstance(message, dict):
             raise McpClientError("stdio MCP server response was not an object")
-        if "error" in message:
-            raise McpClientError(f"stdio MCP server error: {message['error']!r}")
         return message
 
     def _request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        """Sends one JSON-RPC request and reads messages until one with
+        a matching `id` arrives. A message without a matching id (e.g.
+        a server notification sent ahead of the real reply) is not the
+        reply and is skipped rather than mistaken for it."""
         request_id = self._next_id
         self._next_id += 1
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        response = self._read_response()
-        result = response.get("result")
-        return result if isinstance(result, dict) else {}
+        while True:
+            message = self._read_message()
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise McpClientError(f"stdio MCP server error: {message['error']!r}")
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
 
     def _initialize(self) -> None:
         self._request("initialize", {

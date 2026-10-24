@@ -14,17 +14,41 @@ def facts_prompt(request: str, job: str) -> str:
     return (
         f"요청: {request}\n\n"
         f".gongbang/{job}/facts.md 를 쓴다. 이 요청을 실행하는 데 필요한 "
-        "사실(기준·숫자·외부 API 형식 등)을 주장별로 나열하고, 각 주장에 "
-        "「통과」(확인됨, 출처 있음) 또는 「확인 필요」를 표시한다. 「통과」 "
-        "항목은 반드시 같은 줄에 출처(파일:줄, 문서, 실행 로그)를 적는다. "
-        "코드에 그대로 넣을 숫자·기준·API 형식이 있으면 "
-        "「코드에 넣는 값」이라는 제목의 절에 모은다 — 그 절에 확인 필요가 "
-        "남아 있으면 이 일은 다음 단계로 넘어가지 못한다. 모르는 값은 "
-        "지어내지 말고 확인 필요로 남긴다."
+        "사실(기준·숫자·외부 API 형식 등)을 표로 적는다: "
+        "| 주장 | 판정(통과/확인 필요/탈락) | 출처 |. 「통과」 행은 반드시 "
+        "출처(파일:줄, 문서 URL, 실행 로그)를 같은 행의 출처 칸에 적는다 — "
+        "출처 없는 「통과」는 없다. 코드에 그대로 넣을 숫자·기준·API 형식이 "
+        "있으면 「코드에 넣는 값」이라는 제목의 절에 모은다 — 그 절에 확인 "
+        "필요가 남아 있으면 이 일은 다음 단계로 넘어가지 못한다. 모르는 값은 "
+        "지어내지 말고 확인 필요로 남긴다.\n\n"
+        "마지막으로 \"## 외부 대상\" 절을 쓴다 — 이 일이 의존하는 외부 "
+        "API·CLI·파일 형식을 모두 한 줄씩 \"- <이름>: <공식 문서 URL>\" "
+        "형태로 적는다(probe 단계는 이 절만 보고 무엇을 실제로 호출해 "
+        "볼지 정한다). 의존하는 외부 대상이 없으면 그 절 아래에 "
+        "\"(없음)\"이라고만 적는다."
     )
 
 
-def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = "") -> str:
+def prober_prompt(request: str, job: str, targets: tuple[tuple[str, str], ...]) -> str:
+    targets_text = "\n".join(f"- {name}: {url}" for name, url in targets)
+    return (
+        f"요청: {request}\n\n"
+        "이 일이 의존하는 외부 대상(API·CLI·파일 형식)마다 공식 문서를 "
+        "열고 실제로 한 번 호출해 본다. 대상:\n"
+        f"{targets_text}\n\n"
+        f"대상마다 .gongbang/{job}/probe/<이름>.py (또는 .sh, .ts)에 "
+        "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. 그다음 "
+        f".gongbang/{job}/probe/<이름>.log 를 쓴다 -- 첫 줄은 그 대상의 "
+        "공식 문서 URL이고, 성공하면 \"PROBE OK\", 실패하면 \"PROBE "
+        "FAIL\"과 에러 내용을 적은 뒤 실제 요청·응답 형태도 남긴다. "
+        "재사용할 어댑터는 만들지 않는다 -- 호출이 되는지 확인하는 "
+        "스크립트와 로그만 남긴다. 비밀값은 로그에 남기지 않는다."
+    )
+
+
+def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = "",
+                   probe_text: str = "") -> str:
+    probe_part = f"\n\n{probe_text}" if probe_text else ""
     tools_part = ""
     if tool_catalog:
         tools_part = (
@@ -38,7 +62,8 @@ def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = ""
         )
     return (
         f"요청: {request}\n\n"
-        f"사실확정 결과(.gongbang/{job}/facts.md):\n{facts_md}\n\n"
+        f"사실확정 결과(.gongbang/{job}/facts.md):\n{facts_md}"
+        f"{probe_part}\n\n"
         f".gongbang/{job}/plan.json 과, 필요하면 tests/scenes/ 아래 장면 "
         "스크립트를 쓴다. plan.json 스키마: "
         '{"goal": str, "ui": bool, '
@@ -61,22 +86,31 @@ def designer_prompt(request: str, job: str, plan_goal: str) -> str:
         f".gongbang/{job}/design/design.md 와 필요한 시안 파일을 쓴다. "
         "화면 구조·레이아웃·상태(빈 화면·로딩·오류 포함)를 글과 시안으로 "
         "보여준다. 이 시안은 사람이 보고 승인해야 다음 단계(구현)로 "
-        "넘어간다."
+        f"넘어간다. 만든 화면의 스크린샷은 .gongbang/{job}/screens/ 아래에 "
+        "저장한다."
     )
 
 
-def builder_task_text(task: Task, plan_goal: str) -> str:
+def builder_task_text(task: Task, plan_goal: str, job: str | None = None,
+                      ui: bool = False) -> str:
     owns_list = ", ".join(task.owns)
-    return (
+    text = (
         f"목표: {plan_goal}\n\n작업: {task.title}\n\n{task.detail}\n\n"
         f"이 작업에서 고칠 수 있는 경로는 다음뿐이다: {owns_list}. 이 범위 "
         "밖은 고치지 않는다. tests/scenes/ 는 쓰지 않는다(그 경로는 계획 "
         "단계가 이미 끝냈다)."
     )
+    if ui and job:
+        text += (
+            f"\n\n화면을 만들었으면 그 화면의 스크린샷을 .gongbang/{job}/"
+            "screens/ 아래에 저장한다."
+        )
+    return text
 
 
-def fix_task_text(task: Task, plan_goal: str, failing_scenes: tuple[str, ...]) -> str:
-    base = builder_task_text(task, plan_goal)
+def fix_task_text(task: Task, plan_goal: str, failing_scenes: tuple[str, ...],
+                  job: str | None = None, ui: bool = False) -> str:
+    base = builder_task_text(task, plan_goal, job, ui)
     scenes_list = ", ".join(failing_scenes)
     return (
         f"{base}\n\n수락 시험에서 다음 통과 장면이 실패했다: {scenes_list}. "
@@ -85,6 +119,6 @@ def fix_task_text(task: Task, plan_goal: str, failing_scenes: tuple[str, ...]) -
 
 
 __all__ = [
-    "facts_prompt", "planner_prompt", "designer_prompt", "builder_task_text",
-    "fix_task_text",
+    "facts_prompt", "prober_prompt", "planner_prompt", "designer_prompt",
+    "builder_task_text", "fix_task_text",
 ]

@@ -11,6 +11,15 @@ check_design_approved   True iff the ledger has a 'design.approved'
               event for this (project, job) -- appended by `gb2
               approve-design` after the owner has seen the designer
               station's own output and said yes.
+check_probe_targets  facts.md's optional "## 외부 대상" section ->
+              [(name, url), ...] -- the external APIs/CLIs/file formats
+              this job depends on, each with its own official-doc URL.
+              [] (no such section, or facts.md missing) means the probe
+              station is skipped entirely (engine.full_orbit).
+check_probe   [] iff every target in a check_probe_targets() list has
+              its own .gongbang/<job>/probe/<name>.log containing
+              "PROBE OK" -- a missing log or one without that marker is
+              a problem, never a crash.
 """
 from __future__ import annotations
 
@@ -22,6 +31,8 @@ _PASS_MARK = "통과"
 _NEEDS_CHECK_MARK = "확인 필요"
 _SOURCE_MARK = "출처"
 _CODE_VALUES_HEADER = "코드에 넣는 값"
+_PROBE_TARGETS_HEADER = "외부 대상"
+_PROBE_OK_MARK = "PROBE OK"
 
 
 def _facts_path(repo: Path, job: str) -> Path:
@@ -50,6 +61,29 @@ def _code_values_section(lines: list[str]) -> list[str]:
             break
     return lines[start:end]
 
+
+
+def _heading_section(lines: list[str], header_phrase: str) -> list[str]:
+    """Lines belonging to the first heading line containing
+    `header_phrase`, up to (not including) the next heading line, or
+    end of file. [] if no such heading exists. Same shape as
+    _code_values_section above, generalized by the phrase to look
+    for -- kept as its own function rather than a shared helper so a
+    future change to one section's own matching rule never silently
+    changes the other's."""
+    start = None
+    for i, line in enumerate(lines):
+        if _is_heading(line) and header_phrase in line:
+            start = i + 1
+            break
+    if start is None:
+        return []
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if _is_heading(lines[i]):
+            end = i
+            break
+    return lines[start:end]
 
 
 def _cells(line: str) -> list[str]:
@@ -117,4 +151,54 @@ def check_design_approved(ledger: Ledger, project: str, job: str) -> bool:
     return False
 
 
-__all__ = ["check_facts", "check_design_approved"]
+def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
+    """facts.md's optional "## 외부 대상" section, parsed line by line:
+    "- <name>: <공식 문서 URL>" -> (name, url), in the order they
+    appear, skipping any line that does not match that shape. []
+    (never raises) if facts.md does not exist, or has no such section
+    at all -- engine.full_orbit treats that as "this job touches no
+    external API/CLI/file format" and skips the probe station
+    entirely."""
+    path = _facts_path(repo, job)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    section = _heading_section(text.splitlines(), _PROBE_TARGETS_HEADER)
+    targets: list[tuple[str, str]] = []
+    for line in section:
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        body = stripped[1:].strip()
+        name, sep, url = body.partition(":")
+        name, url = name.strip(), url.strip()
+        if sep and name and url:
+            targets.append((name, url))
+    return targets
+
+
+def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[str]:
+    """[] iff every (name, url) in `targets` has its own
+    .gongbang/<job>/probe/<name>.log whose content contains "PROBE OK".
+    A missing log or one without that marker becomes a plain problem
+    string naming the target, never an exception -- engine.full_orbit
+    turns a non-empty result into a needs_owner stop
+    ("probe_failed:<names>"), not a crash."""
+    probe_dir = repo / ".gongbang" / job / "probe"
+    problems: list[str] = []
+    for name, _url in targets:
+        log_path = probe_dir / f"{name}.log"
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            problems.append(f"{name}: log missing")
+            continue
+        if _PROBE_OK_MARK not in text:
+            problems.append(f"{name}: {_PROBE_OK_MARK} not found")
+    return problems
+
+
+__all__ = [
+    "check_facts", "check_design_approved", "check_probe_targets", "check_probe",
+]

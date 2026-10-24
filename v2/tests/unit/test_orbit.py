@@ -707,6 +707,30 @@ def test_stalled_station_continues_on_same_copy(workspace: Workspace) -> None:
     assert "[이어서 하기 2]" in tasks_seen[2] and "[이어서 하기 1]" not in tasks_seen[2]
 
 
+def test_stalled_station_with_tampered_copy_config_fails_closed(workspace: Workspace) -> None:
+    """If the worker copy's .git/config no longer matches what open_job
+    recorded (e.g. a worker-run command planted a clean/smudge filter
+    right before stalling), the orbit must not build a continuation
+    payload that trusts a further git call against that copy -- same
+    integrity guard station._changed_paths applies. The job stops
+    "failed"/"copy_git_config_changed" instead of retrying."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "tampered",
+                          "full", ("builder",))
+    root = copy_root(workspace.config, attempt_id, "builder")
+    config_file = root / ".git" / "config"
+    config_file.write_text(config_file.read_text() + "\n[core]\n\tfsmonitor = evil\n")
+
+    tasks_seen: list[str] = []
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station", {"station": "build", "role": "builder", "task": "do it"})],
+        processor_factory=_stall_factory(1, tasks_seen),
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "copy_git_config_changed"
+    assert len(tasks_seen) == 1  # no continuation run was attempted
+
+
 def test_station_stuck_after_max_continues_asks_owner(workspace: Workspace) -> None:
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "stuck",
                           "full", ("builder",))
