@@ -1,0 +1,112 @@
+{
+  "ledger_path": "ledger.sqlite",
+  "home": "home",
+  "secrets_dir": "secrets",
+  "sandbox": "bwrap",
+  "approval_ttl_sec": 14400,
+  "parallel_review_bench": true,
+  "projects": {
+    "__APP__": {
+      "repo": "repo",
+      "excludes": [
+        "node_modules",
+        ".next",
+        "tsconfig.tsbuildinfo",
+        "dist",
+        "build",
+        ".env",
+        ".env.local"
+      ],
+      "copy_links": [
+        "node_modules"
+      ],
+      "test_cmd": [
+        "npx",
+        "vitest",
+        "run"
+      ],
+      "bench_scope": "related",
+      "related_cmd": [
+        "npx",
+        "vitest",
+        "related",
+        "--run",
+        "{files}"
+      ],
+      "test_timeout_sec": 600,
+      "manifest": "package.json",
+      "install_cmd": [
+        "npm",
+        "install",
+        "--no-audit",
+        "--no-fund"
+      ],
+      "bench_cases": "../bench_cases.json",
+      "copy_link_writable_subpaths": {
+        "node_modules": [
+          ".vite",
+          ".vite-temp",
+          ".cache"
+        ]
+      },
+      "release": null
+    }
+  },
+  "publisher": {
+    "kind": "shell",
+    "argv": ["__DEPLOY_SCRIPT__", "{target}"],
+    "dry_run_argv": ["__DEPLOY_SCRIPT__", "{target}", "--check"],
+    "dry_run": false
+  },
+  "station_owners": {
+    "build": {
+      "builder": [
+        "src/",
+        "tests/",
+        "docs/ai/"
+      ]
+    }
+  },
+  "station_terminal_allow": {
+    "build": {
+      "builder": [
+        "npx vitest run( [A-Za-z0-9_./\\[\\]-]+)*",
+        "npx vitest related --run( [A-Za-z0-9_./\\[\\]-]+)*",
+        "npx tsc --noEmit",
+        "npm run typecheck",
+        "npx eslint src( [A-Za-z0-9_./-]+)*",
+        "git status( --short)?",
+        "git diff( --stat)?( -- [A-Za-z0-9_./\\[\\]-]+)?",
+        "ls( -la?)?( [A-Za-z0-9_./\\[\\]-]+)?"
+      ]
+    }
+  },
+  "protected_paths": [
+    ".gitignore",
+    "package-lock.json",
+    ".env",
+    ".env.local",
+    "CLAUDE.md",
+    "AGENTS.md"
+  ],
+  "workers": {
+    "builder": {
+      "runner": "claude",
+      "model": "sonnet",
+      "max_turns": 60,
+      "budget_usd": 2.5,
+      "timeout_sec": 1500
+    },
+    "reviewer": {
+      "runner": "codex",
+      "max_turns": 40,
+      "budget_usd": 2.0,
+      "timeout_sec": 900,
+      "reasoning": "medium"
+    }
+  },
+  "bench_readonly_paths": [
+    "~/.cache/ms-playwright",
+    "~/.npm"
+  ]
+}

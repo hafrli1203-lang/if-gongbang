@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""gb2 -- a one-line launcher around the gongbang v2 engine
+(engine.cli/engine.orbit) for a single Node/Vitest app.
+
+    tools/gb2 init <app>                 create the engine workspace
+    tools/gb2 run <app> "<task>"         run one job end to end
+    tools/gb2 run <app> --task-file f    same, task text from a file
+    tools/gb2 status <app>               engine.cli status, as JSON
+    tools/gb2 log <app>                  last 5 jobs from this app's
+                                          own run log (not the ledger --
+                                          see _append_run_log)
+    tools/gb2 diff <app>                 git diff master...gb2/work
+    tools/gb2 ship <app>                 find the app's pending release
+                                          publish request, show its
+                                          summary, require the owner to
+                                          TYPE "승인 R-..." on a TTY, then
+                                          fast-forward master + deploy
+    tools/gb2 skip-ship <app>            abandon the pending release
+                                          publish (no deploy), finish
+                                          report -> close
+    tools/gb2 sync <app>                 rebase gb2/work onto the
+                                          current master (refuses if the
+                                          worktree is dirty)
+
+Everything here calls existing engine.* functions (engine.steps.open_job
+.open_job, engine.processor.submit, engine.orbit.continue_job,
+engine.cli.cmd_status) -- no new state transition, no bypass of
+processor.submit. The only new state this script keeps for itself is
+app_workspace(app)/"runs.json" (a small JSON array gb2 run appends one
+record to, consulted by gb2 log/status -- NOT part of the engine's own
+ledger, so no engine code needs to know about it).
+
+One engine workspace per app, under $GB2_WORKSPACE/apps/<app>/:
+  config.json   generated from tools/templates/node-vitest.json
+  ledger.sqlite, home/, secrets/   the engine's own state
+  bench_cases.json                 one negative-control case
+  repo/                            a git worktree of $GB2_APPS_ROOT/<app>,
+                                    branch "gb2/work" off "master" --
+                                    the ORIGINAL repo's own working
+                                    tree is never touched.
+
+Three environment variables locate everything outside this script's own
+workspace tree, so nothing here hardcodes a host path:
+  GB2_WORKSPACE      where this script keeps its own per-app workspaces
+                      (config.json, ledger, home/, runs.json, ...).
+                      Defaults to "~/.gongbang/workspace" if unset.
+  GB2_APPS_ROOT      the directory holding each app's own source repo
+                      (the one `init`/`diff`/`init --with-release` read
+                      from and worktree off of). Required for `init` and
+                      `diff`; every other subcommand only touches
+                      GB2_WORKSPACE and never needs it.
+  GB2_DEPLOY_SCRIPT  the deploy command a release-configured app's
+                      top-level `publisher` argv runs. Defaults to
+                      "<GB2_APPS_ROOT>/_shared/deploy.sh" if unset. Only
+                      read by `init` (baked into that app's config.json
+                      at that point, same as GB2_APPS_ROOT itself).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ENGINE_ROOT))
+
+from engine import evidence, orbit, release  # noqa: E402
+from engine.cli import _build_fakes, _job_name_for_attempt, _outcome_dict  # noqa: E402
+from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
+from engine.config import EngineConfig  # noqa: E402
+from engine.ledger import Ledger  # noqa: E402
+from engine.steps.open_job import open_job  # noqa: E402
+
+
+def _default_workspace_root() -> Path:
+    return Path.home() / ".gongbang" / "workspace"
+
+
+GB2_WORKSPACE = Path(os.environ.get("GB2_WORKSPACE", str(_default_workspace_root())))
+APPS_DIR = GB2_WORKSPACE / "apps"
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+WORKTREE_BRANCH = "gb2/work"
+WORKTREE_BASE = "master"
+
+
+def _apps_root() -> Path:
+    """The directory holding each app's own source repo -- read lazily
+    (only by the subcommands that actually need it: init, diff) rather
+    than resolved at import time, so importing this module, or running
+    a subcommand that only touches GB2_WORKSPACE, never requires
+    GB2_APPS_ROOT to be set."""
+    value = os.environ.get("GB2_APPS_ROOT")
+    if not value:
+        raise SystemExit(
+            "GB2_APPS_ROOT is not set -- export it to the directory that "
+            "holds each app's own source repo before running init/diff"
+        )
+    return Path(value)
+
+
+def _deploy_script_path(apps_root: Path) -> Path:
+    """GB2_DEPLOY_SCRIPT if set, else "<apps_root>/_shared/deploy.sh" --
+    read lazily (cmd_init only), same reasoning as _apps_root."""
+    value = os.environ.get("GB2_DEPLOY_SCRIPT")
+    return Path(value) if value else (apps_root / "_shared" / "deploy.sh")
+
+
+# A single safe path component: no "/", no leading "-" (would otherwise
+# be read as an option by something downstream), not "." or "..". An
+# app name is joined onto both APPS_DIR and GB2_APPS_ROOT without any
+# further escaping, so accepting anything else (a "/", an absolute-
+# looking value, "..") would let `gb2 init` be pointed at an arbitrary
+# path outside either root -- including, in the worst case, making the
+# computed workspace and source repo paths the same directory.
+_APP_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_app_name(app: str) -> None:
+    if app in (".", ".."):
+        raise ValueError(f"invalid app name: {app!r}")
+    if not _APP_NAME_RE.fullmatch(app) or app.startswith("-"):
+        raise ValueError(
+            f"invalid app name: {app!r} (must be a single path component "
+            "matching [A-Za-z0-9._-]+, not '.', '..', or start with '-')"
+        )
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+NEGATIVE_CONTROL_TEST = '''\
+// gb2 negative control -- fails only when GB2_NEGATIVE=1 is set, so the
+// normal suite stays green while the bench can still prove its grader
+// is not "always passes".
+import { describe, expect, it } from "vitest";
+
+describe("gb2 negative control", () => {
+  it.skipIf(!process.env.GB2_NEGATIVE)("fails on purpose when GB2_NEGATIVE is set", () => {
+    expect(1).toBe(2);
+  });
+});
+'''
+
+NEGATIVE_CONTROL_CASES = [
+    {"name": "gb2_negative_control", "selector": "tests/gb2-negative-control.test.ts",
+     "expect_fail": True, "expected_signature": "exit:1", "env": {"GB2_NEGATIVE": "1"}},
+]
+
+
+# --------------------------------------------------------------------
+# Pure helpers (unit-tested without touching git or the real filesystem
+# beyond a tmp_path).
+# --------------------------------------------------------------------
+
+def load_template(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def render_config(template: dict[str, object], app_name: str) -> dict[str, object]:
+    """Return `template` with its single "__APP__" project key renamed
+    to `app_name` -- the only per-app substitution the template needs;
+    every path inside a project entry ("repo", "bench_cases", ...) is
+    already relative to the app's own config.json and needs no further
+    rewriting. Raises ValueError if the template's shape does not match
+    (exactly one project, keyed "__APP__")."""
+    projects = template.get("projects")
+    if not isinstance(projects, dict) or list(projects.keys()) != ["__APP__"]:
+        raise ValueError("template must have exactly one project key '__APP__'")
+    rendered = dict(template)
+    rendered["projects"] = {app_name: projects["__APP__"]}
+    return rendered
+
+
+def substitute_deploy_script(config_dict: dict[str, object],
+                             deploy_script: Path) -> dict[str, object]:
+    """Replace the literal "__DEPLOY_SCRIPT__" placeholder the template
+    puts in the top-level publisher's argv/dry_run_argv entries with
+    the real deploy script path -- the one place a path outside this
+    app's own workspace needs filling in, so it is done here rather
+    than baked into the template as a host-specific string."""
+    publisher = config_dict.get("publisher")
+    if not isinstance(publisher, dict):
+        return config_dict
+    rendered = dict(config_dict)
+    rendered["publisher"] = {
+        **publisher,
+        **{
+            key: [str(part).replace("__DEPLOY_SCRIPT__", str(deploy_script))
+                  for part in publisher[key]]
+            for key in ("argv", "dry_run_argv") if key in publisher
+        },
+    }
+    return rendered
+
+
+def app_workspace(app: str) -> Path:
+    """GB2_WORKSPACE/apps/<app> -- raises ValueError for an app name
+    that is not a single safe path component, or that would somehow
+    still resolve outside APPS_DIR (defense in depth alongside
+    _validate_app_name's own charset check)."""
+    _validate_app_name(app)
+    workspace = (APPS_DIR / app).resolve()
+    if not _is_within(workspace, APPS_DIR.resolve()):
+        raise ValueError(f"app workspace escapes GB2_WORKSPACE/apps: {app!r}")
+    return workspace
+
+
+def _runs_log_path(app: str) -> Path:
+    return app_workspace(app) / "runs.json"
+
+
+def _read_run_log(app: str) -> list[dict[str, object]]:
+    path = _runs_log_path(app)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _append_run_log(app: str, record: dict[str, object]) -> None:
+    runs = _read_run_log(app)
+    runs.append(record)
+    _runs_log_path(app).write_text(
+        json.dumps(runs[-50:], ensure_ascii=False, indent=1), encoding="utf-8",
+    )
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    result = subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                            capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+# --------------------------------------------------------------------
+# init
+# --------------------------------------------------------------------
+
+def _verify_worktree_identity(source_repo: Path, repo_dir: Path) -> None:
+    """Raise ValueError unless `repo_dir` is ALREADY a worktree git
+    itself registers for `source_repo`, currently on WORKTREE_BRANCH --
+    an existing directory at that path must never be silently adopted
+    and used as if it were (it could be anything: a stale unrelated
+    checkout, a directory an app's own build left behind, ...)."""
+    repo_dir_real = str(repo_dir.resolve())
+    out = _git(["worktree", "list", "--porcelain"], cwd=source_repo)
+    for entry in out.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in entry.splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        wt_path = fields.get("worktree")
+        if not wt_path or str(Path(wt_path).resolve()) != repo_dir_real:
+            continue
+        branch_ref = fields.get("branch", "")
+        if branch_ref != f"refs/heads/{WORKTREE_BRANCH}":
+            raise ValueError(
+                f"{repo_dir} is a worktree of {source_repo} but on "
+                f"{branch_ref or '(detached)'!r}, not refs/heads/{WORKTREE_BRANCH}"
+            )
+        return
+    raise ValueError(f"{repo_dir} exists but is not a registered worktree of {source_repo}")
+
+
+def _ensure_worktree(source_repo: Path, repo_dir: Path) -> None:
+    existing_branches = _git(["branch", "--list", WORKTREE_BRANCH], cwd=source_repo)
+    if not existing_branches:
+        _git(["branch", WORKTREE_BRANCH, WORKTREE_BASE], cwd=source_repo)
+    if repo_dir.exists():
+        _verify_worktree_identity(source_repo, repo_dir)
+        return
+    _git(["worktree", "add", str(repo_dir), WORKTREE_BRANCH], cwd=source_repo)
+    source_node_modules = source_repo / "node_modules"
+    if source_node_modules.exists():
+        # copy, never link -- a worker's Bash runs inside this worktree
+        # and must never be able to write back into the source repo's
+        # own node_modules through a shared inode/symlink target.
+        subprocess.run(["cp", "-r", str(source_node_modules),
+                        str(repo_dir / "node_modules")], check=True)
+    neg_test = repo_dir / "tests" / "gb2-negative-control.test.ts"
+    if not neg_test.exists():
+        neg_test.parent.mkdir(parents=True, exist_ok=True)
+        neg_test.write_text(NEGATIVE_CONTROL_TEST, encoding="utf-8")
+        _git(["add", "tests/gb2-negative-control.test.ts"], cwd=repo_dir)
+        _git(["-c", "user.name=gb2", "-c", "user.email=gb2@local",
+             "commit", "-q", "-m", "test: gb2 negative control"], cwd=repo_dir)
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    _validate_app_name(args.app)  # app_workspace() below re-checks too
+    source_repo = (_apps_root() / args.app).resolve()
+    workspace = app_workspace(args.app)
+    if source_repo == workspace or _is_within(workspace, source_repo) \
+            or _is_within(source_repo, workspace):
+        return _err_json(
+            f"workspace {workspace} and source repo {source_repo} must not "
+            "coincide or nest -- check GB2_WORKSPACE/GB2_APPS_ROOT", 1,
+        )
+    if not (source_repo / "package.json").exists():
+        return _err_json(f"no package.json under {source_repo}", 1)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "home").mkdir(exist_ok=True)
+    (workspace / "secrets").mkdir(exist_ok=True)
+
+    template = load_template(TEMPLATES_DIR / "node-vitest.json")
+    config_dict = render_config(template, args.app)
+    config_dict = substitute_deploy_script(config_dict, _deploy_script_path(_apps_root()))
+    if args.with_release:
+        # The real original repo (never the gb2/work worktree) is the
+        # fast-forward target -- `engine.release`'s advance_master step
+        # merges this project's own repo's HEAD into it. `target` is
+        # the deploy name the top-level `publisher` argv's "{target}"
+        # substitutes in.
+        config_dict["projects"][args.app]["release"] = {
+            "master_repo": str(source_repo), "target": args.app,
+        }
+    # The source repo holds the app's real environment files; code the
+    # workers or the tests run must never see it, only the worktree.
+    config_dict["projects"][args.app]["hidden_paths"] = [str(source_repo.resolve())]
+    config_path = workspace / "config.json"
+    config_path.write_text(json.dumps(config_dict, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+
+    bench_cases_path = workspace / "bench_cases.json"
+    if not bench_cases_path.exists():
+        bench_cases_path.write_text(
+            json.dumps(NEGATIVE_CONTROL_CASES, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+
+    _ensure_worktree(source_repo, workspace / "repo")
+
+    config = EngineConfig.from_json(config_path)
+    ledger = Ledger.open(config.ledger_path) if config.ledger_path.exists() \
+        else Ledger.create(config.ledger_path)
+    try:
+        for name in config.projects:
+            ledger.register_project(name)
+    finally:
+        ledger.close()
+
+    print(json.dumps({"ok": True, "app": args.app, "workspace": str(workspace)},
+                     ensure_ascii=False))
+    return 0
+
+
+# --------------------------------------------------------------------
+# run
+# --------------------------------------------------------------------
+
+def _findings_by_severity(findings: list[object]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        if isinstance(finding, dict):
+            severity = str(finding.get("severity", "?"))
+            counts[severity] = counts.get(severity, 0) + 1
+    return counts
+
+
+def _summarize(config: EngineConfig, ledger: Ledger, app: str, attempt_id: str,
+               outcome: orbit.JobOutcome, wall_sec: float) -> dict[str, object]:
+    project = config.projects[app]
+    review = evidence.latest(ledger, attempt_id, "review")
+    bench_row = evidence.latest(ledger, attempt_id, "bench")
+    findings = []
+    if review is not None:
+        findings = review.payload.get("findings", [])
+    commit_hash = None
+    try:
+        commit_hash = _git(["rev-parse", "HEAD"], cwd=project.repo)
+    except subprocess.CalledProcessError:
+        pass
+    changed_files: list[str] = []
+    try:
+        base_head = None
+        for _seq, event in ledger.events(app, "job.opened"):
+            if event.payload.get("attempt_id") == attempt_id:
+                base_head = event.payload.get("base_head")
+                break
+        if base_head and commit_hash and base_head != commit_hash:
+            out = _git(["diff", "--name-only", f"{base_head}..{commit_hash}"],
+                       cwd=project.repo)
+            changed_files = [line for line in out.splitlines() if line]
+    except subprocess.CalledProcessError:
+        pass
+    cost_usd = 0.0
+    for _seq, event in ledger.events(app, "station.finished"):
+        if event.attempt_id == attempt_id:
+            cost = event.payload.get("cost_usd")
+            if isinstance(cost, (int, float)):
+                cost_usd += float(cost)
+    return {
+        "app": app, "attempt_id": attempt_id, "status": outcome.status,
+        "reason": outcome.reason, "commit": commit_hash,
+        "changed_files": changed_files, "cost_usd": round(cost_usd, 4),
+        "minutes": round(wall_sec / 60.0, 2),
+        "findings_by_severity": _findings_by_severity(findings),
+        "bench_scope": (bench_row.payload.get("scope") if bench_row else None),
+        "bench_passed": (bench_row.payload.get("passed") if bench_row else None),
+    }
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
+             file=sys.stderr)
+        return 1
+    if args.task_file:
+        task = Path(args.task_file).read_text(encoding="utf-8")
+    elif args.task:
+        task = args.task
+    else:
+        print(json.dumps({"error": "--task or --task-file required"}), file=sys.stderr)
+        return 1
+
+    config = EngineConfig.from_json(config_path)
+    job_name = args.job_name or f"gb2-{int(time.time())}"
+    ledger = Ledger.open(config.ledger_path)
+    start = time.monotonic()
+    try:
+        attempt_id = open_job(config, ledger, args.app, job_name, "full",
+                              ("builder", "reviewer"))
+        fakes = _build_fakes(config, args.app, attempt_id, None)
+        stages = orbit.default_stages(config, attempt_id, "builder", "reviewer",
+                                      task, job_name)
+
+        def _progress(kind: str) -> None:
+            print(f"[{kind}] done", file=sys.stderr)
+
+        # The FULL stage list in one continue_job call -- driving it one
+        # growing prefix at a time (one stage, then the first two, ...)
+        # would start a brand-new Processor on every call, so a review
+        # stage already finished to "done" in an earlier call could
+        # never be adjacent to bench in a later call's stage list for
+        # config.parallel_review_bench's overlap to actually happen.
+        outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id,
+                                     stages, on_progress=_progress)
+        wall_sec = time.monotonic() - start
+        summary = _summarize(config, ledger, args.app, attempt_id, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    if summary["status"] == "done":
+        return 0
+    if summary["status"] == "needs_owner":
+        return 2
+    return 3
+
+
+# --------------------------------------------------------------------
+# status / log / diff
+# --------------------------------------------------------------------
+
+def cmd_status(args: argparse.Namespace) -> int:
+    config = EngineConfig.from_json(app_workspace(args.app) / "config.json")
+    return _engine_cmd_status(config, argparse.Namespace(project=args.app))
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    runs = _read_run_log(args.app)[-5:]
+    print(json.dumps({"runs": runs}, ensure_ascii=False, indent=1))
+    return 0
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    source_repo = _apps_root() / args.app
+    stat = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}", "--stat"], cwd=source_repo)
+    full = _git(["diff", f"{WORKTREE_BASE}...{WORKTREE_BRANCH}"], cwd=source_repo)
+    print(stat)
+    print(full)
+    return 0
+
+
+# --------------------------------------------------------------------
+# ship / skip-ship / sync (the release track: engine.release + the
+# orbit stop after commit, when a project has `release` configured)
+# --------------------------------------------------------------------
+
+def _find_pending_publish(ledger: Ledger, project: str) -> tuple[str, str, str, str] | None:
+    """(request_id, attempt_id, artifact_hash, target) of the queued
+    'publish' request a release-configured job's orbit run left behind
+    (JobOutcome status "needs_owner", reason "release_approval" --
+    engine.orbit._run_stages), or None if there is none right now."""
+    for row in ledger.queued_requests(project):
+        if row.kind == "publish":
+            return (row.request_id, row.attempt_id,
+                    str(row.payload.get("artifact_hash", "")),
+                    str(row.payload.get("target", "")))
+    return None
+
+
+def _err_json(message: str, code: int) -> int:
+    print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
+    return code
+
+
+def cmd_ship(args: argparse.Namespace) -> int:
+    """Show the pending publish request's summary (commits, diff paths,
+    target, sha, approval TTL), then require the owner to TYPE the
+    exact "승인 R-..." line on a TTY (never accepted non-interactively --
+    refused with exit 4 before anything is read from stdin). On a
+    correct line: engine.release.approve_and_run grants the approval
+    and drives the publish (fast-forward master + the configured
+    deploy) to a terminal status; only on "done" does this continue the
+    job with report -> close (orbit.release_followup_stages). A wrong
+    line, a non-TTY shell, or the publish ending anywhere but "done"
+    all leave the job's project OPEN with the request still resolved
+    (or, for a wrong line, still queued) for a later retry."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    config = EngineConfig.from_json(config_path)
+    project_config = config.projects[args.app]
+    if project_config.release is None:
+        return _err_json("release_not_configured", 1)
+
+    if not sys.stdin.isatty():
+        return _err_json("refused: non-interactive shell, ship requires a TTY", 4)
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        pending = _find_pending_publish(ledger, args.app)
+        if pending is None:
+            return _err_json("no_pending_publish_request", 1)
+        request_id, attempt_id, artifact_hash, target = pending
+
+        summary = release.build_summary(
+            project_config.repo, project_config.release.master_repo, artifact_hash, target,
+        )
+        print(json.dumps({
+            "request_id": request_id, "summary": summary,
+            "approval_ttl_sec": config.approval_ttl_sec,
+        }, ensure_ascii=False, indent=1, sort_keys=True), file=sys.stderr)
+
+        owner_text = input(f'type the approval line exactly ("승인 {request_id}"): ')
+        fakes = _build_fakes(config, args.app, attempt_id, None)
+        publish_outcome = release.approve_and_run(
+            config, ledger, fakes, args.app, request_id, owner_text,
+        )
+        if publish_outcome["status"] != "done":
+            print(json.dumps(publish_outcome, ensure_ascii=False))
+            return 3
+
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+        followup = orbit.release_followup_stages(job_name)
+        final_outcome = orbit.continue_job(
+            config, ledger, fakes, args.app, attempt_id, followup)
+    finally:
+        ledger.close()
+
+    receipt_path = config.home / "publish" / f"{request_id}.json"
+    print(json.dumps({
+        "publish": publish_outcome, "receipt_path": str(receipt_path),
+        **_outcome_dict(final_outcome),
+    }, ensure_ascii=False))
+    return 0 if final_outcome.status == "done" else 3
+
+
+def cmd_skip_ship(args: argparse.Namespace) -> int:
+    """Abandon the pending publish request without ever granting it an
+    approval (processing it with none queued simply fails it
+    "no_approval" -- the same check_approval step every publish request
+    goes through, not a separate code path) and finish the job with
+    report -> close."""
+    config_path = app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    config = EngineConfig.from_json(config_path)
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        pending = _find_pending_publish(ledger, args.app)
+        if pending is None:
+            return _err_json("no_pending_publish_request", 1)
+        request_id, attempt_id, _artifact_hash, _target = pending
+
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+        fakes = _build_fakes(config, args.app, attempt_id, None)
+        followup = orbit.release_followup_stages(job_name)
+        outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
+    finally:
+        ledger.close()
+    print(json.dumps({"skipped_request_id": request_id, **_outcome_dict(outcome)},
+                     ensure_ascii=False))
+    return 0 if outcome.status == "done" else 3
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Rebase the app worktree's gb2/work branch onto the current
+    master -- refuses (no rebase attempted) if the worktree has any
+    uncommitted change, tracked or untracked."""
+    repo_dir = app_workspace(args.app) / "repo"
+    if not repo_dir.exists():
+        return _err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    status = _git(["status", "--porcelain"], cwd=repo_dir)
+    if status:
+        return _err_json("worktree_dirty: commit or stash before sync", 1)
+    _git(["rebase", WORKTREE_BASE], cwd=repo_dir)
+    head = _git(["rev-parse", "HEAD"], cwd=repo_dir)
+    print(json.dumps({"ok": True, "app": args.app, "head": head}, ensure_ascii=False))
+    return 0
+
+
+_HANDLERS = {
+    "init": cmd_init, "run": cmd_run, "status": cmd_status,
+    "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
+    "skip-ship": cmd_skip_ship, "sync": cmd_sync,
+}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="gb2")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init")
+    p_init.add_argument("app")
+    p_init.add_argument("--with-release", action="store_true",
+                        help="turn on the release track: this app's "
+                             "publish requests target its own original "
+                             "repo (never its gb2/work worktree)")
+
+    p_run = sub.add_parser("run")
+    p_run.add_argument("app")
+    p_run.add_argument("task", nargs="?", default=None)
+    p_run.add_argument("--task-file", default=None)
+    p_run.add_argument("--job-name", default=None)
+
+    p_status = sub.add_parser("status")
+    p_status.add_argument("app")
+
+    p_log = sub.add_parser("log")
+    p_log.add_argument("app")
+
+    p_diff = sub.add_parser("diff")
+    p_diff.add_argument("app")
+
+    p_ship = sub.add_parser("ship")
+    p_ship.add_argument("app")
+
+    p_skip_ship = sub.add_parser("skip-ship")
+    p_skip_ship.add_argument("app")
+
+    p_sync = sub.add_parser("sync")
+    p_sync.add_argument("app")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _HANDLERS[args.command](args)
+    except FileNotFoundError as exc:
+        print(json.dumps({"error": f"not_found: {exc}"}), file=sys.stderr)
+        return 1
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

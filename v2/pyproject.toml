@@ -1,0 +1,12 @@
+[project]
+name = "gongbang-engine"
+version = "0.1.0"
+description = "IF gongbang v2 engine, stage 1 (private, under test)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not live'"
+markers = [
+    "live: calls real AI CLIs (claude, codex); run explicitly with -m live",
+]
