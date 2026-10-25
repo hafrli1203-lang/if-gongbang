@@ -70,10 +70,8 @@ call_publisher   re-verifies the artifact hash and the used approval's
                  not) -- "release" is only this project's opt-in to the
                  master_repo fast-forward dance, never a toggle for
                  whether a real deploy call needs the whole suite and
-                 this job's certificate to have passed first (codex-
-                 goal-review-4.md item 13 / codex-diff-review-s17.md
-                 "Whole-job verification is not a universal deployment
-                 invariant"). fakes.publisher.publish(key=request_id, target, hash)
+                 this job's certificate to have passed first.
+                 fakes.publisher.publish(key=request_id, target, hash)
                  on PublisherCrashed: request status -> unknown, stop
                  reconcile: the publisher's own receipt decides -- the
                  ONLY success is a receipt whose status is "done" AND
@@ -428,12 +426,10 @@ def _run_call_publisher(ctx: StepContext) -> dict[str, object]:
             raise StepFailed("master_not_clean")
 
     # Full bench + job certificate, UNCONDITIONALLY -- never only when
-    # release_config happens to be set (codex-goal-review-4.md item 13 /
-    # codex-diff-review-s17.md "Whole-job verification is not a universal
-    # deployment invariant", engine/steps/publish.py:407,545): a project
-    # with no `release` configured at all used to reach the real
-    # publisher call right above check_approval/check_artifact alone --
-    # "release" is this project's opt-in path to the master_repo
+    # release_config happens to be set: a project with no `release`
+    # configured at all must not reach the real publisher call via
+    # just check_approval/check_artifact alone -- "release" is this
+    # project's opt-in path to the master_repo
     # fast-forward dance (advance_master), never a toggle for whether a
     # real deploy needs the whole suite and this job's own acceptance/
     # app_security certificate to have passed first. Both

@@ -333,11 +333,11 @@ def wait_for_exit(pid: int, timeout_sec: float,
     confirmed gone (not is_alive), the real exit code is read from
     `exit_file` (engine.procs.spawn's own wrapper writes it there,
     refusing to follow a symlink or clobber an existing file -- see
-    engine.exit_writer). Trusting a bare "process is gone" as
-    success, the way this used to work, silently turned a crashed or
-    killed worker into a reported success; `exit_file` is None's/
-    missing/unreadable fallback is `_UNKNOWN_EXIT` (-1), which every
-    existing caller already treats as a failure, never 0."""
+    engine.exit_writer). A bare "process is gone" must never be
+    trusted as success on its own, since that would silently turn a
+    crashed or killed worker into a reported success; `exit_file`
+    None/missing/unreadable falls back to `_UNKNOWN_EXIT` (-1), which
+    every existing caller already treats as a failure, never 0."""
     deadline = time.time() + timeout_sec
     while True:
         try:

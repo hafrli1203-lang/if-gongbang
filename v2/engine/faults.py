@@ -32,3 +32,17 @@ class Faults:
             self.crash_before.discard(step_name)
             self.fired.append(f"before:{step_name}")
             raise CrashInjected(step_name)
+
+
+# Flow-layer boundaries (engine.full_orbit, engine.fixup, engine.small_orbit)
+# are not processor steps, so they cannot use Faults.crash_before/after.
+# Each named flow boundary calls flow_boundary(name) right before the
+# ledger write that ends it; a test arms ACTIVE_FLOW_FAULTS to crash there.
+ACTIVE_FLOW_FAULTS: Faults | None = None
+
+
+def flow_boundary(name: str) -> None:
+    """Raises CrashInjected once when a test armed `name` in
+    ACTIVE_FLOW_FAULTS.crash_before; a no-op otherwise."""
+    if ACTIVE_FLOW_FAULTS is not None:
+        ACTIVE_FLOW_FAULTS.maybe_crash_before(name)

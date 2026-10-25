@@ -13,7 +13,7 @@ from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
 from engine.processor import Fakes, Processor, submit
 from engine.steps.open_job import open_job
-from tests.conftest import Workspace
+from tests.conftest import seed_reviewed_manifest, Workspace
 
 
 def _proc(workspace: Workspace, publisher: FakePublisher) -> Processor:
@@ -40,6 +40,7 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
                      **({"policy_hash": security_policy_hash(workspace.config)}
                         if kind == "app_security.recorded" else {})},
         ))
+    seed_reviewed_manifest(workspace.ledger, project, attempt_id)
 
 
 def test_same_publish_payload_twice_dedupes_and_calls_once(workspace: Workspace) -> None:

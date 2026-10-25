@@ -15,7 +15,9 @@ from typing import TYPE_CHECKING
 from engine.acceptance import AcceptanceResult, acceptance_path
 from engine.config import EngineConfig
 from engine.ledger import Event, Ledger
-from engine.plan import classify_skill_tools, plan_digest, plan_path as _plan_json_path
+from engine.plan import (
+    classify_skill_tools, plan_digest, plan_path as _plan_json_path, requirement_coverers,
+)
 
 if TYPE_CHECKING:
     from engine.plan import Plan
@@ -23,6 +25,16 @@ if TYPE_CHECKING:
 _RUN_SCRIPT_CANDIDATES = ("dev", "start", "build", "test")
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 _SCREEN_SUBDIRS = ("screens", "design")
+
+# write_handoff runs strictly BEFORE the app-wide security check and the
+# job's release decision (engine.full_orbit._finish_after_handoff ->
+# finalize_release) -- see write_handoff's own interim note and
+# write_final_section's own docstring.
+_FINAL_SECTION_HEADING = "## 최종 결과"
+_RELEASE_DECISION_TEXT = {
+    "shipped": "배포됨", "skipped": "건너뜀",
+    "not_configured": "배포 설정 없음 (배포 대상 아님)", "failed": "배포 거부/실패",
+}
 
 
 @dataclass(frozen=True)
@@ -238,18 +250,27 @@ def _screens_section(config: EngineConfig, project: str, job: str) -> str:
     return "\n".join(f"![{p.name}]({p.as_posix()})" for p in images)
 
 
-def _scene_table(plan: "Plan", acc: AcceptanceResult) -> str:
+def _scene_table(ledger: Ledger, project: str, job: str, plan: "Plan",
+                 acc: AcceptanceResult) -> str:
     """requirement(plan.requirements) <-> scene/task <-> pass/fail,
-    paired by requirement id (engine.plan.requirement_coverers) -- never
-    positionally. A plan with no requirements yet (predates the earlier
+    rendered from the SAME end-to-end evidence graph (engine.
+    evidence_graph.build) engine.release.job_certificate_status gates
+    release on -- P4 (ENGINE.md s20 flow-map (라)): one place computes
+    "is this requirement actually covered," never two that could drift
+    apart. A plan with no requirements yet (predates the earlier
     requirements/covers fields) falls back to plan.acceptance paired
-    positionally with plan.scenes, same as before that field existed."""
+    positionally with plan.scenes, same as before that field existed --
+    and never touches the ledger at all in that case (several callers
+    in this module's own test suite pass a hand-built AcceptanceResult
+    that was never appended as a real 'acceptance.recorded' event, so
+    building a graph for them would just find nothing)."""
     requirements = getattr(plan, "requirements", ())
     if not requirements:
         return _scene_table_legacy(plan, acc)
-    from engine.plan import requirement_coverers
+    from engine import evidence_graph
 
-    by_scene_id = {s.id: s for s in acc.scenes}
+    graph = evidence_graph.build(ledger, project, job, plan)
+    by_requirement = {r.requirement_id: r for r in graph.requirements}
     coverers = requirement_coverers(plan)
     rows = ["| 요구사항(ID) | 덮는 장면/작업 | 상태 | 비고 |", "|---|---|---|---|"]
     for requirement in requirements:
@@ -258,16 +279,17 @@ def _scene_table(plan: "Plan", acc: AcceptanceResult) -> str:
             rows.append(f"| {requirement.id}: {requirement.text} | - | 덮이지 않음 | - |")
             continue
         covered_by = ", ".join(f"{kind}:{cid}" for kind, cid in pairs)
-        scene_results = [by_scene_id.get(cid) for kind, cid in pairs if kind == "scene"]
-        scene_results = [r for r in scene_results if r is not None]
-        if scene_results:
-            status = "통과" if all(r.passed for r in scene_results) else "실패"
+        ev = by_requirement.get(requirement.id)
+        if ev is not None and ev.scenes:
+            status = "통과" if all(s.result == "pass" for s in ev.scenes) else "실패"
         else:
-            # Covered only by a task, never a scene -- the requirement
-            # counts as covered as soon as that task's own attempt
-            # reached "done" (there is no separate pass/fail signal for
-            # it here; see engine.full_orbit's own post-acceptance check).
-            status = "통과(작업 완료)"
+            # Covered only by a task, never a scene -- owner decision:
+            # NEVER sufficient on its own (the same rule engine.
+            # evidence_graph.missing enforces at release time). A
+            # task's own attempt reaching "done" only means its own
+            # review/bench passed, never that any scene actually
+            # exercised the requirement's real behavior.
+            status = "실패(장면 없음)"
         rows.append(f"| {requirement.id}: {requirement.text} | {covered_by} | {status} | |")
     return "\n".join(rows)
 
@@ -323,6 +345,9 @@ def write_handoff(config: EngineConfig, ledger: Ledger, project: str,
     digest = plan_digest(_plan_json_path(config.projects[project].repo, job))
     body = f"""# 인계 보고 -- {job}
 
+(진행 중 -- 이 보고는 보안 점검과 배포 결정 전에 쓰였습니다. 둘 다 끝나면
+"최종 결과" 절이 아래에 덧붙습니다.)
+
 attempt: {attempt_id}
 
 ## 목표
@@ -332,7 +357,7 @@ attempt: {attempt_id}
 {digest}
 
 ## 요구사항 ↔ 통과 장면
-{_scene_table(plan, acc)}
+{_scene_table(ledger, project, job, plan, acc)}
 
 ## 전체 시험
 {"통과" if acc.full_suite_passed else "실패"} (상세: `{acc_path.relative_to(config.projects[project].repo)}`)
@@ -366,4 +391,83 @@ attempt: {attempt_id}
         project=project, kind="job.handoff_written", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id, payload={"job": job},
     ))
+    return path
+
+
+def _strip_final_section(body: str) -> str:
+    """`body` with everything from `_FINAL_SECTION_HEADING` onward cut
+    off -- a no-op if that heading is not present at all (the common
+    case: the FIRST call for a job). write_final_section calls this on
+    whatever report.md already holds before appending, so a crash-
+    resumed re-run of the SAME decision (finalize_release's own
+    idempotent retry, see its docstring) rewrites one final section,
+    never appends a second one under the first."""
+    idx = body.find(f"\n{_FINAL_SECTION_HEADING}")
+    return body if idx == -1 else body[:idx]
+
+
+def write_final_section(config: EngineConfig, ledger: Ledger, project: str,
+                        job: str, decision: str) -> Path:
+    """Appends report.md's own final section once the job's release
+    decision is known for certain -- write_handoff runs strictly
+    BEFORE the app-wide security check and
+    the release decision (engine.full_orbit._finish_after_handoff),
+    so its own report, by itself, can say "아무 것도 남지 않음" (## 남은
+    항목, _open_items) while security or release are, in fact, still
+    pending or already failed -- an interim note on write_handoff's own
+    body (see its own template) says so plainly; THIS function is what
+    turns that into a real answer once there is one.
+
+    Caller contract: engine.full_orbit.finalize_release is the ONE
+    place in this codebase that computes `decision` (shipped/skipped/
+    failed/not_configured) for certain -- see that function's own
+    docstring. It should call this (passing that same `decision`
+    string) right after computing it, before finalize_release itself
+    returns -- exactly once per terminal outcome, on all three of its
+    own paths (shipped, rejected, and the plain report+close a project
+    with no release track takes). Idempotent the same way
+    finalize_release's own decide-close-record sequence already is:
+    calling this again with the SAME decision (a crash-resumed retry)
+    rewrites one identical section, never appends a second one (see
+    _strip_final_section).
+
+    Renders from the SAME engine.evidence_graph this module's own
+    requirement table already uses, so this section can never disagree
+    with engine.release.job_certificate_status's own release gate: the
+    security line reads graph.certificate_fingerprint/
+    certificate_policy_hash (both non-"" iff the job's newest
+    app_security.recorded event passed), and "증거 완전성" is literally
+    evidence_graph.missing(graph) -- empty only when that SAME gate
+    would have allowed release. A missing/unparseable plan.json
+    degrades to a Plan with zero requirements (engine.release's own
+    _plan_or_empty, re-done locally here for the same "that module is
+    outside this one's owned scope" reason -- see engine.release.
+    _plan_or_empty's own docstring)."""
+    from engine import evidence_graph
+    from engine.plan import Plan as _Plan
+    from engine.plan import PlanError, load_plan
+
+    path = report_path(config, project, job)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    body = _strip_final_section(existing)
+
+    try:
+        plan = load_plan(config.projects[project].repo, job)
+    except PlanError:
+        plan = _Plan(goal="", ui=False, scenes=(), tasks=(), acceptance=())
+    graph = evidence_graph.build(ledger, project, job, plan)
+    gaps = evidence_graph.missing(graph)
+
+    security_line = ("통과" if graph.certificate_fingerprint and graph.certificate_policy_hash
+                     else "실패 또는 기록 없음")
+    decision_line = _RELEASE_DECISION_TEXT.get(decision, decision)
+    evidence_line = "완전함" if not gaps else "; ".join(gaps)
+
+    section = (
+        f"\n{_FINAL_SECTION_HEADING}\n\n"
+        f"보안 점검: {security_line}\n\n"
+        f"배포 결정: {decision_line}\n\n"
+        f"증거 완전성: {evidence_line}\n"
+    )
+    path.write_text(body.rstrip("\n") + "\n" + section, encoding="utf-8")
     return path

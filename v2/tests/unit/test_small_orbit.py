@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from engine import full_orbit, small_orbit
+from engine import full_orbit, position, small_orbit
 from engine.ledger import Event
 from engine.processor import Processor, StepContext, StepDef, StepFailed
 from engine.steps.open_job import copy_root, dirty_paths
@@ -32,6 +32,7 @@ from tests.unit.test_full_orbit import (
     _full_orbit_workspace,
     _install_fake_acceptance_and_handoff,
     _processor_factory,
+    _record_install,
     _review_always_passes_steps,
 )
 
@@ -450,12 +451,7 @@ def test_gb2_continue_resumes_a_small_job_after_a_build_install_request(
     assert build_calls["n"] == 1
     assert state.acceptance_calls == 0
 
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first.attempt_id,
-        payload={"request_id": "r-install-1", "manifest": "package.json",
-                 "change": install_request["change"]},
-    ))
+    _record_install(ws, first.attempt_id, install_request, "r-install-1")
 
     # `gb2 continue` is engine.full_orbit.continue_full_job -- small_orbit
     # itself has no resume entry point of its own (see its module
@@ -524,9 +520,9 @@ def test_small_job_crash_leaves_a_small_plan_cursor_resumable_directly(
     the combined small-mode prompt that was never finished). Regression
     this cursor stage exists to fix: this attempt's own copy was made
     for ONLY the planner role (run_small_job's one combined call) --
-    engine.full_orbit._resume_from_cursor used to resume a bare "facts"
-    cursor stage directly on that SAME attempt_id, reaching for a
-    FACTS_ROLE copy that was never made at all. resume_small_plan
+    resuming a bare "facts" stage directly on that SAME attempt_id
+    would reach for a FACTS_ROLE copy that was never made at all.
+    resume_small_plan
     instead opens a brand-new attempt (never the crashed one) with only
     the PLANNER_ROLE copy, and reruns the WHOLE combined call -- no
     separate "facts" station call is ever made for a small job."""
@@ -550,12 +546,12 @@ def test_small_job_crash_leaves_a_small_plan_cursor_resumable_directly(
 
     # Nothing ran yet -- the crash fired before run_station's own one
     # step ("record_station") ever executed.
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", _JOB)
+    cursor = position.load_position(ws.ledger, "alpha", _JOB)
     assert cursor is not None
-    assert cursor["stage"] == small_orbit.CURSOR_STAGE
-    assert cursor["request"] == request_text
-    crashed_attempt_id = str(cursor["attempt_id"])
-    assert full_orbit._load_progress(ws.ledger, "alpha", crashed_attempt_id, _JOB) is None
+    assert cursor.stage == small_orbit.CURSOR_STAGE
+    assert cursor.get("request") == request_text
+    crashed_attempt_id = str(cursor.attempt_id)
+    assert cursor.stop_reason is None
 
     plan_task_texts: list[str] = []
 
@@ -690,10 +686,10 @@ def test_resume_small_plan_waits_when_owner_request_is_not_yet_fulfilled(
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
 
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", _JOB)
+    cursor = position.load_position(ws.ledger, "alpha", _JOB)
     assert cursor is not None
-    assert cursor["stage"] == small_orbit.CURSOR_STAGE
-    assert cursor["pending_requests"] == [install_request]
+    assert cursor.stage == small_orbit.CURSOR_STAGE
+    assert list(cursor.pending_requests) == [install_request]
 
     # Still unfulfilled -- resume_small_plan must not reopen anything.
     still_waiting = small_orbit.resume_small_plan(
@@ -836,16 +832,11 @@ def test_resume_small_plan_reopens_a_fresh_attempt_once_owner_request_is_fulfill
     assert first.reason == "owner_request"
     first_attempt_id = first.attempt_id
 
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first_attempt_id,
-        payload={"request_id": "r-install-1", "manifest": "package.json",
-                 "change": install_request["change"]},
-    ))
+    _record_install(ws, first_attempt_id, install_request, "r-install-1")
 
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", _JOB)
+    cursor = position.load_position(ws.ledger, "alpha", _JOB)
     assert cursor is not None
-    assert cursor["attempt_id"] == first_attempt_id
+    assert cursor.attempt_id == first_attempt_id
 
     resumed = small_orbit.resume_small_plan(
         ws.config, ws.ledger, _fakes(), "alpha", _JOB, cursor, processor_factory=factory,
@@ -925,11 +916,11 @@ def test_resume_small_plan_after_plan_review_failure_reopens_a_fresh_attempt(
     assert first.reason == "plan_review_failed"
     first_attempt_id = first.attempt_id
 
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", _JOB)
+    cursor = position.load_position(ws.ledger, "alpha", _JOB)
     assert cursor is not None
-    assert cursor["stage"] == small_orbit.CURSOR_STAGE
-    assert cursor["stop_reason"] == "plan_review_failed"
-    assert cursor["pending_requests"] == []
+    assert cursor.stage == small_orbit.CURSOR_STAGE
+    assert cursor.stop_reason == "plan_review_failed"
+    assert cursor.pending_requests == ()
 
     # A second planning worker call is still queued on the stub (reused
     # across both attempts, same as test_full_orbit.py's own plan-
@@ -969,8 +960,8 @@ def test_resume_small_plan_falls_back_to_full_job_when_retry_still_names_an_exte
     })
     _install_fake_acceptance_and_handoff(monkeypatch, [])
 
-    cursor = {"stage": small_orbit.CURSOR_STAGE, "attempt_id": None,
-             "request": "날씨를 보여줘", "max_fix_rounds": 2}
+    cursor = position.JobPosition(job=_JOB, stage=small_orbit.CURSOR_STAGE, attempt_id=None,
+                                  extra={"request": "날씨를 보여줘", "max_fix_rounds": 2})
     resumed = small_orbit.resume_small_plan(
         ws.config, ws.ledger, _fakes(), "alpha", _JOB, cursor,
         processor_factory=_processor_factory(stub),
@@ -983,12 +974,13 @@ def test_resume_small_plan_falls_back_to_full_job_when_retry_still_names_an_exte
     assert stub.calls[0] == ("plan", "planner")
     assert ("facts", "facts") in stub.calls
     assert ws.ledger.attempts_for_job_name("alpha", fallback_job)
-    assert resumed.attempt_id != cursor["attempt_id"]
+    assert resumed.attempt_id != cursor.attempt_id
 
 
 def test_resume_small_plan_rejects_a_cursor_from_another_stage() -> None:
     with pytest.raises(small_orbit.SmallOrbitError):
         small_orbit.resume_small_plan(
             None, None, None, "alpha", _JOB,  # type: ignore[arg-type]
-            {"stage": "facts", "attempt_id": "x", "request": "r"},
+            position.JobPosition(job=_JOB, stage="facts", attempt_id="x",
+                                 extra={"request": "r"}),
         )

@@ -526,3 +526,79 @@ def test_vitest_failure_signature_survives_colour_codes() -> None:
     coloured = ("AssertionError: expected 1 to be 2\n"
                 "\x1b[31m Tests \x1b[39m \x1b[1m\x1b[31m1 failed\x1b[39m\x1b[22m | 3 passed\n")
     assert _case_signature({"text": coloured}) == "assertion"
+
+
+def test_run_tests_cannot_shadow_a_tracked_package_with_a_new_untracked_file(
+    workspace: Workspace,
+) -> None:
+    """run_tests runs against a disposable, tracked-content-only
+    snapshot (engine.steps.bench_run._bench_snapshot), not the real
+    project repo directly -- under
+    sandbox="bwrap", a test_cmd that tries to plant a brand-new,
+    untracked file INSIDE an existing tracked package directory
+    (src/greeter/, here) must fail to write it, the same containment
+    engine.acceptance's own scenes/full suite get."""
+    ws = _bench_workspace(workspace, variant=1)
+    ws = Workspace(ws.root, replace(ws.config, sandbox="bwrap"), ws.ledger,
+                  ws.alpha, ws.beta)
+    shadow_cmd = (
+        sys.executable, "-c",
+        "import pathlib, sys\n"
+        "try:\n"
+        "    pathlib.Path('src/greeter/evil.py').write_text('EVIL = 1\\n')\n"
+        "except OSError:\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n",
+    )
+    project_config = replace(ws.config.projects["alpha"], test_cmd=shadow_cmd)
+    ws = Workspace(ws.root, replace(ws.config,
+                                    projects={**ws.config.projects, "alpha": project_config}),
+                   ws.ledger, ws.alpha, ws.beta)
+    attempt_id, rid = _submit_bench(ws)
+    proc = _processor(ws)
+    proc.run_once("alpha")
+
+    run_tests_row = ws.ledger.steps(rid).get("run_tests")
+    assert run_tests_row is not None
+    assert run_tests_row.payload["returncode"] == 0
+    assert not (ws.alpha / "src" / "greeter" / "evil.py").exists()
+
+
+def test_run_tests_exit_0_with_zero_tests_executed_is_not_ok(workspace: Workspace) -> None:
+    """Reuses bench's own existing no-tests banner
+    (looks_like_zero_tests_ran), never a new
+    heuristic. test_cmd here is env-driven (same pattern the real
+    sample fixtures use for their own negative controls) so the
+    REQUIRED negative-control case (engine.bench.run_bench rejects a
+    suite with none) can still genuinely fail while the "real" run
+    still prints the no-tests banner and exits 0."""
+    ws = _bench_workspace(workspace, variant=1)
+    script = (
+        "import os, sys\n"
+        "if os.environ.get('NEGATIVE_CONTROL'):\n"
+        "    sys.exit(1)\n"
+        "print('Tests  0 passed (0)')\n"
+        "sys.exit(0)\n"
+    )
+    (ws.alpha / "bench" / "cases.json").write_text(json.dumps([
+        {"name": "negctrl", "selector": "x", "expect_fail": True,
+         "env": {"NEGATIVE_CONTROL": "1"}, "expected_signature": "exit:1"},
+    ]), encoding="utf-8")
+    project_config = replace(
+        ws.config.projects["alpha"],
+        test_cmd=(sys.executable, "-c", script),
+    )
+    ws = Workspace(ws.root, replace(ws.config,
+                                    projects={**ws.config.projects, "alpha": project_config}),
+                   ws.ledger, ws.alpha, ws.beta)
+    attempt_id, rid = _submit_bench(ws)
+    proc = _processor(ws)
+    proc.run_once("alpha")
+
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "no_tests_executed"}
+    bench_evidence = ws.ledger.evidence(attempt_id, "bench")
+    assert len(bench_evidence) == 1
+    assert bench_evidence[0].payload["passed"] is False
+    assert bench_evidence[0].payload["reason"] == "no_tests_executed"

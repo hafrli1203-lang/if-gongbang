@@ -56,11 +56,27 @@ check_probe   [] iff every target in a check_probe_targets() list has
               worker-written log; see that module's own docstring) --
               kept here, and fixed to the same id scheme, for whatever
               still calls it directly.
+check_facts_trusted   Same check as check_facts, but reads facts.md
+              exactly ONCE and hands the caller back an engine.trusted.
+              Trusted over those exact bytes alongside the problem
+              list (flow-map §⑤: the facts gate used to read facts.md
+              here, and a caller that later puts "what facts.md says"
+              into a station's instructions -- engine.full_orbit --
+              read it again, independently, on its own schedule; the
+              two reads are only guaranteed to see the same content by
+              TIMING). A caller that keeps this Trusted and calls
+              engine.trusted.verify() on it immediately before using
+              facts.md's content is acting on the bytes this check
+              actually judged, not on whatever a second, later read of
+              the same path happens to find. check_facts (unchanged)
+              stays the plain, Trusted-free entry point for any caller
+              that only needs the problem list.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
+from engine import trusted as _trusted
 from engine.ledger import Ledger
 
 _PASS_MARK = "통과"
@@ -82,7 +98,7 @@ class ProbeTargetsError(Exception):
         super().__init__(reason)
 
 
-def _facts_path(repo: Path, job: str) -> Path:
+def facts_path(repo: Path, job: str) -> Path:
     return repo / ".gongbang" / job / "facts.md"
 
 
@@ -169,16 +185,13 @@ def _table_pass_rows(lines: list[str]) -> dict[int, bool]:
             result[i + 1] = source not in ("", "-")
     return result
 
-def check_facts(repo: Path, job: str) -> list[str]:
-    """[] iff facts.md exists, every line claiming 통과 also carries a
-    출처 marker on the same line, and the 「코드에 넣는 값」 section (if
-    present) contains no 확인 필요 marker anywhere in it."""
-    path = _facts_path(repo, job)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return ["facts_missing"]
-
+def _check_facts_text(text: str) -> list[str]:
+    """The structural half of check_facts, over already-read `text` --
+    factored out so check_facts and check_facts_trusted (module
+    docstring) can share it while each controls its OWN single read of
+    facts.md (a plain path.read_text() for the former, engine.trusted.
+    capture() for the latter) rather than this function reading
+    anything itself."""
     problems: list[str] = []
     lines = text.splitlines()
     table_rows = _table_pass_rows(lines)
@@ -191,12 +204,46 @@ def check_facts(repo: Path, job: str) -> list[str]:
             problems.append(f"line {lineno}: {_PASS_MARK} without {_SOURCE_MARK}")
 
     code_values_lines = _code_values_section(lines)
-    for offset, line in enumerate(code_values_lines):
+    for line in code_values_lines:
         if _NEEDS_CHECK_MARK in line:
             problems.append(
                 f"{_CODE_VALUES_HEADER}: {_NEEDS_CHECK_MARK} remaining ({line.strip()!r})"
             )
     return problems
+
+
+def check_facts(repo: Path, job: str) -> list[str]:
+    """[] iff facts.md exists, every line claiming 통과 also carries a
+    출처 marker on the same line, and the 「코드에 넣는 값」 section (if
+    present) contains no 확인 필요 marker anywhere in it."""
+    path = facts_path(repo, job)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ["facts_missing"]
+    return _check_facts_text(text)
+
+
+def check_facts_trusted(repo: Path, job: str) -> tuple[list[str], "_trusted.Trusted | None"]:
+    """(check_facts(repo, job)'s own problem list, an engine.trusted.
+    Trusted over the exact facts.md bytes this check just read) -- see
+    module docstring and engine.trusted for why a caller that will
+    later USE facts.md's content (rather than just gate on whether it
+    passes) should call this instead of check_facts, keep the Trusted,
+    and engine.trusted.verify() it immediately before that later use.
+    The Trusted is None iff facts.md could not be read at all (problems
+    == ["facts_missing"] or a path engine.trusted.capture() itself
+    refuses -- a symlinked component, a non-regular file, one over
+    engine.trusted.TRUSTED_MAX_BYTES -- folded into the same
+    "facts_missing" problem here, since either way there is no content
+    for a caller to carry forward)."""
+    path = facts_path(repo, job)
+    try:
+        captured = _trusted.capture(path)
+    except _trusted.TrustCaptureError:
+        return ["facts_missing"], None
+    text = captured.data.decode("utf-8", errors="replace")
+    return _check_facts_text(text), captured
 
 
 def check_design_approved(ledger: Ledger, project: str, job: str) -> bool:
@@ -229,7 +276,7 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
     bullet also raises ProbeTargetsError rather than being silently
     skipped -- a malformed target line must stop the job, not quietly
     disappear from the list engine.full_orbit runs probes against."""
-    path = _facts_path(repo, job)
+    path = facts_path(repo, job)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -303,6 +350,6 @@ def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[st
 
 
 __all__ = [
-    "check_facts", "check_design_approved", "check_probe_targets", "check_probe",
-    "probe_target_id", "ProbeTargetsError",
+    "check_facts", "check_facts_trusted", "facts_path", "check_design_approved",
+    "check_probe_targets", "check_probe", "probe_target_id", "ProbeTargetsError",
 ]

@@ -106,6 +106,29 @@ def _current_fp(rws: ReleaseWorkspace) -> str:
     return evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes)
 
 
+def _job_name_for_test(rws: ReleaseWorkspace, attempt_id: str) -> str:
+    for _seq, event in rws.ledger.events("gamma", "job.opened"):
+        if event.payload.get("attempt_id") == attempt_id:
+            return str(event.payload.get("job_name"))
+    raise AssertionError(f"no job.opened event for {attempt_id!r}")
+
+
+def _seed_plan_reviewed(rws: ReleaseWorkspace, attempt_id: str) -> None:
+    """A 'plan.reviewed' event for `attempt_id`'s own job, zero
+    requirement/task ids (every test in this file drives advance_master
+    directly, never through a real plan review -- see _seed_acceptance's
+    own docstring) -- engine.evidence_graph.build() refuses the whole
+    job certificate ("plan: no reviewed manifest") without SOME such
+    event, regardless of how many
+    requirements the fallback zero-requirement Plan actually has."""
+    rws.ledger.append(Event(
+        project="gamma", kind="plan.reviewed", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": _job_name_for_test(rws, attempt_id), "digest": "stub-digest",
+                 "scene_digests": {}, "requirement_ids": [], "task_ids": []},
+    ))
+
+
 def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None) -> None:
     """Record a passing acceptance.recorded event for `attempt_id`,
     bound to `fp` (rws.repo's CURRENT fingerprint by default) --
@@ -117,7 +140,11 @@ def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = No
     acceptance.run_acceptance itself) must seed this the same way it
     already has to seed a passing full bench. By itself this is only
     HALF of the job certificate -- see _seed_app_security and
-    _seed_job_certificate below."""
+    _seed_job_certificate below. Also seeds _seed_plan_reviewed:
+    every caller of this function drives job_certificate_status
+    somewhere down the line, and none of them ever go through a real
+    plan review."""
+    _seed_plan_reviewed(rws, attempt_id)
     rws.ledger.append(Event(
         project="gamma", kind="acceptance.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
@@ -774,25 +801,25 @@ def test_full_bench_failure_blocks_approve_and_run_before_any_merge(
 
 
 # ---------------------------------------------------------------------------
-# P0: the full-bench-failure window a later queue drain (`gb2 skip-ship`'s
-# continue_job, or `gb2 fix`'s run_once) could previously walk into and
-# deploy through -- approve_and_run must grant NOTHING when the bench
-# fails, and advance_master must refuse on its own even if something
-# else ever granted one anyway.
+# A full-bench failure must never leave a window a later queue drain
+# (`gb2 skip-ship`'s continue_job, or `gb2 fix`'s run_once) can walk
+# into and deploy through -- approve_and_run must grant NOTHING when
+# the bench fails, and advance_master must refuse on its own even if
+# something else ever granted one anyway.
 # ---------------------------------------------------------------------------
 
 def test_full_bench_failure_grants_no_approval_so_a_later_drain_cannot_deploy(
     tmp_path: Path,
 ) -> None:
-    """Regression for the ordering bug: approve_and_run used to grant
-    the approval BEFORE calling ensure_full_bench, so a failed full
-    suite left a valid, unused approval sitting next to the still-
-    queued publish request -- a LATER queue drain (this test simulates
-    `gb2 fix`'s own run_once call) would then dispatch it anyway. With
-    ensure_full_bench moved before grant(), no approval is ever
-    created, so that later drain's own check_approval step fails it
-    "no_approval" exactly like it would with no approval attempt at
-    all -- the publisher is never touched and master never advances."""
+    """approve_and_run must call ensure_full_bench BEFORE granting the
+    approval: granting first would leave a valid, unused approval
+    sitting next to the still-queued publish request after a failed
+    full suite, and a LATER queue drain (this test simulates `gb2
+    fix`'s own run_once call) would then dispatch it anyway. With
+    ensure_full_bench before grant(), no approval is ever created, so
+    that later drain's own check_approval step fails it "no_approval"
+    exactly like it would with no approval attempt at all -- the
+    publisher is never touched and master never advances."""
     rws = _rws_with_real_tests(tmp_path)
     attempt_id = _open(rws, "job-fullbench-no-grant")
     _commit(rws.repo, "note.txt", "note\n", "advance")

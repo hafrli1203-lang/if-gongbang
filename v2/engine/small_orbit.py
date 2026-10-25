@@ -18,15 +18,13 @@ digest that review judged, same as a full job's plan station does.
 `gb2 change <app> "<request>" --small` (tools/gb2 cmd_change) is the
 only intended caller; `gb2 new`/`gb2 fix`/`gb2 continue` never take
 --small. This module's own resume entry point is `resume_small_plan`
-(cursor stage "small_plan") -- engine.full_orbit._resume_from_cursor
-dispatches to it the same way it dispatches to this module's own
-`run_small_job` kind of attempt, never by retrying the combined call
-on the SAME, possibly half-merged attempt (see resume_small_plan's own
+(position stage "small_plan", dispatched by engine.position.resume_job),
+never by retrying the combined call on the SAME, possibly half-merged
+attempt (see resume_small_plan's own
 docstring for why a fresh attempt is required). A release-approval
 stop is fully resumable, for free, through the ordinary `gb2 ship`/
 `gb2 skip-ship` commands -- those look up the pending publish request
-straight from the ledger, never through engine.full_orbit's own
-progress-stage bookkeeping, and the finisher this module calls
+straight from the ledger, and the finisher this module calls
 (_maybe_release_or_done) is the literal same function a full job
 calls, so the request it submits is indistinguishable from one a full
 job would have submitted.
@@ -52,10 +50,11 @@ continues on the full path rather than just failing outright."""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Callable
 
-from engine import full_orbit, orbit
+from engine import faults, full_orbit, orbit
 from engine.config import EngineConfig
 from engine.gates import ProbeTargetsError, check_facts, check_probe_targets
 from engine.ledger import Ledger
@@ -63,19 +62,21 @@ from engine.plan import (
     PlanError, load_plan, ordered_tasks, record_plan_reviewed, skill_catalog_text,
     validate_plan, validate_tools,
 )
+from engine.position import (
+    STAGE_SMALL_PLAN, JobPosition, outstanding_requests, record_position,
+)
 from engine.processor import Fakes
 from engine.station_prompts import small_prompt
-from engine.steps.open_job import open_job
 
 PLANNING_ROLE = full_orbit.PLANNER_ROLE
 PLANNING_STATION = "plan"
-CURSOR_STAGE = "small_plan"
+CURSOR_STAGE = STAGE_SMALL_PLAN
 
 ProgressCallback = Callable[[str], None]
 
 
 class SmallOrbitError(ValueError):
-    """Raised by `resume_small_plan` if handed a cursor that is not its
+    """Raised by `resume_small_plan` if handed a position that is not its
     own (stage != CURSOR_STAGE) -- a caller/dispatch bug, never a
     runtime job outcome."""
 
@@ -283,23 +284,12 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     full = full_orbit._station_outcome_to_full(station_outcome, "plan")
     if full is not None:
         _mark_planning_done()
-        # Never a `full_orbit.progress`/STAGE_EARLY_STATION stop --
-        # that shape is read back by `continue_full_job` as a FULL
-        # job's own early-station stop, which would then resume
-        # against this attempt's PLANNER_ROLE-only copy expecting the
-        # facts/prober/designer copies a full job always has (the exact
-        # bug this cursor records against -- see record_cursor's own
-        # call right below and resume_small_plan's module-level
-        # docstring). The cursor IS the only durable record of this
-        # stop: carrying the same stop_reason/pending_requests a
-        # STAGE_EARLY_STATION progress event would have, so
-        # resume_small_plan can run the same owner-request fulfillment
-        # gate continue_full_job's own STAGE_EARLY_STATION dispatch
-        # runs, before `gb2 continue` ever reaches this module.
-        full_orbit.record_cursor(
-            ledger, project, job_name, stage=CURSOR_STAGE, next_action="run_station",
-            attempt_id=attempt_id, request=request, max_fix_rounds=max_fix_rounds,
-            stop_reason=station_outcome.reason, pending_requests=list(station_outcome.pending_requests))
+        # Recorded at stage "small_plan", never STAGE_EARLY_STATION:
+        # a full job's early-station resume expects the facts/prober/
+        # designer copies this PLANNER_ROLE-only attempt never had.
+        _record_small(ledger, project, job_name, attempt_id, request, max_fix_rounds,
+                      stop_reason=station_outcome.reason,
+                      pending_requests=tuple(station_outcome.pending_requests))
         return SmallOutcome(full.status, full.reason, full.attempt_id, None, durations)
 
     # Every check below reads the merge's own files straight off the
@@ -396,20 +386,12 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
         processor_factory=processor_factory, on_progress=on_progress,
     )
     if plan_review_outcome.status != "done":
-        # Same cursor-only story as the station-stop branch above --
-        # never `full_orbit.progress`/STAGE_PLAN_REVIEW, which
-        # continue_full_job's own dispatch would resume via
-        # _reopen_for_retry opening the full facts/prober/planner/
-        # designer role set this attempt never had. No pending_requests
-        # here (a review failure is not an owner request) -- recorded
-        # as an explicit empty list, never left unset, so
-        # resume_small_plan's own fulfillment check has a fixed shape
-        # to read regardless of which branch wrote this cursor.
+        # Stage "small_plan" for the same reason as the station stop
+        # above; no pending requests (a review failure is not an owner
+        # request).
         _mark_planning_done()
-        full_orbit.record_cursor(
-            ledger, project, job_name, stage=CURSOR_STAGE, next_action="run_station",
-            attempt_id=attempt_id, request=request, max_fix_rounds=max_fix_rounds,
-            stop_reason="plan_review_failed", pending_requests=[])
+        _record_small(ledger, project, job_name, attempt_id, request, max_fix_rounds,
+                      stop_reason="plan_review_failed")
         return SmallOutcome("needs_owner", "plan_review_failed", attempt_id, None, durations)
 
     # Validated and reviewed -- commit the combined facts+plan trail
@@ -421,28 +403,24 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     # opens its own fresh attempt per task (engine.full_orbit's own
     # fixed base_head reasoning, see that module's docstring).
     _mark_planning_done()
+    faults.flow_boundary("small_orbit.plan_reviewed")
     record_plan_reviewed(ledger, project, attempt_id, repo, job_name)
     full_orbit._commit_job_trail(
         config, ledger, project, attempt_id, job_name, f"gongbang: {job_name} - small-plan",
         station=PLANNING_STATION, role=PLANNING_ROLE)
-    close_outcome = full_orbit._close_attempt(
-        config, ledger, fakes, project, attempt_id, job_name, on_progress, processor_factory)
-    if close_outcome.status != "done":
-        return SmallOutcome("failed", f"close:{close_outcome.reason}", attempt_id, None,
-                           durations)
-
     task_started = time.monotonic()
-    # Exactly the same task-attempt / acceptance / requirement-coverage
-    # / handoff / security / release machinery a full job uses for the
-    # ONE task this plan has -- see the module docstring for why this
-    # is a direct call, never a reimplementation.
+    # Exactly the same close -> task-attempt / acceptance / requirement-
+    # coverage / handoff / security / release machinery a full job uses
+    # for the ONE task this plan has (including its STAGE_EARLY_CLOSE
+    # position, so a crash in the close resumes the same way) -- see the
+    # module docstring for why this is a direct call, never a
+    # reimplementation.
     try:
-        tasks = ordered_tasks(plan)
+        ordered_tasks(plan)
     except PlanError as exc:
         return SmallOutcome("failed", f"plan:{exc.reason}", attempt_id, None, durations)
-    final = full_orbit._finish_from_tasks(
-        config, ledger, fakes, project, job_name, plan, tasks, max_fix_rounds,
-        on_progress, processor_factory)
+    run = full_orbit.Run(config, ledger, fakes, project, job_name, on_progress, processor_factory)
+    final = full_orbit._close_early_attempt_then_tasks(run, attempt_id, plan, max_fix_rounds)
     wall_ms = (time.monotonic() - task_started) * 1000
 
     # Every attempt this job ever opened (the closed planning attempt
@@ -461,35 +439,50 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                         durations)
 
 
+def _small_intent(job_name: str, request: str, max_fix_rounds: int) -> JobPosition:
+    return JobPosition(job=job_name, stage=CURSOR_STAGE, attempt_id=None,
+                       extra={"request": request, "max_fix_rounds": max_fix_rounds,
+                              "next_action": "run_station"})
+
+
+def _record_small(ledger: Ledger, project: str, job_name: str, attempt_id: str, request: str,
+                  max_fix_rounds: int, *, stop_reason: str | None = None,
+                  pending_requests: tuple[dict, ...] = ()) -> None:
+    """This job's position at its combined planning call (stage
+    "small_plan"), with the stop it made there, if any."""
+    record_position(ledger, project, JobPosition(
+        job=job_name, stage=CURSOR_STAGE, attempt_id=attempt_id,
+        pending_requests=pending_requests, stop_reason=stop_reason,
+        extra={"request": request, "max_fix_rounds": max_fix_rounds,
+               "next_action": "run_station"},
+    ))
+
+
 def run_small_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                   job_name: str, request: str, *, max_fix_rounds: int = 2,
                   on_progress: ProgressCallback | None = None,
                   processor_factory: orbit.ProcessorFactory | None = None) -> SmallOutcome:
-    attempt_id = open_job(config, ledger, project, job_name, "full", (PLANNING_ROLE,))
-    # A crash before this job's own progress is recorded resumes through
-    # `gb2 continue` via resume_small_plan (the cursor's "small_plan"
-    # stage) -- see that function's own docstring -- carrying the
+    # The opening intent is recorded first, so a crash from here on
+    # resumes through `gb2 continue` via resume_small_plan, carrying the
     # original request.
-    full_orbit.record_cursor(ledger, project, job_name, stage=CURSOR_STAGE,
-                             next_action="run_station", attempt_id=attempt_id,
-                             request=request, max_fix_rounds=max_fix_rounds)
+    attempt_id = full_orbit._open_with_intent(
+        config, ledger, project, _small_intent(job_name, request, max_fix_rounds),
+        (PLANNING_ROLE,))
+    _record_small(ledger, project, job_name, attempt_id, request, max_fix_rounds)
     return _run_from_attempt(config, ledger, fakes, project, job_name, request, attempt_id,
                              max_fix_rounds, on_progress, processor_factory)
 
 
 def resume_small_plan(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
-                      job_name: str, cursor: dict[str, object], *,
+                      job_name: str, pos: JobPosition, *,
                       on_progress: ProgressCallback | None = None,
                       processor_factory: orbit.ProcessorFactory | None = None,
                       ) -> full_orbit.FullOutcome:
-    """engine.full_orbit._resume_from_cursor's stage=="small_plan"
-    dispatch (via getattr -- see that function's own module docstring)
-    -- the resume entry point for a small job that crashed, hit an
-    owner-request stop in its own combined planning call, or had that
-    call's plan review rejected. `cursor` is the exact payload
-    `record_cursor`/`run_small_job` last wrote for `job_name` (stage,
-    attempt_id, request, max_fix_rounds, and, for a stop rather than a
-    plain crash, stop_reason/pending_requests).
+    """The resume handler for position stage "small_plan": a small job
+    that crashed, hit an owner-request stop in its own combined planning
+    call, or had that call's plan review rejected. `pos` is the newest
+    position for `job_name` (attempt_id, request, max_fix_rounds, and,
+    for a stop rather than a plain crash, stop_reason/pending_requests).
 
     NEVER reruns the combined call on the SAME attempt: that attempt's
     own merge may already have landed plan.json+facts.md+scenes
@@ -506,13 +499,10 @@ def resume_small_plan(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     copy this fast path ever needed -- never the full facts/prober/
     planner/designer role set engine.full_orbit._reopen_for_retry opens
     for a full job's own early-station resume, which this attempt's
-    copies directory was never made with (the documented bug this
-    cursor stage exists to close: see engine.full_orbit._resume_from_
-    cursor's own comment on a cursor "belonging to a SMALL job").
+    copies directory was never made with.
 
-    An owner-request stop (stop_reason not "plan_review_failed", a
-    non-empty pending_requests) is gated exactly like
-    continue_full_job's own STAGE_EARLY_STATION dispatch: a request
+    An owner-request stop is gated by engine.position's one
+    outstanding-request computation, like every other resume: a request
     that was never actually fulfilled (e.g. the install the builder
     asked for) returns needs_owner/"owner_request" again, WITHOUT
     reopening anything -- `gb2 continue` is safe to call again and
@@ -540,20 +530,28 @@ def resume_small_plan(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     initial `gb2 change --small` call would have -- a refusal
     rediscovered on a resume no longer just sits there reported and
     un-actioned."""
-    if cursor.get("stage") != CURSOR_STAGE:
-        raise SmallOrbitError(f"resume_small_plan given a non-{CURSOR_STAGE!r} cursor: {cursor!r}")
-    request = str(cursor.get("request", ""))
-    max_fix_rounds = int(cursor.get("max_fix_rounds", 2))
-    stale_attempt_id = str(cursor.get("attempt_id") or "") or None
-    stop_reason = cursor.get("stop_reason")
-    pending_requests_raw = cursor.get("pending_requests") or []
-    pending_requests = pending_requests_raw if isinstance(pending_requests_raw, list) else []
-    is_owner_request_stop = bool(pending_requests) and stop_reason != "plan_review_failed"
+    if pos.stage != CURSOR_STAGE:
+        raise SmallOrbitError(f"resume_small_plan given a non-{CURSOR_STAGE!r} position: {pos!r}")
+    request = str(pos.get("request", ""))
+    max_fix_rounds = pos.max_fix_rounds
+    stale_attempt_id = pos.attempt_id
+    is_owner_request_stop = bool(pos.pending_requests)
 
-    if is_owner_request_stop and not full_orbit._pending_requests_fulfilled(
-            ledger, project, pending_requests):
+    if outstanding_requests(ledger, project, pos, repo=config.projects[project].repo):
         return full_orbit.FullOutcome("needs_owner", "owner_request", stale_attempt_id, None)
 
+    if (stale_attempt_id is not None and ledger.attempt(stale_attempt_id).status == "active"
+            and not full_orbit._attempt_has_requests(ledger, project, stale_attempt_id)):
+        # An attempt adopted from this job's opening intent: nothing ran
+        # on it yet, so it is used as-is (with any recorded restore redone).
+        attempt_id = stale_attempt_id
+        restore_from = pos.get("restore_from")
+        if isinstance(restore_from, str):
+            full_orbit._overlay_archive_into_copy(config, attempt_id, PLANNING_ROLE,
+                                                  Path(restore_from))
+        return _run_small_and_fall_back(
+            config, ledger, fakes, project, job_name, request, attempt_id, max_fix_rounds,
+            on_progress, processor_factory, is_owner_request_stop)
     if stale_attempt_id is not None:
         full_orbit._abandon_orphaned_requests(ledger, project, stale_attempt_id)
         close_outcome = full_orbit._close_attempt(
@@ -570,12 +568,24 @@ def resume_small_plan(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     else:
         archive_dir = None
 
-    attempt_id = open_job(config, ledger, project, job_name, "full", (PLANNING_ROLE,))
-    if archive_dir is not None and full_orbit._archive_has_content(archive_dir):
+    intent = _small_intent(job_name, request, max_fix_rounds)
+    restore = archive_dir is not None and full_orbit._archive_has_content(archive_dir)
+    if restore:
+        intent = replace(intent, extra={**intent.extra, "restore_from": str(archive_dir)})
+    attempt_id = full_orbit._open_with_intent(config, ledger, project, intent, (PLANNING_ROLE,))
+    if restore and archive_dir is not None:
         full_orbit._overlay_archive_into_copy(config, attempt_id, PLANNING_ROLE, archive_dir)
-    full_orbit.record_cursor(ledger, project, job_name, stage=CURSOR_STAGE,
-                             next_action="run_station", attempt_id=attempt_id,
-                             request=request, max_fix_rounds=max_fix_rounds)
+    return _run_small_and_fall_back(
+        config, ledger, fakes, project, job_name, request, attempt_id, max_fix_rounds,
+        on_progress, processor_factory, is_owner_request_stop)
+
+
+def _run_small_and_fall_back(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                             job_name: str, request: str, attempt_id: str,
+                             max_fix_rounds: int, on_progress: ProgressCallback | None,
+                             processor_factory: orbit.ProcessorFactory | None,
+                             is_owner_request_stop: bool) -> full_orbit.FullOutcome:
+    _record_small(ledger, project, job_name, attempt_id, request, max_fix_rounds)
     outcome = _run_from_attempt(
         config, ledger, fakes, project, job_name, request, attempt_id, max_fix_rounds,
         on_progress, processor_factory, needs_resume_note=is_owner_request_stop)

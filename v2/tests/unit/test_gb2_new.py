@@ -124,7 +124,7 @@ def _install_fake_full_orbit(monkeypatch: pytest.MonkeyPatch, *, run_result=None
         continue_calls.append((config, ledger, fakes, project, job_name, on_progress))
         return continue_result if continue_result is not None else _FakeFullOutcome(status="done")
 
-    def pending_owner_requests(ledger, project, job_name):
+    def pending_owner_requests(ledger, project, job_name, **_kwargs):
         pending_calls.append((project, job_name))
         return pending_requests
 

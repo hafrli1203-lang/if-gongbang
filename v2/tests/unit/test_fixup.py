@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import evidence, fixup, orbit, state
+from engine import evidence, faults, fixup, orbit, state
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
@@ -37,6 +37,17 @@ def initials(full_name: str) -> str:
     words = full_name.split()
     return "".join(word[0] for word in words).upper()
 '''
+
+
+def _fix_opened(ledger, project: str = "alpha") -> list[str]:
+    """Every replacement attempt a fix cycle recorded as opened (the one
+    `job.position` event whose fix names it)."""
+    opened: list[str] = []
+    for _seq, event in ledger.events(project, "job.position"):
+        fix = event.payload.get("fix")
+        if isinstance(fix, dict) and isinstance(fix.get("new_attempt_id"), str):
+            opened.append(fix["new_attempt_id"])
+    return opened
 
 
 def _fakes() -> Fakes:
@@ -636,7 +647,7 @@ def test_fix_resumes_after_a_crash_right_after_closing_the_old_attempt(
     assert ws.ledger.project("alpha").state == "CLOSED"
     assert len(ws.ledger.events("alpha", "fix.started")) == 1
     assert len(ws.ledger.events("alpha", "fix.closed_old")) == 1
-    assert not ws.ledger.events("alpha", "fix.opened_new")
+    assert not _fix_opened(ws.ledger)
     assert not ws.ledger.events("alpha", "fix.finished")
     with pytest.raises(fixup.FixupError, match="not OPEN"):
         fixup.find_fix_target(ws.ledger, "alpha")
@@ -650,7 +661,7 @@ def test_fix_resumes_after_a_crash_right_after_closing_the_old_attempt(
     assert ws.ledger.project("alpha").state == "CLOSED"
     # exactly ONE new attempt was ever opened for this fix -- the crash
     # must never have forked a second, orphaned one.
-    assert len(ws.ledger.events("alpha", "fix.opened_new")) == 1
+    assert len(_fix_opened(ws.ledger)) == 1
     assert len(ws.ledger.events("alpha", "fix.closed_old")) == 1
 
     notes = ws.alpha / "docs" / "notes.md"
@@ -709,7 +720,7 @@ def test_fix_never_adopts_an_unrelated_reopen_of_the_same_job_name(
                  processor_factory=_processor_factory(review_passed=True))
 
     assert ws.ledger.project("alpha").state == "CLOSED"
-    assert not ws.ledger.events("alpha", "fix.opened_new")
+    assert not _fix_opened(ws.ledger)
 
     # An unrelated reopen of the SAME job_name, landing after both
     # "fix.started" and "fix.closed_old" -- exactly the candidate the old
@@ -723,8 +734,8 @@ def test_fix_never_adopts_an_unrelated_reopen_of_the_same_job_name(
                  processor_factory=_processor_factory(review_passed=True))
 
     # The unrelated attempt was never touched by the fix's archive
-    # overlay, and no "fix.opened_new" was ever wrongly journaled for it.
-    assert not ws.ledger.events("alpha", "fix.opened_new")
+    # overlay, and no fix opening was ever wrongly recorded for it.
+    assert not _fix_opened(ws.ledger)
     assert ws.ledger.project("alpha").current_attempt_id == unrelated_attempt
     assert ws.ledger.attempt(unrelated_attempt).status == "active"
 
@@ -773,11 +784,11 @@ def test_fix_resumes_after_a_crash_right_after_opening_the_new_attempt(
                  processor_factory=_processor_factory(review_passed=True))
 
     assert ws.ledger.project("alpha").state == "OPEN"
-    opened_events = ws.ledger.events("alpha", "fix.opened_new")
-    assert len(opened_events) == 1
+    opened = _fix_opened(ws.ledger)
+    assert len(opened) == 1
     assert not ws.ledger.events("alpha", "fix.restored")
     assert not ws.ledger.events("alpha", "fix.finished")
-    attempt2 = str(opened_events[0][1].payload["new_attempt_id"])
+    attempt2 = opened[0]
     assert ws.ledger.attempt(attempt2).status == "active"
     # the project's own current attempt has no failed (or any) request
     # at all yet -- find_fix_target has nothing to accept here.
@@ -789,7 +800,7 @@ def test_fix_resumes_after_a_crash_right_after_opening_the_new_attempt(
 
     assert calls["n"] == 2
     assert result.new_attempt_id == attempt2  # no duplicate attempt opened
-    assert len(ws.ledger.events("alpha", "fix.opened_new")) == 1
+    assert len(_fix_opened(ws.ledger)) == 1
     assert result.outcome.status == "done"
     assert ws.ledger.project("alpha").state == "CLOSED"
 
@@ -804,8 +815,8 @@ def test_fix_resumes_after_a_crash_between_open_job_and_its_own_journal_write(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A crash hits strictly BETWEEN open_job() returning (so the project
-    is already OPEN on a brand-new attempt) and the "fix.opened_new"
-    journal event ever being appended for it. A retry must detect that
+    is already OPEN on a brand-new attempt) and the fix-opened
+    position being recorded for it. A retry must detect that
     already-open attempt (engine.fixup._already_opened_new_attempt)
     rather than calling open_job() again -- which would raise outright
     (open_job only accepts a CLOSED project) and leave the cycle stuck
@@ -829,19 +840,10 @@ def test_fix_resumes_after_a_crash_between_open_job_and_its_own_journal_write(
     def fakes_for(attempt_id: str) -> Fakes:
         return _fakes()
 
-    calls = {"n": 0}
-    real_append = fixup._append_fix_event
+    monkeypatch.setattr(faults, "ACTIVE_FLOW_FAULTS",
+                        faults.Faults(crash_before={"fixup.fix.opened_new"}))
 
-    def _crashing_append(ledger_, project, kind, old_attempt_id, payload):
-        if kind == "fix.opened_new":
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise RuntimeError("simulated crash right after open_job")
-        return real_append(ledger_, project, kind, old_attempt_id, payload)
-
-    monkeypatch.setattr(fixup, "_append_fix_event", _crashing_append)
-
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    with pytest.raises(faults.CrashInjected):
         fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
                  processor_factory=_processor_factory(review_passed=True))
 
@@ -850,15 +852,13 @@ def test_fix_resumes_after_a_crash_between_open_job_and_its_own_journal_write(
     assert ws.ledger.project("alpha").state == "OPEN"
     attempt2 = ws.ledger.project("alpha").current_attempt_id
     assert attempt2 != attempt1
-    assert not ws.ledger.events("alpha", "fix.opened_new")
+    assert not _fix_opened(ws.ledger)
 
     result = fixup.fix(ws.config, ws.ledger, "alpha", "please finish the fix", fakes_for,
                        processor_factory=_processor_factory(review_passed=True))
 
     assert result.new_attempt_id == attempt2  # the already-open attempt, never a new one
-    opened_events = ws.ledger.events("alpha", "fix.opened_new")
-    assert len(opened_events) == 1
-    assert str(opened_events[0][1].payload["new_attempt_id"]) == attempt2
+    assert _fix_opened(ws.ledger) == [attempt2]
     assert result.outcome.status == "done"
     assert ws.ledger.project("alpha").state == "CLOSED"
 

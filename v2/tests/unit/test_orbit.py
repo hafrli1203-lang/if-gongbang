@@ -26,7 +26,7 @@ from engine.fakes.publisher import FakePublisher
 from engine.ledger import Event
 from engine.processor import Fakes, Processor, StepContext, StepDef, StepFailed, submit
 from engine.steps.open_job import copy_root, open_job
-from tests.conftest import GIT_ENV, Workspace
+from tests.conftest import seed_reviewed_manifest, GIT_ENV, Workspace
 from tests.fixtures.sample_app import make_sample
 
 
@@ -354,6 +354,7 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
                      **({"policy_hash": security_policy_hash(workspace.config)}
                         if kind == "app_security.recorded" else {})},
         ))
+    seed_reviewed_manifest(workspace.ledger, project, attempt_id)
 
 
 def test_blocked_by_unrelated_unknown_request_is_pending(workspace: Workspace) -> None:

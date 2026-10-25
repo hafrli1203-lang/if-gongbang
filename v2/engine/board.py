@@ -94,13 +94,24 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
-def load_app_board(app: str, ledger_path: Path, project: str) -> AppBoard:
+def load_app_board(app: str, ledger_path: Path, project: str,
+                   repo: Path | None = None) -> AppBoard:
     """Read everything for `project` out of the sqlite file at
     `ledger_path`. Never raises -- a missing file, a file that is not a
     sqlite database, or a project with no rows yet all come back as an
     AppBoard with empty jobs/events (and `error` set for the first two),
     so one broken/absent app's ledger never stops the rest of the
-    board from rendering."""
+    board from rendering.
+
+    `repo` (the app's own project repo, where its plan.json files
+    live) is optional and defaults to None, which keeps every existing
+    caller's behavior byte-for-byte unchanged (every test in this
+    module's own test suite omits it). When given, `_derive_job_status`
+    additionally requires the P4 evidence graph (engine.evidence_graph)
+    to be complete before it will ever show 완료/배포됨/건너뜀 for a job
+    whose latest release_decision event says so -- see that function's
+    own docstring for exactly what "complete" means and how a failure
+    to even determine it (no plan.json, ledger busy, ...) degrades."""
     try:
         conn = _connect_ro(ledger_path)
     except sqlite3.OperationalError as exc:
@@ -158,7 +169,7 @@ def load_app_board(app: str, ledger_path: Path, project: str) -> AppBoard:
     jobs = tuple(
         _derive_job(app, job_id, job_names[job_id],
                    sorted(attempts_by_job.get(job_id, ()), key=lambda a: a.n),
-                   events, request_status)
+                   events, request_status, ledger_path=ledger_path, project=project, repo=repo)
         for job_id in job_names
     )
     return AppBoard(app=app, project=project, jobs=jobs, events=events)
@@ -178,10 +189,32 @@ def _safe_json(payload_json: str) -> dict[str, Any]:
 
 _AWAITING_PREFIX = "awaiting_"
 
+# P1 (ENGINE.md s20 flow-map (가)): the flow layer now journals ONE
+# position event, 'job.position' (engine.position.record_position),
+# in place of the former 'full_orbit.cursor'/'full_orbit.progress'
+# pair -- same "stage"/"stop_reason" fields this module already read,
+# but `request_id` moved under payload["extra"]["request_id"] (the
+# JobPosition.extra catch-all) rather than sitting at the payload's own
+# top level. A ledger written before P1 still has 'full_orbit.
+# progress' events and no 'job.position' ones at all -- this module
+# reads BOTH kinds in the SAME seq-ordered pass (see _derive_job_status/
+# _derive_job_stage), so "whichever one has the newest seq wins" still
+# holds across the cutover, old events on an old ledger, new events on
+# a new one, never a mix that needs its own special case.
+_POSITION_EVENT_KINDS = ("full_orbit.progress", "job.position")
+
+
+def _position_request_id(event: "EventRow") -> object:
+    if event.kind == "job.position":
+        extra = event.payload.get("extra")
+        return extra.get("request_id") if isinstance(extra, dict) else None
+    return event.payload.get("request_id")
+
 
 def _derive_job(app: str, job_id: str, job_name: str,
                 attempts: list[AttemptRow], all_events: tuple[EventRow, ...],
-                request_status: dict[str, str]) -> JobBoard:
+                request_status: dict[str, str], *, ledger_path: Path, project: str,
+                repo: Path | None) -> JobBoard:
     attempt_ids = {a.attempt_id for a in attempts}
     job_events = tuple(e for e in all_events if e.attempt_id in attempt_ids)
     timestamps = [e.ts for e in job_events]
@@ -195,7 +228,9 @@ def _derive_job(app: str, job_id: str, job_name: str,
     cost_usd = sum(costs) if costs else None
 
     latest_attempt = attempts[-1] if attempts else None
-    status = _derive_job_status(job_events, latest_attempt, request_status)
+    status = _derive_job_status(job_events, latest_attempt, request_status,
+                                ledger_path=ledger_path, project=project,
+                                job_name=job_name, repo=repo)
     stage = _derive_job_stage(job_events)
 
     return JobBoard(
@@ -227,9 +262,15 @@ _RELEASE_DECISION_LABEL = {
 }
 
 
+_RELEASE_SUCCESS_DECISIONS = ("shipped", "skipped", "not_configured")
+_INCOMPLETE_GRAPH_LABEL = "사람 확인 대기: 증거 불완전"
+
+
 def _derive_job_status(job_events: tuple[EventRow, ...],
                        latest_attempt: AttemptRow | None,
-                       request_status: dict[str, str] | None = None) -> str:
+                       request_status: dict[str, str] | None = None, *,
+                       ledger_path: Path | None = None, project: str | None = None,
+                       job_name: str | None = None, repo: Path | None = None) -> str:
     """Best-effort display label from whatever this job's events show --
     not an authoritative engine state (the engine has no single "job
     status" field; full_orbit's own FullOutcome is a return value, not a
@@ -247,12 +288,14 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
     never leave a stale "release approval waiting" row behind).
 
     Candidates considered, each from its own seq:
-    - the LAST full_orbit.progress event whose stage starts with
-      "awaiting_" -> "사람 확인 대기" (plus ": <stop_reason>" when that
-      event carries one) -- UNLESS it is this
+    - the LAST full_orbit.progress/job.position event (see
+      _POSITION_EVENT_KINDS) whose stage starts with "awaiting_" ->
+      "사람 확인 대기" (plus ": <stop_reason>" when that event carries
+      one) -- UNLESS it is this
       job's release-approval stop AND `request_status` (read straight
       from the ledger's own requests table, never updated by the
-      progress event itself) shows that SAME request_id already ended
+      progress/position event itself) shows that SAME request_id
+      already ended
       "failed"/"unknown": `tools/gb2`'s `ship` drives a publish request
       to exactly that terminal status and then returns without ever
       journaling report/close or a release_decision on a real deploy
@@ -282,50 +325,113 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
     - the LAST full_orbit.release_decision event (engine.full_orbit.
       record_release_decision -- `gb2 ship`/`gb2 skip-ship`'s own
       durable terminal record for a release-configured job) ->
-      _RELEASE_DECISION_LABEL[decision].
+      _RELEASE_DECISION_LABEL[decision] -- UNLESS the decision is one
+      of _RELEASE_SUCCESS_DECISIONS (shipped/skipped/not_configured,
+      i.e. every label this table maps to something other than 실패)
+      AND `repo` was given AND the P4 evidence graph (engine.
+      evidence_graph, built fresh from `ledger_path`'s own CURRENT
+      ledger + `job_name`'s own CURRENT plan.json -- never trusted
+      from this release_decision event's own say-so) is NOT complete
+      right now: a release decision recorded in the past is itself
+      only as good as the evidence that justified it at the time, and
+      this board renders the CURRENT ledger, not a snapshot from when
+      that decision was made -- a requirement's only covering scene
+      quietly losing its pass (plan.json edited since, or the ledger
+      itself edited by hand) must stop a stale "완료" from being
+      displayed as this job's status. `ledger_path`/`project`/
+      `job_name`/`repo` are all optional (default None, this function's
+      own pre-existing callers in this module's test suite never pass
+      them) -- omitting any one of them skips this extra check
+      entirely, the exact behavior before P4. A `repo` with no
+      plan.json, or a ledger that cannot be opened right now
+      (_release_graph_complete returns None either way), is NEVER
+      treated as "incomplete" -- only a definite `missing(graph)` makes
+      this downgrade _INCOMPLETE_GRAPH_LABEL, same "degrade, never
+      raise or over-claim" rule this module's own docstring sets for
+      every other field.
 
     If none of those exist at all, falls back to: the latest attempt's
     own status is abandoned/interrupted -> 중단; otherwise -> 진행 중.
     """
     request_status = request_status or {}
-    candidates: list[tuple[int, str]] = []
+    candidates: list[tuple[int, str, str | None]] = []
     for event in job_events:
-        if event.kind == "full_orbit.progress":
+        if event.kind in _POSITION_EVENT_KINDS:
             stage = event.payload.get("stage")
             if isinstance(stage, str) and stage.startswith(_AWAITING_PREFIX):
-                request_id = event.payload.get("request_id")
+                request_id = _position_request_id(event)
                 if (isinstance(request_id, str)
                         and request_status.get(request_id) in ("failed", "unknown")):
-                    candidates.append((event.seq, "실패"))
+                    candidates.append((event.seq, "실패", None))
                     continue
                 reason = event.payload.get("stop_reason")
                 label = (f"사람 확인 대기: {reason}" if isinstance(reason, str) and reason
                         else "사람 확인 대기")
-                candidates.append((event.seq, label))
+                candidates.append((event.seq, label, None))
         elif event.kind == "job.metrics":
             outcome = event.payload.get("outcome")
             if outcome == "failed":
-                candidates.append((event.seq, "실패"))
+                candidates.append((event.seq, "실패", None))
         elif event.kind == "full_orbit.release_decision":
             decision = event.payload.get("decision")
             if isinstance(decision, str):
-                candidates.append((event.seq, _RELEASE_DECISION_LABEL.get(decision, "완료")))
+                candidates.append((
+                    event.seq, _RELEASE_DECISION_LABEL.get(decision, "완료"),
+                    decision if decision in _RELEASE_SUCCESS_DECISIONS else None,
+                ))
 
     if candidates:
-        candidates.sort(key=lambda pair: pair[0])
-        return candidates[-1][1]
+        candidates.sort(key=lambda row: row[0])
+        _seq, label, success_decision = candidates[-1]
+        if (success_decision is not None and repo is not None and ledger_path is not None
+                and project is not None and job_name is not None):
+            complete = _release_graph_complete(ledger_path, project, job_name, repo)
+            if complete is False:
+                return _INCOMPLETE_GRAPH_LABEL
+        return label
     if latest_attempt is not None and latest_attempt.status in ("abandoned", "interrupted"):
         return "중단"
     return "진행 중"
 
 
+def _release_graph_complete(ledger_path: Path, project: str, job_name: str,
+                            repo: Path) -> bool | None:
+    """True/False once this job's P4 evidence graph (engine.
+    evidence_graph) can actually be computed right now -- None when it
+    cannot be (no plan.json for `job_name` under `repo`, or the ledger
+    at `ledger_path` cannot be opened through engine.ledger.Ledger at
+    this moment). This is the ONE place this module reaches for
+    engine.ledger.Ledger at all (see this module's own docstring for
+    why it otherwise reads the sqlite file directly) -- strictly
+    read-only (never .append()s), and any failure degrades to None
+    rather than ever raising into a board render, same contract
+    load_app_board's own docstring already promises for a broken
+    ledger file."""
+    try:
+        from engine import evidence_graph
+        from engine.ledger import Ledger
+        from engine.plan import load_plan
+
+        plan = load_plan(repo, job_name)
+        ledger = Ledger.open(ledger_path)
+        try:
+            graph = evidence_graph.build(ledger, project, job_name, plan)
+        finally:
+            ledger.close()
+        return not evidence_graph.missing(graph)
+    except Exception:
+        return None
+
+
 def _derive_job_stage(job_events: tuple[EventRow, ...]) -> str:
-    """Last full_orbit.progress.stage if any, else the last
-    station.finished station name, else "-"."""
+    """Last full_orbit.progress/job.position .stage if any (whichever
+    kind's event has the newest seq -- see _POSITION_EVENT_KINDS' own
+    docstring), else the last station.finished station name, else
+    "-"."""
     last_stage: str | None = None
     last_station: str | None = None
     for event in job_events:
-        if event.kind == "full_orbit.progress":
+        if event.kind in _POSITION_EVENT_KINDS:
             stage = event.payload.get("stage")
             if isinstance(stage, str):
                 last_stage = stage
@@ -510,7 +616,7 @@ def _event_label(app: str, event: EventRow) -> str:
     if event.kind == "station.finished":
         return (f"{app}: {p.get('station', '?')}/{p.get('role', '?')} 완료 "
                 f"(ok={p.get('ok')})")
-    if event.kind == "full_orbit.progress":
+    if event.kind in _POSITION_EVENT_KINDS:
         return f"{app}: 진행 - {p.get('stage', '?')}"
     if event.kind == "report.written":
         return f"{app}: 보고서 작성"
@@ -668,15 +774,26 @@ def _render_lessons(lessons: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------
 
 
-def build_board(app_ledgers: dict[str, tuple[Path, str]], *, lessons_path: Path | None = None,
-                queue_path: Path | None = None, generated_ts: float | None = None) -> str:
-    """app_ledgers: {app_name: (ledger_path, project_name)}. Reads the
-    optional lessons export JSON (a list of lesson dicts; any other
-    shape is treated as "no lessons", not an error) and the optional
-    queue markdown file verbatim. Never raises for a missing or
-    unreadable optional file -- only ledger read failures surface (per
-    app, in the error panel)."""
-    apps = [load_app_board(app, path, project) for app, (path, project) in app_ledgers.items()]
+def build_board(
+    app_ledgers: "dict[str, tuple[Path, str] | tuple[Path, str, Path | None]]", *,
+    lessons_path: Path | None = None, queue_path: Path | None = None,
+    generated_ts: float | None = None,
+) -> str:
+    """app_ledgers: {app_name: (ledger_path, project_name)} or
+    {app_name: (ledger_path, project_name, repo)} -- the third, optional
+    element (an app's own project repo, where its plan.json files live)
+    enables load_app_board's own P4 evidence-graph completeness check
+    for that app's jobs; a 2-tuple (every existing caller today) keeps
+    that check off, exactly as before it existed. Reads the optional
+    lessons export JSON (a list of lesson dicts; any other shape is
+    treated as "no lessons", not an error) and the optional queue
+    markdown file verbatim. Never raises for a missing or unreadable
+    optional file -- only ledger read failures surface (per app, in the
+    error panel)."""
+    apps = [
+        load_app_board(app, value[0], value[1], repo=value[2] if len(value) > 2 else None)
+        for app, value in app_ledgers.items()
+    ]
     lessons = _load_lessons(lessons_path) if lessons_path is not None else None
     queue_text = _load_text(queue_path) if queue_path is not None else None
     return render_board_html(apps, lessons=lessons, queue_text=queue_text,

@@ -490,3 +490,118 @@ def test_security_fix_stop_after_handoff_shows_waiting_not_완료(tmp_path):
     board = load_app_board("alpha", ledger_path, project)
 
     assert board.jobs[0].status == "사람 확인 대기: security_failed"
+
+
+# ---------------------------------------------------------------------
+# P1 cutover: 'job.position' (engine.position.record_position) replaces
+# 'full_orbit.cursor'/'full_orbit.progress' -- this module must read
+# BOTH kinds (old ledgers only ever have the old one) and pick whichever
+# has the newest seq, same as it already does across every other event
+# kind pair here. See board._POSITION_EVENT_KINDS' own docstring.
+# ---------------------------------------------------------------------
+
+def test_job_position_awaiting_stage_shows_waiting(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.position", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "stage": "awaiting_design_approval",
+                 "attempt_id": "job-1.1", "task_id": None, "remaining_task_ids": [],
+                 "fixing": False, "fix": None, "pending_requests": [],
+                 "stop_reason": None, "extra": {}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기"
+
+
+def test_job_position_stop_reason_shown(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.position", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "stage": "awaiting_probe_retry",
+                 "attempt_id": "job-1.1", "task_id": None, "remaining_task_ids": [],
+                 "fixing": False, "fix": None, "pending_requests": [],
+                 "stop_reason": "probe_failed:stripe", "extra": {}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기: probe_failed:stripe"
+
+
+def test_job_position_request_id_lives_under_extra(tmp_path):
+    """The P1 payload shape moved request_id under payload["extra"] --
+    a request that already ended failed/unknown in the requests table
+    must still override "사람 확인 대기" with 실패, the same as the old
+    full_orbit.progress shape (top-level request_id) already did."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.position", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "stage": "awaiting_release_approval",
+                 "attempt_id": "job-1.1", "task_id": None, "remaining_task_ids": [],
+                 "fixing": False, "fix": None, "pending_requests": [],
+                 "stop_reason": "release_approval", "extra": {"request_id": "r-pub-9"}},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-pub-9", "kind": "publish",
+                 "content_hash": "h1", "payload": {}},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.status", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r-pub-9", "status": "failed",
+                 "result": {"reason": "deploy_script_failed"}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "실패"
+
+
+def test_job_position_newest_seq_wins_over_an_older_full_orbit_progress(tmp_path):
+    """A ledger that straddles the P1 cutover (old full_orbit.progress
+    events from before, new job.position events from after) must still
+    pick whichever event has the newest seq, regardless of which of
+    the two kinds it is."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_release_approval", "stop_reason": "release_approval"},
+    ))
+    ledger.append(Event(
+        project=project, kind="job.position", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "stage": "awaiting_security_fix",
+                 "attempt_id": "job-1.1", "task_id": None, "remaining_task_ids": [],
+                 "fixing": False, "fix": None, "pending_requests": [],
+                 "stop_reason": "security_failed", "extra": {}},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기: security_failed"
+    assert board.jobs[0].stage == "awaiting_security_fix"

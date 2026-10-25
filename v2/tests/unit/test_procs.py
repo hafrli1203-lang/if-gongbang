@@ -220,16 +220,14 @@ def test_spawn_adopts_a_live_process_left_by_a_crash_before_proc_started(
 def test_spawn_recovers_a_completed_dispatch_instead_of_discarding_its_receipt(
     workspace: Workspace, tmp_path: Path,
 ) -> None:
-    """Regression for codex-diff-review-s17.md's "Launch recovery can
-    execute completed work twice" (engine/procs.py:328): a worker's
-    REAL command can finish -- its sh wrapper's exit-writer step
-    writes the real exit code to the exit file -- before the engine
-    gets to append proc.started for it; the crash window this
-    simulates is strictly AFTER that completion, so there is nothing
-    live left to adopt (see test_spawn_adopts_a_live_process_left_by_a
-    _crash_before_proc_started for the still-live sibling case) and,
-    before this fix, the fall-through path unconditionally deleted the
-    exit file, truncated the already-written stdout, and launched a
+    """A worker's REAL command can finish -- its sh wrapper's
+    exit-writer step writes the real exit code to the exit file --
+    before the engine gets to append proc.started for it; the crash
+    window this simulates is strictly AFTER that completion, so there
+    is nothing live left to adopt (see test_spawn_adopts_a_live_process
+    _left_by_a_crash_before_proc_started for the still-live sibling
+    case). The fall-through path must not unconditionally delete the
+    exit file, truncate the already-written stdout, and launch a
     SECOND, fully redundant process for identical work.
 
     A later spawn() call for the IDENTICAL identity must now adopt
@@ -444,14 +442,27 @@ def test_engine_death_leaves_no_survivor_under_bwrap(
     os.kill(standin.pid, signal.SIGKILL)  # simulated engine crash
     standin.wait(timeout=5)
 
-    deadline = time.time() + 5
+    # --die-with-parent + PR_SET_PDEATHSIG tear the tree down
+    # asynchronously (the kernel delivers the signal, then each process
+    # still has to actually run its handler and exit) -- on an idle
+    # machine that is sub-second, but under heavy contention (many
+    # other test suites' processes competing for the same CPUs, as
+    # happened in the full-suite run that first flaked here) the
+    # scheduler can leave a doomed process runnable-but-not-yet-run for
+    # several seconds. 20s is not an assertion that teardown itself
+    # takes that long -- it is "how long this test waits before
+    # concluding the kernel guarantee failed", chosen generously above
+    # any contention this machine has shown so a loaded run gets the
+    # same pass/fail verdict as an idle one; the loop still exits the
+    # instant every pid is gone, so the common case stays fast.
+    deadline = time.time() + 20
     while time.time() < deadline and any(
         Path("/proc", str(pid)).exists() for pid in all_watched
     ):
         time.sleep(0.05)
 
     survivors = [pid for pid in all_watched if Path("/proc", str(pid)).exists()]
-    assert survivors == []
+    assert survivors == [], f"still alive after the 20s deadline: {survivors}"
 
 
 @_needs_bwrap

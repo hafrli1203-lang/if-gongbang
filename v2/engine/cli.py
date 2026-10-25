@@ -26,6 +26,7 @@ from engine import ids, orbit
 from engine.config import EngineConfig
 from engine.fakes.publisher import FakePublisher
 from engine.ledger import Ledger, LedgerError
+from engine.ledger import backup as ledger_backup
 from engine.processor import Fakes, Processor, retry_unknown, submit
 from engine.steps.open_job import open_job
 
@@ -390,9 +391,22 @@ def cmd_close(config: EngineConfig, args: argparse.Namespace) -> int:
     return 0 if status == "done" else 3
 
 
+def cmd_backup(config: EngineConfig, args: argparse.Namespace) -> int:
+    """Back up the ledger (engine.ledger.backup -- SQLite's online
+    backup API, verified by PRAGMA integrity_check on the copy) into
+    --dest (default: config.home / "backups"), then prune that
+    directory to the newest --keep files. Does not touch the live
+    ledger beyond opening a read connection to it."""
+    dest_dir = Path(args.dest) if args.dest else (config.home / "backups")
+    path = ledger_backup(config.ledger_path, dest_dir, keep=args.keep)
+    print(json.dumps({"backup_path": str(path)}, ensure_ascii=False))
+    return 0
+
+
 _HANDLERS = {
     "init": cmd_init, "open": cmd_open, "run": cmd_run, "status": cmd_status,
     "retry-unknown": cmd_retry_unknown, "approve": cmd_approve, "close": cmd_close,
+    "backup": cmd_backup,
 }
 
 
@@ -445,6 +459,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_close = sub.add_parser("close", parents=[common])
     p_close.add_argument("project")
     p_close.add_argument("attempt_id")
+
+    p_backup = sub.add_parser("backup", parents=[common])
+    p_backup.add_argument("--dest", default=None,
+                          help="backup directory (default: <home>/backups)")
+    p_backup.add_argument("--keep", type=int, default=10,
+                          help="newest backups to keep in --dest (default: 10)")
 
     return parser
 

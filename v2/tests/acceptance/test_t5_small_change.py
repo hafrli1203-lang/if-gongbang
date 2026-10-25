@@ -378,15 +378,13 @@ def _write_small_job_scripts_with_external_target(
 def test_gb2_change_small_closes_and_falls_back_to_full_job_on_an_external_target(
     tmp_path: Path, scripts_dir: Path,
 ) -> None:
-    """Regression (Codex diff-review-s17, tools/gb2:1037 /
-    small_orbit.py:213): a small job whose own combined planning call
-    names a real external target used to return NEEDS_PROBE_REASON
-    WITHOUT closing its attempt -- the project stayed OPEN, so
+    """A small job whose own combined planning call names a real
+    external target must close its attempt before falling back, so
     tools/gb2's own fallback call (engine.full_orbit.run_full_job,
-    under a fresh job_name) immediately raised "required state
-    ('CLOSED',), got 'OPEN'" instead of ever actually falling back.
-    This drives the real `gb2` CLI end to end (never engine.small_orbit
-    directly) to prove the fallback now actually completes."""
+    under a fresh job_name) finds the project CLOSED rather than
+    raising "required state ('CLOSED',), got 'OPEN'". This drives the
+    real `gb2` CLI end to end (never engine.small_orbit directly) to
+    prove the fallback actually completes."""
     apps_root = tmp_path / "source"
     workspace = tmp_path / "workspace"
     apps_root.mkdir()

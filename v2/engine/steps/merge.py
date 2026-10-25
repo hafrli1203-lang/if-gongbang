@@ -401,9 +401,7 @@ def _attempt_already_applied_hashes(ctx: StepContext) -> dict[str, str | None]:
     engine.full_orbit's own install/owner-approval pause leaves THIS
     SAME attempt active while the repo sits there waiting, and an
     owner is free to hand-edit a file merge already wrote during that
-    window before approving continuation (codex-goal-review-4.md item
-    6 / codex-diff-review-s17.md "Repeated merging can overwrite owner
-    edits", engine/steps/merge.py:423) -- a later re-merge on the same
+    window before approving continuation -- a later re-merge on the same
     attempt must still catch that, not silently overwrite it just
     because the path's NAME was already applied once before. Later
     events for the same rel overwrite earlier ones (the hash of the
@@ -428,10 +426,9 @@ def _verify_destinations_unchanged(ctx: StepContext, rels: set[str]) -> None:
     this attempt has NEVER applied before falls back to the plain
     "does the destination still equal base_head" comparison.
 
-    The order matters (codex-diff-review-s18.md G6: "merge.py:453
-    accepts destination equal to base BEFORE checking the last applied
-    digest"): checking "current == base_content" first, and only
-    consulting the last-applied hash on a MISMATCH against base, means
+    The order matters: checking "current == base_content" first, and
+    only consulting the last-applied hash on a MISMATCH against base,
+    means
     an owner who reverts an already-merged path back to its base_head
     content (undoing this attempt's own earlier write, on purpose)
     makes current == base_content true again -- short-circuiting

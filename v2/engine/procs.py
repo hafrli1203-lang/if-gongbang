@@ -359,9 +359,7 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     exit-writer wrapper to completion: THAT case now checks the exit
     file first and adopts its real, already-written code via
     _recover_completed_dispatch instead of deleting the receipt and
-    launching a second, fully redundant process (the bug this
-    closes -- codex-diff-review-s17.md, "Launch recovery can execute
-    completed work twice").
+    launching a second, fully redundant process for identical work.
 
     env=None inherits this process's own environment (Popen's default),
     exactly as before this parameter existed; a worker runner instead
@@ -426,10 +424,9 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     (never exec) to run "$@", since it still has to write the exit
     code afterward -- that forked grandchild is a plain Unix child of
     `sh` with no pdeathsig of its own, so it is NOT reached by
-    _die_with_engine killing `sh`: if `sh` dies (via this fix, or any
-    other way) while the real, unsandboxed command is still running,
-    that command is simply reparented to init and keeps running,
-    orphaned, same as before this fix existed. Closing this would mean
+    _die_with_engine killing `sh`: if `sh` dies while the real,
+    unsandboxed command is still running, that command is simply
+    reparented to init and keeps running, orphaned. Closing this would mean
     replacing the `sh -c` wrapper itself with a small supervisor
     process that forks its own child with its OWN pdeathsig pointed at
     the supervisor (rather than relying on a shell's lack of any such

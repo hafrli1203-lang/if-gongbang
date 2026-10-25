@@ -18,7 +18,7 @@ from engine.ledger import Event
 from engine.processor import Fakes, Processor, StepContext, StepUnknown, submit
 from engine.steps.open_job import open_job
 from engine.steps.publish import _reconcile_call_publisher, _run_record_publish
-from tests.conftest import Workspace
+from tests.conftest import seed_reviewed_manifest, Workspace
 
 
 def _proc(workspace: Workspace, publisher: FakePublisher | None = None) -> Processor:
@@ -51,6 +51,7 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> str:
                      **({"policy_hash": security_policy_hash(workspace.config)}
                         if kind == "app_security.recorded" else {})},
         ))
+    seed_reviewed_manifest(workspace.ledger, project, attempt_id)
     return fp
 
 
@@ -96,15 +97,12 @@ def test_publish_fails_without_approval(workspace: Workspace) -> None:
 def test_publish_without_release_still_requires_full_bench_before_dispatch(
     workspace: Workspace,
 ) -> None:
-    """Regression for codex-goal-review-4.md item 13 / codex-diff-
-    review-s17.md "Whole-job verification is not a universal
-    deployment invariant" (engine/steps/publish.py:407,545): this
-    project has NO `release` configured at all -- before this fix, an
-    approved+artifact-matching publish reached the real publisher call
-    on nothing more than check_approval/check_artifact, with no full-
-    suite bench and no job certificate required, simply because
-    release_config was None. A passing approval and artifact hash
-    alone must no longer be enough."""
+    """This project has NO `release` configured at all -- an
+    approved+artifact-matching publish must still require a full-
+    suite bench and a job certificate before reaching the real
+    publisher call, not just check_approval/check_artifact, even
+    though release_config is None. A passing approval and artifact
+    hash alone is not enough."""
     attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job-no-bench",
                           "full", roles=("builder",))
     artifact_hash = sha256_file(workspace.beta / "dist" / "bundle.js")

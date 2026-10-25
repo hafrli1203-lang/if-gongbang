@@ -121,31 +121,52 @@ def test_scene_table_pairs_by_requirement_id_not_position(workspace: Workspace) 
     sit at the same list index."""
     from engine.plan import Plan as RealPlan
     from engine.plan import Requirement
-    from engine.plan import Scene as RealScene
-    from engine.plan import Task as RealTask
+    import json
+
+    from engine.plan import load_plan, plan_path, record_plan_reviewed
 
     ws = _sample_workspace(workspace)
     attempt_id = open_job(ws.config, ws.ledger, "alpha", "job1", "full",
                           roles=("builder",))
-    plan = RealPlan(
-        goal="x", ui=False,
-        requirements=(
-            Requirement(id="R1", text="인사말이 Hello, X 형태로 나온다", kind="function"),
-            Requirement(id="R2", text="입력을 검증한다", kind="security"),
-        ),
-        # Scene s2 is declared BEFORE s1 here -- deliberately out of
-        # requirement order, so a positional pairing would mismatch R1/R2.
-        scenes=(
-            RealScene(id="s2", actor_does="y", app_shows="y", where="cli",
-                     cmd=(sys.executable, "-c", "pass"), covers=()),
-            RealScene(id="s1", actor_does="x", app_shows="Hello, World", where="cli",
-                     cmd=(sys.executable, "-c", "pass"), covers=("R1",)),
-        ),
-        tasks=(RealTask(id="t1", title="검증", detail="", owns=("src/",),
-                        depends_on=(), covers=("R2",)),),
-        acceptance=("인사말이 Hello, X 형태로 나온다",),
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
     )
+    # Scene s2 is declared BEFORE s1 here -- deliberately out of
+    # requirement order, so a positional pairing would mismatch R1/R2.
+    # s1 is the only scene that `covers` a requirement, so it alone
+    # goes through engine.acceptance's trusted-runner resolution (see
+    # engine.plan's own module docstring) -- it must be a real,
+    # reviewed, on-disk plan.json for that to pass at all (a
+    # hand-built Plan object, never written to disk, would refuse
+    # with "plan_never_reviewed" before ever running s1).
+    data = {
+        "goal": "x", "ui": False,
+        "scenes": [
+            {"id": "s2", "actor_does": "y", "app_shows": "y", "where": "cli",
+             "cmd": [sys.executable, "-c", "pass"]},
+            {"id": "s1", "actor_does": "x", "app_shows": "Hello, World", "where": "cli",
+             "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+        ],
+        "tasks": [{"id": "t1", "title": "검증", "detail": "", "owns": ["src/"],
+                   "depends_on": [], "covers": ["R2"]}],
+        "acceptance": ["인사말이 Hello, X 형태로 나온다"],
+        "requirements": [
+            {"id": "R1", "text": "인사말이 Hello, X 형태로 나온다", "kind": "function"},
+            {"id": "R2", "text": "입력을 검증한다", "kind": "security"},
+        ],
+    }
+    path_ = plan_path(ws.alpha, "job1")
+    path_.parent.mkdir(parents=True, exist_ok=True)
+    path_.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    record_plan_reviewed(ws.ledger, "alpha", attempt_id, ws.alpha, "job1")
+    plan = load_plan(ws.alpha, "job1")
     acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+    assert acc.scenes[1].id == "s1" and acc.scenes[1].passed is True
 
     path = write_handoff(ws.config, ws.ledger, "alpha", attempt_id, "job1", plan, acc)
     text = path.read_text(encoding="utf-8")
@@ -153,9 +174,12 @@ def test_scene_table_pairs_by_requirement_id_not_position(workspace: Workspace) 
     r1_line = next(line for line in text.splitlines() if line.startswith("| R1"))
     assert "scene:s1" in r1_line
     assert "통과" in r1_line
+    # R2 is covered only by a task (t1), never a scene -- owner decision:
+    # task-only coverage is never sufficient, so this must read as not
+    # passed even though t1 itself is tracked as the coverer.
     r2_line = next(line for line in text.splitlines() if line.startswith("| R2"))
     assert "task:t1" in r2_line
-    assert "통과(작업 완료)" in r2_line
+    assert "실패" in r2_line
 
 
 def test_report_overwritten_by_a_later_write_for_the_same_job(workspace: Workspace) -> None:
@@ -362,3 +386,108 @@ def test_write_handoff_appends_job_handoff_written_event(workspace: Workspace) -
     _seq, event = events[0]
     assert event.attempt_id == attempt_id
     assert event.payload["job"] == "job1"
+
+
+# ---------------------------------------------------------------------
+# write_handoff's own interim note + write_final_section: the handoff
+# report runs BEFORE security/release, so it must say so plainly, and
+# a separate call once the decision is known must append the real
+# answer.
+# ---------------------------------------------------------------------
+
+def test_write_handoff_marks_the_report_as_interim(workspace: Workspace) -> None:
+    from engine.handoff import _FINAL_SECTION_HEADING
+
+    ws = _sample_workspace(workspace)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "job1", "full",
+                          roles=("builder",))
+    plan = _plan()
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    path = write_handoff(ws.config, ws.ledger, "alpha", attempt_id, "job1", plan, acc)
+    text = path.read_text(encoding="utf-8")
+
+    assert "진행 중" in text
+    assert _FINAL_SECTION_HEADING not in text
+
+
+def _reviewed_real_plan_job(ws: Workspace) -> tuple[str, "object"]:
+    """A real engine.plan.Plan (not tests/plan_stub's), written to
+    disk, reviewed, with one requirement R1 covered by a scene that
+    actually runs and passes -- the shared setup write_final_section's
+    own tests build on."""
+    import json
+
+    from engine.plan import load_plan, plan_path, record_plan_reviewed
+
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "job1", "full",
+                          roles=("builder",))
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
+    )
+    data = {
+        "goal": "x", "ui": False,
+        "scenes": [{"id": "s1", "actor_does": "x", "app_shows": "x", "where": "cli",
+                   "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
+        "tasks": [{"id": "t1", "title": "x", "detail": "", "owns": ["src/"],
+                   "depends_on": []}],
+        "acceptance": ["x"],
+        "requirements": [{"id": "R1", "text": "x", "kind": "function"}],
+    }
+    path = plan_path(ws.alpha, "job1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    record_plan_reviewed(ws.ledger, "alpha", attempt_id, ws.alpha, "job1")
+    return attempt_id, load_plan(ws.alpha, "job1")
+
+
+def test_write_final_section_renders_security_and_decision_from_the_graph(
+    workspace: Workspace,
+) -> None:
+    from engine.handoff import write_final_section
+    from engine.ledger import Event
+
+    ws = _sample_workspace(workspace)
+    attempt_id, plan = _reviewed_real_plan_job(ws)
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+    write_handoff(ws.config, ws.ledger, "alpha", attempt_id, "job1", plan, acc)
+    # Security passed, but R1's own task t1 was never committed/reviewed
+    # -- missing() must still report that gap in "증거 완전성" even
+    # though the requirement itself is satisfied by its own scene.
+    ws.ledger.append(Event(
+        project="alpha", kind="app_security.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"passed": True, "findings": [], "ran": ["secret_scan"],
+                 "fingerprint": "sec-fp", "policy_hash": "sec-hash"},
+    ))
+
+    path = write_final_section(ws.config, ws.ledger, "alpha", "job1", "shipped")
+    text = path.read_text(encoding="utf-8")
+
+    assert "## 최종 결과" in text
+    assert "보안 점검: 통과" in text
+    assert "배포 결정: 배포됨" in text
+    assert "task t1" in text  # the uncommitted/unreviewed task still shows as a gap
+
+
+def test_write_final_section_is_idempotent_and_never_duplicates_the_heading(
+    workspace: Workspace,
+) -> None:
+    from engine.handoff import write_final_section
+
+    ws = _sample_workspace(workspace)
+    attempt_id, plan = _reviewed_real_plan_job(ws)
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+    write_handoff(ws.config, ws.ledger, "alpha", attempt_id, "job1", plan, acc)
+
+    write_final_section(ws.config, ws.ledger, "alpha", "job1", "skipped")
+    path = write_final_section(ws.config, ws.ledger, "alpha", "job1", "skipped")
+    text = path.read_text(encoding="utf-8")
+
+    assert text.count("## 최종 결과") == 1
+    assert "배포 결정: 건너뜀" in text

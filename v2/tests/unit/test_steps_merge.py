@@ -485,9 +485,7 @@ def test_merge_conflict_with_head_when_destination_diverged_from_base(workspace:
 def test_remerge_on_same_attempt_catches_an_owner_edit_of_an_already_merged_path(
     workspace: Workspace,
 ) -> None:
-    """Regression for codex-goal-review-4.md item 6 / codex-diff-review-
-    s17.md "Repeated merging can overwrite owner edits"
-    (engine/steps/merge.py:423): a first merge on this attempt writes
+    """A first merge on this attempt writes
     src/app.py; the OWNER then hand-edits that same path directly
     (simulating an owner-approval/install pause that leaves this same
     attempt active -- engine.full_orbit's own owner stops), without
@@ -539,21 +537,17 @@ def test_remerge_on_same_attempt_catches_an_owner_edit_of_an_already_merged_path
 def test_remerge_on_same_attempt_catches_an_owner_revert_to_exactly_base_content(
     workspace: Workspace,
 ) -> None:
-    """Regression for codex-diff-review-s18.md G6: "merge.py:453
-    accepts destination equal to base BEFORE checking the last applied
-    digest. An owner reverting an engine edit is still overwritten."
-    Same shape as the owner-edit test above, but the owner's edit here
-    is specifically a REVERT back to exactly base_head's own bytes
-    (undoing this attempt's first merge on purpose), not some other
-    arbitrary content. _verify_destinations_unchanged used to check
-    "does the destination still equal base_head" FIRST and only
-    consult the last-applied hash on a mismatch -- a revert-to-base
-    makes that first check true again, short-circuiting straight past
-    the already-applied hash entirely and right past the owner's
-    revert, so the second merge would silently overwrite it. The fix
-    checks the last-applied hash FIRST for every already-applied rel,
+    """Same shape as the owner-edit test above, but the owner's edit
+    here is specifically a REVERT back to exactly base_head's own
+    bytes (undoing this attempt's first merge on purpose), not some
+    other arbitrary content. _verify_destinations_unchanged checks
+    the last-applied hash FIRST for every already-applied rel,
     regardless of what the destination's current bytes happen to
-    equal, so this is still caught."""
+    equal right now -- checking "does the destination still equal
+    base_head" first instead would short-circuit straight past the
+    already-applied hash and right past the owner's revert, letting
+    the second merge silently overwrite it. Checking the last-applied
+    hash first catches it instead."""
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "revert-to-base",
                            "full", ("builder",))
     copy_a = copy_root(workspace.config, attempt_id, "builder")
@@ -597,7 +591,7 @@ def test_remerge_on_same_attempt_of_an_untouched_already_applied_path_succeeds(
     destination between the two merges, so the second merge's
     destination still equals exactly what the first merge itself
     wrote -- re-applying (here, a second, different path from the
-    same copy) must still succeed, the same as before this fix."""
+    same copy) must still succeed."""
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "reedit-ok",
                            "full", ("builder",))
     copy_a = copy_root(workspace.config, attempt_id, "builder")

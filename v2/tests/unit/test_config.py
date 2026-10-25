@@ -491,11 +491,13 @@ def test_context_required_skills_and_require_library_roundtrip(tmp_path: Path) -
     """engine.context.ContextConfig.required_skills/require_library (a
     station's own mandatory skills, and projects where a library
     lookup failure must also count as required-material missing) must
-    survive from_json -> to_json_dict -> from_json unchanged -- an
-    earlier round added both fields to the dataclass but never to
-    _parse_context/_KNOWN_CONTEXT_KEYS/_context_to_json, so no
-    production JSON config could actually set them (unknown-key
-    ValueError on load, silently dropped on save)."""
+    survive from_json -> to_json_dict -> from_json unchanged -- a
+    field known only to parsing (or only to serialization) would
+    otherwise either be unsettable from JSON at all (unknown-key
+    ValueError on load) or silently dropped on save; engine.config.
+    CONTEXT_FIELDS is the single table that makes that structurally
+    impossible (see test_config_roundtrip.py for the exhaustive,
+    table-driven version of this check)."""
     from engine.config import to_json_dict, write_json
 
     make_repo(tmp_path / "repo", {"a.txt": "a\n"})

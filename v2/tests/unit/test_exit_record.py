@@ -1,8 +1,8 @@
-"""Unit tests for the crash-safe exit-code recovery contract (an earlier round item
-6, hardened another change item 1): engine.procs.spawn writing a worker's
-real exit code to a file engine.procs.exit_file_for derives from
-stdout_path -- now a SIBLING "exit" directory, never the same
-worker-writable stations directory stdout_path itself lives in (see
+"""Unit tests for the crash-safe exit-code recovery contract:
+engine.procs.spawn writing a worker's real exit code to a file
+engine.procs.exit_file_for derives from stdout_path -- a SIBLING
+"exit" directory, never the same worker-writable stations directory
+stdout_path itself lives in (see
 that function's own docstring) -- refusing to follow a symlink or
 clobber an existing file there (engine.exit_writer), and engine.
 workers.base.wait_for_exit/wait_while_progressing reading it back when

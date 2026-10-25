@@ -511,18 +511,16 @@ def test_copy_links_entry_under_an_earlier_links_symlink_is_skipped(
 def test_commit_job_trail_never_absorbs_an_unrelated_already_staged_file(
     workspace: Workspace,
 ) -> None:
-    """Regression for codex-goal-review-4.md item 4 / codex-diff-
-    review-s17.md "Ungated trail commits can absorb unrelated staged
-    source" (engine/full_orbit.py:472): this is a plain, UNGATED
-    engine-side commit (full_orbit._commit_job_trail's own docstring)
-    meant to cover only what the processor itself just wrote under
-    .gongbang/<job>/ -- it must never also commit some OTHER path the
-    owner (or anything else) had already `git add`ed before this ran.
-    A bare `git commit` with no pathspec commits every currently
-    staged change regardless of what `git add` was just given; this
-    checks the fix (passing the same path list to `commit -- <paths>`
-    that `add` used) leaves an unrelated already-staged file exactly
-    as staged as it was, never swept into this commit."""
+    """This is a plain, UNGATED engine-side commit
+    (full_orbit._commit_job_trail's own docstring) meant to cover only
+    what the processor itself just wrote under .gongbang/<job>/ -- it
+    must never also commit some OTHER path the owner (or anything
+    else) had already `git add`ed before this ran. A bare `git
+    commit` with no pathspec would commit every currently staged
+    change regardless of what `git add` was just given; passing the
+    same path list to `commit -- <paths>` that `add` used leaves an
+    unrelated already-staged file exactly as staged as it was, never
+    swept into this commit."""
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha",
                           "trail-scope", "full", ("builder",))
     job_name = "trail-scope"

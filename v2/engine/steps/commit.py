@@ -12,8 +12,22 @@ git_commit           tree = evidence.range_tree(repo, excludes) -- the same
                      (tree_changed) if tree != fp; commit with message
                      "{message}\n\nattempt: {attempt_id}\nfingerprint: {fp}"
                      reconcile: HEAD message contains both lines AND
-                     HEAD^{tree} == fp -> done
-record_commit        append commit.recorded {sha, fp}
+                     HEAD^{tree} == fp -> done. Checked UNCONDITIONALLY
+                     at the top of run() too (_head_already_commits),
+                     not only via reconcile: a genuinely different
+                     request_id for the same (attempt, fp) -- never
+                     'started' before, so the processor never consults
+                     this step's reconcile for it at all -- must still
+                     recognize the effect already happened and skip
+                     committing again, rather than producing a second
+                     real `git commit` for one task's one change (the
+                     T6 crash-matrix's own found bug).
+record_commit        append commit.recorded {sha, fp} -- skipped (returns
+                     the existing {sha, fp} instead) if a commit.recorded
+                     for this exact (sha, fp) already exists under ANY
+                     request_id (_existing_commit_record), the same
+                     any-request_id idempotency git_commit provides one
+                     step earlier.
 report               report.write_report / report.exists
 """
 from __future__ import annotations
@@ -124,12 +138,74 @@ def _commit_tree_onto(repo: Path, tree: str, parent: str, message: str) -> str:
     return commit_sha
 
 
+def _head_already_commits(ctx: StepContext, fp: str) -> str | None:
+    """HEAD's own sha iff HEAD's commit message already carries THIS
+    (attempt_id, fp) pair and HEAD^{tree} already equals fp -- i.e. the
+    commit effect this step is about to perform has ALREADY happened.
+    None otherwise (including on any git failure -- an attempt to read
+    "has this already happened" that cannot even read HEAD has not
+    established that it has).
+
+    This is deliberately NOT scoped to the current request_id: every
+    crash point in this stage must be recognizable from observable
+    state ("검사한 바이트를 그대로 실행한다" -- execute exactly the bytes
+    that were checked), and engine.processor's own per-request
+    reconcile dispatch (engine.processor.Processor._run_steps: "done
+    건너뛰기 / started는 reconcile / 없으면 실행") only ever calls a
+    step's reconcile for a request whose OWN journal already has a
+    'started' row for that step -- never for a request that has not
+    run this step before. A genuinely different request_id for the
+    SAME task's SAME (attempt, content) -- e.g. engine.full_orbit's
+    resume path resubmitting 'commit' for a task it (wrongly) believes
+    was never committed, this codebase's own T6 crash-matrix finding
+    (docs/flow-map.md; tests/acceptance/test_t6_crash_matrix.py) -- has
+    no 'started' row to reconcile against at all; its step function
+    would simply RUN, unconditionally, producing a second real `git
+    commit` for one task's one change. Checking this directly inside
+    _run_git_commit's own body (not only via _reconcile_git_commit)
+    closes that gap regardless of which request_id reaches it, or at
+    which of this stage's crash points the previous attempt stopped."""
+    repo = _repo(ctx)
+    try:
+        message = subprocess.run(
+            git_argv(repo, "log", "-1", "--format=%B"),
+            check=True, capture_output=True, text=True,
+        ).stdout
+        head_sha = subprocess.run(
+            git_argv(repo, "rev-parse", "HEAD"),
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        head_tree = subprocess.run(
+            git_argv(repo, "rev-parse", "HEAD^{tree}"),
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+    if (f"attempt: {ctx.attempt_id}" in message
+            and f"fingerprint: {fp}" in message
+            and head_tree == fp):
+        return head_sha
+    return None
+
+
 def _run_git_commit(ctx: StepContext) -> dict[str, object]:
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
     recorded_head = str(_journal_payload(ctx, "compute_fingerprint")["head"])
     message = str(ctx.request.payload.get("message", ""))
     full_message = f"{message}\n\nattempt: {ctx.attempt_id}\nfingerprint: {fp}"
     repo = _repo(ctx)
+
+    # This exact commit effect already happened -- by this very request
+    # on an earlier crash-resume, or by an unrelated, now-redundant
+    # request for the same task within the same attempt (see
+    # _head_already_commits's own docstring). Nothing left to do: no
+    # second `git commit`, and no head_moved/tree_changed check either
+    # -- both compare against what THIS request's own compute_fingerprint
+    # saw, which is moot once the effect it was building towards is
+    # already sitting at HEAD.
+    already = _head_already_commits(ctx, fp)
+    if already is not None:
+        return {"sha": already, "fp": fp}
 
     # Re-read HEAD fresh, right before building anything: if it no longer
     # matches what compute_fingerprint saw, something else moved HEAD in
@@ -150,23 +226,21 @@ def _run_git_commit(ctx: StepContext) -> dict[str, object]:
 
 def _reconcile_git_commit(ctx: StepContext) -> bool:
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
-    repo = _repo(ctx)
-    try:
-        message = subprocess.run(
-            git_argv(repo, "log", "-1", "--format=%B"),
-            check=True, capture_output=True, text=True,
-        ).stdout
-        head_tree = subprocess.run(
-            git_argv(repo, "rev-parse", "HEAD^{tree}"),
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-    except subprocess.CalledProcessError:
-        return False
-    return (
-        f"attempt: {ctx.attempt_id}" in message
-        and f"fingerprint: {fp}" in message
-        and head_tree == fp
-    )
+    return _head_already_commits(ctx, fp) is not None
+
+
+def _existing_commit_record(ctx: StepContext, sha: str, fp: str) -> dict[str, object] | None:
+    """{"sha": sha, "fp": fp} iff a commit.recorded event already exists
+    for this EXACT (sha, fp) pair, regardless of which request_id wrote
+    it -- the record_commit half of the same observable-state check
+    _head_already_commits does for git_commit (module docstring): a
+    second, different request_id reaching record_commit for a commit
+    git_commit itself recognized as already-done (same sha) must not
+    still append a second commit.recorded event for it."""
+    for _seq, event in ctx.ledger.events(ctx.project, "commit.recorded"):
+        if event.payload.get("sha") == sha and event.payload.get("fp") == fp:
+            return {"sha": sha, "fp": fp}
+    return None
 
 
 def _run_record_commit(ctx: StepContext) -> dict[str, object]:
@@ -179,6 +253,9 @@ def _run_record_commit(ctx: StepContext) -> dict[str, object]:
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
+    existing = _existing_commit_record(ctx, sha, fp)
+    if existing is not None:
+        return existing
     ctx.ledger.append(Event(
         project=ctx.project, kind="commit.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=ctx.attempt_id,

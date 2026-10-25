@@ -527,9 +527,9 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
         "done" only means its own review/bench passed, never that any
         scene actually exercised the requirement's real behavior. A requirement with ONLY a task coverer
         would otherwise pass this static check yet never be able to
-        pass engine.full_orbit's own runtime completion gate
-        (_uncovered_requirement_ids), which only ever counts a PASSING
-        scene -- so this is checked here too, not only there.
+        pass engine.evidence_graph's own runtime completion gate
+        (missing()), which only ever counts a PASSING scene -- so this
+        is checked here too, not only there.
     Schema-level problems (missing/mistyped fields) are not re-checked
     here -- load_plan already raised PlanError for those before a Plan
     object could exist."""
@@ -538,9 +538,9 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
         # A plan with no requirements at all would otherwise sail
         # through every other check here with zero problems -- yet
         # name nothing for the handoff's own requirement<->scene table
-        # (engine.handoff._scene_table) or engine.full_orbit's runtime
-        # completion gate (_uncovered_requirement_ids) to ever check
-        # against. Required for every plan, full-job and `--small`
+        # (engine.handoff._scene_table) or engine.evidence_graph's runtime
+        # completion gate (missing()) to ever check against. Required
+        # for every plan, full-job and `--small`
         # alike (per the owner's design, same rule as the probe
         # station's own facts.md evidence requirement).
         problems.append("plan_requirements_missing")
@@ -640,19 +640,51 @@ def _latest_plan_reviewed(ledger: Ledger, project: str,
     return payload
 
 
+def is_plan_reviewed(ledger: Ledger, project: str, job_name: str) -> bool:
+    """True iff a plan.reviewed event has EVER been recorded for this
+    (project, job_name) -- the one ledger-side, un-tamperable signal
+    engine.acceptance.run_acceptance uses to decide whether this job's
+    Plan must be loaded fresh from that call's own certified snapshot
+    (never the live repo, and never whatever Plan object a caller
+    already parsed earlier) rather than trusting a caller-supplied Plan
+    object as-is.
+
+    Deliberately NOT based on whether the CURRENT plan.json still has
+    any scene claiming `covers` (the previous gating condition both
+    here and in run_acceptance): a plan.json edited after review to
+    simply remove every `covers` entry is exactly the kind of edit
+    plan_digest/verify_reviewed_scenes exists to catch, but a check
+    gated on "does the (possibly already-edited) content still claim
+    coverage" would skip itself entirely on precisely that edit --
+    stripping `covers` would have silently disabled the one check that
+    exists to catch stripping `covers`. Whether a plan was EVER
+    reviewed lives only in the ledger, which an edit to the repo's own
+    plan.json cannot touch.
+
+    Public wrapper around _latest_plan_reviewed so a caller outside
+    this module never has to reach for that private name (the pattern
+    engine.full_orbit's own `_facts_path` import used to need)."""
+    return _latest_plan_reviewed(ledger, project, job_name) is not None
+
+
 def verify_reviewed_scenes(ledger: Ledger, project: str, job_name: str,
-                           repo: Path) -> list[str]:
+                           snapshot: Path) -> list[str]:
     """[] iff plan.json's CURRENT plan_digest (plan.json's own bytes
-    plus every tests/scenes/ file any scene's cmd references) still
-    matches the latest plan.reviewed event's digest for this (project,
-    job_name) -- the narrow, cheap check engine.acceptance.
-    run_acceptance runs immediately before executing any covers-
-    claiming scene, so a scene script (or plan.json itself) edited
-    after review -- even within the SAME attempt, with no owner-stop/
-    resume involved at all -- can never be certified as if a reviewer
-    had actually seen it. This is the single-purpose digest half of
-    check_resumed_plan, factored out on its own: run_acceptance has no
-    reason to also re-run the full validate_plan sweep (build
+    plus every tests/scenes/ file any scene's cmd references), read
+    from `snapshot`, still matches the latest plan.reviewed event's
+    digest for this (project, job_name) -- the narrow, cheap check
+    engine.acceptance.run_acceptance runs against EACH STAGE'S OWN
+    disposable snapshot, right after that snapshot is built and before
+    anything in it executes, never against the live project repo: a
+    check against the repo and an execution against a snapshot built
+    moments later are two separate reads of two different (if usually
+    identical) things, so only checking the exact bytes about to run
+    -- the snapshot itself -- proves a scene script (or plan.json
+    itself) edited after review, even within the SAME attempt with no
+    owner-stop/resume involved at all, can never be certified as if a
+    reviewer had actually seen it. This is the single-purpose digest
+    half of check_resumed_plan, factored out on its own: run_acceptance
+    has no reason to also re-run the full validate_plan sweep (build
     prefixes, requirement coverage, dependency cycles -- all already
     enforced once at plan review and again at every resume point) on
     every single acceptance call.
@@ -664,7 +696,7 @@ def verify_reviewed_scenes(ledger: Ledger, project: str, job_name: str,
     reviewed = _latest_plan_reviewed(ledger, project, job_name)
     if reviewed is None:
         return ["plan_never_reviewed"]
-    if reviewed.get("digest") != plan_digest(plan_path(repo, job_name)):
+    if reviewed.get("digest") != plan_digest(plan_path(snapshot, job_name)):
         return ["plan_changed_since_review"]
     return []
 
@@ -674,10 +706,10 @@ def check_resumed_plan(ledger: Ledger, project: str, job_name: str, repo: Path) 
     `repo` is still, in every sense that matters, the plan a reviewer
     last approved -- the check every resume point in engine.full_orbit/
     engine.small_orbit must run before trusting a job's plan to keep
-    going with build/merge/commit work under it -- previously only the
-    STAGE_DESIGN_APPROVAL resume ever re-checked this; a task/
-    security/cursor resume accepted a plan.json edited since review
-    with no check at all.
+    going with build/merge/commit work under it -- every resume point
+    must re-check this, not just STAGE_DESIGN_APPROVAL, so a task/
+    security/cursor resume never accepts a plan.json edited since
+    review with no check at all.
 
     Problems, in order:
       - plan.json fails to load/parse: [f"plan:{PlanError.reason}"],
@@ -976,4 +1008,5 @@ __all__ = [
     "validate_plan", "validate_tools", "tools_for_station", "classify_skill_tools",
     "ordered_tasks", "requirement_coverers", "plan_digest", "scene_file_digests",
     "record_plan_reviewed", "check_resumed_plan", "verify_reviewed_scenes",
+    "is_plan_reviewed",
 ]

@@ -88,10 +88,11 @@ class ContextConfig:
                          StationContext.required_missing, which a
                          caller (engine.full_orbit) can check to stop
                          the job needs_owner instead of silently
-                         proceeding without it (an earlier round's own
-                         finding: "Missing required skills/company
-                         material ... failures still become annotations
-                         without stopping the job" -- see ENGINE.md).
+                         proceeding without it -- without an explicit
+                         name here, a missing required skill or
+                         company-material lookup failure stays a mere
+                         annotation and never stops the job (see
+                         ENGINE.md).
     require_library  -- project names for which a library_mcp lookup
                          failure (Context.failed) must likewise count
                          as a required-material gap

@@ -306,6 +306,74 @@ def _is_within(path: Path, base: Path) -> bool:
         return False
 
 
+class TreeExportError(Exception):
+    """export_tree refuses a tree entry shaped in a way git itself
+    never actually writes (an absolute path, or one containing
+    "..") -- never trusted regardless, since this is reading git's
+    OWN object database, not external input, but a caller must still
+    never silently skip or mis-place such an entry."""
+
+
+def export_tree(repo: Path, fp: str, dest: Path) -> None:
+    """Extracts tree object `fp` -- already written into `repo`'s own
+    git object database by fingerprint()/range_tree(), never a fresh
+    read of the live working tree -- into `dest` (which must already
+    exist as an empty directory; the caller owns creating/clearing it),
+    entry by entry via `git ls-tree` + `git cat-file blob` (both
+    through engine.gitutil, never a raw git invocation), rather than
+    `git archive`. `git archive` applies `export-ignore`/`export-subst`
+    .gitattributes: an `export-ignore`'d path can be OMITTED from the
+    archive entirely even though the fingerprinted tree itself contains
+    it (so a caller that then certifies "this is what fp means" would
+    never actually see a file the recorded evidence says was part of
+    it), and an `export-subst`'d path has its content REWRITTEN (a
+    `$Format:...$` placeholder expanded) rather than exported byte-for-
+    byte. Neither behavior is appropriate for a snapshot that must
+    match the fingerprinted tree exactly: `ls-tree -r` lists every blob
+    (and gitlink) entry regardless of attributes, and `cat-file blob`
+    returns that exact entry's bytes, unfiltered. A gitlink entry (mode
+    160000, a submodule reference) is skipped outright -- there is no
+    blob to read for it, and this engine does not manage submodules.
+
+    Moved here (from engine.steps.review, the reviewer's own snapshot
+    export, which still calls this) so engine.steps.bench_run can reuse
+    the exact same exporter for engine.acceptance's and its own
+    disposable snapshots, so none of them can miss an export-ignored
+    file."""
+    listing = subprocess.run(
+        git_argv(repo, "ls-tree", "-r", "-z", fp),
+        check=True, capture_output=True,
+    ).stdout
+    for raw_entry in listing.split(b"\0"):
+        if not raw_entry:
+            continue
+        meta, _, rel_bytes = raw_entry.partition(b"\t")
+        mode_bytes, obj_type_bytes, oid_bytes = meta.split(b" ")
+        mode = mode_bytes.decode("ascii")
+        obj_type = obj_type_bytes.decode("ascii")
+        if obj_type != "blob":
+            continue  # gitlink (submodule, type "commit"); never a blob to read
+        oid = oid_bytes.decode("ascii")
+        rel = rel_bytes.decode("utf-8", "surrogateescape")
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            # git itself never writes a tree entry shaped like this;
+            # fail closed rather than trust it regardless.
+            raise TreeExportError(f"unsafe tree entry path: {rel!r}")
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        blob = subprocess.run(
+            git_argv(repo, "cat-file", "blob", oid),
+            check=True, capture_output=True,
+        ).stdout
+        if mode == "120000":
+            target.symlink_to(blob.decode("utf-8", "surrogateescape"))
+        else:
+            target.write_bytes(blob)
+            if mode == "100755":
+                target.chmod(0o755)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:

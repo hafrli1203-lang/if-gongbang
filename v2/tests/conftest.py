@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from engine.config import EngineConfig, ProjectConfig
-from engine.ledger import Ledger
+from engine.ledger import Event, Ledger
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
@@ -22,6 +22,21 @@ def git(repo: Path, *args: str) -> str:
     out = subprocess.run(["git", "-C", str(repo), *args], check=True,
                          capture_output=True, text=True, env=GIT_ENV)
     return out.stdout.strip()
+
+
+def seed_reviewed_manifest(ledger: Ledger, project: str, attempt_id: str) -> None:
+    """Records an empty reviewed plan manifest for attempt_id's job, the
+    shape engine.plan.record_plan_reviewed writes. Tests that seed a job
+    certificate by hand need it, because the release gate refuses a job
+    with no reviewed manifest."""
+    job = next(str(e.payload.get("job_name")) for _s, e in ledger.events(project, "job.opened")
+               if e.payload.get("attempt_id") == attempt_id)
+    ledger.append(Event(
+        project=project, kind="plan.reviewed", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": job, "digest": "stub-digest", "scene_digests": {},
+                 "requirement_ids": [], "task_ids": []},
+    ))
 
 
 def make_repo(path: Path, files: dict[str, str]) -> Path:

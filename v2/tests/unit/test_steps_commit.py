@@ -255,6 +255,77 @@ def test_record_commit_crash_after_leaves_exactly_one_event(workspace: Workspace
     assert len(events) == 1
 
 
+def test_a_second_commit_request_for_the_same_attempt_and_content_is_a_no_op(
+    workspace: Workspace,
+) -> None:
+    """T6 crash-matrix finding (docs/flow-map.md; the harness's own repro:
+    a crash anywhere inside a build task's commit stage, while the
+    attempt stays ACTIVE, makes engine.full_orbit's resume path submit a
+    SECOND 'commit' request -- a brand new request_id, never 'started'
+    before -- for the SAME task with no new merge content). That second
+    request must be a true no-op: no second real `git commit` (HEAD's
+    rev-list count does not advance again), and no second
+    commit.recorded event for the SAME (attempt, fingerprint) pair --
+    this is the fix at the commit-step level the crash matrix's
+    duplicate-detection cases needed (test_t6_crash_matrix.py's
+    _FOUND_BUG commit cases), independent of whatever full_orbit resume
+    bug actually causes the duplicate submission upstream."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "job-dup",
+                          "full", roles=("builder",))
+    (workspace.alpha / "src" / "app.py").write_text("print('dup')\n", encoding="utf-8")
+    _record_matching_evidence(workspace, attempt_id)
+    before = subprocess.run(["git", "-C", str(workspace.alpha), "rev-list", "--count", "HEAD"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+
+    rid1 = submit(workspace.ledger, "alpha", attempt_id, "commit",
+                 {"message": "one task's one change"}, "owner")
+    proc = _proc(workspace)
+    assert proc.run_once("alpha") == 1
+    assert workspace.ledger.request(rid1).status == "done"
+    after_first = subprocess.run(
+        ["git", "-C", str(workspace.alpha), "rev-list", "--count", "HEAD"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    assert int(after_first) == int(before) + 1
+    head_after_first = subprocess.run(
+        ["git", "-C", str(workspace.alpha), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True).stdout.strip()
+
+    # The redundant resubmission: same attempt, same task, no new merge
+    # -- review/bench evidence for the SAME (already-committed) fp is
+    # still on the ledger from the first request, so a second 'commit'
+    # request (a genuinely different request_id -- engine.processor.
+    # submit() only dedupes an EXACT payload match; the actual
+    # full_orbit resume bug this stands in for resubmits a request
+    # engine.ids.request_id hashes differently for reasons outside this
+    # module's own file ownership) still passes verify_three the same
+    # way the first one did, and reaches git_commit with the IDENTICAL
+    # fingerprint. Never 'started' before -- so per-request reconcile
+    # alone cannot catch this; git_commit/record_commit must recognize
+    # the effect from observable state instead.
+    rid2 = submit(workspace.ledger, "alpha", attempt_id, "commit",
+                 {"message": "one task's one change (resubmitted)"}, "owner")
+    assert rid2 != rid1
+    n = proc.run_once("alpha")
+
+    assert n == 1
+    assert workspace.ledger.request(rid2).status == "done"
+    after_second = subprocess.run(
+        ["git", "-C", str(workspace.alpha), "rev-list", "--count", "HEAD"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    # No second real commit landed.
+    assert int(after_second) == int(after_first)
+    head_after_second = subprocess.run(
+        ["git", "-C", str(workspace.alpha), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    assert head_after_second == head_after_first
+    # Exactly one commit.recorded for this task's one fingerprint --
+    # not one per request_id.
+    events = [e for _seq, e in workspace.ledger.events("alpha", "commit.recorded")]
+    shas = {e.payload.get("sha") for e in events}
+    assert shas == {head_after_first}
+    assert len(events) == 1
+
+
 def test_git_commit_reconcile_true_once_head_has_markers(workspace: Workspace) -> None:
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "job3",
                           "full", roles=("builder",))

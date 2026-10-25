@@ -48,6 +48,8 @@ PENDING_KIND_WHITELIST: frozenset[str] = frozenset(
 # nothing else -- an extra key is a sign the request was not built by
 # the station protocol this gate expects.
 _INSTALL_PAYLOAD_KEYS: frozenset[str] = frozenset({"manifest", "change"})
+# engine.position.proposal_id: "<attempt_id>:<station.finished seq>".
+_PROPOSAL_ID = re.compile(r"[A-Za-z0-9_#.-]{1,120}:[0-9]{1,12}")
 
 _MAX_REQUEST_BYTES = 16 * 1024
 _PREVIEW_MAX_CHARS = 200
@@ -236,7 +238,7 @@ def validate_pending(config: EngineConfig, project: str,
 
 def approve_pending(config: EngineConfig, ledger: Ledger, project: str,
                      attempt_id: str, request: dict, *, confirm: bool,
-                     confirm_source: str = "unknown") -> str:
+                     confirm_source: str = "unknown", proposal: str | None = None) -> str:
     """Owner input: approve one pending request and queue it.
 
     `confirm` must be True -- the caller (a CLI) is responsible for
@@ -287,6 +289,13 @@ def approve_pending(config: EngineConfig, ledger: Ledger, project: str,
         raise ValueError("kind_requires_interactive_confirm")
 
     payload = {key: value for key, value in request.items() if key != "kind"}
+    if proposal is not None:
+        # The proposal this approval answers (engine.position.proposal_id)
+        # is part of the request's identity, so an identical proposal made
+        # again gets its own request instead of the earlier completed one.
+        if not _PROPOSAL_ID.fullmatch(proposal):
+            raise ValueError("proposal_id_invalid")
+        payload["proposal"] = proposal
     # kind + manifest + section/key NAMES only -- never a value (see
     # _redacted_change_preview's docstring for why this, not the raw
     # payload, is what a persisted ledger event carries).

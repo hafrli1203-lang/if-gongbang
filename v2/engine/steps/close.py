@@ -27,7 +27,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from engine import ids, procs, state
+from engine import faults, ids, procs, state
 from engine.evidence import FingerprintError, fingerprint, sha256_file
 from engine.ledger import Event
 from engine.processor import StepContext, StepDef, StepFailed
@@ -372,12 +372,14 @@ def _run_set_closed(ctx: StepContext) -> dict[str, object]:
     redoing (and duplicating) the first effect too."""
     status = "closed" if ctx.request.kind == "close" else "abandoned"
     if ctx.ledger.attempt(ctx.attempt_id).status == "active":
+        faults.flow_boundary("close.attempt_finished")
         ctx.ledger.append(Event(
             project=ctx.project, kind="attempt.finished", actor_kind="processor",
             actor_id="processor", attempt_id=ctx.attempt_id,
             payload={"attempt_id": ctx.attempt_id, "status": status},
         ))
     if ctx.ledger.project(ctx.project).state != "CLOSED":
+        faults.flow_boundary("close.state_closed")
         state.transition(ctx.ledger, ctx.project, "finalized", "processor")
     return {"status": status}
 

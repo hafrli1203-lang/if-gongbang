@@ -63,13 +63,13 @@ def test_exists_false_when_no_report_written(workspace: Workspace) -> None:
 
 
 def test_exists_false_when_file_present_without_event(workspace: Workspace) -> None:
-    """#25b: write_report now appends report.written BEFORE writing the
-    file, so a crash in between leaves the event with no file (reads as
-    "not done" — correct). This test covers the inverse, defense-in-depth
+    """write_report appends report.written BEFORE writing the file, so
+    a crash in between leaves the event with no file (reads as "not
+    done" — correct). This test covers the inverse, defense-in-depth
     case directly: a report.md that matches content-wise but has no
-    report.written event for this request_id (e.g. written by some other
-    means, or left over from before this fix) must still read as "not
-    done" — exists() must require the event, not just the file."""
+    report.written event for this request_id (e.g. written by some
+    other means) must still read as "not done" — exists() must
+    require the event, not just the file."""
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "job1",
                           "full", roles=("builder",))
     request = _request("R-dddd", attempt_id)

@@ -48,10 +48,15 @@ The fix this module implements:
 
 Every effect here is an existing, already-audited engine entry point
 (processor.submit, engine.steps.open_job.open_job, orbit.continue_job)
--- this module adds no new ledger event kind and no new state
-transition. The only genuinely new filesystem operation is step 4's
-copy from the archive directory into the new builder copy, which never
-touches the project repo itself.
+-- this module adds no new state transition. The only genuinely new
+filesystem operation is step 4's copy from the archive directory into
+the new builder copy, which never touches the project repo itself.
+
+Release: when the attempt being fixed belongs to a full-orbit job (its
+position says so, engine.position.is_full_job), fix() runs with the
+project's own `release` removed -- the whole job makes one publish
+request at its very end, never one per repaired task. A plain
+single-task job keeps its release stop right after its own commit.
 
 Fix-after-a-failed-fix: a fix() attempt can itself fail before its OWN
 merge ever completes (the builder crashes at run_station, or merge
@@ -81,9 +86,10 @@ looks the way find_fix_target saw it), "fix.closed_old" {archive_dir},
 already-open attempt after a crash -- see _already_opened_new_attempt --
 invalidated by a later "fix.opening_failed" {} if the open_job() call it
 precedes itself raises, so a stale marker can never wrongly bound an
-unrelated future job.opened for the same job_name), "fix.opened_new"
-{new_attempt_id}, "fix.restored", "fix.submitted"
-{request_id}, "fix.finished" -- and _find_unfinished_fix_cycle looks for
+unrelated future job.opened for the same job_name), then ONE
+`job.position` event (engine.position) that both names the replacement
+attempt and moves the job's position onto it, "fix.restored",
+"fix.submitted" {request_id}, "fix.finished" -- and _find_unfinished_fix_cycle looks for
 a "fix.started" with no later "fix.finished" at the very top of fix(),
 resuming from whichever of those events already exist instead of
 calling find_fix_target (which the CLOSED-but-not-reopened case could
@@ -102,11 +108,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from engine import evidence, orbit
+from engine import evidence, faults, orbit
 from engine import release as release_mod
 from engine.config import EngineConfig
 from engine.ledger import Event, Ledger, RequestRow
 from engine.processor import Fakes, Processor, submit
+from engine.position import (
+    STAGE_TASK, JobPosition, fix_opened_attempt, fix_opened_position, is_full_job,
+    load_position, record_position, stages_from_spec, task_stop_position, without_release,
+)
 from engine.steps.open_job import copy_root, open_job
 
 
@@ -149,6 +159,9 @@ class FixResult:
     job_name: str
     task: str
     outcome: orbit.JobOutcome
+    # True when the repaired task belongs to a full-orbit job, whose
+    # remaining work engine.position.resume_after_fix continues.
+    full_job: bool = False
 
 
 FakesFor = Callable[[str], Fakes]
@@ -535,6 +548,7 @@ def _append_fix_event(ledger: Ledger, project: str, kind: str, old_attempt_id: s
     """Append one of this module's own journal events (see module
     docstring) and return its seq -- used by fix.started's own seq to
     bound which later events belong to the same cycle."""
+    faults.flow_boundary(f"fixup.{kind}")
     return ledger.append(Event(
         project=project, kind=kind, actor_kind="owner", actor_id="owner",
         attempt_id=old_attempt_id, payload=payload,
@@ -666,6 +680,37 @@ def _find_unfinished_fix_cycle(ledger: Ledger, project: str) -> tuple[int, dict[
 # top-level entry point
 # ---------------------------------------------------------------------
 
+def _full_job_task_config(config: EngineConfig, project: str, job_name: str) -> EngineConfig:
+    """engine.full_orbit.task_attempt_config for this job's plan; without a
+    loadable plan, only the per-task release is removed."""
+    from engine import full_orbit
+    from engine.plan import PlanError, load_plan
+
+    try:
+        plan = load_plan(config.projects[project].repo, job_name)
+    except PlanError:
+        return without_release(config, project)
+    return full_orbit.task_attempt_config(config, project, job_name, plan)
+
+
+def _fix_spec(pos: "JobPosition | None", old_attempt_id: str, config: EngineConfig,
+              new_attempt_id: str, task: str) -> list[dict] | None:
+    """The replaced task's own recorded stage spec, for the replacement
+    attempt, with the composed fix task given to the builder and the
+    reviewer. None when the replaced attempt has no recorded spec."""
+    if pos is None or pos.attempt_id != old_attempt_id:
+        return None
+    spec = pos.get("stages")
+    if not isinstance(spec, list):
+        return None
+    stages = stages_from_spec(spec, config, new_attempt_id, task_text=task)
+    return [
+        {"kind": stage.kind,
+         "payload": ({**stage.payload, "task": task} if stage.kind == "review" else stage.payload)}
+        for stage in stages
+    ]
+
+
 def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
        fakes_for: FakesFor,
        on_progress: orbit.ProgressCallback | None = None,
@@ -713,6 +758,13 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
             "archive_source": archive_source,
         })
 
+    pos = load_position(ledger, project, job_name)
+    full_job = is_full_job(pos)
+    if full_job:
+        # The same task-attempt config the task's own first run used
+        # (no per-task release, a UI plan's screens/ allowance).
+        config = _full_job_task_config(config, project, job_name)
+
     # Cancel any publish request still queued for the attempt being
     # replaced BEFORE close_failed_attempt below runs processor.run_once
     # (which drains the WHOLE project queue, including that request) --
@@ -736,8 +788,8 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
     # what actually holds merged work to continue from.
     archive_dir = Path(str(archive_source)) if archive_source is not None else own_archive_dir
 
-    opened = _latest_fix_event_after(ledger, project, "fix.opened_new", started_seq)
-    if opened is None:
+    new_attempt_id = fix_opened_attempt(ledger, project, old_attempt_id, started_seq)
+    if new_attempt_id is None:
         # This cycle's own fix id for _already_opened_new_attempt's
         # identity check -- journaled here, immediately before the
         # open_job() call below, rather than reusing "fix.started"'s own
@@ -782,44 +834,31 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
                 # own identity check.
                 _append_fix_event(ledger, project, "fix.opening_failed", old_attempt_id, {})
                 raise
-        _append_fix_event(ledger, project, "fix.opened_new", old_attempt_id,
-                          {"new_attempt_id": new_attempt_id})
-    else:
-        # NEVER call open_job again here -- a second call would silently
-        # fork a second, orphaned attempt on the same job rather than
-        # resuming the one a prior (interrupted) call already opened.
-        new_attempt_id = str(opened.payload["new_attempt_id"])
-
-    # Transfer this job's own "task" cursor from old_attempt_id to
-    # new_attempt_id the moment new_attempt_id is known -- BEFORE any
-    # of this cycle's own effects (restore/submit) run. Without this,
-    # the cursor stayed pointed at old_attempt_id through this whole
-    # function: if the fix's own new attempt later ends in a plain
-    # "failed" (review/bench fails again), `resume_full_job_after_
-    # task_fix` (tools/gb2's own caller) never gets a "done"/
-    # "needs_owner" to react to and records nothing either, so a later
-    # `gb2 continue` reads the STALE cursor, tries to reopen old_
-    # attempt_id's own replacement AGAIN, and is refused outright (the
-    # fix's own new attempt is still ACTIVE). And if the process dies
-    # after this cycle's own commit+close but before tools/gb2 ever
-    # calls resume_full_job_after_task_fix, that same stale cursor
-    # would make `gb2 continue` rerun the task this fix JUST finished,
-    # from scratch, all over again. engine.full_orbit.
-    # transfer_task_cursor_to_fix_attempt is a no-op once the cursor
-    # already names new_attempt_id, so calling it again on every
-    # resumed call within this same cycle (or a later cycle that never
-    # needed to touch this job's cursor at all) is always safe.
-    from engine import full_orbit  # sibling module; lazy import (no cycle)
-
-    full_orbit.transfer_task_cursor_to_fix_attempt(
-        ledger, project, job_name, old_attempt_id, new_attempt_id, task)
+        # One event names the replacement attempt AND moves the job's
+        # position onto it, so no crash can leave the position on the
+        # closed attempt while the replacement is already open.
+        faults.flow_boundary("fixup.fix.opened_new")
+        record_position(ledger, project, fix_opened_position(
+            pos, job_name, old_attempt_id, new_attempt_id, task,
+            stages=_fix_spec(pos, old_attempt_id, config, new_attempt_id, task)))
+        pos = load_position(ledger, project, job_name)
+    # Otherwise the replacement is already open and recorded: NEVER call
+    # open_job again, which would fork a second, orphaned attempt.
 
     restored = _latest_fix_event_after(ledger, project, "fix.restored", started_seq)
     if restored is None:
         _overlay_archive_into_builder_copy(config, new_attempt_id, builder_role, archive_dir)
         _append_fix_event(ledger, project, "fix.restored", old_attempt_id, {})
 
-    stages = orbit.fix_stages(config, new_attempt_id, builder_role, reviewer_role, task, job_name)
+    # A full job's task replays its own recorded stage spec (owns, tools,
+    # review) with the composed task; every recovery of this fix replays
+    # the same spec from the position. A plain single-task job has none.
+    spec = pos.get("stages") if pos is not None and pos.attempt_id == new_attempt_id else None
+    if isinstance(spec, list):
+        stages = stages_from_spec(spec, config, new_attempt_id)
+    else:
+        stages = orbit.fix_stages(config, new_attempt_id, builder_role, reviewer_role, task,
+                                  job_name)
 
     # Submitted here, deliberately OUTSIDE orbit.continue_job, so this
     # journal can record the request_id the moment it exists -- submit()
@@ -848,9 +887,18 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         config, ledger, new_fakes, project, new_attempt_id, stages,
         processor_factory=processor_factory, on_progress=on_progress,
     )
+    if (full_job and pos is not None and pos.stage == STAGE_TASK
+            and pos.attempt_id == new_attempt_id
+            and (outcome.status == "needs_owner" or outcome.pending_requests)):
+        # The repaired task stopped for the owner (e.g. another install):
+        # recorded here, where the outcome is known, so a later resume
+        # waits on that request instead of rebuilding.
+        faults.flow_boundary("fixup.fix.task_stop")
+        record_position(ledger, project, task_stop_position(
+            pos, new_attempt_id, outcome.reason, list(outcome.pending_requests)))
     return FixResult(
         old_attempt_id=old_attempt_id, new_attempt_id=new_attempt_id,
-        job_name=job_name, task=task, outcome=outcome,
+        job_name=job_name, task=task, outcome=outcome, full_job=full_job,
     )
 
 

@@ -291,51 +291,24 @@ def _job_name_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> str 
     return None
 
 
-def _latest_passing_fingerprint(
-    ledger: Ledger, project: str, kind: str, attempt_ids: frozenset[str],
-) -> str | None:
-    """The payload["fingerprint"] of the newest event of `kind` whose
-    attempt_id is one of `attempt_ids` and whose payload["passed"] is
-    True -- None if no such event exists, or if the newest one has no
-    non-"" fingerprint recorded (a run that itself failed to fingerprint
-    the repo at all must never be trusted as a match for anything)."""
-    rows = [
-        (seq, event) for seq, event in ledger.events(project, kind)
-        if event.attempt_id in attempt_ids
-    ]
-    if not rows:
-        return None
-    _seq, latest = max(rows, key=lambda row: row[0])
-    if latest.payload.get("passed") is not True:
-        return None
-    fp = latest.payload.get("fingerprint")
-    return str(fp) if fp else None
+def _plan_or_empty(repo: Path, job_name: str) -> "Plan":
+    """engine.plan.load_plan(repo, job_name), or a Plan with zero
+    requirements when plan.json does not exist/does not parse --
+    job_certificate_status predates plan.json existing at all (several
+    of this module's own tests drive it straight off hand-written
+    ledger events, with no plan.json ever written to `repo`), so a
+    missing/broken plan must never itself make a certificate check
+    raise. A Plan with zero requirements makes
+    engine.evidence_graph.build() return a graph with an empty
+    `requirements` tuple -- missing() then falls back to its own
+    job-wide fingerprint/certificate checks only, exactly what this
+    function checked on its own before engine.evidence_graph existed."""
+    from engine.plan import Plan, PlanError, load_plan
 
-
-def _latest_passing_app_security_policy_hash(
-    ledger: Ledger, project: str, attempt_ids: frozenset[str],
-) -> str | None:
-    """The payload["policy_hash"] of the newest 'app_security.recorded'
-    event among `attempt_ids` whose payload["passed"] is True -- same
-    selection as _latest_passing_fingerprint's own "app_security.
-    recorded" case (so this is always reading the SAME event
-    job_certificate_status's fingerprint check already found), just
-    pulling a different field. None if no such event exists, or if it
-    carries no non-"" policy_hash at all (an app_security.recorded
-    event from before engine.app_security.security_policy_hash existed
-    -- that absence must refuse the same as a real mismatch would,
-    never be treated as "nothing to compare, so it still matches")."""
-    rows = [
-        (seq, event) for seq, event in ledger.events(project, "app_security.recorded")
-        if event.attempt_id in attempt_ids
-    ]
-    if not rows:
-        return None
-    _seq, latest = max(rows, key=lambda row: row[0])
-    if latest.payload.get("passed") is not True:
-        return None
-    policy_hash = latest.payload.get("policy_hash")
-    return str(policy_hash) if policy_hash else None
+    try:
+        return load_plan(repo, job_name)
+    except PlanError:
+        return Plan(goal="", ui=False, scenes=(), tasks=(), acceptance=())
 
 
 def _tree_exists(repo: Path, tree_sha: str) -> bool:
@@ -493,7 +466,27 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
     to call engine.app_security.record() after .check() on the real
     release path, NO job will ever satisfy this function's app_security
     half at all -- not a fingerprint problem, there is simply no event
-    yet."""
+    yet.
+
+    P4 (ENGINE.md s20 flow-map (라)): the existence half of both checks
+    above -- "is there a passing acceptance.recorded event at all" and
+    "is there a passing app_security.recorded event at all" -- is no
+    longer this function's own job. It now builds engine.evidence_
+    graph.build(ledger, project, job_name, plan) (plan via
+    _plan_or_empty: this function predates plan.json existing at all,
+    so a missing/unparseable one degrades to zero requirements rather
+    than raising) and refuses outright whenever engine.evidence_graph.
+    missing(graph) is non-empty -- which now ALSO catches a requirement
+    whose only covering scene stopped actually passing (plan.json
+    edited, or the scene removed, since the job's last real acceptance
+    run), something neither of this function's own former per-kind
+    checks ever looked at. What this function still does on its own,
+    because engine.evidence_graph.build() takes no `repo`/`config` at
+    all and so cannot do either: the tree-diff-tolerant match between
+    EACH recorded fingerprint (graph.fingerprint, graph.
+    certificate_fingerprint) and the actually-released `fingerprint`
+    (the docstring section above, on why exact equality is too strict),
+    and the policy_hash-vs-current-config staleness check below."""
     if not fingerprint or not _tree_exists(repo, fingerprint):
         # The caller's own, just-computed release fingerprint must
         # itself be a real tree -- defensive only (engine.evidence.
@@ -506,17 +499,15 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
     job_name = _job_name_for_attempt(ledger, project, attempt_id)
     if job_name is None:
         return False, _JOB_CERTIFICATE_MISSING_REASON
-    attempt_ids = frozenset(
-        row.attempt_id for row in ledger.attempts_for_job_name(project, job_name)
-    )
-    if not attempt_ids:
+
+    from engine import evidence_graph
+
+    graph = evidence_graph.build(ledger, project, job_name, _plan_or_empty(repo, job_name))
+    if evidence_graph.missing(graph):
         return False, _JOB_CERTIFICATE_MISSING_REASON
 
     changed: list[str] = []
-    for kind in ("acceptance.recorded", "app_security.recorded"):
-        recorded_fp = _latest_passing_fingerprint(ledger, project, kind, attempt_ids)
-        if recorded_fp is None:
-            return False, _JOB_CERTIFICATE_MISSING_REASON
+    for recorded_fp in (graph.fingerprint, graph.certificate_fingerprint):
         if recorded_fp == fingerprint:
             continue
         if not _tree_exists(repo, recorded_fp):
@@ -539,12 +530,7 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
     # still need updating.
     if config is not None:
         from engine import app_security  # lazy import, see full_orbit's own convention
-        recorded_policy_hash = _latest_passing_app_security_policy_hash(
-            ledger, project, attempt_ids,
-        )
-        if recorded_policy_hash is None:
-            return False, _JOB_CERTIFICATE_MISSING_REASON
-        if recorded_policy_hash != app_security.security_policy_hash(config):
+        if graph.certificate_policy_hash != app_security.security_policy_hash(config):
             return False, _JOB_CERTIFICATE_STALE_POLICY_REASON
 
     if changed:

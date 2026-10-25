@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import fixup, full_orbit, orbit
+from engine import fixup, full_orbit, orbit, position
 from engine import plan as plan_module
 from engine.app_security import security_policy_hash
 from engine.config import McpServerConfig, ReleaseConfig
@@ -64,12 +64,49 @@ def _full_orbit_workspace(workspace: Workspace) -> Workspace:
     return Workspace(workspace.root, new_config, workspace.ledger, sample.repo, workspace.beta)
 
 
+def _position_view(ledger, job_name: str, project: str = "alpha") -> dict | None:
+    """The job's newest position (engine.position.load_position) as a
+    plain dict: stage, attempt_id, task_id, remaining_task_ids,
+    pending_requests, stop_reason, fixing, fix, plus every extra field."""
+    pos = position.load_position(ledger, project, job_name)
+    if pos is None:
+        return None
+    return {**pos.extra, "stage": pos.stage, "attempt_id": pos.attempt_id,
+            "task_id": pos.task_id, "remaining_task_ids": list(pos.remaining_task_ids),
+            "pending_requests": list(pos.pending_requests), "stop_reason": pos.stop_reason,
+            "fixing": pos.fixing, "fix": pos.fix}
+
+
+def _stop_view(ledger, job_name: str, attempt_id: str | None,
+               project: str = "alpha") -> dict | None:
+    """The job's newest position when it is an owner stop ("awaiting_*")
+    on `attempt_id`, else None."""
+    view = _position_view(ledger, job_name, project)
+    if view is None or not str(view["stage"]).startswith("awaiting_"):
+        return None
+    if view["attempt_id"] != attempt_id:
+        return None
+    return view
+
+
+def _record_task_position(ledger, job_name: str, attempt_id: str, task_id: str,
+                          remaining: tuple[str, ...], *, stage: str = "task",
+                          stop_reason: str | None = None,
+                          pending_requests: tuple[dict, ...] = (), project: str = "alpha") -> None:
+    position.record_position(ledger, project, position.JobPosition(
+        job=job_name, stage=stage, attempt_id=attempt_id, task_id=task_id,
+        remaining_task_ids=remaining, pending_requests=pending_requests,
+        stop_reason=stop_reason,
+        extra={"task_text": "x", "base_task_text": "x", "max_fix_rounds": 2},
+    ))
+
+
 def _fakes() -> Fakes:
     return Fakes(publisher=FakePublisher(), installer=FakeInstaller())
 
 
-# validate_plan (engine.plan, since the s17-evidence merge) now
-# rejects a plan with no `requirements`, and rejects any scene
+# validate_plan (engine.plan) rejects a plan with no `requirements`,
+# and rejects any scene
 # `covers` that is not backed by a REAL tests/scenes/ script on disk.
 # Every plan.json this file builds gets one requirement ("R1") covered
 # by one scene ("s1") that runs this one trivial, always-exits-0
@@ -78,7 +115,7 @@ def _fakes() -> Fakes:
 # same way a real planner would, so it exists in the repo by the time
 # validate_plan checks for it. _FakeAcceptanceResult's own default
 # `scenes` (below) mirrors this same "s1" id so the runtime completion
-# gate (full_orbit._uncovered_requirement_ids) sees it covered too,
+# gate (full_orbit._requirements_without_evidence) sees it covered too,
 # without every call site needing to say so explicitly.
 _SCENE_SCRIPT_PATH = "tests/scenes/req_check.sh"
 _SCENE_SCRIPT_CONTENT = "exit 0\n"
@@ -202,9 +239,9 @@ class _FakeAcceptanceResult:
         # Every plan.json this file builds (_plan_json) declares one
         # requirement ("R1") covered by one scene ("s1") -- a call
         # site that does not say otherwise gets a single "s1" scene
-        # matching `self.passed`, so full_orbit._uncovered_requirement_
-        # ids (the RUNTIME completion gate, read off THIS fake result's
-        # own .scenes, never off plan.scenes) sees that requirement as
+        # matching `self.passed`, so the runtime completion gate
+        # (full_orbit._requirements_without_evidence, reading the
+        # acceptance.recorded event the fake records) sees that requirement as
         # covered/uncovered consistently with the acceptance verdict
         # itself, without every call site needing to spell "s1" out.
         if not self.scenes:
@@ -248,6 +285,13 @@ def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch, *,
     return calls
 
 
+def _job_of(ledger, project: str, attempt_id: str) -> str:
+    for _seq, event in ledger.events(project, "job.opened"):
+        if event.payload.get("attempt_id") == attempt_id:
+            return str(event.payload.get("job_name"))
+    return ""
+
+
 def _install_fake_acceptance_and_handoff(
     monkeypatch: pytest.MonkeyPatch, results: list[_FakeAcceptanceResult], *,
     security_passed: bool = True,
@@ -255,11 +299,29 @@ def _install_fake_acceptance_and_handoff(
     _install_fake_app_security(monkeypatch, passed=security_passed)
     state = _AcceptanceHandoffFakes(results=list(results))
 
+    from engine import handoff as real_handoff
+
     acceptance_mod = types.ModuleType("engine.acceptance")
 
     def run_acceptance(config, ledger, project, attempt_id, plan):
+        # Records acceptance.recorded the way engine.acceptance does, so
+        # the engine's evidence graph reads these scene results.
+        from engine import evidence
+
         state.acceptance_calls += 1
-        return state.results.pop(0)
+        result = state.results.pop(0)
+        project_config = config.projects[project]
+        ledger.append(Event(
+            project=project, kind="acceptance.recorded", actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"job": _job_of(ledger, project, attempt_id), "passed": result.passed,
+                     "scenes": [{"id": sc.id, "passed": sc.passed} for sc in result.scenes],
+                     "full_suite_passed": result.full_suite_passed, "tree_changed": False,
+                     "fingerprint": evidence.fingerprint(project_config.repo,
+                                                         project_config.excludes),
+                     "reason": None},
+        ))
+        return result
 
     acceptance_mod.run_acceptance = run_acceptance  # type: ignore[attr-defined]
 
@@ -294,6 +356,11 @@ def _install_fake_acceptance_and_handoff(
         return report_path
 
     handoff_mod.write_handoff = write_handoff  # type: ignore[attr-defined]
+    # The final section is the real one (imported above, before the
+    # stubs): it only reads the ledger and the plan, and appends to the
+    # report this stub wrote.
+    handoff_mod.write_final_section = real_handoff.write_final_section  # type: ignore[attr-defined]
+    handoff_mod.report_path = real_handoff.report_path  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine.handoff", handoff_mod)
     import engine as _engine_pkg
     monkeypatch.setattr(_engine_pkg, "handoff", handoff_mod, raising=False)
@@ -683,6 +750,72 @@ def test_probe_runs_and_logs_reach_the_planner_as_실측_결과(
     assert "PROBE OK" in plan_text
 
 
+def test_facts_changed_after_the_facts_gate_never_reach_the_planner(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """facts.md is captured when the facts gate passes; if it changes
+    before the planner prompt is built, the planner is never called."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "facts-changed-job"
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md":
+                  "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+    })
+    real_run_probe = full_orbit._run_probe
+
+    def _probe_then_tamper(*args, **kwargs):
+        result = real_run_probe(*args, **kwargs)
+        (ws.alpha / f".gongbang/{job_name}/facts.md").write_text(
+            "- 요청 확인: 통과 (출처: request)\n- 바뀐 값: 통과 (출처: request)\n\n"
+            "## 외부 대상\n(없음)\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(full_orbit, "_run_probe", _probe_then_tamper)
+
+    outcome = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=_processor_factory(stub),
+    )
+
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "facts_changed_after_check"
+    assert ("plan", "planner") not in stub.calls
+    stop = _stop_view(ws.ledger, job_name, outcome.attempt_id)
+    assert stop is not None and stop["stage"] == full_orbit.STAGE_PLAN_REVIEW
+
+
+def test_probe_log_changed_after_its_check_stops_before_the_planner(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "probe-log-changed-job"
+    facts_md = ("- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n"
+                "- stripe: https://docs.stripe.com/api\n")
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": facts_md}],
+        "probe": [{f".gongbang/{job_name}/probe/t1.log":
+                  "https://docs.stripe.com/api\nPROBE OK\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+    real_capture = full_orbit._capture_probe_logs
+
+    def _capture_then_tamper(repo, job, targets):
+        captured = real_capture(repo, job, targets)
+        (repo / f".gongbang/{job}/probe/t1.log").write_text("injected\n", encoding="utf-8")
+        return captured
+
+    monkeypatch.setattr(full_orbit, "_capture_probe_logs", _capture_then_tamper)
+
+    outcome = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "stripe 결제 붙여줘",
+        processor_factory=_processor_factory(stub),
+    )
+
+    assert outcome.status == "needs_owner"
+    assert outcome.reason == "probe_log_changed_after_check:stripe"
+    assert ("plan", "planner") not in stub.calls
+
+
 def test_probe_failure_stops_needs_owner_without_crashing(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -850,7 +983,7 @@ def test_worker_stuck_resume_reruns_build_task_before_review(
     # progress stop_reason, which continue_full_job reads to pick the
     # right resume path.
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stop_reason") == "worker_stuck"
     # The merge stage never ran for this stalled attempt -- nothing landed.
@@ -868,10 +1001,8 @@ def test_worker_stuck_resume_reruns_build_task_before_review(
     assert len(state.handoff_calls) == 1
 
 
-# ---- cursor fallback: an ORDINARY task failure (never a needs_owner
-# stop, so full_orbit.progress has nothing for continue_full_job to
-# read) still resumes at the right task via record_cursor/
-# _resume_from_cursor -------------------------------------------------
+# ---- an ORDINARY task failure (never a needs_owner stop) still resumes
+# at the right task from the task position ------------------------------
 
 def test_cursor_resumes_a_plain_task_failure_that_recorded_no_progress(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
@@ -879,13 +1010,10 @@ def test_cursor_resumes_a_plain_task_failure_that_recorded_no_progress(
     """task 2's own run_station fails OUTRIGHT (a plain StepFailed
     reason, never one of orbit.CONTINUABLE_REASONS -- so this is a
     genuine terminal "failed" JobOutcome, not a "worker_stuck"
-    needs_owner stop). _station_outcome_to_full never records
-    full_orbit.progress for an ordinary "failed" outcome -- only for
-    needs_owner -- so before record_cursor existed, `continue_full_job`
-    had nothing to resume from at all here (FullOrbitError). The "task"
-    cursor _run_task_attempt wrote right after opening task 2's own
-    attempt (before run_station ever ran) is the only record of where
-    this job actually stopped."""
+    needs_owner stop). No stop is recorded for an ordinary "failed"
+    outcome; the task position _run_task_attempt wrote right after
+    opening task 2's own attempt is the record of where this job
+    actually stopped."""
     ws = _full_orbit_workspace(workspace)
     job_name = "ordinary-failure-job"
     plan_json = _plan_json(tasks=[
@@ -959,8 +1087,8 @@ def test_cursor_resumes_a_plain_task_failure_that_recorded_no_progress(
     assert first.reason is not None and first.reason.startswith("build:")
     # No needs_owner stop at all for this attempt -- the ordinary bug
     # this fix closes: nothing for the old progress-only lookup to find.
-    assert full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name) is None
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    assert _stop_view(ws.ledger, job_name, first.attempt_id) is None
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None
     assert cursor["stage"] == "task"
     assert cursor["task_id"] == "t2"
@@ -979,15 +1107,14 @@ def test_cursor_resumes_a_plain_task_failure_that_recorded_no_progress(
     assert len(state.handoff_calls) == 1
 
 
-def test_resume_full_job_after_task_fix_runs_remaining_tasks_then_finishes(
+def test_resume_after_fix_runs_remaining_tasks_then_finishes(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The acceptance scenario the s17 contract calls out: a 3-task
     plan, task 2's review fails ordinarily (no needs_owner stop --
     engine.fixup.fix is the owner's OWN recovery path for this, not
     continue_full_job), `gb2 fix`'s equivalent (fixup.fix) repairs
-    JUST task 2, and engine.full_orbit.resume_full_job_after_task_fix
-    then hands the result back to the full-job coordinator: task 3
+    JUST task 2, and engine.position.resume_after_fix then hands the result back to the full-job coordinator: task 3
     still runs, then acceptance + handoff + the app-wide security
     check + exactly ONE release decision (record_release_decision
     "not_configured", since this project has no `release` track --
@@ -1057,8 +1184,8 @@ def test_resume_full_job_after_task_fix_runs_remaining_tasks_then_finishes(
         processor_factory=factory,
     )
     assert first.status == "failed"
-    assert full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name) is None
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    assert _stop_view(ws.ledger, job_name, first.attempt_id) is None
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None and cursor["task_id"] == "t2"
     assert list(cursor["remaining_task_ids"]) == ["t2", "t3"]
     assert not (ws.alpha / "src/greeter/extra3.py").exists()
@@ -1071,9 +1198,9 @@ def test_resume_full_job_after_task_fix_runs_remaining_tasks_then_finishes(
     assert fix_result.outcome.status == "done", fix_result.outcome
     assert (ws.alpha / "src/greeter/extra2.py").read_text(encoding="utf-8") == "VALUE_2 = 2\n"
 
-    resumed = full_orbit.resume_full_job_after_task_fix(
-        ws.config, ws.ledger, _fakes(), "alpha", fix_result.job_name, fix_result.outcome,
-        fix_result.new_attempt_id, processor_factory=factory,
+    assert fix_result.full_job is True
+    resumed = position.resume_after_fix(
+        ws.config, ws.ledger, _fakes(), "alpha", fix_result, processor_factory=factory,
     )
 
     assert resumed is not None
@@ -1087,71 +1214,118 @@ def test_resume_full_job_after_task_fix_runs_remaining_tasks_then_finishes(
     assert decisions == ["not_configured"]
 
 
-def test_resume_full_job_after_task_fix_records_cursor_on_the_new_attempt_when_it_stops_again(
+def test_fix_that_stops_for_the_owner_records_the_stop_on_the_new_attempt(
     workspace: Workspace,
 ) -> None:
-    """`gb2 fix`'s repair can itself stop needs_owner again (e.g. the
-    fixed task asks for another install) instead of landing "done".
-    Before this fix, resume_full_job_after_task_fix returned that
-    outcome as-is without ever recording a cursor/progress for
-    `new_attempt_id` -- the job's own "task" cursor stayed pointed at
-    the OLD attempt fixup.fix() already closed, so a later `gb2
-    continue` would try to resume building on an attempt engine.
-    processor.submit now refuses outright ('attempt_not_active')."""
+    """`gb2 fix`'s repair can itself stop needs_owner (the repaired task
+    asks for an install). engine.fixup.fix records that stop on the
+    replacement attempt, so `continue` waits on the request instead of
+    rebuilding or reaching for the closed attempt."""
     ws = _full_orbit_workspace(workspace)
     job_name = "fix-stops-again-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+        {"id": "t2", "title": "둘째 파일", "detail": "", "owns": ["src/greeter/extra2.py"],
+         "depends_on": ["t1"]},
+    ])
+    early = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+    })
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    build_calls = {"t2": 0}
 
-    old_attempt_id = full_orbit.open_job(
-        ws.config, ws.ledger, "alpha", job_name, "full", ("builder",),
+    def _run_station_steps(ctx: StepContext) -> list[StepDef]:
+        if ctx.request.payload.get("station") != "build":
+            return early.steps(ctx)
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            task = str(ctx.request.payload.get("task", ""))
+            copy = copy_root(ctx.config, ctx.attempt_id, "builder")
+            requests: list[dict[str, object]] = []
+            if "둘째 파일" in task:
+                build_calls["t2"] += 1
+                rel = "src/greeter/extra2.py"
+                if build_calls["t2"] == 2:
+                    requests = [install_request]
+            else:
+                rel = "src/greeter/extra1.py"
+            (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+            (copy / rel).write_text("VALUE = 1\n", encoding="utf-8")
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={"request_id": ctx.request.request_id, "station": "build",
+                         "role": "builder", "ok": True, "summary": "stub", "cost_usd": 0.0,
+                         "turns": 1, "changed_paths": list(dirty_paths(copy, ())),
+                         "requests": requests},
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            return any(event.payload.get("request_id") == ctx.request.request_id
+                       for _seq, event in ctx.ledger.events(ctx.project, "station.finished"))
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    review_calls: list[str] = []
+
+    def _review_steps(ctx: StepContext) -> list[StepDef]:
+        task_text = str(ctx.request.payload.get("task", ""))
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls.append(task_text)
+            if "둘째 파일" in task_text and sum("둘째 파일" in t for t in review_calls) == 1:
+                raise StepFailed("review_rejected")
+            project_config = ctx.config.projects[ctx.project]
+            fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+            evidence.record(ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                            payload={"passed": True, "request_id": ctx.request.request_id,
+                                     "findings": []})
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            return any(row.payload.get("request_id") == ctx.request.request_id
+                       for row in ctx.ledger.evidence(ctx.attempt_id, "review"))
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", _run_station_steps)
+        proc.register("review", _review_steps)
+        return proc
+
+    from engine import evidence
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "두 파일을 만들어줘",
+        processor_factory=factory,
     )
-    full_orbit.record_cursor(
-        ws.ledger, "alpha", job_name, stage="task", next_action="run_station",
-        attempt_id=old_attempt_id, task_id="t2", task_text="둘째 파일",
-        base_task_text="둘째 파일", fixing=False, remaining_task_ids=["t2", "t3"],
-        max_fix_rounds=2,
+    assert first.status == "failed", first
+
+    fix_result = fixup.fix(ws.config, ws.ledger, "alpha", "", lambda _a: _fakes(),
+                           processor_factory=factory)
+    assert fix_result.full_job is True
+    assert fix_result.outcome.status == "needs_owner", fix_result.outcome
+
+    stop = _stop_view(ws.ledger, job_name, fix_result.new_attempt_id)
+    assert stop is not None
+    assert stop["stage"] == full_orbit.STAGE_TASK_OWNER
+    assert stop["task_id"] == "t2"
+    assert stop["pending_requests"] == [install_request]
+    assert position.pending_owner_requests(ws.ledger, "alpha", job_name) == (install_request,)
+
+    waiting = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
     )
-    # Simulate fixup.fix() having already closed the old attempt (the
-    # real close step's own two effects, bypassed here the same way
-    # tests/unit/test_steps_close.py's own crash tests inject ledger
-    # state directly) and opened a replacement.
-    ws.ledger.append(Event(
-        project="alpha", kind="attempt.finished", actor_kind="processor",
-        actor_id="processor", attempt_id=old_attempt_id,
-        payload={"attempt_id": old_attempt_id, "status": "closed"},
-    ))
-    from engine import state as state_mod
-
-    state_mod.transition(ws.ledger, "alpha", "close_job", "owner")
-    state_mod.transition(ws.ledger, "alpha", "finalized", "owner")
-    new_attempt_id = full_orbit.open_job(
-        ws.config, ws.ledger, "alpha", job_name, "full", ("builder",),
-    )
-
-    outcome = orbit.JobOutcome(
-        attempt_id=new_attempt_id, status="needs_owner", failed_request=None,
-        reason="owner_request",
-        pending_requests=({"kind": "install", "manifest": "package.json",
-                           "change": {"dependencies": {"left-pad": "^1.0.0"}}},),
-    )
-    resumed = full_orbit.resume_full_job_after_task_fix(
-        ws.config, ws.ledger, _fakes(), "alpha", job_name, outcome, new_attempt_id,
-    )
-
-    assert resumed is not None
-    assert resumed.status == "needs_owner"
-    assert resumed.attempt_id == new_attempt_id
-
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
-    assert cursor is not None
-    assert cursor["stage"] == "task"
-    assert cursor["attempt_id"] == new_attempt_id
-    assert cursor["task_id"] == "t2"
-
-    progress = full_orbit._load_progress(ws.ledger, "alpha", new_attempt_id, job_name)
-    assert progress is not None
-    assert progress["stage"] == full_orbit.STAGE_TASK_OWNER
-    assert progress["current_task_id"] == "t2"
-    assert list(progress["pending_requests"]) == list(outcome.pending_requests)
+    assert waiting.status == "needs_owner"
+    assert waiting.reason == "owner_request"
+    assert waiting.attempt_id == fix_result.new_attempt_id
+    assert build_calls["t2"] == 2
 
 
 # ---- 10. release: ONE publish request for the whole job, not one per task --
@@ -1251,12 +1425,19 @@ def _release_stopped_job(workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
     # run_full_job's own handoff commit) so the certificate check's own
     # diff-tolerance sees zero changed paths -- same reasoning
     # tests/unit/test_gb2.py's own _setup_release_job uses.
+    # Every plan scene is reported as run and passed, as the real
+    # acceptance would: engine.evidence_graph requires each requirement's
+    # covering scene to have a recorded passing result.
     from engine import evidence
+    from engine.plan import load_plan
+
+    plan = load_plan(ws.alpha, job_name)
     fp = evidence.fingerprint(ws.alpha, config.projects["alpha"].excludes)
     ws.ledger.append(Event(
         project="alpha", kind="acceptance.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=outcome.attempt_id,
-        payload={"job": job_name, "passed": True, "scenes": [],
+        payload={"job": job_name, "passed": True,
+                 "scenes": [{"id": scene.id, "passed": True} for scene in plan.scenes],
                  "full_suite_passed": True, "tree_changed": False,
                  "reason": None, "fingerprint": fp},
     ))
@@ -1393,10 +1574,9 @@ def test_continue_after_probe_failed_reruns_probe_then_finishes(
     )
     assert first.status == "needs_owner"
     assert first.reason == "probe_failed:stripe"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_PROBE_RETRY
-    assert progress.get("resume_at") == full_orbit.STAGE_PROBE_RETRY
     assert ("plan", "planner") not in stub.calls
 
     done = full_orbit.continue_full_job(
@@ -1469,7 +1649,7 @@ def test_continue_after_plan_review_failed_reruns_plan_and_review(
     )
     assert first.status == "needs_owner"
     assert first.reason == "plan_review_failed"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_PLAN_REVIEW
     assert ("build", "builder") not in stub.calls
@@ -1589,7 +1769,7 @@ def test_owner_request_resume_reruns_builder_after_install_then_reviews(
     )
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("pending_requests") == [install_request]
     # The builder's own file change already merged (same as always) --
@@ -1608,12 +1788,7 @@ def test_owner_request_resume_reruns_builder_after_install_then_reviews(
     # Now the owner actually fulfills it (the real flow: a submitted
     # "install" ledger request runs to completion and journals
     # install.recorded with this exact manifest+change).
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first.attempt_id,
-        payload={"request_id": "r-install-1", "kind": install_request["kind"],
-                 "manifest": "package.json", "change": install_request["change"]},
-    ))
+    _record_install(ws, first.attempt_id, install_request, "r-install-1")
 
     done = full_orbit.continue_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
@@ -1710,16 +1885,11 @@ def test_owner_request_resume_that_stops_again_updates_pending_requests(
         processor_factory=factory,
     )
     assert first.status == "needs_owner"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("pending_requests") == [install_request_1]
 
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first.attempt_id,
-        payload={"request_id": "r-install-1", "kind": install_request_1["kind"],
-                 "manifest": "package.json", "change": install_request_1["change"]},
-    ))
+    _record_install(ws, first.attempt_id, install_request_1, "r-install-1")
 
     second = full_orbit.continue_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
@@ -1729,7 +1899,7 @@ def test_owner_request_resume_that_stops_again_updates_pending_requests(
     # showing the first (already-fulfilled) one forever (the P2 bug this
     # test guards against).
     assert second.status == "needs_owner"
-    progress_2 = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress_2 = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress_2 is not None
     assert progress_2.get("pending_requests") == [install_request_2]
     assert progress_2.get("stop_reason") != "release_approval"
@@ -1738,12 +1908,7 @@ def test_owner_request_resume_that_stops_again_updates_pending_requests(
     # The FIRST install's own request is no longer what gates this job --
     # recording it AGAIN (a stale approve) must not be mistaken for the
     # second (current) one.
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first.attempt_id,
-        payload={"request_id": "r-install-1-again", "kind": install_request_1["kind"],
-                 "manifest": "package.json", "change": install_request_1["change"]},
-    ))
+    _record_install(ws, first.attempt_id, install_request_1, "r-install-1-again")
     still_waiting = full_orbit.continue_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
     )
@@ -1752,14 +1917,9 @@ def test_owner_request_resume_that_stops_again_updates_pending_requests(
 
     # Fulfilling the SECOND (current) request is what actually resumes
     # the build -- content match, not stale journal state.
-    ws.ledger.append(Event(
-        project="alpha", kind="install.recorded", actor_kind="processor",
-        actor_id="processor", attempt_id=first.attempt_id,
-        payload={"request_id": "r-install-2", "kind": install_request_2["kind"],
-                 "manifest": "package.json", "change": install_request_2["change"]},
-    ))
-    assert full_orbit._pending_requests_fulfilled(
-        ws.ledger, "alpha", progress_2["pending_requests"])
+    _record_install(ws, first.attempt_id, install_request_2, "r-install-2")
+    assert position.outstanding_requests(
+        ws.ledger, "alpha", position.load_position(ws.ledger, "alpha", job_name)) == ()
 
 
 # ---- 14. the review stage always carries the plan's own tools table ----
@@ -1866,18 +2026,25 @@ def _station_stub_with_one_owner_request(queues: dict[str, list[dict[str, str]]]
     return stub, steps
 
 
-def _approve_early_install(ws: Workspace, attempt_id: str) -> None:
+def _record_install(ws: Workspace, attempt_id: str, request: dict, request_id: str) -> None:
+    """What a real approved install leaves behind: the manifest holding
+    the change, and the install.recorded event of the request's kind."""
+    from engine.installers import merge_one_level
+
+    manifest = ws.alpha / str(request["manifest"])
+    current = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    manifest.write_text(json.dumps(merge_one_level(current, request["change"])),
+                        encoding="utf-8")
     ws.ledger.append(Event(
         project="alpha", kind="install.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
-        # "kind" matches the real event shape engine.steps.install._record
-        # always writes (ctx.request.kind) -- full_orbit._install_request_
-        # fulfilled matches it too, not just manifest+change, so an
-        # "install" proposal is never satisfied by a differently-kinded
-        # historical record that happens to share the same shape.
-        payload={"request_id": "r-install-early", "kind": _EARLY_INSTALL_REQUEST["kind"],
-                 "manifest": "package.json", "change": _EARLY_INSTALL_REQUEST["change"]},
+        payload={"request_id": request_id, "kind": request["kind"],
+                 "manifest": request["manifest"], "change": request["change"]},
     ))
+
+
+def _approve_early_install(ws: Workspace, attempt_id: str) -> None:
+    _record_install(ws, attempt_id, _EARLY_INSTALL_REQUEST, "r-install-early")
 
 
 def test_facts_owner_request_resumes_to_done(
@@ -1911,7 +2078,7 @@ def test_facts_owner_request_resumes_to_done(
     )
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
     assert progress.get("station") == "facts"
@@ -1969,7 +2136,7 @@ def test_probe_owner_request_resumes_to_done(
     )
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
     assert progress.get("station") == "probe"
@@ -2012,7 +2179,7 @@ def test_plan_owner_request_resumes_to_done(
     )
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
     assert progress.get("station") == "plan"
@@ -2056,7 +2223,7 @@ def test_design_owner_request_resumes_to_design_approval(
     )
     assert first.status == "needs_owner"
     assert first.reason == "owner_request"
-    progress = full_orbit._load_progress(ws.ledger, "alpha", first.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
     assert progress is not None
     assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
     assert progress.get("station") == "design"
@@ -2072,63 +2239,93 @@ def test_design_owner_request_resumes_to_design_approval(
     assert next_stop.reason == "design_approval"
 
 
-# ---- 16. requirement completion needs a PASSING scene, never a task --
-# ---- alone ------------------------------------
+# ---- 16. requirement completion reads the evidence graph: a PASSING
+# recorded scene, or a commit for a task-only requirement ---------------
 
-def test_uncovered_requirement_ids_ignores_task_only_coverage() -> None:
-    """A requirement covered by a TASK's own `covers` (tracking only)
-    but no scene at all must still read as uncovered -- a task
-    reaching "done" only means its own review/bench passed, never that
-    any scene actually exercised the requirement's real behavior."""
-    from types import SimpleNamespace
+def _evidence_job(ws: Workspace, job_name: str, scenes: list[dict]) -> str:
+    """An attempt for `job_name` with one acceptance.recorded event."""
+    from engine import evidence
 
-    from engine.plan import Plan, Requirement, Task
-
-    plan = Plan(
-        goal="g", ui=False, scenes=(), acceptance=("ok",),
-        requirements=(Requirement(id="R1", text="입력 검증", kind="security"),),
-        tasks=(Task(id="t1", title="t", detail="", owns=("src/",), depends_on=(),
-                    covers=("R1",)),),
-    )
-    acc = SimpleNamespace(scenes=())
-    assert full_orbit._uncovered_requirement_ids(plan, acc) == ("R1",)
+    attempt_id = full_orbit.open_job(ws.config, ws.ledger, "alpha", job_name, "full", ())
+    ws.ledger.append(Event(
+        project="alpha", kind="acceptance.recorded", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": job_name, "passed": True, "scenes": scenes,
+                 "fingerprint": evidence.fingerprint(ws.alpha, ()), "reason": None},
+    ))
+    return attempt_id
 
 
-def test_uncovered_requirement_ids_requires_the_scene_to_have_passed() -> None:
-    from types import SimpleNamespace
-
-    from engine.plan import Plan, Requirement, Scene
-
-    plan = Plan(
-        goal="g", ui=False, acceptance=("ok",), tasks=(),
-        requirements=(Requirement(id="R1", text="입력 검증", kind="function"),),
-        scenes=(Scene(id="s1", actor_does="클릭", app_shows="결과", where="home",
-                     cmd=("true",), covers=("R1",)),),
-    )
-    failed_scene = SimpleNamespace(id="s1", passed=False)
-    assert full_orbit._uncovered_requirement_ids(plan, SimpleNamespace(scenes=(failed_scene,))) \
-        == ("R1",)
-
-    passed_scene = SimpleNamespace(id="s1", passed=True)
-    assert full_orbit._uncovered_requirement_ids(plan, SimpleNamespace(scenes=(passed_scene,))) \
-        == ()
-
-
-def test_uncovered_requirement_ids_passing_scene_covers_it_even_with_a_task_too() -> None:
-    from types import SimpleNamespace
-
+def _r1_plan(*, scene: bool, task: bool):
     from engine.plan import Plan, Requirement, Scene, Task
 
-    plan = Plan(
+    return Plan(
         goal="g", ui=False, acceptance=("ok",),
         requirements=(Requirement(id="R1", text="입력 검증", kind="function"),),
-        scenes=(Scene(id="s1", actor_does="클릭", app_shows="결과", where="home",
-                     cmd=("true",), covers=("R1",)),),
-        tasks=(Task(id="t1", title="t", detail="", owns=("src/",), depends_on=(),
-                    covers=("R1",)),),
+        scenes=((Scene(id="s1", actor_does="클릭", app_shows="결과", where="home",
+                       cmd=("true",), covers=("R1",)),) if scene else ()),
+        tasks=((Task(id="t1", title="t", detail="", owns=("src/",), depends_on=(),
+                     covers=("R1",)),) if task else ()),
     )
-    acc = SimpleNamespace(scenes=(SimpleNamespace(id="s1", passed=True),))
-    assert full_orbit._uncovered_requirement_ids(plan, acc) == ()
+
+
+def test_task_only_requirement_without_a_commit_has_no_evidence(workspace: Workspace) -> None:
+    ws = _full_orbit_workspace(workspace)
+    _evidence_job(ws, "task-only", [])
+    assert full_orbit._requirements_without_evidence(
+        ws.ledger, "alpha", "task-only", _r1_plan(scene=False, task=True)) == ("R1",)
+
+
+def test_requirement_needs_its_scene_to_have_passed(workspace: Workspace) -> None:
+    ws = _full_orbit_workspace(workspace)
+    plan = _r1_plan(scene=True, task=False)
+    _evidence_job(ws, "scene-failed", [{"id": "s1", "passed": False}])
+    assert full_orbit._requirements_without_evidence(
+        ws.ledger, "alpha", "scene-failed", plan) == ("R1",)
+
+
+def test_passing_recorded_scene_covers_it_even_with_a_task_too(workspace: Workspace) -> None:
+    ws = _full_orbit_workspace(workspace)
+    _evidence_job(ws, "scene-passed", [{"id": "s1", "passed": True}])
+    assert full_orbit._requirements_without_evidence(
+        ws.ledger, "alpha", "scene-passed", _r1_plan(scene=True, task=True)) == ()
+
+
+def test_every_task_position_carries_its_task_id_and_attempt_id(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """engine.evidence_graph pairs each task with the attempt that ran it
+    from the stage="task" positions."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "task-pairs-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+        {"id": "t2", "title": "둘째 파일", "detail": "", "owns": ["src/greeter/extra2.py"],
+         "depends_on": ["t1"]},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [{"src/greeter/extra1.py": "V = 1\n"}, {"src/greeter/extra2.py": "V = 2\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+    outcome = full_orbit.run_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
+                                      "두 파일을 만들어줘", processor_factory=_processor_factory(stub))
+    assert outcome.status == "done", outcome
+
+    task_positions = [e for _s, e in ws.ledger.events("alpha", "job.position")
+                      if e.payload.get("job") == job_name and e.payload.get("stage") == "task"]
+    # each task: its opening intent (no attempt yet, the roles to open
+    # with), then its position on the opened attempt
+    assert [e.payload["task_id"] for e in task_positions] == ["t1", "t1", "t2", "t2"]
+    intents, opened = task_positions[0::2], task_positions[1::2]
+    for event in intents:
+        assert event.payload["attempt_id"] is None
+        assert event.payload["extra"]["roles"] == [full_orbit.BUILDER_ROLE]
+    for event in opened:
+        assert event.payload["attempt_id"] == event.attempt_id
+        assert ws.ledger.attempt(event.attempt_id).status == "closed"
 
 
 # ---- plan_digest/plan.reviewed: a plan.json edit between a
@@ -2263,9 +2460,8 @@ def test_design_approval_resume_reruns_plan_review_when_plan_json_changed_since(
 
 
 # ---------------------------------------------------------------------------
-# s18-resume item (9): check_resumed_plan is called at every resume point,
-# via getattr (engine.plan may not define it in every worktree this runs
-# against).
+# check_resumed_plan is called at every resume point, via getattr
+# (engine.plan may not define it in every worktree this runs against).
 # ---------------------------------------------------------------------------
 
 def test_check_resumed_plan_filters_out_plan_never_reviewed(
@@ -2317,11 +2513,7 @@ def test_continue_full_job_stops_needs_owner_when_check_resumed_plan_flags_a_pro
     attempt_id = full_orbit.open_job(
         ws.config, ws.ledger, "alpha", job_name, "full", ("builder",),
     )
-    full_orbit.record_cursor(
-        ws.ledger, "alpha", job_name, stage="task", next_action="run_station",
-        attempt_id=attempt_id, task_id="t1", task_text="x", base_task_text="x",
-        fixing=False, remaining_task_ids=["t1"], max_fix_rounds=2,
-    )
+    _record_task_position(ws.ledger, job_name, attempt_id, "t1", ("t1",))
 
     def _fake_check(ledger, project, job_name_, repo):
         return ["requirement R1 disappeared"]
@@ -2332,14 +2524,11 @@ def test_continue_full_job_stops_needs_owner_when_check_resumed_plan_flags_a_pro
 
     assert outcome.status == "needs_owner"
     assert outcome.reason is not None and "requirement R1 disappeared" in outcome.reason
-    # The ORIGINAL "task" cursor must be left exactly as it was -- never
+    # The ORIGINAL task position must be left exactly as it was -- never
     # overwritten with a generic stop that would lose which task (and
-    # what remains behind it) this job was actually interrupted at
-    # (codex-diff-review-s18.md's "Plan guard destroys continuation
-    # state"). No full_orbit.progress exists either (record_cursor
-    # alone never writes one).
-    assert full_orbit._load_progress(ws.ledger, "alpha", attempt_id, job_name) is None
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    # what remains behind it) this job was actually interrupted at.
+    assert _stop_view(ws.ledger, job_name, attempt_id) is None
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None
     assert cursor["stage"] == "task"
     assert cursor["task_id"] == "t1"
@@ -2349,8 +2538,8 @@ def test_continue_full_job_stops_needs_owner_when_check_resumed_plan_flags_a_pro
 def test_plan_guard_stop_resumes_the_interrupted_task_once_cleared_not_acceptance(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact codex-diff-review-s18.md repro: a build task stops
-    needs_owner (STAGE_TASK_OWNER, an install request); while stopped,
+    """A build task stops needs_owner (STAGE_TASK_OWNER, an install
+    request); while stopped,
     a plan/scene edit trips the plan guard -- `gb2 continue` must stay
     needs_owner on the SAME task, never silently replacing that stop
     with a generic one. Once the edit is reverted (check_resumed_plan
@@ -2378,13 +2567,9 @@ def test_plan_guard_stop_resumes_the_interrupted_task_once_cleared_not_acceptanc
     )
     install_request = {"kind": "install", "manifest": "package.json",
                        "change": {"dependencies": {"left-pad": "^1.0.0"}}}
-    full_orbit._record_progress(
-        ws.ledger, "alpha", attempt_id, job_name,
-        stage=full_orbit.STAGE_TASK_OWNER, resume_at=full_orbit.STAGE_TASK_OWNER,
-        remaining_task_ids=["t1", "t2"], current_task_id="t1", current_task_text="x",
-        current_base_task_text="x", stop_reason="owner_request", fixing=False,
-        max_fix_rounds=2, pending_requests=[install_request],
-    )
+    _record_task_position(ws.ledger, job_name, attempt_id, "t1", ("t1", "t2"),
+                          stage=full_orbit.STAGE_TASK_OWNER, stop_reason="owner_request",
+                          pending_requests=(install_request,))
 
     bad_check_calls = {"n": 0}
 
@@ -2396,10 +2581,10 @@ def test_plan_guard_stop_resumes_the_interrupted_task_once_cleared_not_acceptanc
     blocked = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name)
     assert blocked.status == "needs_owner"
     assert bad_check_calls["n"] == 1
-    progress = full_orbit._load_progress(ws.ledger, "alpha", attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, attempt_id)
     assert progress is not None
     assert progress["stage"] == full_orbit.STAGE_TASK_OWNER
-    assert progress["current_task_id"] == "t1"
+    assert progress["task_id"] == "t1"
 
     # The edit is reverted -- check_resumed_plan is clean again. Spy on
     # both the task-owner resume path and the acceptance path to prove
@@ -2407,8 +2592,8 @@ def test_plan_guard_stop_resumes_the_interrupted_task_once_cleared_not_acceptanc
     monkeypatch.setattr(plan_module, "check_resumed_plan", lambda *a, **k: [], raising=False)
     resume_calls: list[str] = []
     acceptance_calls: list[str] = []
-    monkeypatch.setattr(
-        full_orbit, "_resume_task_owner",
+    monkeypatch.setitem(
+        full_orbit.RESUME_TABLE, full_orbit.STAGE_TASK_OWNER,
         lambda *a, **k: (resume_calls.append("called"),
                          full_orbit.FullOutcome("needs_owner", "stub", attempt_id, None))[1],
     )
@@ -2425,7 +2610,7 @@ def test_plan_guard_stop_resumes_the_interrupted_task_once_cleared_not_acceptanc
     assert resumed.status == "needs_owner" and resumed.reason == "stub"
 
 
-def test_resume_full_job_after_task_fix_stops_when_check_resumed_plan_flags_a_problem(
+def test_resume_after_fix_stops_when_check_resumed_plan_flags_a_problem(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ws = _full_orbit_workspace(workspace)
@@ -2433,11 +2618,7 @@ def test_resume_full_job_after_task_fix_stops_when_check_resumed_plan_flags_a_pr
     old_attempt_id = full_orbit.open_job(
         ws.config, ws.ledger, "alpha", job_name, "full", ("builder",),
     )
-    full_orbit.record_cursor(
-        ws.ledger, "alpha", job_name, stage="task", next_action="run_station",
-        attempt_id=old_attempt_id, task_id="t1", task_text="x", base_task_text="x",
-        fixing=False, remaining_task_ids=["t1"], max_fix_rounds=2,
-    )
+    _record_task_position(ws.ledger, job_name, old_attempt_id, "t1", ("t1",))
 
     def _fake_check(ledger, project, job_name_, repo):
         return ["task t2 disappeared"]
@@ -2447,9 +2628,9 @@ def test_resume_full_job_after_task_fix_stops_when_check_resumed_plan_flags_a_pr
     outcome = orbit.JobOutcome(
         attempt_id=old_attempt_id, status="done", failed_request=None, reason=None,
     )
-    resumed = full_orbit.resume_full_job_after_task_fix(
-        ws.config, ws.ledger, _fakes(), "alpha", job_name, outcome, old_attempt_id,
-    )
+    result = fixup.FixResult(old_attempt_id=old_attempt_id, new_attempt_id=old_attempt_id,
+                             job_name=job_name, task="x", outcome=outcome, full_job=True)
+    resumed = position.resume_after_fix(ws.config, ws.ledger, _fakes(), "alpha", result)
 
     assert resumed is not None
     assert resumed.status == "needs_owner"
@@ -2457,19 +2638,18 @@ def test_resume_full_job_after_task_fix_stops_when_check_resumed_plan_flags_a_pr
 
 
 # ---------------------------------------------------------------------------
-# s18-resume item (10): cursor stage "small_plan" is handed to
-# engine.small_orbit.resume_small_plan via getattr.
+# position stage "small_plan" is handed to engine.small_orbit.resume_small_plan.
 # ---------------------------------------------------------------------------
 
-def test_resume_from_cursor_dispatches_small_plan_stage_to_small_orbit(
+def test_resume_dispatches_small_plan_stage_to_small_orbit(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ws = _full_orbit_workspace(workspace)
     calls: list[tuple] = []
 
-    def _fake_resume_small_plan(config, ledger, fakes, project, job_name, cursor, *,
+    def _fake_resume_small_plan(config, ledger, fakes, project, job_name, pos, *,
                                 on_progress=None, processor_factory=None):
-        calls.append((project, job_name, cursor["stage"]))
+        calls.append((project, job_name, pos.stage))
         return full_orbit.FullOutcome("needs_owner", "small_mode_needs_probe", "A#1", None)
 
     from engine import small_orbit as small_orbit_module
@@ -2477,10 +2657,12 @@ def test_resume_from_cursor_dispatches_small_plan_stage_to_small_orbit(
     monkeypatch.setattr(small_orbit_module, "resume_small_plan", _fake_resume_small_plan,
                         raising=False)
 
-    cursor = {"stage": "small_plan", "attempt_id": "A#1", "max_fix_rounds": 2}
-    outcome = full_orbit._resume_from_cursor(
-        ws.config, ws.ledger, _fakes(), "alpha", "small-job-1", cursor, None, None,
-    )
+    attempt_id = full_orbit.open_job(
+        ws.config, ws.ledger, "alpha", "small-job-1", "full", (full_orbit.PLANNER_ROLE,))
+    position.record_position(ws.ledger, "alpha", position.JobPosition(
+        job="small-job-1", stage="small_plan", attempt_id=attempt_id,
+        extra={"max_fix_rounds": 2}))
+    outcome = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", "small-job-1")
 
     assert calls == [("alpha", "small-job-1", "small_plan")]
     assert outcome.status == "needs_owner"
@@ -2490,10 +2672,10 @@ def test_resume_from_cursor_dispatches_small_plan_stage_to_small_orbit(
 
 
 # ---------------------------------------------------------------------------
-# s18-resume item (8): a probe/plan retry preserves an owner's own
-# uncommitted edit (made while the job sat STAGE_PROBE_RETRY/STAGE_PLAN_
-# REVIEW needs_owner) instead of letting _reopen_for_retry's own close
-# (archive, then reset_to_head) silently discard it.
+# A probe/plan retry preserves an owner's own uncommitted edit (made
+# while the job sat STAGE_PROBE_RETRY/STAGE_PLAN_REVIEW needs_owner)
+# instead of letting _reopen_for_retry's own close (archive, then
+# reset_to_head) silently discard it.
 # ---------------------------------------------------------------------------
 
 def test_reopen_for_retry_restores_an_owner_edit_into_the_fresh_attempts_copy(
@@ -2533,7 +2715,7 @@ def test_reopen_for_retry_without_a_retry_stage_does_not_restore_anything(
     workspace: Workspace,
 ) -> None:
     """The two PRE-EXISTING callers of _reopen_for_retry (the design-
-    approval resume, and resume_full_job_after_task_fix's own kin) never
+    approval resume, and the crash resume of a station) never
     pass `retry_stage` -- the default (None) must keep the OLD
     behavior exactly: close, then open fresh, with no archive lookup or
     restore at all."""
@@ -2588,7 +2770,7 @@ def test_facts_stops_needs_owner_when_a_required_skill_is_missing(
 
     assert outcome.status == "needs_owner"
     assert outcome.reason is not None and "필수-없는-스킬" in outcome.reason
-    progress = full_orbit._load_progress(ws.ledger, "alpha", outcome.attempt_id, job_name)
+    progress = _stop_view(ws.ledger, job_name, outcome.attempt_id)
     assert progress is not None
     assert progress["stage"] == full_orbit.STAGE_EARLY_STATION
     assert progress["station"] == "facts"
@@ -2616,9 +2798,9 @@ def test_facts_stops_needs_owner_when_a_required_skill_is_missing(
 
 
 # ---------------------------------------------------------------------------
-# codex-diff-review-s18.md P1: a "task" cursor's attempt being
-# closed/abandoned does NOT by itself mean the task finished --
-# fixup.close_failed_attempt closes a FAILED task's attempt (to archive
+# A "task" cursor's attempt being closed/abandoned does NOT by itself
+# mean the task finished -- fixup.close_failed_attempt closes a
+# FAILED task's attempt (to archive
 # its work before a repair reopens it) with the exact same status a
 # genuinely successful close leaves. Only a real "commit" request
 # reaching "done" proves the task actually finished.
@@ -2698,7 +2880,7 @@ def test_closed_task_attempt_without_a_commit_reruns_from_scratch_not_skipped(
     assert first.status == "failed"
     assert first.reason is not None and first.reason.startswith("build:")
     failed_attempt_id = first.attempt_id
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None and cursor["task_id"] == "t1"
 
     # The repair's own FIRST step -- close the failed attempt, archiving
@@ -2724,8 +2906,8 @@ def test_closed_task_attempt_without_a_commit_reruns_from_scratch_not_skipped(
 
 
 # ---------------------------------------------------------------------------
-# codex-diff-review-s18.md P1: continue_full_job must not bypass a build
-# task's own required-context stop -- it must rebuild and recheck
+# continue_full_job must not bypass a build task's own required-
+# context stop -- it must rebuild and recheck
 # unmet_required() before ever dispatching the builder again, never
 # silently apply the "installation completed" followup note to a task
 # that was never asked to install anything.
@@ -2794,24 +2976,31 @@ def test_required_build_context_stop_is_rechecked_on_continue_not_bypassed(
 
 
 # ---------------------------------------------------------------------------
-# codex-diff-review-s18.md P1: pending_owner_requests() must also surface
-# a small job's own owner-request, recorded only on a "small_plan"
+# pending_owner_requests() must also surface a small job's own
+# owner-request, recorded only on a "small_plan"
 # cursor (engine.small_orbit never writes a full_orbit.progress event
 # for its own stops -- see that module's docstring).
 # ---------------------------------------------------------------------------
 
-def test_pending_owner_requests_reads_a_small_plan_cursor_too(workspace: Workspace) -> None:
+def test_pending_owner_requests_reads_a_legacy_small_plan_cursor_too(
+    workspace: Workspace,
+) -> None:
+    """A ledger written before `job.position` existed: the small job's
+    stop lives only on a `full_orbit.cursor` event."""
     job_name = "small-job-pending-install"
     attempt_id = full_orbit.open_job(
         workspace.config, workspace.ledger, "alpha", job_name, "full", ("planner",),
     )
     install_request = {"kind": "install", "manifest": "package.json",
                        "change": {"dependencies": {"left-pad": "^1.0.0"}}}
-    full_orbit.record_cursor(
-        workspace.ledger, "alpha", job_name, stage="small_plan", next_action="run_station",
-        attempt_id=attempt_id, request="작은 작업", max_fix_rounds=2,
-        stop_reason="owner_request", pending_requests=[install_request],
-    )
+    workspace.ledger.append(Event(
+        project="alpha", kind="full_orbit.cursor", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": job_name, "stage": "small_plan", "task_id": None,
+                 "next_action": "run_station", "attempt_id": attempt_id,
+                 "request": "작은 작업", "max_fix_rounds": 2,
+                 "stop_reason": "owner_request", "pending_requests": [install_request]},
+    ))
 
     pending = full_orbit.pending_owner_requests(workspace.ledger, "alpha", job_name)
 
@@ -2828,13 +3017,10 @@ def test_pending_owner_requests_still_empty_with_no_cursor_or_progress(
 
 
 # ---------------------------------------------------------------------------
-# External review P1: fixup.fix()'s own new attempt can itself end in an
-# ordinary "failed" (review/bench fails again) or crash before tools/gb2
-# ever hands its outcome back to resume_full_job_after_task_fix -- either
-# way the job's "task" cursor must already point at the FIX's own new
-# attempt (engine.full_orbit.transfer_task_cursor_to_fix_attempt, called
-# by fixup.fix() itself the moment it opens that attempt), never the old,
-# closed one.
+# fixup.fix()'s own new attempt can itself end in an ordinary "failed"
+# (review/bench fails again) or crash before tools/gb2 hands its outcome
+# on -- either way the job's position already points at the FIX's own new
+# attempt (recorded by the one event that opens it), never the old one.
 # ---------------------------------------------------------------------------
 
 def test_fix_attempt_that_also_fails_is_resumed_by_continue_not_the_old_attempt(
@@ -2915,17 +3101,16 @@ def test_fix_attempt_that_also_fails_is_resumed_by_continue_not_the_old_attempt(
     new_attempt_id = fix_result.new_attempt_id
     assert new_attempt_id != old_attempt_id
 
-    # The cursor must already point at the fix's own attempt -- BEFORE
-    # tools/gb2 (resume_full_job_after_task_fix) ever runs.
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    # The position already points at the fix's own attempt -- BEFORE
+    # tools/gb2 (resume_after_fix) ever runs.
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None
     assert cursor["attempt_id"] == new_attempt_id
 
     # tools/gb2's own cmd_fix calls this next regardless of outcome --
     # a plain "failed" outcome passes straight through unchanged.
-    handed_back = full_orbit.resume_full_job_after_task_fix(
-        ws.config, ws.ledger, fakes_for, "alpha", fix_result.job_name, fix_result.outcome,
-        new_attempt_id, processor_factory=factory,
+    handed_back = position.resume_after_fix(
+        ws.config, ws.ledger, fakes_for, "alpha", fix_result, processor_factory=factory,
     )
     assert handed_back is not None and handed_back.status == "failed"
 
@@ -2944,7 +3129,7 @@ def test_fix_commits_and_closes_crash_before_handback_continue_skips_fixed_task(
 ) -> None:
     """(b) the fix's own repair commits and closes (outcome "done"),
     then the process dies before tools/gb2 ever calls
-    resume_full_job_after_task_fix -- `gb2 continue` must proceed
+    resume_after_fix -- `gb2 continue` must proceed
     straight to the remaining tasks, never rerun the task the fix
     already finished."""
     ws = _full_orbit_workspace(workspace)
@@ -3018,10 +3203,10 @@ def test_fix_commits_and_closes_crash_before_handback_continue_skips_fixed_task(
     assert fix_result.outcome.status == "done", fix_result.outcome
     new_attempt_id = fix_result.new_attempt_id
 
-    # The cursor already points at the fix's own (now closed, committed)
-    # attempt -- "crash" here: resume_full_job_after_task_fix is NEVER
+    # The position already points at the fix's own (now closed,
+    # committed) attempt -- "crash" here: resume_after_fix is NEVER
     # called at all.
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None and cursor["attempt_id"] == new_attempt_id
     assert full_orbit._task_attempt_committed(ws.ledger, "alpha", new_attempt_id) is True
 
@@ -3039,13 +3224,13 @@ def test_fix_commits_and_closes_crash_before_handback_continue_skips_fixed_task(
 
 
 # ---------------------------------------------------------------------------
-# codex-diff-review-s19.md P1: a crash between transfer_task_cursor_to_
-# fix_attempt and fixup's own archive restore must not resume straight
-# into a plain build-task resume (clean HEAD, OLD pre-fix task text) --
-# it must finish the fix's own restore/submit first.
+# A crash between the fix attempt's opening and fixup's own archive
+# restore must not resume straight into a plain build-task resume (clean
+# HEAD, OLD pre-fix task text) -- it must finish the fix's restore/submit
+# first.
 # ---------------------------------------------------------------------------
 
-def test_crash_between_cursor_transfer_and_archive_restore_finishes_the_fix(
+def test_crash_between_fix_open_and_archive_restore_finishes_the_fix(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ws = _full_orbit_workspace(workspace)
@@ -3112,7 +3297,7 @@ def test_crash_between_cursor_transfer_and_archive_restore_finishes_the_fix(
     def fakes_for(attempt_id: str):
         return _fakes()
 
-    # Simulate a crash right after fixup.fix() transfers the cursor but
+    # Simulate a crash right after fixup.fix() opens the new attempt but
     # BEFORE it restores the archived work into the new attempt's own
     # builder copy -- the exact gap this fix closes. Patched directly
     # (not via monkeypatch.setattr) so it can be undone on its own,
@@ -3128,14 +3313,13 @@ def test_crash_between_cursor_transfer_and_archive_restore_finishes_the_fix(
     finally:
         fixup._overlay_archive_into_builder_copy = real_overlay
 
-    # The cursor is already on the fix's own attempt (an active one,
+    # The position is already on the fix's own attempt (an active one,
     # never the old closed one) -- but fix.restored was never recorded.
-    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    cursor = _position_view(ws.ledger, job_name)
     assert cursor is not None
     new_attempt_id = cursor["attempt_id"]
     assert new_attempt_id != old_attempt_id
-    assert cursor.get("fixing_attempt") is True
-    assert cursor.get("fix_old_attempt_id") == old_attempt_id
+    assert cursor["fix"] == position.FixState(old_attempt_id, new_attempt_id, finished=False)
     assert ws.ledger.attempt(new_attempt_id).status == "active"
     restored_events = [e for _s, e in ws.ledger.events("alpha", "fix.restored")
                        if e.attempt_id == old_attempt_id]

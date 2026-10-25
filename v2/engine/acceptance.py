@@ -114,11 +114,9 @@ snapshot only points back into it (e.g. node_modules) still resolves.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -127,10 +125,18 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from engine import evidence, gates, ids, sandbox
+from engine import trusted as _trusted
 from engine.config import EngineConfig
 from engine.gitutil import git_argv
 from engine.ledger import Event, Ledger
 from engine.steps.bench_run import _TAIL_CHARS, _bench_env, _bench_sandbox_argv
+from engine.steps.bench_run import looks_like_zero_tests_ran as _looks_like_zero_tests_ran
+from engine.steps.bench_run import (
+    lock_tracked_files as _lock_tracked_files,
+    link_snapshot_deps as _link_snapshot_deps, make_snapshot as _make_snapshot,
+    snapshot_dir as _snapshot_dir, tracked_directories as _tracked_directories,
+    tracked_file_paths as _tracked_file_paths,
+)
 from engine.steps.open_job import _is_within, _job_name_for
 
 if TYPE_CHECKING:
@@ -335,6 +341,13 @@ def _run_scene(config: EngineConfig, project: str, attempt_id: str, repo: Path,
     returncode, tail = _run_in_bench_sandbox(
         config, project, attempt_id, repo, argv, env, timeout_sec,
         extra_readonly=extra_readonly)
+    if returncode == 0 and _looks_like_zero_tests_ran(tail):
+        # An exit-0 scene
+        # that executed zero actual tests/assertions must not pass --
+        # same reuse of bench's own existing no-tests signal as
+        # _run_full_suite below, never a separately invented one.
+        return SceneResult(id=scene.id, passed=False, returncode=-1,
+                           tail="no_tests_executed")
     return SceneResult(id=scene.id, passed=returncode == 0,
                        returncode=returncode, tail=tail)
 
@@ -353,196 +366,14 @@ def _run_full_suite(config: EngineConfig, project: str, attempt_id: str,
     returncode, tail = _run_in_bench_sandbox(
         config, project, attempt_id, repo, list(test_cmd), env, timeout_sec,
         extra_readonly=extra_readonly)
+    if returncode == 0 and _looks_like_zero_tests_ran(tail):
+        return False, -1, "no_tests_executed"
     return returncode == 0, returncode, tail
 
 
 def _job_name(ledger: Ledger, project: str, attempt_id: str) -> str:
     job_id = ledger.attempt(attempt_id).job_id
     return _job_name_for(ledger, project, job_id)
-
-
-def _snapshot_dir(config: EngineConfig, attempt_id: str, label: str) -> Path:
-    """Scratch location for ONE disposable acceptance snapshot (module
-    docstring) -- under config.home, never under any project's repo, so
-    it is never itself part of anything evidence.fingerprint covers.
-    `label` picks out which of the several independent snapshots a
-    single run_acceptance call builds this is: "scene-<i>" (0-based
-    position in plan.scenes, never the scene's own free-text id --
-    same position-keyed reasoning as engine.gates.probe_target_id, so
-    two scenes can never collide onto the same directory regardless of
-    id collisions) or "full_suite". Each label gets its OWN directory
-    so a scene's run can never see another scene's (or the full
-    suite's) leftover untracked state -- see run_acceptance's per-
-    stage rebuild."""
-    return config.home / "acceptance" / ids.attempt_dirname(attempt_id) / label
-
-
-_SNAPSHOT_GIT_IDENTITY = {
-    "GIT_AUTHOR_NAME": "engine", "GIT_AUTHOR_EMAIL": "engine@local",
-    "GIT_COMMITTER_NAME": "engine", "GIT_COMMITTER_EMAIL": "engine@local",
-}
-
-
-def _make_snapshot(repo: Path, dest: Path, fp: str) -> None:
-    """Materialize exactly the content `fp` (evidence.fingerprint's tree
-    hash for `repo`, taken by the caller BEFORE any scene runs) into a
-    fresh, self-contained copy at `dest` -- `git archive <tree hash>`
-    extracted, then `git init`/`add -A`/`commit` with a fixed identity
-    (same pattern as engine.steps.open_job._make_copy's worker copy),
-    so `dest` is a normal git worktree a test runner can `git status`
-    against rather than a bare tar extraction. Removes any stale `dest`
-    from a previous run of the same attempt first."""
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-    archive = subprocess.run(
-        git_argv(repo, "archive", fp), check=True, capture_output=True,
-    ).stdout
-    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
-    subprocess.run(git_argv(dest, "init", "-q"), check=True, capture_output=True)
-    env = {**os.environ, **_SNAPSHOT_GIT_IDENTITY, "GIT_CONFIG_GLOBAL": "/dev/null"}
-    subprocess.run(git_argv(dest, "add", "-A"), check=True,
-                    capture_output=True, env=env)
-    subprocess.run(git_argv(dest, "commit", "-q", "-m", "acceptance-snapshot"),
-                    check=True, capture_output=True, env=env)
-
-
-def _tracked_file_paths(snapshot: Path) -> tuple[Path, ...]:
-    """Absolute paths, under `snapshot`, of every file HEAD tracks in
-    THIS disposable snapshot's own commit (_make_snapshot) -- the exact
-    set a scene must never be able to modify in place (see
-    _lock_tracked_files and run_acceptance's extra_readonly use of this
-    same list). Never includes anything _link_snapshot_deps adds
-    afterwards (copy_links symlinks, e.g. node_modules): those are
-    untracked by definition and legitimately need their destination to
-    stay writable (new child entries) for the test tooling that walks
-    them."""
-    out = subprocess.run(
-        git_argv(snapshot, "ls-tree", "-r", "-z", "--name-only", "HEAD"),
-        check=True, capture_output=True,
-    ).stdout
-    names = out.decode("utf-8", "surrogateescape").split("\0")
-    return tuple(snapshot / name for name in names if name)
-
-
-def _lock_tracked_files(tracked: tuple[Path, ...]) -> None:
-    """Strip every write bit from each tracked file's CURRENT mode --
-    the plain-permissions half of closing "a scene patches/tests/
-    restores implementation, or supplies an untracked substitute"
-    (module docstring, acceptance.py:520 finding): a scene's own
-    `open(path, 'w')`/`Path.write_text` on a certified file now raises
-    PermissionError regardless of sandbox mode, including mode="none"
-    (engine.sandbox.wrap is a no-op there, so the per-file read-only
-    BIND below never runs at all -- this chmod is the only guard that
-    mode has). Directories are left untouched, and so is anything that
-    is not, right now, a plain tracked file (a symlink git tracked, or
-    a path a prior stage already turned into something else) -- only
-    pre-existing tracked FILES lose their write bit, so a scene can
-    still create a brand-new, untracked file anywhere, including next
-    to tracked content (see the sibling leak tests in
-    test_acceptance.py: dropping a new config/marker file at the repo
-    root is exactly this, and must keep working).
-
-    This alone does not stop a scene from deleting a tracked file and
-    writing a new one back at the same path -- unlink is governed by
-    the PARENT directory's write permission, which must stay writable
-    for the reason above, not by the file's own mode bits.
-    sandbox="bwrap" closes that remaining gap (run_acceptance passes
-    this same tracked list as extra read-only binds): a bind-mounted
-    read-only file cannot be unlinked either (confirmed empirically --
-    EBUSY, "device or resource busy", not EACCES). Under sandbox="none"
-    that one gap remains, the same same-UID class of limitation
-    documented elsewhere in this codebase for that mode."""
-    for path in tracked:
-        if path.is_symlink() or not path.is_file():
-            continue
-        current = stat.S_IMODE(path.stat().st_mode)
-        path.chmod(current & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-
-
-def _link_snapshot_deps(project_cfg, repo: Path, snapshot: Path) -> None:
-    """Give the snapshot the same untracked dependency links a worker copy
-    gets (project copy_links, e.g. node_modules) -- read through to the
-    repo, so scenes and the full suite can resolve their test tools.
-
-    Deliberately does NOT call engine.steps.open_job._link_copy_link_entry
-    (used for WORKER role copies): that helper fails closed
-    ("copy_link_source_escapes_repo") when `repo/entry` resolves outside
-    `repo`, to guard against a worker's own git-tracked commit planting an
-    intermediate symlink that makes a role copy -- built by git-archiving
-    that very commit -- escape `repo`. That risk does not apply here:
-    every current copy_links entry (node_modules) is also one of the
-    project's own `excludes`, i.e. untracked, written straight onto
-    `repo`'s filesystem by engine/tooling infra (tools/gb2's worktree
-    setup, npm install) and never by anything in a worker's commit; the
-    snapshot's own git-archive step (_make_snapshot, run before this)
-    already strips every untracked path out, so there is no tracked-tree
-    content here that could smuggle an escaping symlink. `repo/entry`
-    resolving outside `repo` is therefore not failed closed on below --
-    linking the snapshot to it exposes nothing beyond what every
-    ordinary, non-acceptance bench run already reads straight out of
-    `repo` via the sandbox's default `--ro-bind / /` (engine.sandbox.wrap
-    module docstring), and this project's own node_modules IS exactly
-    this shape (tools/gb2's worktree setup can leave it a symlink to an
-    external node_modules tree, e.g. GB2_TEST_NODE_MODULES in
-    tests/acceptance/test_t3_gb2_node_e2e.py -- confirmed empirically:
-    with the escape check, the snapshot ended up with no node_modules at
-    all, `npx vitest run` fell back to the registry, and acceptance
-    failed closed with "tests_failed"/npm EAI_AGAIN under net=False).
-    `copy_link_writable_subpaths` are unaffected either way: they always
-    become real, empty, LOCAL directories inside the snapshot, never
-    symlinked to the repo or its target (see the per-child loop below) --
-    nothing a scene writes there can reach the real repo or the external
-    dependency tree. The DESTINATION-side checks (a pre-existing symlink
-    in `dest`'s own parent chain, which COULD have been planted by the
-    snapshot's own git-archived tracked tree) are still enforced below,
-    since that risk is unrelated to where the source lives."""
-    dest_real = Path(os.path.realpath(snapshot))
-    writable_subpaths_by_entry = getattr(project_cfg, "copy_link_writable_subpaths", {}) or {}
-    for entry in getattr(project_cfg, "copy_links", ()) or ():
-        _link_snapshot_dep_entry(
-            dest_real, snapshot, repo, entry,
-            tuple(writable_subpaths_by_entry.get(entry, ())),
-        )
-
-
-def _link_snapshot_dep_entry(dest_real: Path, dest: Path, repo: Path, entry: str,
-                             writable_subpaths: tuple[str, ...] = ()) -> None:
-    """One copy_links entry re-exposed inside the acceptance snapshot --
-    see _link_snapshot_deps for why this does not reuse (and does not
-    need) engine.steps.open_job._link_copy_link_entry's source-
-    containment check. Silently does nothing for a missing/unsafe case
-    (same fail-closed-but-non-raising shape as that function), since a
-    missing test dependency surfaces on its own as a scene/full-suite
-    failure rather than needing a second signal here."""
-    target = repo / entry
-    if not target.exists():
-        return
-    current = dest
-    for part in Path(entry).parts[:-1]:
-        current = current / part
-        if current.exists() and current.is_symlink():
-            return  # destination parent already a symlink -- unsafe, skip
-    current.mkdir(parents=True, exist_ok=True)
-    parent_real = Path(os.path.realpath(current))
-    if parent_real != dest_real and not _is_within(parent_real, dest_real):
-        return  # destination parent escapes the snapshot -- unsafe, skip
-
-    if not writable_subpaths:
-        (dest / entry).symlink_to(target)
-        return
-
-    if not target.is_dir():
-        return  # writable_subpaths only make sense for a directory entry
-    entry_dest = dest / entry
-    entry_dest.mkdir(parents=True, exist_ok=True)
-    writable_names = set(writable_subpaths)
-    for child_name in os.listdir(target):
-        if child_name in writable_names:
-            continue  # the writable subpath wins; never symlinked to the repo
-        (entry_dest / child_name).symlink_to(target / child_name)
-    for subpath in writable_subpaths:
-        (entry_dest / subpath).mkdir(parents=True, exist_ok=True)
 
 
 def _write_acceptance_json(
@@ -632,47 +463,76 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     timeout_sec = project_cfg.test_timeout_sec
     job_name = _job_name(ledger, project, attempt_id)
 
-    if any(getattr(scene, "covers", ()) for scene in plan.scenes):
-        # Re-check the reviewed plan's own digest immediately before
-        # running anything -- a covers-claiming scene's cmd (or
-        # plan.json itself) edited since the last review must never
-        # be certified as if a reviewer had seen THIS version of it,
-        # even within the same attempt with no owner-stop/resume in
-        # between (see engine.plan.verify_reviewed_scenes). Plans with
-        # no covers-claiming scene at all (the test-only Plan/Scene
-        # stub some unit tests still use has no `covers` field, hence
-        # getattr) carry no such claim for this to protect, so this
-        # check is skipped entirely for them -- same as before this
-        # check existed.
-        from engine.plan import verify_reviewed_scenes
-
-        plan_problems = verify_reviewed_scenes(ledger, project, job_name, repo)
-        if plan_problems:
-            reason = ";".join(plan_problems)
-            acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False)
-            _write_acceptance_json(config, project, job_name, False, False, -1,
-                                   reason, ())
-            _record(ledger, project, attempt_id, job_name, acc, reason=reason)
-            return acc
-
-    if not plan.scenes:
-        acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False)
-        _write_acceptance_json(config, project, job_name, False, False, -1,
-                               "no_scenes", ())
-        _record(ledger, project, attempt_id, job_name, acc, reason="no_scenes")
-        return acc
-
     before_fp = _fingerprint_or_none(repo, project_cfg.excludes)
     if before_fp is None:
         # Nothing to certify: a fingerprint that cannot be computed is
         # never trusted as proof of what tree scenes would even be
         # accepting (see _fingerprint_or_none) -- fail the same way a
         # tree that changed mid-run does, without running anything.
+        # (Checked before even loading a Plan: there is no certified
+        # snapshot to load one FROM without a fingerprint.)
         acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False,
                                tree_changed=True)
         _write_acceptance_json(config, project, job_name, False, False, -1,
                                "no_fingerprint", (), tree_changed=True)
         _record(ledger, project, attempt_id, job_name, acc, reason="tree_changed")
+        return acc
+
+    # Whether this job's plan was EVER reviewed (engine.plan.
+    # is_plan_reviewed) -- not whether the plan object a caller passed
+    # in still claims any `covers` (the previous gating condition, and
+    # the exact loophole a plan.json edited after review to simply
+    # delete every `covers` entry could walk through: stripping
+    # `covers` would otherwise have silently disabled the very check
+    # meant to catch stripping `covers`, see is_plan_reviewed's own
+    # docstring). When reviewed, `plan` is REPLACED here with the Plan
+    # parsed from THIS call's own certified snapshot (never the live
+    # repo, and never the caller's already-parsed object, which could
+    # have been parsed before a later edit) -- a job with no review on
+    # record at all (the test-only Plan/Scene stub some unit tests
+    # still use, which never calls engine.plan.record_plan_reviewed)
+    # has no certified snapshot-plan to prefer over the caller's own,
+    # so it keeps using exactly what the caller passed, unchanged from
+    # before this check existed.
+    from engine.plan import PlanError, is_plan_reviewed, load_plan, verify_reviewed_scenes
+
+    reviewed = is_plan_reviewed(ledger, project, job_name)
+    if reviewed:
+        plan_snapshot = _snapshot_dir(config, attempt_id, "plan")
+        _make_snapshot(repo, plan_snapshot, before_fp)
+        try:
+            plan = load_plan(plan_snapshot, job_name)
+        except PlanError as exc:
+            reason = f"plan:{exc.reason}"
+            acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False,
+                                   fingerprint=before_fp)
+            _write_acceptance_json(config, project, job_name, False, False, -1,
+                                   reason, (), fingerprint=before_fp)
+            _record(ledger, project, attempt_id, job_name, acc, reason=reason)
+            return acc
+    elif any(getattr(scene, "covers", ()) for scene in plan.scenes):
+        # Never reviewed at all, yet this plan claims to cover at least
+        # one requirement -- a real (non-stub) plan reaching acceptance
+        # in this shape is a production bug (review was skipped or
+        # never ran), not something to quietly certify against whatever
+        # the caller happened to parse. Only a plan with NO covers claim
+        # anywhere (the test-only Plan/Scene stub some unit tests still
+        # use, which has no `covers` field at all -- see getattr) keeps
+        # the old, review-free path below unchanged.
+        reason = "plan_never_reviewed"
+        acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False,
+                               fingerprint=before_fp)
+        _write_acceptance_json(config, project, job_name, False, False, -1,
+                               reason, (), fingerprint=before_fp)
+        _record(ledger, project, attempt_id, job_name, acc, reason=reason)
+        return acc
+
+    if not plan.scenes:
+        acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False,
+                               fingerprint=before_fp)
+        _write_acceptance_json(config, project, job_name, False, False, -1,
+                               "no_scenes", (), fingerprint=before_fp)
+        _record(ledger, project, attempt_id, job_name, acc, reason="no_scenes")
         return acc
 
     # Every scene and the full suite gets its OWN fresh snapshot, built
@@ -685,18 +545,44 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     # node_modules) would resolve to nothing inside this sandbox --
     # read-only, so a stage still cannot write back into the real repo
     # through it.
+    #
+    # The reviewed-plan digest check (engine.plan.verify_reviewed_scenes)
+    # runs AGAINST EACH STAGE'S OWN SNAPSHOT, right after that snapshot
+    # is built and before anything in it executes -- never against
+    # `repo` itself. Checking the work tree and then building a
+    # snapshot from a fingerprint taken afterwards (the previous shape
+    # of this function) left a window between "what was checked" and
+    # "what gets executed": the engine never re-reads plan.json/scene
+    # files after this check, but repo is a live working tree another
+    # process could still be writing to, so the checked bytes and the
+    # executed bytes were only guaranteed equal by timing, not by
+    # construction. Checking the snapshot itself closes that gap -- the
+    # digest comparison and the scene run now read the exact same,
+    # already-materialized, nobody-else-can-touch-it files. Skipped
+    # entirely only for a job with NO plan.reviewed record at all
+    # (`reviewed` above, computed once from the ledger before anything
+    # here ran) -- never based on whether the CURRENT plan still
+    # claims any `covers` (see is_plan_reviewed's own docstring for
+    # why that used to be the wrong, strippable gate).
     scenes: list[SceneResult] = []
     snapshot_mutated = False
+    plan_problems: list[str] = []
     full_suite_passed, full_suite_returncode, full_suite_tail = False, -1, "not_run"
     for i, scene in enumerate(plan.scenes):
         scene_snapshot = _snapshot_dir(config, attempt_id, f"scene-{i}")
         _make_snapshot(repo, scene_snapshot, before_fp)
+        if reviewed:
+            plan_problems = verify_reviewed_scenes(
+                ledger, project, job_name, scene_snapshot)
+            if plan_problems:
+                break
         scene_tracked = _tracked_file_paths(scene_snapshot)
         _lock_tracked_files(scene_tracked)
+        scene_tracked_dirs = _tracked_directories(scene_snapshot)
         _link_snapshot_deps(config.projects[project], repo, scene_snapshot)
         scenes.append(_run_scene(config, project, attempt_id, scene_snapshot, env,
                                  timeout_sec, scene,
-                                 extra_readonly=(repo, *scene_tracked)))
+                                 extra_readonly=(repo, *scene_tracked, *scene_tracked_dirs)))
         # Fail fast the instant a scene leaves ITS OWN snapshot's
         # HEAD-tracked content mutated: a scene that patches an
         # implementation file must never let a LATER scene or the full
@@ -705,15 +591,34 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
         if _tracked_mutated_paths(scene_snapshot):
             snapshot_mutated = True
             break
+    if plan_problems:
+        reason = ";".join(plan_problems)
+        acc = AcceptanceResult(passed=False, scenes=tuple(scenes), full_suite_passed=False)
+        _write_acceptance_json(config, project, job_name, False, False, -1,
+                               reason, tuple(scenes))
+        _record(ledger, project, attempt_id, job_name, acc, reason=reason)
+        return acc
     if not snapshot_mutated:
         suite_snapshot = _snapshot_dir(config, attempt_id, "full_suite")
         _make_snapshot(repo, suite_snapshot, before_fp)
+        if reviewed:
+            plan_problems = verify_reviewed_scenes(
+                ledger, project, job_name, suite_snapshot)
+            if plan_problems:
+                reason = ";".join(plan_problems)
+                acc = AcceptanceResult(passed=False, scenes=tuple(scenes),
+                                       full_suite_passed=False)
+                _write_acceptance_json(config, project, job_name, False, False, -1,
+                                       reason, tuple(scenes))
+                _record(ledger, project, attempt_id, job_name, acc, reason=reason)
+                return acc
         suite_tracked = _tracked_file_paths(suite_snapshot)
         _lock_tracked_files(suite_tracked)
+        suite_tracked_dirs = _tracked_directories(suite_snapshot)
         _link_snapshot_deps(config.projects[project], repo, suite_snapshot)
         full_suite_passed, full_suite_returncode, full_suite_tail = _run_full_suite(
             config, project, attempt_id, suite_snapshot, env, timeout_sec,
-            extra_readonly=(repo, *suite_tracked))
+            extra_readonly=(repo, *suite_tracked, *suite_tracked_dirs))
         if _tracked_mutated_paths(suite_snapshot):
             snapshot_mutated = True
 
@@ -904,7 +809,39 @@ def run_probe_scripts(
                 id=probe_id, name=name, script="", returncode=-1,
                 stdout_tail="script_missing", ok=False, url=url, fingerprint=fp))
             continue
-        script_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
+        # Capture the script's bytes from THIS snapshot, then verify
+        # them again immediately before the sandbox actually executes
+        # it -- never a single read trusted to still hold at exec time
+        # (see engine.trusted's module docstring: the gap this closes
+        # is the same one for every check-then-later-use pair in this
+        # codebase, not something special to acceptance scenes). The
+        # disposable snapshot has no other writer, so this should
+        # never trip; a TrustViolation here means something DID touch
+        # the snapshot between the two reads, and the script must then
+        # never run at all -- not "run it anyway since exit 0 would
+        # look the same as success".
+        try:
+            captured_script = _trusted.capture(script)
+        except _trusted.TrustCaptureError:
+            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
+                                   str(script), -1, "script_missing", url=url,
+                                   fingerprint=fp)
+            results.append(ProbeEvidence(
+                id=probe_id, name=name, script=str(script), returncode=-1,
+                stdout_tail="script_missing", ok=False, url=url, fingerprint=fp))
+            continue
+        script_sha256 = captured_script.digest
+        try:
+            _trusted.verify(captured_script, script)
+        except _trusted.TrustViolation:
+            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
+                                   str(script), -1, "script_changed_before_run",
+                                   url=url, sha256=script_sha256, fingerprint=fp)
+            results.append(ProbeEvidence(
+                id=probe_id, name=name, script=str(script), returncode=-1,
+                stdout_tail="script_changed_before_run", ok=False, url=url,
+                sha256=script_sha256, fingerprint=fp))
+            continue
         returncode, tail = _run_in_bench_sandbox(
             config, project, attempt_id, snapshot, _probe_argv(script), env, timeout_sec,
             net=True, extra_readonly=(repo,))

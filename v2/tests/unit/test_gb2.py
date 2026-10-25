@@ -338,6 +338,14 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
         payload={"passed": True, "findings": [], "ran": ["secret_scan"],
                  "fingerprint": fp, "policy_hash": security_policy_hash(config)},
     ))
+    # The job certificate needs a reviewed plan manifest; this job has no
+    # requirements or tasks of its own.
+    ledger.append(Event(
+        project="demo", kind="plan.reviewed", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": "job1", "digest": "stub-digest", "scene_digests": {},
+                 "requirement_ids": [], "task_ids": []},
+    ))
 
     fakes = Fakes(FakePublisher(), FakeInstaller())
     outcome = orbit.continue_job(
@@ -909,20 +917,16 @@ def test_cmd_fix_calls_fixup_fix_with_the_app_and_extra_text(
     assert calls == [("demo", "also check the edge case")]
 
 
-def test_cmd_fix_strips_release_when_the_attempt_belongs_to_a_full_orbit_job(
+def test_cmd_fix_leaves_the_release_decision_to_fixup_and_continues_the_full_job(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The attempt being repaired belongs to a multi-task full-orbit job
-    (a full_orbit.cursor was recorded for its job_name) -- cmd_fix must
-    pass fixup.fix a config with this project's own `release` stripped,
-    so repairing ONE task never stops needs_owner for a per-task
-    release approval (engine.orbit's own commit-stage special case).
-    `resume_full_job_after_task_fix`, called right after, still gets the
-    ORIGINAL config (release intact) -- only the single call to
-    fixup.fix itself is affected."""
+    """cmd_fix passes the project's config unchanged: fixup.fix itself
+    decides whether the task belongs to a full-orbit job and removes the
+    per-task release (tests/unit/test_full_orbit.py covers that rule).
+    The fix result is then handed to engine.position.resume_after_fix."""
     from engine import fixup as fixup_module
-    from engine import full_orbit as full_orbit_module
     from engine import orbit as orbit_module
+    from engine import position as position_module
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
@@ -946,15 +950,7 @@ def test_cmd_fix_strips_release_when_the_attempt_belongs_to_a_full_orbit_job(
     config = write_json(config, workspace / "config.json")
     ledger = Ledger.create(config.ledger_path)
     ledger.register_project("demo")
-    # The attempt about to be repaired, already belonging to a job
-    # full_orbit has recorded a "task" cursor for -- is_full_orbit_job
-    # must see this and strip release before fixup.fix ever runs.
     orig_attempt_id = open_job(config, ledger, "demo", "orig-job", "full", ())
-    full_orbit_module.record_cursor(
-        ledger, "demo", "orig-job", stage="task", next_action="run_station",
-        attempt_id=orig_attempt_id, task_id="t1", task_text="x", base_task_text="x",
-        fixing=False, remaining_task_ids=["t1"], max_fix_rounds=2,
-    )
     ledger.close()
 
     seen_release: list[object] = []
@@ -966,17 +962,22 @@ def test_cmd_fix_strips_release_when_the_attempt_belongs_to_a_full_orbit_job(
         )
         return fixup_module.FixResult(
             old_attempt_id=orig_attempt_id, new_attempt_id=orig_attempt_id,
-            job_name="orig-job", task="composed task text", outcome=outcome,
+            job_name="orig-job", task="composed task text", outcome=outcome, full_job=True,
         )
 
+    handed: list[object] = []
+
+    def _fake_resume_after_fix(cfg, ledger_, fakes, project, result, **kwargs):
+        handed.append(result)
+        return None
+
     monkeypatch.setattr(gb2.fixup, "fix", _fake_fix)
+    monkeypatch.setattr(position_module, "resume_after_fix", _fake_resume_after_fix)
 
     gb2.main(["fix", "demo"])
 
-    assert seen_release == [None]
-    # The ORIGINAL config (release intact) is what everything else in
-    # cmd_fix (resume_full_job_after_task_fix, _build_fakes) still uses.
-    assert config.projects["demo"].release is not None
+    assert seen_release == [config.projects["demo"].release]
+    assert len(handed) == 1 and handed[0].full_job is True
 
 
 def test_cmd_init_hides_the_whole_apps_and_workspace_roots_from_every_sandbox(
@@ -1825,9 +1826,9 @@ _EARLY_DESIGN_PLAN_JSON = json.dumps({
 _EARLY_DESIGN_STATION_OWNERS = {
     "facts": {"facts": (".gongbang/",)},
     "probe": {"prober": (".gongbang/",)},
-    # "tests/scenes/" too -- validate_plan (since the s17-evidence
-    # merge) requires every plan.json requirement to be covered by a
-    # real tests/scenes/ script; the planner role must be able to
+    # "tests/scenes/" too -- validate_plan requires every plan.json
+    # requirement to be covered by a real tests/scenes/ script; the
+    # planner role must be able to
     # write it alongside plan.json, same as the real FULL_STATION_
     # OWNERS["plan"]["planner"] does.
     "plan": {"planner": (".gongbang/", "tests/scenes/")},
@@ -2019,13 +2020,44 @@ def test_approve_install_finds_and_resumes_an_early_station_request(
     ledger = Ledger.open(job["config"].ledger_path)
     try:
         install_events = ledger.events("demo", "install.recorded")
-        progress = None
-        for _seq, event in ledger.events("demo", "full_orbit.progress"):
-            if event.payload.get("job") == job["job_name"]:
-                progress = event.payload
+        from engine import position as position_module
+
+        pos = position_module.load_position(ledger, "demo", job["job_name"])
     finally:
         ledger.close()
     assert len(install_events) == 1
     assert install_events[0][1].payload["change"] == _EARLY_DESIGN_INSTALL_REQUEST["change"]
-    assert progress is not None
-    assert progress["stage"] == "awaiting_design_approval"
+    assert pos is not None
+    assert pos.stage == "awaiting_design_approval"
+
+
+def test_approve_install_offers_every_owner_request_kind_not_only_installs(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A station's scripts_change proposal is shown and approved by the
+    same TTY command as an install."""
+    from engine import full_orbit as full_orbit_module
+    from engine import owner as owner_module
+
+    job = _setup_early_design_install_job(gb2, tmp_path, monkeypatch)
+    _force_tty_approval(monkeypatch, f"승인 {job['job_name']}")
+    scripts_request = {"kind": "scripts_change", "manifest": "package.json",
+                       "change": {"scripts": {"lint": "eslint ."}}}
+    monkeypatch.setattr(full_orbit_module, "pending_owner_requests",
+                        lambda ledger, project, job_name, **kw: (scripts_request,))
+    approved: list[dict] = []
+
+    def _approve(config, ledger, project, attempt_id, request, **kwargs):
+        approved.append(request)
+        return "R-approved"
+
+    monkeypatch.setattr(owner_module, "approve_pending", _approve)
+    monkeypatch.setattr(gb2, "_drain", lambda *a, **k: "done")
+    monkeypatch.setattr(full_orbit_module, "continue_full_job",
+                        lambda *a, **k: full_orbit_module.FullOutcome(
+                            "needs_owner", "design_approval", job["attempt_id"], None))
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert approved == [scripts_request]
+    assert code == 2, code

@@ -14,7 +14,7 @@ import pytest
 from engine import sandbox
 from engine.acceptance import acceptance_path, run_acceptance, run_probe_scripts
 from engine.steps.open_job import open_job
-from tests.conftest import Workspace
+from tests.conftest import Workspace, git
 from tests.fixtures.sample_app import make_sample
 from tests.plan_stub import Plan, Scene
 
@@ -260,9 +260,9 @@ def test_scene_patching_a_tracked_file_fails_the_scene_outright(
 def test_scene_that_tries_to_patch_and_restore_src_now_fails_outright(
     workspace: Workspace,
 ) -> None:
-    """Regression for the "acceptance certifies different executed
-    code" finding (engine/acceptance.py module docstring, codex-
-    goal-review-4.md item 12): a scene that patches a tracked file,
+    """Acceptance must not certify different executed code than what
+    actually gets committed (see engine/acceptance.py's own module
+    docstring): a scene that patches a tracked file,
     runs (anything) against the patched version, then restores the
     original bytes before anything re-checks `git status` used to
     leave no HEAD-tracked diff, so _tracked_mutated_paths alone could
@@ -664,3 +664,270 @@ def test_scene_edited_after_review_fails_acceptance_without_running_any_scene(
     assert acc.scenes == ()
     assert acc.full_suite_passed is False
     assert acc.passed is False
+
+
+def test_scene_edited_in_the_race_window_before_the_old_check_point_is_still_caught(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_acceptance must never check engine.plan.verify_reviewed_scenes
+    against the live `repo` separately from the fingerprint/snapshot it
+    actually executes: if it did, a scene script edited in the window
+    between that check and the fingerprint call (a worker process
+    racing the acceptance run) could pass the digest check against the
+    OLD content, then get fingerprinted/snapshotted/executed WITH the
+    new, never-reviewed content, and still certify a passing scene.
+    This test reproduces that exact window by monkeypatching
+    engine.acceptance._fingerprint_or_none -- the point right after
+    where such a repo-level check would run -- to tamper with the
+    scene script as a side effect the first time it runs, before
+    delegating to the real implementation. run_acceptance must never
+    let this scene run at all: the digest check happens against each
+    stage's OWN already-built snapshot, which necessarily already
+    contains whatever the file held at fingerprint time, so there is
+    no window left for a check to see one version and an execution to
+    see another."""
+    import engine.acceptance as acceptance_module
+
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    scene_path = scenes_dir / "s1.py"
+    scene_path.write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
+    )
+    _write_and_review_real_plan(ws, "job1", ("python3", "tests/scenes/s1.py"))
+
+    real_fingerprint_or_none = acceptance_module._fingerprint_or_none
+    tampered = {"done": False}
+
+    def _tampering_fingerprint_or_none(repo: Path, excludes: tuple[str, ...]):
+        if not tampered["done"]:
+            tampered["done"] = True
+            # The race: something changes the scene script in the
+            # window right after the (now-removed) repo-level check
+            # the old code ran, and right before this fingerprint call
+            # -- never seen by any reviewer.
+            scene_path.write_text("import sys; sys.exit(1)  # tampered mid-race\n",
+                                  encoding="utf-8")
+        return real_fingerprint_or_none(repo, excludes)
+
+    monkeypatch.setattr(acceptance_module, "_fingerprint_or_none",
+                        _tampering_fingerprint_or_none)
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, _real_plan(ws, "job1"))
+
+    # Never ran unreviewed: no scene (and no full suite) executed at all.
+    assert acc.scenes == ()
+    assert acc.full_suite_passed is False
+    # Never yields passing evidence.
+    assert acc.passed is False
+
+    events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
+    assert events[-1].payload["reason"] == "plan_changed_since_review"
+    data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
+    assert data["passed"] is False
+    assert data["scenes"] == []
+
+
+def test_stripping_covers_after_review_is_still_caught_even_with_a_stale_caller_plan(
+    workspace: Workspace,
+) -> None:
+    """Codex goal review 5, P1 (acceptance.py:634/full_orbit.py:1446):
+    the previous gating condition for whether run_acceptance even runs
+    engine.plan.verify_reviewed_scenes was "does the Plan object the
+    caller passed in still claim any `covers`" -- but a plan.json
+    edited AFTER review to simply delete every `covers` entry makes
+    that condition False too, silently disabling the one check meant
+    to catch exactly that edit. This test strips `covers` from
+    plan.json on disk after review, then calls run_acceptance with a
+    STALE Plan object a caller parsed BEFORE that edit (the realistic
+    full_orbit shape: a design-station resume loads Plan once, then a
+    later edit happens to the repo before run_acceptance actually
+    runs) -- the stale object still has `covers`, so the OLD gating
+    condition would have run the check using the caller's own (now
+    wrong) belief about the content. The fix makes run_acceptance load
+    its own Plan from this call's certified snapshot whenever
+    is_plan_reviewed() is true, regardless of what the caller passed,
+    so the covers-stripped plan.json's changed digest is still caught."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
+    )
+    _write_and_review_real_plan(ws, "job1", ("python3", "tests/scenes/s1.py"))
+    stale_plan = _real_plan(ws, "job1")  # parsed BEFORE the strip below
+    assert any(getattr(s, "covers", ()) for s in stale_plan.scenes)
+
+    # The attack: delete `covers` from plan.json on disk, after review.
+    from engine.plan import plan_path
+
+    path = plan_path(ws.alpha, "job1")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for scene in data["scenes"]:
+        scene.pop("covers", None)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, stale_plan)
+
+    assert acc.scenes == ()
+    assert acc.full_suite_passed is False
+    assert acc.passed is False
+    events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
+    assert events[-1].payload["reason"] == "plan_changed_since_review"
+
+
+def test_a_never_reviewed_stub_plan_runs_exactly_as_given(workspace: Workspace) -> None:
+    """A job with no plan.reviewed record at all (the test-only
+    Plan/Scene stub most of this file's other tests use) has no
+    certified snapshot-plan to prefer over the caller's own -- the fix
+    for the reviewed case must not force every caller to also write a
+    real engine.plan plan.json + review record just to call
+    run_acceptance at all."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="greet works", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="greets", app_shows="Hello, World",
+                 where="cli", cmd=(sys.executable, "-c",
+                                    "import sys; sys.path.insert(0, 'src'); "
+                                    "from greeter import greet; "
+                                    "assert greet('World') == 'Hello, World'")),
+        ),
+        tasks=(), acceptance=("greet returns Hello, X",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.passed is True
+    assert acc.scenes[0].passed is True
+
+
+def test_scene_that_exits_0_with_zero_tests_executed_does_not_pass(
+    workspace: Workspace,
+) -> None:
+    """Authorization evidence must never be a skipped test: a scene
+    that exits 0 but never actually executed anything (e.g. its own
+    assertions all skipped)
+    must not be certified as having proven the requirement it claims
+    to cover. Reuses bench's own existing vitest no-tests-ran banner
+    (engine.steps.bench_run.looks_like_zero_tests_ran) -- never a
+    separately invented heuristic."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                     cmd=(sys.executable, "-c",
+                          "print('Tests  0 passed (0)'); raise SystemExit(0)")),),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is False
+    assert acc.scenes[0].tail == "no_tests_executed"
+    assert acc.passed is False
+
+
+def test_full_suite_that_exits_0_with_all_tests_skipped_does_not_pass(
+    workspace: Workspace,
+) -> None:
+    ws = _sample_workspace(workspace)
+    project_config = replace(ws.config.projects["alpha"],
+                             test_cmd=(sys.executable, "-c",
+                                      "print('Tests  3 skipped (3)'); raise SystemExit(0)"))
+    ws = Workspace(ws.root, replace(ws.config, projects={**ws.config.projects, "alpha": project_config}),
+                   ws.ledger, ws.alpha, ws.beta)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                     cmd=(sys.executable, "-c", "raise SystemExit(0)")),),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert acc.full_suite_passed is False
+    assert acc.full_suite_tail == "no_tests_executed"
+    assert acc.passed is False
+
+
+@_needs_bwrap
+def test_scene_cannot_shadow_a_tracked_package_with_a_new_untracked_file(
+    workspace: Workspace,
+) -> None:
+    """A scene creating a brand-new, untracked file INSIDE an existing
+    tracked package directory (src/greeter/, here) -- an untracked
+    package shadowing a tracked module -- must fail to write it under
+    sandbox="bwrap" (engine.acceptance.
+    _tracked_directories' own read-only bind), unlike a scratch/output
+    file at the snapshot's own root (test_scene_mutation_runs_against_
+    a_snapshot_not_the_real_repo and friends -- that keeps working)."""
+    ws = _sample_workspace(workspace)
+    ws = Workspace(ws.root, replace(ws.config, sandbox="bwrap"), ws.ledger,
+                  ws.alpha, ws.beta)
+    attempt_id = _open(ws)
+    shadow_script = (
+        "import pathlib, sys\n"
+        "try:\n"
+        "    pathlib.Path('src/greeter/evil.py').write_text('EVIL = 1\\n')\n"
+        "except OSError:\n"
+        "    sys.exit(0)  # write correctly refused\n"
+        "sys.exit(1)  # write SUCCEEDED -- containment failed\n"
+    )
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                     cmd=(sys.executable, "-c", shadow_script)),),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert not (ws.alpha / "src" / "greeter" / "evil.py").exists()
+
+
+def test_snapshot_includes_an_export_ignored_file(workspace: Workspace) -> None:
+    """A `git archive <fp>` snapshot would honor `.gitattributes`
+    export-ignore -- a certified, fingerprinted file could be silently
+    MISSING from the snapshot a scene/test actually runs against.
+    engine.evidence.export_tree (ls-tree + cat-file blob) ignores
+    export-ignore entirely; the snapshot must still contain the file,
+    or acceptance refuses outright (it would never even reach the
+    scene if the snapshot's own tree hash stopped matching fp)."""
+    ws = _sample_workspace(workspace)
+    (ws.alpha / ".gitattributes").write_text(
+        "src/greeter/__init__.py export-ignore\n", encoding="utf-8",
+    )
+    git(ws.alpha, "add", "-A")
+    git(ws.alpha, "commit", "-q", "-m", "export-ignore the runtime module")
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="greet works", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="greets", app_shows="Hello, World",
+                 where="cli", cmd=(sys.executable, "-c",
+                                    "import sys; sys.path.insert(0, 'src'); "
+                                    "from greeter import greet; "
+                                    "assert greet('World') == 'Hello, World'")),
+        ),
+        tasks=(), acceptance=("greet returns Hello, X",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert acc.passed is True

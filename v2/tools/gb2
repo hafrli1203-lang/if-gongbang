@@ -129,6 +129,7 @@ sys.path.insert(0, str(_ENGINE_ROOT))
 from engine import evidence, fixup, orbit, release  # noqa: E402
 from engine.cli import _build_fakes, _drain, _job_name_for_attempt, _outcome_dict  # noqa: E402
 from engine.cli import cmd_status as _engine_cmd_status  # noqa: E402
+from engine.cli import cmd_backup as _engine_cmd_backup  # noqa: E402
 from engine.bootstrap import ensure_installed, record_bootstrap  # noqa: E402
 from engine.config import EngineConfig, WorkerConfig  # noqa: E402
 from engine.ledger import Event, Ledger  # noqa: E402
@@ -1241,8 +1242,10 @@ def cmd_continue(args: argparse.Namespace) -> int:
 
 
 def cmd_approve_install(args: argparse.Namespace) -> int:
-    """`gb2 approve-install <app>`: TTY-only approval for a pending
-    "install" request a station asked for -- a build task (engine.
+    """`gb2 approve-install <app>`: TTY-only approval for every pending
+    owner request a station asked for (any kind engine.owner.
+    PENDING_KIND_WHITELIST allows: install, scripts_change,
+    test_config_change) -- a build task (engine.
     full_orbit.STAGE_TASK_OWNER) or an earlier facts/probe/plan/design
     station (STAGE_EARLY_STATION) -- found via engine.full_orbit.
     pending_owner_requests, the station.finished "requests" entry a
@@ -1281,23 +1284,32 @@ def cmd_approve_install(args: argparse.Namespace) -> int:
             return _err_json("no_active_job", 1)
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
 
-        pending = [req for req in full_orbit.pending_owner_requests(ledger, args.app, job_name)
-                   if req.get("kind") == "install"]
+        # Every owner action kind a station can propose (install,
+        # scripts_change, test_config_change), still unfulfilled against
+        # the current manifest.
+        pending = [req for req in full_orbit.pending_owner_requests(
+                       ledger, args.app, job_name, repo=config.projects[args.app].repo)
+                   if req.get("kind") in owner_module.PENDING_KIND_WHITELIST]
         if not pending:
-            return _err_json("no_pending_install_request", 1)
+            return _err_json("no_pending_owner_request", 1)
 
-        print(json.dumps({"job_name": job_name, "pending_install_requests": pending},
+        print(json.dumps({"job_name": job_name, "pending_owner_requests": pending},
                          ensure_ascii=False, indent=1, sort_keys=True), file=sys.stderr)
 
         owner_text = input(f'type the approval line exactly ("승인 {job_name}"): ')
         if owner_text != f"승인 {job_name}":
             return _err_json("refused: approval line did not match, nothing changed", 1)
 
+        from engine import position as position_module
+
+        stop = position_module.load_position(ledger, args.app, job_name)
         for request in pending:
             try:
                 request_id = owner_module.approve_pending(
                     config, ledger, args.app, attempt_id, request,
                     confirm=True, confirm_source="tty",
+                    proposal=(position_module.proposal_id(ledger, args.app, stop, request)
+                              if stop is not None else None),
                 )
             except ValueError as exc:
                 return _err_json(f"approve_pending_refused: {exc}", 1)
@@ -1451,14 +1463,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
     If the fixed attempt belongs to a full-orbit job (`gb2 new`/`gb2
     change`, as opposed to a plain `gb2 run` single-task job), the one
     task fixup.fix() repairs is never the whole job -- once it ends
-    "done", this hands the result to engine.full_orbit.
-    resume_full_job_after_task_fix, which continues with whatever
-    plan.tasks are still queued behind it, then acceptance, the
-    requirement-coverage check, the handoff report, the app-wide
-    security check, and (only once, for the WHOLE job, never for this
-    one task) its single release request. For a plain single-task job
-    (no full-orbit cursor recorded for it), resume_full_job_after_task_fix
-    returns None and this behaves exactly as before."""
+    "done", engine.position.resume_after_fix continues the job through
+    engine.position.resume_job: whatever plan.tasks are still queued,
+    then acceptance, the requirement-coverage check, the handoff report,
+    the app-wide security check, and (only once, for the WHOLE job) its
+    single release request. For a plain single-task job it returns None
+    and the fix outcome is the whole result."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
@@ -1477,42 +1487,20 @@ def cmd_fix(args: argparse.Namespace) -> int:
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
-        from engine import full_orbit
+        from engine import position
 
-        # If the attempt about to be repaired belongs to a multi-task
-        # full-orbit job (`gb2 new`/`gb2 change`, not a plain single-task
-        # `gb2 run`), strip this project's own `release` before calling
-        # fixup.fix: fix() drives the repaired task through orbit.
-        # continue_job the same way any other attempt does, and engine.
-        # orbit's own commit-stage release special case would otherwise
-        # stop THIS ONE TASK needs_owner for a per-task release approval
-        # right after its commit -- the full-orbit contract makes
-        # exactly ONE release request for the WHOLE job, at the very
-        # end (full_orbit._maybe_release_or_done), never one per
-        # repaired task. A plain single-task job has no such contract
-        # to protect -- stopping needs_owner for release approval right
-        # after ITS one and only commit is the entire point, so `config`
-        # (unchanged) is used for it.
-        fix_config = config
-        current_attempt_id = ledger.project(args.app).current_attempt_id
-        if current_attempt_id is not None:
-            try:
-                current_job_name = _job_name_for_attempt(ledger, args.app, current_attempt_id)
-            except Exception:
-                current_job_name = None
-            if current_job_name is not None and full_orbit.is_full_orbit_job(
-                    ledger, args.app, current_job_name):
-                fix_config = full_orbit.config_without_release(config, args.app)
-
+        # fixup.fix decides on its own whether this task belongs to a
+        # full-orbit job (and so must not release per task);
+        # resume_after_fix then continues that job's remaining work, or
+        # returns None for a plain single-task job.
         try:
-            result = fixup.fix(fix_config, ledger, args.app, extra, fakes_for,
+            result = fixup.fix(config, ledger, args.app, extra, fakes_for,
                                on_progress=_progress)
         except fixup.FixupError as exc:
             return _err_json(str(exc), 1)
 
-        full_outcome = full_orbit.resume_full_job_after_task_fix(
-            config, ledger, fakes_for, args.app, result.job_name, result.outcome,
-            result.new_attempt_id, on_progress=_progress,
+        full_outcome = position.resume_after_fix(
+            config, ledger, fakes_for, args.app, result, on_progress=_progress,
         )
         wall_sec = time.monotonic() - start
         if full_outcome is not None:
@@ -1541,6 +1529,13 @@ def cmd_fix(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     config = EngineConfig.from_json(app_workspace(args.app) / "config.json")
     return _engine_cmd_status(config, argparse.Namespace(project=args.app))
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Copies this app's ledger with engine.cli backup (verified copy,
+    newest --keep kept) into --dest or the workspace's backups folder."""
+    config = EngineConfig.from_json(app_workspace(args.app) / "config.json")
+    return _engine_cmd_backup(config, argparse.Namespace(dest=args.dest, keep=args.keep))
 
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -1578,7 +1573,7 @@ def cmd_board(args: argparse.Namespace) -> int:
     from engine.board import build_board
 
     app_names = [args.app] if args.app else _discover_apps()
-    app_ledgers: dict[str, tuple[Path, str]] = {}
+    app_ledgers: dict[str, tuple[Path, str, Path]] = {}
     skipped: list[str] = []
     for app in app_names:
         config_path = app_workspace(app) / "config.json"
@@ -1589,7 +1584,8 @@ def cmd_board(args: argparse.Namespace) -> int:
         if app not in config.projects:
             skipped.append(app)
             continue
-        app_ledgers[app] = (config.ledger_path, app)
+        # The repo enables the board's evidence-graph completeness check.
+        app_ledgers[app] = (config.ledger_path, app, config.projects[app].repo)
 
     lessons_path = Path(args.lessons_export) if args.lessons_export else None
     queue_path = Path(args.queue) if args.queue else None
@@ -2244,7 +2240,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
-    "init": cmd_init, "run": cmd_run, "fix": cmd_fix, "status": cmd_status,
+    "init": cmd_init, "run": cmd_run, "fix": cmd_fix, "status": cmd_status, "backup": cmd_backup,
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
     "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
     "new": cmd_new, "change": cmd_change, "approve-design": cmd_approve_design,
@@ -2276,6 +2272,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status")
     p_status.add_argument("app")
+
+    p_backup = sub.add_parser("backup")
+    p_backup.add_argument("app")
+    p_backup.add_argument("--dest", default=None)
+    p_backup.add_argument("--keep", type=int, default=10)
 
     p_log = sub.add_parser("log")
     p_log.add_argument("app")

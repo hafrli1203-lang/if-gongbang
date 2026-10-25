@@ -437,3 +437,56 @@ def test_set_closing_resumes_and_kills_procs_left_alive_after_transition(
     while _is_alive(proc_handle.pid) and time.time() < deadline:
         time.sleep(0.05)
     assert not _is_alive(proc_handle.pid)
+
+
+def _close_crashing_at(workspace: Workspace, boundary: str, monkeypatch) -> str:
+    """Opens an attempt, edits the tree, and runs its close request with
+    a crash armed at the named flow boundary inside set_closed."""
+    from engine import faults
+
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", f"job-{boundary}",
+                          "full", roles=("builder",))
+    (workspace.alpha / "src" / "app.py").write_text("print('changed')\n", encoding="utf-8")
+    submit(workspace.ledger, "alpha", attempt_id, "close", {"mode": "close"}, "owner")
+    monkeypatch.setattr(faults, "ACTIVE_FLOW_FAULTS", Faults(crash_before={boundary}))
+    try:
+        _proc(workspace).run_once("alpha")
+        raise AssertionError("expected CrashInjected")
+    except CrashInjected:
+        pass
+    monkeypatch.setattr(faults, "ACTIVE_FLOW_FAULTS", None)
+    return attempt_id
+
+
+def _attempt_finished_count(workspace: Workspace, attempt_id: str) -> int:
+    return sum(1 for _seq, e in workspace.ledger.events("alpha", "attempt.finished")
+               if e.attempt_id == attempt_id)
+
+
+def test_crash_before_attempt_finished_resumes_to_closed_once(
+    workspace: Workspace, monkeypatch,
+) -> None:
+    attempt_id = _close_crashing_at(workspace, "close.attempt_finished", monkeypatch)
+    assert workspace.ledger.attempt(attempt_id).status == "active"
+    assert workspace.ledger.project("alpha").state == "CLOSING"
+
+    _proc(workspace).run_once("alpha")
+
+    assert workspace.ledger.project("alpha").state == "CLOSED"
+    assert workspace.ledger.attempt(attempt_id).status == "closed"
+    assert _attempt_finished_count(workspace, attempt_id) == 1
+
+
+def test_crash_between_attempt_finished_and_state_closed_resumes_once(
+    workspace: Workspace, monkeypatch,
+) -> None:
+    """Flow-map boundary 12: the attempt is finished, the project still
+    CLOSING. Resuming only finishes the state transition."""
+    attempt_id = _close_crashing_at(workspace, "close.state_closed", monkeypatch)
+    assert workspace.ledger.attempt(attempt_id).status == "closed"
+    assert workspace.ledger.project("alpha").state == "CLOSING"
+
+    _proc(workspace).run_once("alpha")
+
+    assert workspace.ledger.project("alpha").state == "CLOSED"
+    assert _attempt_finished_count(workspace, attempt_id) == 1
