@@ -18,6 +18,65 @@ from tests.conftest import Workspace
 _needs_bwrap = pytest.mark.skipif(
     not sandbox.available(), reason="bwrap not available on this host",
 )
+_needs_fork = pytest.mark.skipif(
+    not hasattr(os, "fork"), reason="os.fork not available on this host",
+)
+
+
+@_needs_fork
+def test_die_with_engine_exits_immediately_on_parent_pid_mismatch(
+    tmp_path: Path,
+) -> None:
+    """External-review P2 (procs.py:40-79/476-482): the fork-to-prctl
+    race -- if the engine died between this child's fork() and
+    PR_SET_PDEATHSIG actually being armed, the child is reparented to
+    init BEFORE the signal is ever scheduled, and the arming itself
+    then does nothing. The fix is the os.getppid() check right after
+    the prctl call, against `expected_parent_pid` (captured by the
+    real caller, in the real parent, right before the fork -- see
+    spawn()'s own `this_pid`). This test exercises that SAME function,
+    through the SAME code path, with a deliberately WRONG expected
+    parent (never the real caller's own pid) to simulate the mismatch
+    without needing an actual dead parent -- a real os.fork() child
+    (never a same-process call: _die_with_engine calling os._exit on a
+    mismatch would kill the test runner itself if called in-process)
+    whose own write-a-marker-then-exit-0 code must never run once the
+    mismatch is hit."""
+    marker = tmp_path / "ran_past_mismatch.txt"
+    wrong_parent_pid = os.getpid() + 1_000_000  # never this test's real ppid
+    child_pid = os.fork()
+    if child_pid == 0:
+        procs._die_with_engine(wrong_parent_pid)
+        # Unreachable if the mismatch check worked -- os._exit(1) above
+        # must have already ended this process before this line.
+        marker.write_text("ran")
+        os._exit(0)
+
+    _, status = os.waitpid(child_pid, 0)
+    assert not marker.exists()
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 1
+
+
+@_needs_fork
+def test_die_with_engine_returns_normally_on_parent_pid_match(tmp_path: Path) -> None:
+    """Counterpart of the test above: when `expected_parent_pid` DOES
+    match this child's real ppid (the ordinary, non-crashed case --
+    exactly what spawn() passes on every real call), _die_with_engine
+    must return normally rather than exiting, so the real command
+    after it in spawn()'s own preexec_fn chain still runs."""
+    marker = tmp_path / "ran_past_match.txt"
+    child_pid = os.fork()
+    if child_pid == 0:
+        real_parent_pid = os.getppid()
+        procs._die_with_engine(real_parent_pid)
+        marker.write_text("ran")
+        os._exit(0)
+
+    _, status = os.waitpid(child_pid, 0)
+    assert marker.exists()
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
 
 
 def test_spawn_and_close_station_kills_child(workspace: Workspace) -> None:

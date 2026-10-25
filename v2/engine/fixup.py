@@ -790,6 +790,30 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         # resuming the one a prior (interrupted) call already opened.
         new_attempt_id = str(opened.payload["new_attempt_id"])
 
+    # Transfer this job's own "task" cursor from old_attempt_id to
+    # new_attempt_id the moment new_attempt_id is known -- BEFORE any
+    # of this cycle's own effects (restore/submit) run. Without this,
+    # the cursor stayed pointed at old_attempt_id through this whole
+    # function: if the fix's own new attempt later ends in a plain
+    # "failed" (review/bench fails again), `resume_full_job_after_
+    # task_fix` (tools/gb2's own caller) never gets a "done"/
+    # "needs_owner" to react to and records nothing either, so a later
+    # `gb2 continue` reads the STALE cursor, tries to reopen old_
+    # attempt_id's own replacement AGAIN, and is refused outright (the
+    # fix's own new attempt is still ACTIVE). And if the process dies
+    # after this cycle's own commit+close but before tools/gb2 ever
+    # calls resume_full_job_after_task_fix, that same stale cursor
+    # would make `gb2 continue` rerun the task this fix JUST finished,
+    # from scratch, all over again. engine.full_orbit.
+    # transfer_task_cursor_to_fix_attempt is a no-op once the cursor
+    # already names new_attempt_id, so calling it again on every
+    # resumed call within this same cycle (or a later cycle that never
+    # needed to touch this job's cursor at all) is always safe.
+    from engine import full_orbit  # sibling module; lazy import (no cycle)
+
+    full_orbit.transfer_task_cursor_to_fix_attempt(
+        ledger, project, job_name, old_attempt_id, new_attempt_id, task)
+
     restored = _latest_fix_event_after(ledger, project, "fix.restored", started_seq)
     if restored is None:
         _overlay_archive_into_builder_copy(config, new_attempt_id, builder_role, archive_dir)

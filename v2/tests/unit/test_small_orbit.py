@@ -194,12 +194,9 @@ def test_small_job_refuses_a_ui_plan(
     assert ws.ledger.project("alpha").state == "CLOSED"
 
 
-def test_small_job_refuses_a_plan_with_more_than_one_task(
-    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ws = _full_orbit_workspace(workspace)
-    two_task_plan = json.dumps({
-        "goal": "작은 변경", "ui": False,
+def _two_task_plan_json(*, ui: bool) -> str:
+    return json.dumps({
+        "goal": "작은 변경", "ui": ui,
         "requirements": [{"id": "R1", "text": "요청이 반영된다", "kind": "function"}],
         "scenes": [{"id": "s1", "actor_does": "값을 확인한다", "app_shows": "바뀐 값이 보인다",
                    "where": "cli", "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
@@ -211,8 +208,14 @@ def test_small_job_refuses_a_plan_with_more_than_one_task(
         ],
         "acceptance": ["요청이 반영된다"],
     })
+
+
+def test_small_job_refuses_a_plan_with_more_than_one_task(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
     stub = _RunStationStub({
-        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, two_task_plan)],
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _two_task_plan_json(ui=False))],
     })
     _install_fake_acceptance_and_handoff(monkeypatch, [])
 
@@ -223,6 +226,91 @@ def test_small_job_refuses_a_plan_with_more_than_one_task(
 
     assert outcome.status == "failed"
     assert outcome.reason == small_orbit.SINGLE_TASK_REASON
+    # Committed+closed, same as the external-target/UI refusals -- the
+    # project returns to CLOSED so a full-orbit fallback can open.
+    assert ws.ledger.project("alpha").state == "CLOSED"
+
+
+def test_small_job_ui_plan_with_more_than_one_task_is_reported_as_ui_not_single_task(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External-review finding: the ui check must run BEFORE the task-
+    count check, so a ui:true plan with more than one task is reported
+    (and falls back) as UI_PLAN_REASON, never SINGLE_TASK_REASON just
+    because it also happens to have more than one task."""
+    ws = _full_orbit_workspace(workspace)
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _two_task_plan_json(ui=True))],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [])
+
+    outcome = small_orbit.run_small_job(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "화면 두 개 바꿔줘",
+        processor_factory=_processor_factory(stub),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.reason == small_orbit.UI_PLAN_REASON
+    assert ws.ledger.project("alpha").state == "CLOSED"
+
+
+def test_small_job_ui_two_task_plan_falls_back_to_full_job(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a ui:true plan with more than one task goes to the
+    full fallback (maybe_full_fallback), same as any other UI plan."""
+    ws = _full_orbit_workspace(workspace)
+    fallback_job = small_orbit.fallback_job_name(_JOB)
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _two_task_plan_json(ui=True))],
+        "facts": [{f".gongbang/{fallback_job}/facts.md": _FACTS_MD_NO_TARGETS}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [])
+
+    outcome = small_orbit.run_small_job(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "화면 두 개 바꿔줘",
+        processor_factory=_processor_factory(stub),
+    )
+    assert outcome.reason == small_orbit.UI_PLAN_REASON
+
+    fallback = small_orbit.maybe_full_fallback(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "화면 두 개 바꿔줘", outcome,
+        processor_factory=_processor_factory(stub),
+    )
+    assert fallback is not None
+    assert ws.ledger.attempts_for_job_name("alpha", fallback_job)
+    assert ("facts", "facts") in stub.calls
+
+
+def test_small_job_non_ui_two_task_plan_falls_back_to_full_job(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a plain (non-UI) plan with more than one task also
+    falls back (maybe_full_fallback) -- a multi-task plan is itself a
+    "this request was not small enough" signal, same as an external
+    target or a UI plan, so the request continues on the full path
+    instead of just failing outright."""
+    ws = _full_orbit_workspace(workspace)
+    fallback_job = small_orbit.fallback_job_name(_JOB)
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _two_task_plan_json(ui=False))],
+        "facts": [{f".gongbang/{fallback_job}/facts.md": _FACTS_MD_NO_TARGETS}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [])
+
+    outcome = small_orbit.run_small_job(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "값 두 개를 바꿔줘",
+        processor_factory=_processor_factory(stub),
+    )
+    assert outcome.reason == small_orbit.SINGLE_TASK_REASON
+
+    fallback = small_orbit.maybe_full_fallback(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "값 두 개를 바꿔줘", outcome,
+        processor_factory=_processor_factory(stub),
+    )
+    assert fallback is not None
+    assert ws.ledger.attempts_for_job_name("alpha", fallback_job)
+    assert ("facts", "facts") in stub.calls
 
 
 def test_small_job_refuses_a_plan_with_no_requirements(

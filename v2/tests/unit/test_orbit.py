@@ -17,6 +17,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from engine.app_security import security_policy_hash
 from engine import evidence, orbit
 from engine.approvals import grant
 from engine.config import ReleaseConfig
@@ -349,7 +350,9 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
         workspace.ledger.append(Event(
             project=project, kind=kind, actor_kind="processor",
             actor_id="processor", attempt_id=attempt_id,
-            payload={"passed": True, "fingerprint": fp},
+            payload={"passed": True, "fingerprint": fp,
+                     **({"policy_hash": security_policy_hash(workspace.config)}
+                        if kind == "app_security.recorded" else {})},
         ))
 
 

@@ -262,7 +262,7 @@ def _job_certificate_ok_for_release(ctx: StepContext) -> tuple[bool, str]:
     if fp is None:
         return False, "release_requires_job_certificate"
     return release_mod.job_certificate_status(ctx.ledger, ctx.project, ctx.attempt_id,
-                                              _repo(ctx), fp)
+                                              _repo(ctx), fp, config=ctx.config)
 
 
 def _run_advance_master(ctx: StepContext) -> dict[str, object]:

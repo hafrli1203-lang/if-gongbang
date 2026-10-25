@@ -467,6 +467,87 @@ def test_check_carries_the_repo_fingerprint(workspace: Workspace, tmp_path: Path
     assert len(result.fingerprint) == 40
 
 
+def test_policy_hash_changes_when_an_allow_flag_is_flipped(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """security_policy_hash binds a certificate to the EFFECTIVE policy,
+    not just the repo tree -- allow_no_lockfile=true vs. false is the
+    exact change a later release check must be able to tell apart,
+    since both leave the repo's own fingerprint unchanged."""
+    dir_a, dir_b = tmp_path / "a", tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    allowed = _config_with_security(workspace, {"allow_no_lockfile": True}, dir_a)
+    denied = _config_with_security(workspace, {"allow_no_lockfile": False}, dir_b)
+    assert app_security.security_policy_hash(allowed) != app_security.security_policy_hash(denied)
+
+
+def test_policy_hash_is_stable_for_the_same_config_regardless_of_key_order(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "engine.json"
+    config_path.write_text(
+        json.dumps({"security": {"allow_no_lockfile": True, "allow_audit_unavailable": False}}),
+        encoding="utf-8",
+    )
+    reordered_path = tmp_path / "engine2.json"
+    reordered_path.write_text(
+        json.dumps({"security": {"allow_audit_unavailable": False, "allow_no_lockfile": True}}),
+        encoding="utf-8",
+    )
+    config_a = replace(workspace.config, config_path=config_path)
+    config_b = replace(workspace.config, config_path=reordered_path)
+    assert (app_security.security_policy_hash(config_a)
+           == app_security.security_policy_hash(config_b))
+
+
+def test_policy_hash_recorded_on_the_ledger_event(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    config = _config_with_security(workspace, {"allow_no_lockfile": True}, tmp_path)
+    attempt_id = "J-alpha-TEST#16b"
+    result = app_security.check(config, "alpha", attempt_id, plan=None)
+    assert result.policy_hash == app_security.security_policy_hash(config)
+    assert len(result.policy_hash) == 64  # sha256 hex digest
+
+    app_security.record(workspace.ledger, "alpha", attempt_id, result)
+    events = [e for _seq, e in workspace.ledger.events("alpha", "app_security.recorded")]
+    assert events[0].payload["policy_hash"] == result.policy_hash
+
+
+def test_check_reads_the_security_policy_exactly_once_and_hashes_that_snapshot(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """Regression: an earlier version of check() read _security_config
+    once (line ~370-equivalent, to decide pass/fail) and then called
+    security_policy_hash(config) at the very end, which re-read
+    config.config_path a SECOND time. If the policy changed in
+    between (a concurrent `gb2` command editing engine.json, or a
+    crash-recovery rewrite racing the check), the recorded policy_hash
+    would describe a policy that never actually produced the verdict
+    just computed -- exactly the staleness bug this whole feature
+    exists to prevent, just moved one step earlier. Proven here by
+    making _security_config return a DIFFERENT dict on its second call
+    (simulating the file changing mid-check): check() must call it
+    exactly once, and the recorded policy_hash must match the FIRST
+    (verdict-producing) snapshot, never the second."""
+    from unittest.mock import patch
+
+    config = _config_with_security(workspace, {"allow_no_lockfile": True}, tmp_path)
+    policy_during_check = {"allow_no_lockfile": True}
+    policy_after_check = {"allow_no_lockfile": False}
+
+    with patch(
+        "engine.app_security._security_config",
+        side_effect=[policy_during_check, policy_after_check],
+    ) as mock_security_config:
+        result = app_security.check(config, "alpha", "J-alpha-TEST#24", plan=None)
+
+    assert mock_security_config.call_count == 1
+    assert result.policy_hash == app_security._hash_security_policy(policy_during_check)
+    assert result.policy_hash != app_security._hash_security_policy(policy_after_check)
+
+
 def test_record_appends_app_security_recorded_event(
     workspace: Workspace, tmp_path: Path,
 ) -> None:
@@ -481,6 +562,7 @@ def test_record_appends_app_security_recorded_event(
     assert events[0].payload == {
         "passed": result.passed, "findings": list(result.findings),
         "ran": list(result.ran), "fingerprint": result.fingerprint,
+        "policy_hash": result.policy_hash,
     }
     assert seq > 0
 

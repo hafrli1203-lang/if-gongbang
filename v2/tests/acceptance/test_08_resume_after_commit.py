@@ -12,6 +12,7 @@ import subprocess
 
 from engine import ids
 from engine.approvals import grant
+from engine.app_security import security_policy_hash
 from engine.evidence import fingerprint, record, sha256_file
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -36,7 +37,9 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
         workspace.ledger.append(Event(
             project=project, kind=kind, actor_kind="processor",
             actor_id="processor", attempt_id=attempt_id,
-            payload={"passed": True, "fingerprint": fp},
+            payload={"passed": True, "fingerprint": fp,
+                     **({"policy_hash": security_policy_hash(workspace.config)}
+                        if kind == "app_security.recorded" else {})},
         ))
 
 

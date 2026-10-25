@@ -18,6 +18,7 @@ import pytest
 
 from dataclasses import replace
 
+from engine.app_security import security_policy_hash
 from engine.approvals import grant
 from engine.bootstrap import BootstrapResult
 from engine.config import EngineConfig, ProjectConfig, ReleaseConfig, write_json
@@ -335,7 +336,7 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
         project="demo", kind="app_security.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
         payload={"passed": True, "findings": [], "ran": ["secret_scan"],
-                 "fingerprint": fp},
+                 "fingerprint": fp, "policy_hash": security_policy_hash(config)},
     ))
 
     fakes = Fakes(FakePublisher(), FakeInstaller())

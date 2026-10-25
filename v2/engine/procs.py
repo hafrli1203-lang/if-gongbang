@@ -37,8 +37,10 @@ except OSError:
 _PR_SET_PDEATHSIG = 1  # Linux prctl(2) option; see _die_with_engine.
 
 
-def _die_with_engine() -> None:
-    """preexec_fn for spawn()'s own Popen call below -- runs in the
+def _die_with_engine(expected_parent_pid: int) -> None:
+    """preexec_fn for spawn()'s own Popen call below (bound to this
+    call's own `expected_parent_pid` via a lambda at the call site,
+    since Popen's preexec_fn itself takes no arguments) -- runs in the
     freshly forked child, after fork but before exec, asking the
     kernel (Linux prctl, PR_SET_PDEATHSIG) to SIGKILL THIS process the
     moment its real parent -- THIS engine process, as it existed at
@@ -70,13 +72,32 @@ def _die_with_engine() -> None:
     exec) to run "$@" so it can still write the exit code afterward --
     that forked grandchild has no pdeathsig of its own and is NOT
     reached by this fix; see spawn()'s own docstring's "Known limit"
-    paragraph for that one, narrower, still-open gap."""
-    if _LIBC is None:
-        return
-    try:
-        _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
-    except OSError:
-        pass
+    paragraph for that one, narrower, still-open gap.
+
+    Remaining race (external review, P2) and its close: fork() and
+    this prctl call are two separate steps -- if the engine dies in
+    the (normally tiny) window between them, this child is reparented
+    to init BEFORE PR_SET_PDEATHSIG is ever armed, so the SIGKILL this
+    is meant to deliver never gets scheduled at all, and the child
+    keeps running orphaned, exactly the outcome this whole mechanism
+    exists to prevent. `expected_parent_pid` is os.getpid() read by
+    the PARENT, in the parent's own process, immediately before
+    Popen() forks -- the real parent pid this child is SUPPOSED to
+    have right after that fork, before any reparenting could possibly
+    happen. Immediately after the prctl call (armed or not), this
+    compares os.getppid() (read fresh, in the child, right now)
+    against that value: if they differ, the parent is already gone --
+    reparented to init -- so this exits immediately via os._exit (not
+    sys.exit/return: this is still before exec, and must never run
+    any more Python, let alone the real child argv, having already
+    lost its supervising engine)."""
+    if _LIBC is not None:
+        try:
+            _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+        except OSError:
+            pass
+    if os.getppid() != expected_parent_pid:
+        os._exit(1)
 
 
 def exit_file_for(stdout_path: Path) -> Path:
@@ -382,12 +403,14 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     caller of this exit code is unaffected.
 
     Engine death policy: the Popen call below also sets preexec_fn=
-    _die_with_engine, so the immediate child (this `sh` wrapper, or
-    the raw argv when no exit_file is used) is itself killed the
-    moment THIS engine process exits, for any reason -- see
-    _die_with_engine's own docstring for the mechanism
-    (PR_SET_PDEATHSIG) and why start_new_session=True alone does not
-    already provide this. Combined with bwrap's own --die-with-parent
+    (a lambda closing over this_pid, this process's own pid read right
+    before the fork) calling _die_with_engine, so the immediate child
+    (this `sh` wrapper, or the raw argv when no exit_file is used) is
+    itself killed the moment THIS engine process exits, for any reason
+    -- see _die_with_engine's own docstring for the mechanism
+    (PR_SET_PDEATHSIG), the fork-to-prctl race its ppid check closes,
+    and why start_new_session=True alone does not already provide
+    this. Combined with bwrap's own --die-with-parent
     (engine.sandbox.wrap, tied to whatever process execs the bwrap
     invocation -- here, this same `sh` wrapper), a mode="bwrap"
     sandboxed tree is fully chained to the engine process's own
@@ -469,6 +492,11 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
             f'"$@"; code=$?; {writer_cmd} "$0" "$code"; exit "$code"',
             str(exit_file), *argv,
         ]
+    # Read in THIS process, right before the fork below -- see
+    # _die_with_engine's own "Remaining race" paragraph for why this
+    # exact value, read at this exact point, is what closes the
+    # fork-to-prctl race rather than merely narrowing it.
+    this_pid = os.getpid()
     try:
         if stdout_path is not None:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +507,7 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
             stderr=subprocess.STDOUT if stdout_handle is not None else subprocess.DEVNULL,
             stdin=subprocess.DEVNULL if stdin_devnull else None,
             start_new_session=True,
-            preexec_fn=_die_with_engine,
+            preexec_fn=lambda: _die_with_engine(this_pid),
         )
     finally:
         if stdout_handle is not None:

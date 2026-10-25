@@ -531,3 +531,136 @@ def test_no_test_cmd_configured_fails_closed(workspace: Workspace) -> None:
 
     assert acc.full_suite_passed is False
     assert acc.passed is False
+
+
+# ---- a covers-claiming scene's cmd is resolved/verified, never run as
+# given -- see engine.plan._scene_script_arg and
+# engine.acceptance._trusted_scene_argv/verify_reviewed_scenes ---------
+
+def _write_and_review_real_plan(ws: Workspace, job_name: str, scene_cmd: tuple[str, ...]) -> None:
+    """Write a real plan.json (engine.plan's own schema, not the
+    tests/plan_stub one) with one scene covering requirement R1 via
+    `scene_cmd`, and record it as reviewed -- the on-disk state
+    engine.plan.verify_reviewed_scenes/check_resumed_plan actually
+    read, independent from whatever Plan object a caller then hands
+    to run_acceptance."""
+    from engine.ledger import Ledger
+    from engine.plan import plan_path, record_plan_reviewed
+
+    data = {
+        "goal": "greet works", "ui": False,
+        "scenes": [{"id": "s1", "actor_does": "greets", "app_shows": "Hello, World",
+                    "where": "cli", "cmd": list(scene_cmd), "covers": ["R1"]}],
+        "tasks": [{"id": "t1", "title": "x", "detail": "", "owns": ["src/"],
+                   "depends_on": []}],
+        "acceptance": ["greet returns Hello, X"],
+        "requirements": [{"id": "R1", "text": "greet returns Hello, X", "kind": "function"}],
+    }
+    path = plan_path(ws.alpha, job_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    record_plan_reviewed(ws.ledger, "alpha", "attempt-ignored", ws.alpha, job_name)
+
+
+def _real_plan(ws: Workspace, job_name: str):
+    from engine.plan import load_plan
+
+    return load_plan(ws.alpha, job_name)
+
+
+def test_scene_covering_a_requirement_via_bare_python3_passes(workspace: Workspace) -> None:
+    """End-to-end happy path: a reviewed, unedited covers-claiming
+    scene using a bare "python3" runner actually runs and passes."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
+    )
+    _write_and_review_real_plan(ws, "job1", ("python3", "tests/scenes/s1.py"))
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, _real_plan(ws, "job1"))
+
+    assert acc.scenes[0].passed is True
+    assert acc.passed is True
+
+
+def test_scene_with_path_qualified_runner_is_never_executed_even_if_it_would_exit_0(
+    workspace: Workspace,
+) -> None:
+    """A covers-claiming scene whose cmd[0] is path-qualified (e.g.
+    "./fake_node", the external review's exact shape) must never
+    actually run -- even a fake runner that would always exit 0 must
+    not make the scene, or overall acceptance, pass."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.js").write_text("// never actually run\n", encoding="utf-8")
+    fake_runner = ws.alpha / "fake_node"
+    fake_runner.write_text("#!/bin/sh\ntouch RAN_FAKE_RUNNER\nexit 0\n", encoding="utf-8")
+    fake_runner.chmod(0o755)
+    _write_and_review_real_plan(ws, "job1", ("./fake_node", "tests/scenes/s1.js"))
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, _real_plan(ws, "job1"))
+
+    assert acc.scenes[0].passed is False
+    assert acc.scenes[0].tail == "scene_cmd_untrusted"
+    assert acc.passed is False
+    assert not (ws.alpha / "RAN_FAKE_RUNNER").exists()
+
+
+def test_scene_with_symlinked_tests_scenes_directory_is_never_executed(
+    workspace: Workspace,
+) -> None:
+    """The boundary-escape shape at runtime: "tests/scenes" itself
+    is a symlink (here, to "src", which make_sample already commits)
+    -- resolving it BEFORE it becomes the containment boundary would
+    make src/check.py look "contained" in tests/scenes/. Must never
+    actually run, regardless of what check.py would have done."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    (ws.alpha / "src" / "check.py").write_text(
+        "open('RAN_CHECK', 'w').close()\n", encoding="utf-8",
+    )
+    (ws.alpha / "tests" / "scenes").symlink_to(ws.alpha / "src")
+    _write_and_review_real_plan(ws, "job1", ("python3", "tests/scenes/check.py"))
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, _real_plan(ws, "job1"))
+
+    assert acc.scenes[0].passed is False
+    assert acc.scenes[0].tail == "scene_cmd_untrusted"
+    assert acc.passed is False
+    assert not (ws.alpha / "RAN_CHECK").exists()
+
+
+def test_scene_edited_after_review_fails_acceptance_without_running_any_scene(
+    workspace: Workspace,
+) -> None:
+    """A scene script edited after its plan was reviewed must fail
+    acceptance outright -- no scene (and no full suite) ever runs,
+    since nothing was certified against THIS edited version."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    scenes_dir = ws.alpha / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").write_text(
+        "import sys; sys.path.insert(0, 'src')\n"
+        "from greeter import greet\n"
+        "assert greet('World') == 'Hello, World'\n",
+        encoding="utf-8",
+    )
+    _write_and_review_real_plan(ws, "job1", ("python3", "tests/scenes/s1.py"))
+    # Edited AFTER review -- never seen by any reviewer.
+    (scenes_dir / "s1.py").write_text("import sys; sys.exit(1)  # tampered\n",
+                                      encoding="utf-8")
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, _real_plan(ws, "job1"))
+
+    assert acc.scenes == ()
+    assert acc.full_suite_passed is False
+    assert acc.passed is False

@@ -252,11 +252,88 @@ def _run_in_bench_sandbox(
     return result.returncode, combined[-_TAIL_CHARS:]
 
 
+def _trusted_scene_argv(scene: "Scene", scene_snapshot: Path) -> list[str] | None:
+    """The argv engine.acceptance actually executes for a covers-
+    claiming scene -- never `scene.cmd` as given. engine.plan's own
+    plan-review-time check (_scene_script_arg) only looks at STRINGS;
+    it cannot stop a plan.json that was never actually re-reviewed
+    (see verify_reviewed_scenes, which guards against that separately)
+    from still trying to run something untrustworthy here, and it has
+    no access to a real filesystem to catch a tracked SYMLINK escaping
+    tests/scenes/ at the moment of execution. So this function re-
+    derives the scene path the same way (_scene_script_arg), then:
+      - resolves cmd[0] (already verified bare, no path separator) to
+        an ABSOLUTE executable via shutil.which against the ENGINE's
+        OWN os.environ PATH -- never anything the sandboxed child env,
+        the project config, or the repo itself could have set -- so
+        the actual binary that runs can never be a same-named
+        executable the job's own repo happens to ship
+      - verifies the scene path's REAL location (symlinks followed),
+        resolved against THIS snapshot's REAL, non-symlinked
+        tests/scenes/ directory
+
+    None on any failure (no supported runner, no scene path, the
+    runner cannot be found via shutil.which, "tests" or
+    "tests/scenes" itself is a symlink -- see
+    engine.plan.validate_plan's own matching check for why resolving
+    THROUGH either one before it becomes the containment boundary is
+    exactly the bug this guards against -- or the scene path's real
+    location escapes tests/scenes/) -- the caller must record this
+    scene as failed, never fall back to running `scene.cmd` as
+    given."""
+    from engine.plan import _scene_script_arg
+
+    cmd = tuple(scene.cmd)
+    scene_path = _scene_script_arg(cmd)
+    if scene_path is None:
+        return None
+    runner_path = shutil.which(cmd[0])
+    if runner_path is None:
+        return None
+    tests_dir = scene_snapshot / "tests"
+    scenes_dir = tests_dir / "scenes"
+    if tests_dir.is_symlink() or scenes_dir.is_symlink():
+        # A symlinked "tests" or "tests/scenes" would make .resolve()
+        # follow it BEFORE it becomes the boundary below -- e.g.
+        # "tests/scenes" -> "../src" resolves scenes_root to this
+        # snapshot's own src/, so src/check.py would then look
+        # "contained". The REAL tests/scenes/ is only ever trusted
+        # when neither component is itself a symlink.
+        return None
+    scenes_root = scenes_dir.resolve()
+    try:
+        resolved = (scene_snapshot / scene_path).resolve()
+    except OSError:
+        return None
+    if not _is_within(resolved, scenes_root):
+        return None
+    return [runner_path, *cmd[1:]]
+
+
 def _run_scene(config: EngineConfig, project: str, attempt_id: str, repo: Path,
               env: dict[str, str], timeout_sec: float, scene: "Scene",
               extra_readonly: tuple[Path, ...] = ()) -> SceneResult:
+    """Runs one scene's cmd inside the bench sandbox against `repo`
+    (the scene's own disposable snapshot -- see module docstring). A
+    scene that `covers` a requirement (getattr, duck-typed -- the test-
+    only Plan/Scene stub some unit tests still use has no `covers`
+    field at all, and is never meant to exercise this path) is never
+    run as `scene.cmd` verbatim: _trusted_scene_argv re-resolves it to
+    a trusted, absolute argv first. A scene whose cmd fails that
+    resolution is recorded failed (returncode=-1, never actually
+    executed) -- not silently run as given, and not silently treated
+    as passing either. A scene with no `covers` keeps running exactly
+    as given, same as before this check existed -- it carries no
+    requirement-evidence claim for this resolution to protect."""
+    if getattr(scene, "covers", ()):
+        argv = _trusted_scene_argv(scene, repo)
+        if argv is None:
+            return SceneResult(id=scene.id, passed=False, returncode=-1,
+                               tail="scene_cmd_untrusted")
+    else:
+        argv = list(scene.cmd)
     returncode, tail = _run_in_bench_sandbox(
-        config, project, attempt_id, repo, list(scene.cmd), env, timeout_sec,
+        config, project, attempt_id, repo, argv, env, timeout_sec,
         extra_readonly=extra_readonly)
     return SceneResult(id=scene.id, passed=returncode == 0,
                        returncode=returncode, tail=tail)
@@ -554,6 +631,29 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     env = _bench_env(_bench_ctx(config, project, attempt_id))
     timeout_sec = project_cfg.test_timeout_sec
     job_name = _job_name(ledger, project, attempt_id)
+
+    if any(getattr(scene, "covers", ()) for scene in plan.scenes):
+        # Re-check the reviewed plan's own digest immediately before
+        # running anything -- a covers-claiming scene's cmd (or
+        # plan.json itself) edited since the last review must never
+        # be certified as if a reviewer had seen THIS version of it,
+        # even within the same attempt with no owner-stop/resume in
+        # between (see engine.plan.verify_reviewed_scenes). Plans with
+        # no covers-claiming scene at all (the test-only Plan/Scene
+        # stub some unit tests still use has no `covers` field, hence
+        # getattr) carry no such claim for this to protect, so this
+        # check is skipped entirely for them -- same as before this
+        # check existed.
+        from engine.plan import verify_reviewed_scenes
+
+        plan_problems = verify_reviewed_scenes(ledger, project, job_name, repo)
+        if plan_problems:
+            reason = ";".join(plan_problems)
+            acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False)
+            _write_acceptance_json(config, project, job_name, False, False, -1,
+                                   reason, ())
+            _record(ledger, project, attempt_id, job_name, acc, reason=reason)
+            return acc
 
     if not plan.scenes:
         acc = AcceptanceResult(passed=False, scenes=(), full_suite_passed=False)

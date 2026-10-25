@@ -1013,17 +1013,18 @@ def _run_small_job_and_report(args: argparse.Namespace, config: EngineConfig,
     """`gb2 change <app> "..." --small`: engine.small_orbit.run_small_job
     against this app's workspace. If small mode refuses outright --
     engine.small_orbit.NEEDS_PROBE_REASON (facts.md names a real
-    external dependency) or UI_PLAN_REASON (plan.json sets "ui": true,
-    which needs the full job's own designer/approval gate) -- falls
+    external dependency), UI_PLAN_REASON (plan.json sets "ui": true,
+    which needs the full job's own designer/approval gate), or
+    SINGLE_TASK_REASON (plan.json has more than one task) -- falls
     back to the ordinary full job (engine.full_orbit.run_full_job),
     via engine.small_orbit.maybe_full_fallback -- the SAME helper a
     later `gb2 continue` (engine.small_orbit.resume_small_plan) calls
-    for this exact pair of refusals, so a fallback discovered on a
-    resume runs under the identical fallback job_name
-    (engine.small_orbit.fallback_job_name) this initial call would
-    have used. The owner still gets a real job out of a single
-    `gb2 change --small` call, just not the fast path. Both refusals
-    already closed+committed the small attempt themselves
+    for this exact set of refusals (FULL_FALLBACK_REASONS), so a
+    fallback discovered on a resume runs under the identical fallback
+    job_name (engine.small_orbit.fallback_job_name) this initial call
+    would have used. The owner still gets a real job out of a single
+    `gb2 change --small` call, just not the fast path. Every refusal
+    already closed+committed the small attempt itself
     (engine.small_orbit._close_preserving_evidence) before returning,
     so the project is CLOSED again here and this fallback's own
     open_job call succeeds. The printed summary carries "durations_ms"

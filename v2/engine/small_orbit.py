@@ -37,13 +37,18 @@ CLI/file format) -- a job that depends on a real external target must
 go through the full job's real probe station, never skip it just
 because small mode asked for speed -- or if plan.json sets "ui": true
 -- a UI job needs the full job's designer/approval stage, which this
-fast path never runs. Both refusals COMMIT the combined call's own
+fast path never runs -- or if plan.json has more than one task --
+small mode's whole point is ONE combined call for ONE task; a plan
+that itself needed more is not a small change, whatever its own
+facts.md/ui said. All three refusals COMMIT the combined call's own
 facts.md/plan.json/scenes as this job's trail and CLOSE the attempt
 first (see `_close_preserving_evidence`), so the request and its
 evidence survive in project history and the project returns to CLOSED
 -- the one state tools/gb2's own fallback (engine.full_orbit.
 run_full_job, under a fresh job_name) requires before it can open a
-new attempt at all."""
+new attempt at all. `maybe_full_fallback` then runs that fallback for
+any of the three (FULL_FALLBACK_REASONS), so the request still
+continues on the full path rather than just failing outright."""
 from __future__ import annotations
 
 import time
@@ -111,14 +116,16 @@ REQUIREMENT_REASON = "small_mode_requires_requirement"
 # like any other UI job.
 UI_PLAN_REASON = "small_mode_requires_full_for_ui"
 
-# The two SmallOutcome.reason values _close_preserving_evidence's own
-# callers return -- the only two cases a person cannot simply fix and
-# retry small mode with; the job must actually continue through the
-# full orbit instead. Shared by `maybe_full_fallback` below AND by
+# The three SmallOutcome.reason values _close_preserving_evidence's own
+# callers return -- the only cases a person cannot simply fix and retry
+# small mode with (a real external dependency, a UI job, or a plan that
+# itself needed more than one task -- all three mean "this request was
+# not small enough"); the job must actually continue through the full
+# orbit instead. Shared by `maybe_full_fallback` below AND by
 # tools/gb2's own initial-call fallback (`_run_small_job_and_report`),
 # so a retry/continue landing on the same refusal falls back exactly
 # the same way the very first call would have.
-FULL_FALLBACK_REASONS = (NEEDS_PROBE_REASON, UI_PLAN_REASON)
+FULL_FALLBACK_REASONS = (NEEDS_PROBE_REASON, UI_PLAN_REASON, SINGLE_TASK_REASON)
 
 
 def fallback_job_name(job_name: str) -> str:
@@ -136,9 +143,9 @@ def maybe_full_fallback(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
                         on_progress: ProgressCallback | None = None,
                         processor_factory: orbit.ProcessorFactory | None = None,
                         ) -> full_orbit.FullOutcome | None:
-    """None iff `outcome` is not one of the two small-mode refusals this
-    module itself hand-authors (FULL_FALLBACK_REASONS) -- the caller
-    keeps its own outcome. Otherwise runs the ordinary full job
+    """None iff `outcome` is not one of the three small-mode refusals
+    this module itself hand-authors (FULL_FALLBACK_REASONS) -- the
+    caller keeps its own outcome. Otherwise runs the ordinary full job
     (engine.full_orbit.run_full_job) under `fallback_job_name(job_name)`,
     same request, and returns ITS FullOutcome.
 
@@ -302,10 +309,10 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     # never commits or closes this attempt either, matching that same
     # function's own "plan:<problems>" failure branch -- a person (or a
     # later `gb2 fix`) can still inspect the real, uncommitted
-    # facts.md/plan.json this worker turn actually wrote. Only the two
-    # NEEDS_PROBE_REASON/UI_PLAN_REASON refusals below commit+close --
-    # those are the two cases a person cannot simply edit around; the
-    # job must actually continue through the full orbit instead.
+    # facts.md/plan.json this worker turn actually wrote. Only the
+    # three FULL_FALLBACK_REASONS refusals below commit+close -- those
+    # are the cases a person cannot simply edit around; the job must
+    # actually continue through the full orbit instead.
     facts_problems = check_facts(repo, job_name)
     if facts_problems:
         _mark_planning_done()
@@ -338,8 +345,35 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
         _mark_planning_done()
         return SmallOutcome("failed", f"plan:{exc.reason}", attempt_id, None, durations)
 
-    if len(plan.tasks) != 1:
+    if plan.ui:
+        # A UI job needs the full orbit's designer + design-approval
+        # gate -- small mode goes straight from plan review to the
+        # build task and never runs either. Checked BEFORE the task-
+        # count check below: a ui:true plan must always fall back to
+        # the full path regardless of how many tasks it has, never get
+        # misreported as SINGLE_TASK_REASON just because it also
+        # happens to have more than one task. Same commit+close/
+        # fallback story as the external-target refusal above.
         _mark_planning_done()
+        closed = _close_preserving_evidence(
+            config, ledger, fakes, project, job_name, attempt_id, on_progress, processor_factory)
+        if closed is not None:
+            return SmallOutcome(closed.status, closed.reason, closed.attempt_id, None, durations)
+        return SmallOutcome("failed", UI_PLAN_REASON, attempt_id, None, durations)
+
+    if len(plan.tasks) != 1:
+        # More than one task is itself a "this request was not small
+        # enough" signal, same as an external target or a UI plan --
+        # the full orbit's own task loop (engine.full_orbit._finish_
+        # from_tasks) already runs tasks in dependency order; this fast
+        # path never does. Same commit+close/fallback story as the two
+        # refusals above, so the request still continues (through the
+        # full path) instead of just failing outright.
+        _mark_planning_done()
+        closed = _close_preserving_evidence(
+            config, ledger, fakes, project, job_name, attempt_id, on_progress, processor_factory)
+        if closed is not None:
+            return SmallOutcome(closed.status, closed.reason, closed.attempt_id, None, durations)
         return SmallOutcome("failed", SINGLE_TASK_REASON, attempt_id, None, durations)
     if not plan.requirements:
         _mark_planning_done()
@@ -350,18 +384,6 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     if problems:
         _mark_planning_done()
         return SmallOutcome("failed", "plan:" + "; ".join(problems), attempt_id, None, durations)
-
-    if plan.ui:
-        # A UI job needs the full orbit's designer + design-approval
-        # gate -- small mode goes straight from plan review to the
-        # build task and never runs either. Same commit+close/fallback
-        # story as the external-target refusal above.
-        _mark_planning_done()
-        closed = _close_preserving_evidence(
-            config, ledger, fakes, project, job_name, attempt_id, on_progress, processor_factory)
-        if closed is not None:
-            return SmallOutcome(closed.status, closed.reason, closed.attempt_id, None, durations)
-        return SmallOutcome("failed", UI_PLAN_REASON, attempt_id, None, durations)
 
     # Review the merged-but-uncommitted plan.json+facts.md+scenes change
     # BEFORE it is ever committed -- same reasoning engine.full_orbit.
@@ -512,7 +534,7 @@ def resume_small_plan(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     the stale attempt closed.
 
     If the fresh planning call's own outcome is one of this module's
-    two full-fallback refusals (NEEDS_PROBE_REASON/UI_PLAN_REASON --
+    full-fallback refusals (FULL_FALLBACK_REASONS --
     e.g. the owner's retry still names a real external target),
     `maybe_full_fallback` runs the SAME full-orbit fallback the
     initial `gb2 change --small` call would have -- a refusal

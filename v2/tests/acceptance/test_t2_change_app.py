@@ -134,13 +134,13 @@ def _plan_json(job: str) -> str:
         "scenes": [
             {"id": "s1", "actor_does": "기존 인사를 그대로 받는다 (회귀 확인)",
              "app_shows": "Hello, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s1_greet_regression.py"]},
+             "cmd": ["python3", "tests/scenes/s1_greet_regression.py"]},
             {"id": "s2", "actor_does": "이름의 이니셜을 구한다",
              "app_shows": "AL", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s2_initials.py"], "covers": ["R1"]},
+             "cmd": ["python3", "tests/scenes/s2_initials.py"], "covers": ["R1"]},
             {"id": "s3", "actor_does": "작별 인사를 받는다",
              "app_shows": "Goodbye, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s3_farewell.py"], "covers": ["R2"]},
+             "cmd": ["python3", "tests/scenes/s3_farewell.py"], "covers": ["R2"]},
         ],
         "tasks": [
             {"id": "t1", "title": "initials 추가",

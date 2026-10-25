@@ -273,6 +273,7 @@ def _latest_full_bench_passed(ledger: Ledger, attempt_id: str, fp: str) -> bool:
 
 
 _JOB_CERTIFICATE_MISSING_REASON = "release_requires_job_certificate"
+_JOB_CERTIFICATE_STALE_POLICY_REASON = "release_requires_job_certificate:security_policy_changed"
 
 
 def _job_name_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> str | None:
@@ -309,6 +310,32 @@ def _latest_passing_fingerprint(
         return None
     fp = latest.payload.get("fingerprint")
     return str(fp) if fp else None
+
+
+def _latest_passing_app_security_policy_hash(
+    ledger: Ledger, project: str, attempt_ids: frozenset[str],
+) -> str | None:
+    """The payload["policy_hash"] of the newest 'app_security.recorded'
+    event among `attempt_ids` whose payload["passed"] is True -- same
+    selection as _latest_passing_fingerprint's own "app_security.
+    recorded" case (so this is always reading the SAME event
+    job_certificate_status's fingerprint check already found), just
+    pulling a different field. None if no such event exists, or if it
+    carries no non-"" policy_hash at all (an app_security.recorded
+    event from before engine.app_security.security_policy_hash existed
+    -- that absence must refuse the same as a real mismatch would,
+    never be treated as "nothing to compare, so it still matches")."""
+    rows = [
+        (seq, event) for seq, event in ledger.events(project, "app_security.recorded")
+        if event.attempt_id in attempt_ids
+    ]
+    if not rows:
+        return None
+    _seq, latest = max(rows, key=lambda row: row[0])
+    if latest.payload.get("passed") is not True:
+        return None
+    policy_hash = latest.payload.get("policy_hash")
+    return str(policy_hash) if policy_hash else None
 
 
 def _tree_exists(repo: Path, tree_sha: str) -> bool:
@@ -380,7 +407,8 @@ def _certificate_reason(changed: tuple[str, ...]) -> str:
 
 
 def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
-                           repo: Path, fingerprint: str) -> tuple[bool, str]:
+                           repo: Path, fingerprint: str,
+                           config: "EngineConfig | None" = None) -> tuple[bool, str]:
     """(ok, reason) for whether the JOB `attempt_id` belongs to carries
     the certificate a release of the commit fingerprinted as
     `fingerprint` is required to have: the newest passing
@@ -398,7 +426,19 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
     source change). reason is "" when ok, else
     "release_requires_job_certificate" (optionally suffixed with
     ":<first few changed paths>" when the refusal is specifically
-    because something outside those two generated paths changed).
+    because something outside those two generated paths changed, or
+    with ":security_policy_changed" -- see `config` below).
+
+    `config`, when given, additionally requires the newest passing
+    'app_security.recorded' event's own policy_hash (engine.
+    app_security.security_policy_hash at the moment that check() ran)
+    to equal security_policy_hash(config) recomputed from THIS call's
+    `config` -- a repo tree can match exactly while the "security"
+    config itself was tightened afterward (e.g.
+    allow_no_lockfile true -> false), which must make an
+    already-recorded "passed" certificate stale even though nothing
+    about the tree changed. `config=None` (the default) skips this
+    check entirely, for callers not yet updated to pass it.
 
     Why an exact fingerprint match is too strict for acceptance's own
     recorded fingerprint (root cause investigated and reported to the
@@ -483,6 +523,30 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
             return False, _JOB_CERTIFICATE_MISSING_REASON
         changed.extend(_changed_paths_outside_gongbang(repo, recorded_fp, fingerprint,
                                                        job_name))
+
+    # A matching tree is not enough for the app_security half: the
+    # "security" config itself (audit_cmd/allow_no_lockfile/
+    # allow_audit_unavailable/...) can be tightened AFTER the
+    # certificate was recorded, with the repo tree never changing at
+    # all -- e.g. allow_no_lockfile true -> false. The recorded
+    # certificate's own policy_hash (engine.app_security.
+    # security_policy_hash, computed at check()-time) is compared
+    # against the SAME hash recomputed from the CURRENT config; a
+    # mismatch means the certificate speaks for a policy that no
+    # longer applies, security has to rerun. `config=None` (a caller
+    # that has not been updated to pass it yet) skips this check
+    # entirely -- see this function's own call sites for which ones
+    # still need updating.
+    if config is not None:
+        from engine import app_security  # lazy import, see full_orbit's own convention
+        recorded_policy_hash = _latest_passing_app_security_policy_hash(
+            ledger, project, attempt_ids,
+        )
+        if recorded_policy_hash is None:
+            return False, _JOB_CERTIFICATE_MISSING_REASON
+        if recorded_policy_hash != app_security.security_policy_hash(config):
+            return False, _JOB_CERTIFICATE_STALE_POLICY_REASON
+
     if changed:
         # Dedupe while keeping first-seen order (acceptance's own diff
         # before app_security's), so the reason's truncated path list

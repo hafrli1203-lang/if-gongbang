@@ -668,12 +668,15 @@ def test_scene_covering_a_requirement_via_npx_vitest_run_is_fine(tmp_path: Path)
     assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
 
 
-def test_scene_covering_a_requirement_via_full_interpreter_path_is_fine(
+def test_scene_covering_a_requirement_via_a_path_qualified_runner_is_a_problem(
     tmp_path: Path,
 ) -> None:
-    """sys.executable (an absolute interpreter path, the shape real
-    acceptance-test fixtures use) must still count as the "python3"
-    runner."""
+    """cmd[0] must be a BARE runner name -- a path-qualified runner
+    (a full interpreter path like sys.executable, or a repo-relative
+    one like "./src/node") is never trusted here, since it resolves
+    relative to the process's own cwd regardless of PATH, letting a
+    job's own repo content silently stand in for the runner a
+    reviewer thinks they are trusting."""
     import sys
 
     _write_scene_script(tmp_path)
@@ -683,7 +686,115 @@ def test_scene_covering_a_requirement_via_full_interpreter_path_is_fine(
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+def test_scene_covering_a_requirement_via_a_repo_relative_runner_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    """The exact shape the external review flagged: `cmd[0]` is a
+    relative path into the repo (`./src/node`), whose basename happens
+    to match a supported runner's name -- this must never be trusted,
+    since it would run the REPO's own executable, not the engine's."""
+    _write_scene_script(tmp_path, "tests/scenes/s1.js")
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["./src/node", "tests/scenes/s1.js"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+def test_scene_covering_a_requirement_via_bare_python3_is_fine(tmp_path: Path) -> None:
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
     assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_scene_covering_a_requirement_via_scene_path_escaping_tests_scenes_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    """The exact shape the external review flagged: the scene path
+    LITERALLY starts with "tests/scenes/" but normalizes to something
+    outside it."""
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/../../src/check.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+def test_scene_script_tracked_symlink_escaping_tests_scenes_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    """A scene path that stays textually inside tests/scenes/ but is a
+    SYMLINK (the shape a committed, reviewed-looking file can still
+    take) pointing outside it must still be rejected -- validate_plan
+    resolves the real path, symlinks followed."""
+    outside = tmp_path / "secret.py"
+    outside.write_text("print('not a scene')\n", encoding="utf-8")
+    scenes_dir = tmp_path / "tests" / "scenes"
+    scenes_dir.mkdir(parents=True)
+    (scenes_dir / "s1.py").symlink_to(outside)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("escapes tests/scenes/" in p for p in problems)
+
+
+def test_symlinked_tests_scenes_directory_is_rejected(tmp_path: Path) -> None:
+    """The boundary-escape shape: "tests/scenes" ITSELF is a
+    symlink (e.g. to "../src") -- resolving it would make it the
+    containment boundary's OWN resolved target, so anything under
+    that target (src/check.py) would wrongly look "contained". A
+    symlinked tests/scenes/ must be rejected outright, not resolved
+    through."""
+    outside = tmp_path / "src"
+    outside.mkdir()
+    (outside / "check.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "scenes").symlink_to(outside)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/check.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("tests/scenes/ itself is a symlink" in p for p in problems)
+
+
+def test_symlinked_tests_directory_is_rejected(tmp_path: Path) -> None:
+    """Same boundary bug one level up: "tests" itself is a symlink,
+    with a real "scenes" subdirectory underneath it."""
+    outside = tmp_path / "elsewhere"
+    (outside / "scenes").mkdir(parents=True)
+    (outside / "scenes" / "check.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "tests").symlink_to(outside)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/check.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("tests/scenes/ itself is a symlink" in p for p in problems)
 
 
 def test_scene_covering_a_requirement_with_scene_path_not_the_first_arg_is_a_problem(
@@ -812,3 +923,46 @@ def test_check_resumed_plan_skips_owns_subset_check(tmp_path: Path) -> None:
     ])
     ledger = _reviewed_ledger(tmp_path, data)
     assert check_resumed_plan(ledger, "alpha", "job", tmp_path) == []
+
+
+# ---- verify_reviewed_scenes -------------------------------------------
+
+def test_verify_reviewed_scenes_ok_when_unchanged(tmp_path: Path) -> None:
+    from engine.plan import verify_reviewed_scenes
+
+    ledger = _reviewed_ledger(tmp_path, _valid_plan_dict())
+    assert verify_reviewed_scenes(ledger, "alpha", "job", tmp_path) == []
+
+
+def test_verify_reviewed_scenes_flags_never_reviewed(tmp_path: Path) -> None:
+    from engine.ledger import Ledger
+    from engine.plan import verify_reviewed_scenes
+
+    _write_plan(tmp_path, "job", _valid_plan_dict())
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    assert verify_reviewed_scenes(ledger, "alpha", "job", tmp_path) == ["plan_never_reviewed"]
+
+
+def test_verify_reviewed_scenes_flags_plan_json_edited_since_review(tmp_path: Path) -> None:
+    from engine.plan import verify_reviewed_scenes
+
+    ledger = _reviewed_ledger(tmp_path, _valid_plan_dict())
+    _write_plan(tmp_path, "job", _valid_plan_dict(goal="owner-edited goal"))
+    assert verify_reviewed_scenes(ledger, "alpha", "job", tmp_path) == ["plan_changed_since_review"]
+
+
+def test_verify_reviewed_scenes_flags_scene_file_edited_since_review(tmp_path: Path) -> None:
+    """Editing the SCENE SCRIPT (never plan.json itself) after review
+    must also be caught -- plan_digest folds in every referenced
+    tests/scenes/ file's own bytes, not just plan.json's."""
+    from engine.plan import verify_reviewed_scenes
+
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+    ])
+    ledger = _reviewed_ledger(tmp_path, data)
+    (tmp_path / "tests" / "scenes" / "s1.py").write_text("print('tampered')\n", encoding="utf-8")
+
+    assert verify_reviewed_scenes(ledger, "alpha", "job", tmp_path) == ["plan_changed_since_review"]

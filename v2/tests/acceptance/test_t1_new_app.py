@@ -156,10 +156,10 @@ def _plan_json(job: str) -> str:
         "scenes": [
             {"id": "s1", "actor_does": "이름을 주고 인사를 받는다",
              "app_shows": "Hello, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s1_greet.py"], "covers": ["R1"]},
+             "cmd": ["python3", "tests/scenes/s1_greet.py"], "covers": ["R1"]},
             {"id": "s2", "actor_does": "이름을 주고 작별 인사를 받는다",
              "app_shows": "Goodbye, World", "where": "cli",
-             "cmd": [sys.executable, "tests/scenes/s2_farewell.py"], "covers": ["R2"]},
+             "cmd": ["python3", "tests/scenes/s2_farewell.py"], "covers": ["R2"]},
         ],
         "tasks": [
             {"id": "t1", "title": "greet 구현", "detail": "greet()과 그 시험을 만든다",

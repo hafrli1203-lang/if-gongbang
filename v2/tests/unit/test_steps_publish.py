@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from engine.app_security import security_policy_hash
 from engine.approvals import grant
 from engine.evidence import fingerprint as _repo_fingerprint
 from engine.evidence import record, sha256_file
@@ -46,7 +47,9 @@ def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> str:
         workspace.ledger.append(Event(
             project=project, kind=kind, actor_kind="processor",
             actor_id="processor", attempt_id=attempt_id,
-            payload={"passed": True, "fingerprint": fp},
+            payload={"passed": True, "fingerprint": fp,
+                     **({"policy_hash": security_policy_hash(workspace.config)}
+                        if kind == "app_security.recorded" else {})},
         ))
     return fp
 

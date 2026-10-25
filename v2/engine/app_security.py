@@ -88,11 +88,20 @@ is simply treated as {} (no audit_cmd configured, allow_audit_unavailable/
 allow_no_lockfile default to False).
 
 record() appends one app_security.recorded ledger event per check()
-call -- {passed, findings, ran, fingerprint} -- so a later release
-gate can read back what this check found and bind to the
-exact tree it found it on, without re-running the scan itself."""
+call -- {passed, findings, ran, fingerprint, policy_hash} -- so a
+later release gate can read back what this check found and bind to the
+exact tree it found it on, without re-running the scan itself.
+`policy_hash` (security_policy_hash()) is a hash of the EFFECTIVE
+"security" config at the moment check() ran -- audit_cmd/
+python_audit_cmd/allow_no_lockfile/allow_audit_unavailable all change
+which verdict a given repo state produces, so a certificate recorded
+under one policy must never silently keep certifying a release once
+that policy has since been tightened (or loosened) -- engine.release.
+job_certificate_status recomputes this same hash from the CURRENT
+config and refuses a stale certificate on a mismatch."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -141,6 +150,10 @@ class SecurityResult:
     # "no finding"; a later caller must never treat "" as "the tree
     # this result applies to is unambiguous."
     fingerprint: str = ""
+    # _hash_security_policy() of the SAME security_config snapshot
+    # check() read once and used for this very verdict -- see this
+    # module's own docstring and security_policy_hash's.
+    policy_hash: str = ""
 
 
 def _tracked_files(repo: Path) -> tuple[str, ...]:
@@ -177,6 +190,50 @@ def _security_config(config: EngineConfig) -> dict[str, Any]:
         return {}
     security = raw.get("security")
     return security if isinstance(security, dict) else {}
+
+
+def _hash_security_policy(security_config: dict[str, Any]) -> str:
+    """sha256 hex digest of `security_config`, normalized by
+    `json.dumps(..., sort_keys=True)` so key order never changes the
+    hash. Takes the dict directly (never re-reads config.config_path
+    itself) so a caller that already has its own snapshot -- check()
+    below is the one that matters -- hashes THAT EXACT snapshot rather
+    than whatever config.config_path happens to contain at the moment
+    of hashing. check() and security_policy_hash() both go through
+    this one function so there is only one normalization rule to keep
+    in sync."""
+    normalized = json.dumps(security_config, sort_keys=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def security_policy_hash(config: EngineConfig) -> str:
+    """sha256 hex digest of `_security_config(config)`, read fresh from
+    `config.config_path` right now. Every field in that dict can change
+    which verdict check() reaches for the SAME repo state (audit_cmd/
+    python_audit_cmd select what runs at all; allow_no_lockfile/
+    allow_audit_unavailable select whether an "unavailable"/
+    "no_lockfile" state is forgiven) -- this is the "effective security
+    policy" a recorded certificate is bound to, and what engine.release.
+    job_certificate_status calls (with no snapshot of its own to reuse)
+    to recompute the CURRENT policy's hash and detect a policy change
+    after the fact (e.g. tightening allow_no_lockfile from true to
+    false must make an already-recorded "passed" certificate stale,
+    even though the repo tree itself never changed). An absent
+    "security" key normalizes to the same hash as an explicit {} --
+    _security_config's own contract already treats them the same way.
+
+    check() itself does NOT call this function -- it reads
+    `_security_config(config)` exactly once into its own local
+    `security_config` (config.config_path could change between two
+    separate reads, e.g. a concurrent `gb2` command editing it, or
+    simply the clock ticking past a crash-recovery rewrite -- an
+    earlier version of check() called this function at the very end,
+    which re-read the file a SECOND time and could hash a policy that
+    never actually produced the verdict just computed) and passes that
+    same dict to _hash_security_policy() directly, so the recorded
+    policy_hash always matches the exact snapshot the verdict was
+    computed from."""
+    return _hash_security_policy(_security_config(config))
 
 
 _AUDIT_STATES = ("passed", "vulnerabilities", "unavailable", "no_lockfile")
@@ -375,26 +432,29 @@ def check(config: EngineConfig, project: str, attempt_id: str,
                 passed = False
 
     return SecurityResult(passed=passed, findings=tuple(findings), ran=tuple(ran),
-                          fingerprint=fingerprint)
+                          fingerprint=fingerprint,
+                          policy_hash=_hash_security_policy(security_config))
 
 
 def record(ledger: Ledger, project: str, attempt_id: str,
           result: SecurityResult) -> int:
     """Append one app_security.recorded event ({passed, findings, ran,
-    fingerprint}) and return its seq -- the caller runs check() first
-    and passes its result straight through; this function does not
-    re-run anything. Secret-free by construction: `result.findings`
-    entries already never carry a matched secret VALUE (see
-    _scan_secrets), only kind/path/line, so nothing here needs to
-    redact anything further before it is written to the ledger."""
+    fingerprint, policy_hash}) and return its seq -- the caller runs
+    check() first and passes its result straight through; this
+    function does not re-run anything. Secret-free by construction:
+    `result.findings` entries already never carry a matched secret
+    VALUE (see _scan_secrets), only kind/path/line, so nothing here
+    needs to redact anything further before it is written to the
+    ledger."""
     return ledger.append(Event(
         project=project, kind="app_security.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
         payload={
             "passed": result.passed, "findings": list(result.findings),
             "ran": list(result.ran), "fingerprint": result.fingerprint,
+            "policy_hash": result.policy_hash,
         },
     ))
 
 
-__all__ = ["SecurityResult", "check", "record"]
+__all__ = ["SecurityResult", "check", "record", "security_policy_hash"]

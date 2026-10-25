@@ -28,6 +28,7 @@ import pytest
 
 from engine import fixup, full_orbit, orbit
 from engine import plan as plan_module
+from engine.app_security import security_policy_hash
 from engine.config import McpServerConfig, ReleaseConfig
 from engine.context import ContextConfig
 from engine.fakes.installer import FakeInstaller
@@ -240,6 +241,7 @@ def _install_fake_app_security(monkeypatch: pytest.MonkeyPatch, *,
         return _FakeSecurityResult(passed=passed)
 
     security_mod.check = check  # type: ignore[attr-defined]
+    security_mod.security_policy_hash = security_policy_hash  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine.app_security", security_mod)
     import engine as _engine_pkg
     monkeypatch.setattr(_engine_pkg, "app_security", security_mod, raising=False)
@@ -1261,7 +1263,8 @@ def _release_stopped_job(workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
     ws.ledger.append(Event(
         project="alpha", kind="app_security.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=outcome.attempt_id,
-        payload={"passed": True, "findings": [], "ran": ["secret_scan"], "fingerprint": fp},
+        payload={"passed": True, "findings": [], "ran": ["secret_scan"], "fingerprint": fp,
+                 "policy_hash": security_policy_hash(ws.config)},
     ))
     return config, ws, outcome, publish_requests[0].request_id
 
@@ -2822,3 +2825,333 @@ def test_pending_owner_requests_still_empty_with_no_cursor_or_progress(
     full_orbit.open_job(workspace.config, workspace.ledger, "alpha", job_name, "full", ("planner",))
 
     assert full_orbit.pending_owner_requests(workspace.ledger, "alpha", job_name) == ()
+
+
+# ---------------------------------------------------------------------------
+# External review P1: fixup.fix()'s own new attempt can itself end in an
+# ordinary "failed" (review/bench fails again) or crash before tools/gb2
+# ever hands its outcome back to resume_full_job_after_task_fix -- either
+# way the job's "task" cursor must already point at the FIX's own new
+# attempt (engine.full_orbit.transfer_task_cursor_to_fix_attempt, called
+# by fixup.fix() itself the moment it opens that attempt), never the old,
+# closed one.
+# ---------------------------------------------------------------------------
+
+def test_fix_attempt_that_also_fails_is_resumed_by_continue_not_the_old_attempt(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) task fails -> gb2 fix's own repair ALSO fails (review rejects
+    it again) -> a later `gb2 continue` must resume the FIX's own
+    attempt (not get refused trying to reopen the already-active fix
+    attempt, nor silently stay stuck on the old closed one)."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "fix-also-fails-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # original attempt (fails review)
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # gb2 fix's own retry (fails again)
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # gb2 continue's own retry (passes)
+        ],
+    })
+    review_calls: list[str] = []
+
+    def _review_steps(ctx: StepContext) -> list[StepDef]:
+        task_text = str(ctx.request.payload.get("task", ""))
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls.append(task_text)
+            t1_reviews = sum(1 for t in review_calls if "첫 파일" in t)
+            if "첫 파일" in task_text and t1_reviews <= 2:
+                raise StepFailed("review_rejected")
+            fp = evidence.fingerprint(
+                ctx.config.projects[ctx.project].repo, ctx.config.projects[ctx.project].excludes,
+            )
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", _review_steps)
+        return proc
+
+    from engine import evidence
+
+    state = _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "failed"
+    old_attempt_id = first.attempt_id
+
+    def fakes_for(attempt_id: str):
+        return _fakes()
+
+    fix_result = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                           processor_factory=factory)
+    assert fix_result.outcome.status == "failed", fix_result.outcome
+    new_attempt_id = fix_result.new_attempt_id
+    assert new_attempt_id != old_attempt_id
+
+    # The cursor must already point at the fix's own attempt -- BEFORE
+    # tools/gb2 (resume_full_job_after_task_fix) ever runs.
+    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    assert cursor is not None
+    assert cursor["attempt_id"] == new_attempt_id
+
+    # tools/gb2's own cmd_fix calls this next regardless of outcome --
+    # a plain "failed" outcome passes straight through unchanged.
+    handed_back = full_orbit.resume_full_job_after_task_fix(
+        ws.config, ws.ledger, fakes_for, "alpha", fix_result.job_name, fix_result.outcome,
+        new_attempt_id, processor_factory=factory,
+    )
+    assert handed_back is not None and handed_back.status == "failed"
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert resumed.status == "done", resumed
+    assert resumed.attempt_id != old_attempt_id
+    assert sum(1 for t in review_calls if "첫 파일" in t) == 3
+    assert state.acceptance_calls == 1
+
+
+def test_fix_commits_and_closes_crash_before_handback_continue_skips_fixed_task(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) the fix's own repair commits and closes (outcome "done"),
+    then the process dies before tools/gb2 ever calls
+    resume_full_job_after_task_fix -- `gb2 continue` must proceed
+    straight to the remaining tasks, never rerun the task the fix
+    already finished."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "fix-done-crash-before-handback-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+        {"id": "t2", "title": "둘째 파일", "detail": "", "owns": ["src/greeter/extra2.py"],
+         "depends_on": ["t1"]},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # t1's first (to-be-fixed) attempt
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # t1's fix() retry
+            {"src/greeter/extra2.py": "VALUE_2 = 2\n"},
+        ],
+    })
+    review_calls: list[str] = []
+
+    def _review_steps(ctx: StepContext) -> list[StepDef]:
+        task_text = str(ctx.request.payload.get("task", ""))
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls.append(task_text)
+            t1_reviews = sum(1 for t in review_calls if "첫 파일" in t)
+            if "첫 파일" in task_text and t1_reviews == 1:
+                raise StepFailed("review_rejected")
+            fp = evidence.fingerprint(
+                ctx.config.projects[ctx.project].repo, ctx.config.projects[ctx.project].excludes,
+            )
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", _review_steps)
+        return proc
+
+    from engine import evidence
+
+    state = _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "두 파일을 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "failed"
+
+    def fakes_for(attempt_id: str):
+        return _fakes()
+
+    fix_result = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                           processor_factory=factory)
+    assert fix_result.outcome.status == "done", fix_result.outcome
+    new_attempt_id = fix_result.new_attempt_id
+
+    # The cursor already points at the fix's own (now closed, committed)
+    # attempt -- "crash" here: resume_full_job_after_task_fix is NEVER
+    # called at all.
+    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    assert cursor is not None and cursor["attempt_id"] == new_attempt_id
+    assert full_orbit._task_attempt_committed(ws.ledger, "alpha", new_attempt_id) is True
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert resumed.status == "done", resumed
+    # t1's review ran exactly twice (original + the fix's own retry) --
+    # continuing never reran it a third time.
+    assert sum(1 for t in review_calls if "첫 파일" in t) == 2
+    assert any("둘째 파일" in t for t in review_calls)
+    assert (ws.alpha / "src/greeter/extra2.py").read_text(encoding="utf-8") == "VALUE_2 = 2\n"
+    assert state.acceptance_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# codex-diff-review-s19.md P1: a crash between transfer_task_cursor_to_
+# fix_attempt and fixup's own archive restore must not resume straight
+# into a plain build-task resume (clean HEAD, OLD pre-fix task text) --
+# it must finish the fix's own restore/submit first.
+# ---------------------------------------------------------------------------
+
+def test_crash_between_cursor_transfer_and_archive_restore_finishes_the_fix(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "fix-crash-before-restore-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # the ORIGINAL (to-be-fixed) attempt
+            {"src/greeter/extra1.py": "VALUE_1 = 1\n"},  # the fix's own retry, after resume
+        ],
+    })
+    review_calls: list[str] = []
+
+    def _review_steps(ctx: StepContext) -> list[StepDef]:
+        task_text = str(ctx.request.payload.get("task", ""))
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls.append(task_text)
+            t1_reviews = sum(1 for t in review_calls if "첫 파일" in t or "Original request" in t)
+            if t1_reviews == 1:
+                raise StepFailed("review_rejected")
+            fp = evidence.fingerprint(
+                ctx.config.projects[ctx.project].repo, ctx.config.projects[ctx.project].excludes,
+            )
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", _review_steps)
+        return proc
+
+    from engine import evidence, fixup
+
+    state = _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "failed"
+    old_attempt_id = first.attempt_id
+
+    def fakes_for(attempt_id: str):
+        return _fakes()
+
+    # Simulate a crash right after fixup.fix() transfers the cursor but
+    # BEFORE it restores the archived work into the new attempt's own
+    # builder copy -- the exact gap this fix closes. Patched directly
+    # (not via monkeypatch.setattr) so it can be undone on its own,
+    # without reverting the acceptance/handoff/app_security fakes
+    # installed above too.
+    real_overlay = fixup._overlay_archive_into_builder_copy
+    fixup._overlay_archive_into_builder_copy = (
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated crash"))
+    )
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for, processor_factory=factory)
+    finally:
+        fixup._overlay_archive_into_builder_copy = real_overlay
+
+    # The cursor is already on the fix's own attempt (an active one,
+    # never the old closed one) -- but fix.restored was never recorded.
+    cursor = full_orbit._load_cursor(ws.ledger, "alpha", job_name)
+    assert cursor is not None
+    new_attempt_id = cursor["attempt_id"]
+    assert new_attempt_id != old_attempt_id
+    assert cursor.get("fixing_attempt") is True
+    assert cursor.get("fix_old_attempt_id") == old_attempt_id
+    assert ws.ledger.attempt(new_attempt_id).status == "active"
+    restored_events = [e for _s, e in ws.ledger.events("alpha", "fix.restored")
+                       if e.attempt_id == old_attempt_id]
+    assert restored_events == []
+
+    resumed = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert resumed.status == "done", resumed
+    # The SECOND review call (the one that actually passed) got the
+    # FIX's own composed task text, not the plain pre-fix builder text.
+    assert any("Original request" in t for t in review_calls)
+    assert sum(1 for t in review_calls if "첫 파일" in t or "Original request" in t) == 2
+    assert (ws.alpha / "src/greeter/extra1.py").read_text(encoding="utf-8") == "VALUE_1 = 1\n"
+    restored_after = [e for _s, e in ws.ledger.events("alpha", "fix.restored")
+                      if e.attempt_id == old_attempt_id]
+    assert len(restored_after) == 1
+    assert state.acceptance_calls == 1

@@ -20,10 +20,20 @@ validate_plan/_scene_script_arg). This is why `["true",
 appears in `cmd`: `true` ignores its arguments and exits 0 without
 ever executing that script, which would let a scene claim a
 requirement is demonstrated when nothing was ever run against it.
-Supported runners (matched on cmd[0]'s basename, so a full
-interpreter path like sys.executable still counts as "python3"):
-"python3", "python", "node", "bash", "sh", and "npx vitest run" (the
-three-token prefix, for a Node test file used as a scene).
+Supported runners: "python3", "python", "node", "bash", "sh", and
+"npx vitest run" (the three-token prefix, for a Node test file used
+as a scene). cmd[0] must be a BARE runner name -- never a path (no
+"/" or "\\") -- so `["./src/node", "tests/scenes/x.js"]` is also
+rejected: a path-qualified cmd[0] resolves relative to the process's
+cwd regardless of PATH, which would let a job's own repo content
+silently stand in for the trusted "node" engine.acceptance actually
+resolves (via shutil.which against the ENGINE's own environment, not
+anything the repo or the sandbox env could have set) when it
+executes a covers-claiming scene. The scene path itself must stay
+inside tests/scenes/ once normalized -- no ".." component, never
+absolute -- so `["python3", "tests/scenes/../../src/check.py"]` is
+rejected too, even though that string literally starts with
+"tests/scenes/".
 """
 from __future__ import annotations
 
@@ -430,36 +440,59 @@ def requirement_coverers(plan: Plan) -> dict[str, tuple[tuple[str, str], ...]]:
 
 # Scene cmd runners a `covers`-claiming scene is allowed to use (see
 # the module docstring for why this exists). Each entry is the fixed
-# prefix of tokens `cmd` must start with; cmd[0] is compared by its
-# basename (Path(cmd[0]).name) so a full interpreter path -- e.g.
-# sys.executable in a test fixture -- still matches "python3", while
-# every later prefix token ("vitest", "run") is compared literally,
-# since those are never path-qualified in a scene cmd.
+# prefix of tokens `cmd` must start with -- cmd[0] must match the
+# FIRST token LITERALLY (never by basename: a full/relative path like
+# sys.executable or "./src/node" is a different, untrusted thing, see
+# _scene_script_arg), and every later prefix token ("vitest", "run")
+# is also compared literally.
 _SUPPORTED_SCENE_RUNNERS: tuple[tuple[str, ...], ...] = (
     ("python3",), ("python",), ("node",), ("bash",), ("sh",),
     ("npx", "vitest", "run"),
 )
 
 
+def _is_safe_scene_path(token: str) -> bool:
+    """True iff `token` is a tests/scenes/ file path with no escape --
+    never absolute, never containing a ".." component (so
+    "tests/scenes/../../src/check.py" is rejected even though that
+    literal string starts with "tests/scenes/" -- normalizing it
+    collapses to "../src/check.py", no longer under tests/scenes/ at
+    all), and its own posixpath.normpath leaves it unchanged (no
+    redundant "./", doubled slashes, or trailing slash hiding a second
+    reading of the same path)."""
+    if not token or token.startswith("/") or token.startswith("\\"):
+        return False
+    if any(part in ("..", "") for part in token.split("/")[1:]):
+        # [1:] so "tests/scenes/x.py".split("/") -- whose first part
+        # is "tests", never "" or ".." -- is never flagged by its own
+        # first component; every part after the first still must be a
+        # real, non-empty, non-".." name.
+        return False
+    if posixpath.normpath(token) != token:
+        return False
+    return token.startswith("tests/scenes/") and token != "tests/scenes/"
+
+
 def _scene_script_arg(cmd: tuple[str, ...]) -> str | None:
     """The tests/scenes/ path `cmd` actually runs -- the token right
-    after a matched _SUPPORTED_SCENE_RUNNERS prefix, iff that token
-    starts with "tests/scenes/". None if `cmd` does not start with any
-    supported runner, or the runner's first real argument is something
-    else (a flag, a different path, or the scene path buried behind
-    other tokens) -- `cmd` mentioning "tests/scenes/..." ANYWHERE else
-    does not count (see module docstring: `["true",
-    "tests/scenes/x.py"]` must return None here, since `true` never
-    runs that script)."""
-    if not cmd:
+    after a matched _SUPPORTED_SCENE_RUNNERS prefix, iff that token is
+    a safe scene path (_is_safe_scene_path). None if `cmd` does not
+    start with any supported runner, cmd[0] is not a BARE runner name
+    (contains "/" or "\\" -- a path-qualified cmd[0] is never trusted
+    here at all, see module docstring), or the runner's first real
+    argument is something else (a flag, a different path, a path that
+    escapes tests/scenes/, or the scene path buried behind other
+    tokens) -- `cmd` mentioning "tests/scenes/..." ANYWHERE else does
+    not count (see module docstring: `["true", "tests/scenes/x.py"]`
+    must return None here, since `true` never runs that script)."""
+    if not cmd or "/" in cmd[0] or "\\" in cmd[0]:
         return None
-    runner0 = Path(cmd[0]).name
     for prefix in _SUPPORTED_SCENE_RUNNERS:
         n = len(prefix)
-        if len(cmd) <= n or runner0 != prefix[0] or tuple(cmd[1:n]) != prefix[1:]:
+        if len(cmd) <= n or cmd[0] != prefix[0] or tuple(cmd[1:n]) != prefix[1:]:
             continue
         arg = cmd[n]
-        if arg.startswith("tests/scenes/"):
+        if _is_safe_scene_path(arg):
             return arg
     return None
 
@@ -518,10 +551,46 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
                     problems.append(
                         f"task {task.id}: owns {entry!r} is outside build prefixes {list(build_prefixes)!r}"
                     )
+    tests_dir = repo / "tests"
+    scenes_dir = tests_dir / "scenes"
+    # A symlinked "tests" or "tests/scenes" directory would make
+    # .resolve() follow it BEFORE it becomes the containment boundary
+    # below -- e.g. "tests/scenes" -> "../src" resolves scenes_root to
+    # `repo`'s own src/ itself, so a token "tests/scenes/check.py"
+    # also resolving under repo/src/ would wrongly look "contained"
+    # (it literally IS src/check.py by then). The REAL, non-symlinked
+    # tests/scenes/ is the only boundary ever trusted: if either
+    # component is itself a symlink, every tests/scenes/ reference in
+    # this plan is rejected outright, never silently resolved through
+    # it.
+    scenes_boundary_is_symlink = tests_dir.is_symlink() or scenes_dir.is_symlink()
+    scenes_root = None if scenes_boundary_is_symlink else scenes_dir.resolve()
     for scene in plan.scenes:
         for token in scene.cmd:
-            if token.startswith("tests/scenes/") and not (repo / token).exists():
+            if not token.startswith("tests/scenes/"):
+                continue
+            if scenes_boundary_is_symlink:
+                problems.append(
+                    f"scene {scene.id}: tests/scenes/ itself is a symlink: {token}"
+                )
+                continue
+            candidate = repo / token
+            if not candidate.exists():
                 problems.append(f"scene {scene.id}: script not found: {token}")
+                continue
+            # The string already starts with "tests/scenes/" -- but a
+            # TRACKED SYMLINK at that literal path can still point
+            # anywhere once resolved (git faithfully recreates a
+            # committed symlink in any checkout/snapshot). A scene
+            # script must stay inside tests/scenes/ once symlinks are
+            # followed too, not just by its own unresolved spelling.
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                problems.append(f"scene {scene.id}: script not found: {token}")
+                continue
+            if resolved != scenes_root and scenes_root not in resolved.parents:
+                problems.append(f"scene {scene.id}: script escapes tests/scenes/: {token}")
         if scene.covers and _scene_script_arg(scene.cmd) is None:
             # A scene claiming it demonstrates a requirement must
             # actually RUN a planner-owned script under tests/scenes/
@@ -555,6 +624,49 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
                 "(a task-only `covers` is kept for tracking but is never enough)"
             )
     return problems
+
+
+def _latest_plan_reviewed(ledger: Ledger, project: str,
+                          job_name: str) -> dict[str, object] | None:
+    """The payload of the latest "plan.reviewed" ledger event recorded
+    for this (project, job_name), or None if there is none -- the one
+    place both check_resumed_plan and verify_reviewed_scenes read this
+    back from, so the two can never disagree about which event is
+    "the latest" one."""
+    payload: dict[str, object] | None = None
+    for _seq, event in ledger.events(project, "plan.reviewed"):
+        if event.payload.get("job") == job_name:
+            payload = event.payload
+    return payload
+
+
+def verify_reviewed_scenes(ledger: Ledger, project: str, job_name: str,
+                           repo: Path) -> list[str]:
+    """[] iff plan.json's CURRENT plan_digest (plan.json's own bytes
+    plus every tests/scenes/ file any scene's cmd references) still
+    matches the latest plan.reviewed event's digest for this (project,
+    job_name) -- the narrow, cheap check engine.acceptance.
+    run_acceptance runs immediately before executing any covers-
+    claiming scene, so a scene script (or plan.json itself) edited
+    after review -- even within the SAME attempt, with no owner-stop/
+    resume involved at all -- can never be certified as if a reviewer
+    had actually seen it. This is the single-purpose digest half of
+    check_resumed_plan, factored out on its own: run_acceptance has no
+    reason to also re-run the full validate_plan sweep (build
+    prefixes, requirement coverage, dependency cycles -- all already
+    enforced once at plan review and again at every resume point) on
+    every single acceptance call.
+
+    "plan_never_reviewed" if no plan.reviewed event exists at all;
+    "plan_changed_since_review" if the digest no longer matches. Never
+    raises -- plan_digest's own tolerant shape always yields SOME
+    digest to compare, even for a plan.json that cannot be read."""
+    reviewed = _latest_plan_reviewed(ledger, project, job_name)
+    if reviewed is None:
+        return ["plan_never_reviewed"]
+    if reviewed.get("digest") != plan_digest(plan_path(repo, job_name)):
+        return ["plan_changed_since_review"]
+    return []
 
 
 def check_resumed_plan(ledger: Ledger, project: str, job_name: str, repo: Path) -> list[str]:
@@ -604,22 +716,16 @@ def check_resumed_plan(ledger: Ledger, project: str, job_name: str, repo: Path) 
 
     problems = validate_plan(plan, repo, None)
 
-    reviewed_digest: str | None = None
-    reviewed_requirement_ids: tuple[str, ...] = ()
-    reviewed_task_ids: tuple[str, ...] = ()
-    for _seq, event in ledger.events(project, "plan.reviewed"):
-        if event.payload.get("job") == job_name:
-            reviewed_digest = event.payload.get("digest")
-            reviewed_requirement_ids = tuple(event.payload.get("requirement_ids", ()))
-            reviewed_task_ids = tuple(event.payload.get("task_ids", ()))
-
-    if reviewed_digest is None:
+    reviewed = _latest_plan_reviewed(ledger, project, job_name)
+    if reviewed is None:
         problems.append("plan_never_reviewed")
         return problems
 
-    if reviewed_digest != plan_digest(plan_path(repo, job_name)):
+    if reviewed.get("digest") != plan_digest(plan_path(repo, job_name)):
         problems.append("plan_changed_since_review")
 
+    reviewed_requirement_ids = tuple(reviewed.get("requirement_ids", ()))
+    reviewed_task_ids = tuple(reviewed.get("task_ids", ()))
     current_requirement_ids = {r.id for r in plan.requirements}
     current_task_ids = {t.id for t in plan.tasks}
     for rid in reviewed_requirement_ids:
@@ -869,5 +975,5 @@ __all__ = [
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "validate_tools", "tools_for_station", "classify_skill_tools",
     "ordered_tasks", "requirement_coverers", "plan_digest", "scene_file_digests",
-    "record_plan_reviewed", "check_resumed_plan",
+    "record_plan_reviewed", "check_resumed_plan", "verify_reviewed_scenes",
 ]

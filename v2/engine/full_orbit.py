@@ -362,6 +362,58 @@ def _load_cursor(ledger: Ledger, project: str, job_name: str) -> dict[str, objec
     return latest
 
 
+def transfer_task_cursor_to_fix_attempt(ledger: Ledger, project: str, job_name: str,
+                                        old_attempt_id: str, new_attempt_id: str,
+                                        fix_task_text: str) -> None:
+    """Called by engine.fixup.fix() the moment it opens (or recovers)
+    the replacement attempt for `old_attempt_id`'s own failed task --
+    moves this job's "task" cursor from the old (about to be closed or
+    already closed) attempt to the new one, BEFORE fix() runs any of
+    its own effects (restore/submit). A no-op unless the LATEST "task"
+    cursor for this job is, in fact, still for `old_attempt_id` --
+    calling this again later in the SAME fix cycle (a resumed call),
+    or for a job this cycle never touched the cursor of at all, must
+    never clobber something else.
+
+    Without this, the job's cursor stayed pointed at `old_attempt_id`
+    through fixup.fix()'s whole run: once the fix's own new attempt
+    reaches ANY terminal outcome -- "done", "needs_owner", or an
+    ordinary "failed" (review/bench fails again) -- a later `gb2
+    continue` either got refused outright (the fix's own new attempt
+    is still ACTIVE, so open_job() for yet another replacement is
+    refused) or, once that attempt closed, wrongly reran the already-
+    fixed task from scratch. Moving the cursor here, as early as
+    possible, closes both gaps at once: it covers the ordinary-
+    "failed" case tools/gb2's own resume_full_job_after_task_fix never
+    reacts to at all, and it covers a crash between this cycle's own
+    commit+close and tools/gb2 ever calling that function.
+
+    `fix_task_text` -- fixup.compose_fix_task's own composed text
+    (original task + review findings + bench tail + extra), stored as
+    BOTH this cursor's task_text and base_task_text (fixup has no
+    separate context-free variant the way a fresh task build does),
+    and `fix_old_attempt_id`/`fixing_attempt=True` recorded alongside
+    it -- the one durable record that this cursor's own attempt still
+    has an in-flight fix transition (archive restore, then submit)
+    behind it, read back by _resume_from_cursor's "task" branch (see
+    that function's own docstring) so a crash BETWEEN this transfer
+    and fixup's own archive restore never resumes straight into a
+    plain build on a clean HEAD with the OLD, pre-fix task text,
+    silently losing both the archived work and the fix instructions."""
+    cursor = _load_cursor(ledger, project, job_name)
+    if cursor is None or cursor.get("stage") != "task" or cursor.get("attempt_id") != old_attempt_id:
+        return
+    record_cursor(
+        ledger, project, job_name, stage="task", next_action="run_station",
+        attempt_id=new_attempt_id, task_id=cursor.get("task_id"),
+        task_text=fix_task_text, base_task_text=fix_task_text,
+        fixing=bool(cursor.get("fixing", False)),
+        remaining_task_ids=list(cursor.get("remaining_task_ids", [])),
+        max_fix_rounds=int(cursor.get("max_fix_rounds", 2)),
+        fixing_attempt=True, fix_old_attempt_id=old_attempt_id,
+    )
+
+
 def _record_early_station_stop(ledger: Ledger, project: str, attempt_id: str, job_name: str,
                                station: str, outcome: "orbit.JobOutcome", *, request: str,
                                max_fix_rounds: int, probe_text: str = "") -> None:
@@ -1794,6 +1846,63 @@ def _rerun_closed_task_from_scratch(config: EngineConfig, ledger: Ledger, fakes:
                               max_fix_rounds, on_progress, processor_factory, new_attempt_id)
 
 
+def _fix_cycle_unfinished(ledger: Ledger, project: str, old_attempt_id: str) -> bool:
+    """True iff engine.fixup's own "fix.started" journal for
+    `old_attempt_id` has no later "fix.finished" -- mirrors fixup.
+    _find_unfinished_fix_cycle's own check (duplicated rather than
+    imported: this module does not depend on fixup's internals, same
+    reasoning fixup.py's own module docstring gives for not reusing
+    another module's private helpers). "" (no fix_old_attempt_id ever
+    recorded) is always False."""
+    if not old_attempt_id:
+        return False
+    started_seq: int | None = None
+    for seq, event in ledger.events(project, "fix.started"):
+        if event.payload.get("old_attempt_id") == old_attempt_id:
+            started_seq = seq
+    if started_seq is None:
+        return False
+    for seq, _event in ledger.events(project, "fix.finished"):
+        if seq > started_seq:
+            return False
+    return True
+
+
+def _finish_pending_fix_and_resume(config: EngineConfig, ledger: Ledger, fakes: Fakes,
+                                   project: str, job_name: str,
+                                   on_progress: ProgressCallback | None,
+                                   processor_factory: orbit.ProcessorFactory | None,
+                                   ) -> FullOutcome:
+    """A "task" cursor engine.fixup.fix() itself transferred
+    (transfer_task_cursor_to_fix_attempt, fixing_attempt=True) whose
+    own fix transition never finished -- a crash between that transfer
+    and fixup's own archive restore/submit (see transfer_task_cursor_
+    to_fix_attempt's own docstring). Calls engine.fixup.fix() again:
+    its own _find_unfinished_fix_cycle detects and resumes exactly
+    this cycle idempotently (restore the archive if not yet done,
+    submit the composed fix task if not yet done) instead of falling
+    through to a plain build-task resume, which would dispatch the
+    OLD, pre-fix task text against a clean HEAD -- silently losing
+    both the archived work and the fix instructions. The resulting
+    FixResult is handed to resume_full_job_after_task_fix exactly the
+    way tools/gb2's own `fix` subcommand would."""
+    from engine import fixup  # sibling module; lazy import (no cycle)
+
+    def fakes_for(attempt_id: str) -> Fakes:
+        return _fakes_for(fakes, attempt_id)
+
+    fix_result = fixup.fix(config, ledger, project, "", fakes_for,
+                           on_progress=on_progress, processor_factory=processor_factory)
+    handed_back = resume_full_job_after_task_fix(
+        config, ledger, fakes, project, fix_result.job_name, fix_result.outcome,
+        fix_result.new_attempt_id, on_progress=on_progress, processor_factory=processor_factory,
+    )
+    if handed_back is not None:
+        return handed_back
+    return FullOutcome(fix_result.outcome.status, fix_result.outcome.reason,
+                       fix_result.new_attempt_id, None)
+
+
 def _abandon_orphaned_requests(ledger: Ledger, project: str, attempt_id: str) -> None:
     """Reconciles every non-terminal request left over for `attempt_id`
     before this stale attempt is discarded (see _reopen_for_retry's own
@@ -2131,6 +2240,17 @@ def _resume_from_cursor(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
             return _rerun_closed_task_from_scratch(config, ledger, fakes, project, job_name,
                                                    plan, cursor, max_fix_rounds, on_progress,
                                                    processor_factory)
+        if cursor.get("fixing_attempt") and _fix_cycle_unfinished(
+                ledger, project, str(cursor.get("fix_old_attempt_id", ""))):
+            # This attempt is still ACTIVE, but it is fixup.fix()'s own
+            # replacement attempt and its fix transition never
+            # finished (a crash between the cursor transfer and the
+            # archive restore/submit) -- finish THAT recovery first,
+            # never fall through to a plain build-task resume below
+            # (which would use the right task text but dispatch
+            # against a clean HEAD, still missing the archived work).
+            return _finish_pending_fix_and_resume(config, ledger, fakes, project, job_name,
+                                                  on_progress, processor_factory)
         synthetic_progress: dict[str, object] = {
             "current_task_id": cursor.get("task_id"),
             "current_task_text": cursor.get("task_text"),
@@ -2630,7 +2750,8 @@ def _resume_task_owner(config: EngineConfig, ledger: Ledger, fakes: Fakes, proje
 __all__ = [
     "FullOutcome", "FullOrbitError", "run_full_job", "continue_full_job",
     "record_release_decision", "finalize_release", "pending_owner_requests",
-    "record_cursor", "resume_full_job_after_task_fix", "pending_release_progress",
+    "record_cursor", "transfer_task_cursor_to_fix_attempt",
+    "resume_full_job_after_task_fix", "pending_release_progress",
     "config_without_release", "is_full_orbit_job",
     "FACTS_ROLE", "PROBER_ROLE", "PLANNER_ROLE", "DESIGNER_ROLE", "BUILDER_ROLE",
     "REVIEWER_ROLE",

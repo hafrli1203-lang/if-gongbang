@@ -127,18 +127,30 @@ def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = No
     ))
 
 
-def _seed_app_security(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None) -> None:
+def _seed_app_security(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None, *,
+                       policy_hash: str | None = None) -> None:
     """Record a passing app_security.recorded event for `attempt_id`,
     bound to `fp` (rws.repo's CURRENT fingerprint by default) -- the
     OTHER half of the job certificate engine.release.
     job_certificate_status requires, matching the real
     engine.app_security.record() payload shape
-    ({"passed","findings","ran","fingerprint"})."""
+    ({"passed","findings","ran","fingerprint","policy_hash"}).
+    `policy_hash` defaults to rws.config's OWN current
+    security_policy_hash -- engine.steps.publish now always passes its
+    real `config` into job_certificate_status (ctx.config, never
+    None), so every test that goes through the real publish/Processor
+    pipeline (approve_and_run, run_request, ...) needs a certificate
+    that actually matches rws.config's policy by default; a test
+    exercising a MISMATCH deliberately passes a different one."""
+    from engine import app_security
+
     rws.ledger.append(Event(
         project="gamma", kind="app_security.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
         payload={"passed": True, "findings": [], "ran": ["secret_scan"],
-                 "fingerprint": fp if fp is not None else _current_fp(rws)},
+                 "fingerprint": fp if fp is not None else _current_fp(rws),
+                 "policy_hash": (policy_hash if policy_hash is not None
+                                 else app_security.security_policy_hash(rws.config))},
     ))
 
 
@@ -1029,6 +1041,61 @@ def test_job_certificate_status_finds_evidence_on_an_earlier_attempt_of_the_same
         rws.ledger, "gamma", release_attempt_id, rws.repo, fp)
     assert ok is True
     assert reason == ""
+
+
+def _config_with_security(rws: ReleaseWorkspace, security: dict, config_path: Path) -> EngineConfig:
+    import json
+    config_path.write_text(json.dumps({"security": security}), encoding="utf-8")
+    return replace(rws.config, config_path=config_path)
+
+
+def test_job_certificate_status_ignores_policy_when_config_omitted(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Backward compatibility for the one caller (engine.steps.publish)
+    not yet updated to pass `config` -- omitting it (the default) must
+    keep behaving exactly as before this check existed, even though the
+    seeded app_security.recorded event carries no real policy_hash."""
+    attempt_id = _open(rws, "job-cert-no-config")
+    _seed_job_certificate(rws, attempt_id)
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws))
+    assert ok is True
+    assert reason == ""
+
+
+def test_job_certificate_status_refuses_a_stale_certificate_after_tightening_the_security_policy(
+    rws: ReleaseWorkspace, tmp_path: Path,
+) -> None:
+    """The regression this fix closes: app_security.check() passed
+    under allow_no_lockfile=true and recorded its own policy_hash for
+    that policy. The repo tree never changes at all, but the owner
+    then tightens the config to allow_no_lockfile=false -- a release
+    check bound only to the repo fingerprint would still see a
+    "passing" certificate and ship. Passing the CURRENT config must
+    instead recompute the policy hash fresh and refuse, since the
+    certificate speaks for a policy that no longer applies."""
+    from engine import app_security
+
+    attempt_id = _open(rws, "job-cert-policy")
+    loose_config = _config_with_security(rws, {"allow_no_lockfile": True},
+                                         tmp_path / "loose.json")
+    fp = _current_fp(rws)
+    _seed_acceptance(rws, attempt_id, fp)
+    _seed_app_security(rws, attempt_id, fp,
+                       policy_hash=app_security.security_policy_hash(loose_config))
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, fp, config=loose_config)
+    assert ok is True
+    assert reason == ""
+
+    strict_config = _config_with_security(rws, {"allow_no_lockfile": False},
+                                          tmp_path / "strict.json")
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, fp, config=strict_config)
+    assert ok is False
+    assert reason == "release_requires_job_certificate:security_policy_changed"
 
 
 def test_advance_master_refuses_without_job_certificate_even_with_full_bench(
