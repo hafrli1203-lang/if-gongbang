@@ -396,8 +396,88 @@ def test_net_true_allows_outbound_connection(tmp_path: Path) -> None:
 # the real HOME is where it is usually installed.
 # ---------------------------------------------------------------------------
 
+@_needs_bwrap
+def test_hiding_apps_and_workspace_roots_still_lets_a_cargo_style_runtime_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tools/gb2's own hidden-roots policy (the whole apps root and the
+    whole gb2 workspace root hidden, with only this job's own copy re-
+    exposed) exercised directly against engine.sandbox: a neighbor
+    app's secret and the workspace root's own secret must both stay
+    unreadable, while THIS job's own re-exposed copy is readable and a
+    runtime installed in a `~/.cargo/bin`-style flat directory (one
+    secret FILE placed directly alongside the real binary) still
+    starts, without that sibling secret becoming readable either --
+    see resolve_runtime's own narrow-mount docstring for why a flat
+    bin directory holding several unrelated tools is exactly the
+    layout its old "mount the whole parent directory" rule used to
+    over-expose."""
+    apps_root = tmp_path / "apps_root"
+    workspace_root = tmp_path / "workspace_root"
+    this_job_copy = apps_root / "app_a"
+    neighbor_app = apps_root / "app_b"
+    this_job_copy.mkdir(parents=True)
+    neighbor_app.mkdir(parents=True)
+    (this_job_copy / "own_file.txt").write_text("app_a content", encoding="utf-8")
+    (neighbor_app / "secret.txt").write_text("app_b secret", encoding="utf-8")
+    workspace_root.mkdir(parents=True)
+    (workspace_root / "secret.txt").write_text("workspace secret", encoding="utf-8")
+
+    cargo_bin = tmp_path / "cargo_bin"
+    cargo_bin.mkdir(parents=True)
+    real_tool = cargo_bin / "mytool"
+    real_tool.write_text(f"#!{sys.executable}\nprint('mytool-1.0')\n", encoding="utf-8")
+    real_tool.chmod(0o755)
+    (cargo_bin / "othersecrettool").write_text("neighbor tool secret", encoding="utf-8")
+
+    monkeypatch.setenv("PATH", f"{cargo_bin}:{os.environ.get('PATH', '')}")
+    sandbox._reset_available_cache()
+    try:
+        runtime = sandbox.resolve_runtime("mytool")
+        argv = sandbox.wrap(
+            ["mytool"], cwd=tmp_path,
+            hidden=(apps_root, workspace_root),
+            readonly=(this_job_copy,) + runtime.readonly,
+            symlinks=runtime.symlinks,
+            net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
+        )
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0
+        assert "mytool-1.0" in result.stdout
+
+        def _cannot_read(target: Path) -> None:
+            cat_argv = sandbox.wrap(
+                ["cat", str(target)], cwd=tmp_path,
+                hidden=(apps_root, workspace_root),
+                readonly=(this_job_copy,) + runtime.readonly,
+                symlinks=runtime.symlinks,
+                net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
+            )
+            cat_result = subprocess.run(cat_argv, capture_output=True, text=True, timeout=10)
+            assert cat_result.returncode != 0
+
+        _cannot_read(neighbor_app / "secret.txt")
+        _cannot_read(workspace_root / "secret.txt")
+        _cannot_read(cargo_bin / "othersecrettool")
+
+        can_read_argv = sandbox.wrap(
+            ["cat", str(this_job_copy / "own_file.txt")], cwd=tmp_path,
+            hidden=(apps_root, workspace_root),
+            readonly=(this_job_copy,) + runtime.readonly,
+            symlinks=runtime.symlinks,
+            net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
+        )
+        can_read_result = subprocess.run(can_read_argv, capture_output=True, text=True, timeout=10)
+        assert can_read_result.returncode == 0
+        assert "app_a content" in can_read_result.stdout
+    finally:
+        sandbox._reset_available_cache()
+
+
 def test_resolve_runtime_returns_empty_for_unknown_command() -> None:
-    assert sandbox.resolve_runtime("no_such_command_at_all_xyz") == ()
+    mounts = sandbox.resolve_runtime("no_such_command_at_all_xyz")
+    assert mounts.readonly == ()
+    assert mounts.symlinks == ()
 
 
 @_needs_bwrap
@@ -431,9 +511,10 @@ def test_resolve_runtime_lets_a_home_installed_launcher_start_under_a_hidden_hom
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
     sandbox._reset_available_cache()
     try:
-        readonly = sandbox.resolve_runtime("tool")
+        runtime = sandbox.resolve_runtime("tool")
         argv = sandbox.wrap(
-            ["tool"], cwd=tmp_path, hidden=(home,), readonly=readonly,
+            ["tool"], cwd=tmp_path, hidden=(home,), readonly=runtime.readonly,
+            symlinks=runtime.symlinks,
             net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
         )
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
@@ -442,7 +523,8 @@ def test_resolve_runtime_lets_a_home_installed_launcher_start_under_a_hidden_hom
 
         cat_argv = sandbox.wrap(
             ["cat", str(sentinel)], cwd=tmp_path, hidden=(home,),
-            readonly=readonly, net=False, mode="bwrap",
+            readonly=runtime.readonly, symlinks=runtime.symlinks,
+            net=False, mode="bwrap",
             child_env={"PATH": os.environ["PATH"]},
         )
         cat_result = subprocess.run(cat_argv, capture_output=True, text=True, timeout=10)
@@ -466,11 +548,11 @@ def test_resolve_runtime_claude_starts_under_a_hidden_real_home() -> None:
     if host.returncode != 0 or not host.stdout.strip():
         pytest.skip("claude on PATH is a placeholder (prints no version) on this host")
     home = Path(os.environ["HOME"])
-    readonly = sandbox.resolve_runtime("claude")
-    assert readonly, "claude resolved via PATH but resolve_runtime found no mounts"
+    runtime = sandbox.resolve_runtime("claude")
+    assert runtime.readonly, "claude resolved via PATH but resolve_runtime found no mounts"
     argv = sandbox.wrap(
         ["claude", "--version"], cwd=Path("/tmp"), hidden=(home,),
-        readonly=readonly, net=False, mode="bwrap",
+        readonly=runtime.readonly, symlinks=runtime.symlinks, net=False, mode="bwrap",
         child_env={"PATH": os.environ.get("PATH", "")},
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
@@ -489,11 +571,11 @@ def test_resolve_runtime_codex_starts_under_a_hidden_real_home() -> None:
     if host.returncode != 0 or not host.stdout.strip():
         pytest.skip("codex on PATH is a placeholder (prints no version) on this host")
     home = Path(os.environ["HOME"])
-    readonly = sandbox.resolve_runtime("codex")
-    assert readonly, "codex resolved via PATH but resolve_runtime found no mounts"
+    runtime = sandbox.resolve_runtime("codex")
+    assert runtime.readonly, "codex resolved via PATH but resolve_runtime found no mounts"
     argv = sandbox.wrap(
         ["codex", "--version"], cwd=Path("/tmp"), hidden=(home,),
-        readonly=readonly, net=False, mode="bwrap",
+        readonly=runtime.readonly, symlinks=runtime.symlinks, net=False, mode="bwrap",
         child_env={"PATH": os.environ.get("PATH", "")},
     )
     result = subprocess.run(argv, capture_output=True, text=True, timeout=20)

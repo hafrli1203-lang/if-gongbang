@@ -43,7 +43,7 @@ check_conflicts     first re-verifies the live copies still match
                     because check_conflicts itself crashed and is being
                     resumed, must not be judged on stale/mismatched data)
                     -> StepFailed("copy_changed_after_check") if not.
-                    Then two kinds of conflict, both -> request failed,
+                    Then three kinds of conflict, all -> request failed,
                     nothing written:
                       same relative path changed by two copies with
                       different content -> StepFailed("merge_conflict")
@@ -52,12 +52,21 @@ check_conflicts     first re-verifies the live copies still match
                       already differs from base_head's content for that
                       path -> StepFailed("merge_conflict_with_head")
                       (someone else's committed change landed there since
-                      this copy's base; stage 1 has no 3-way merge).
+                      this copy's base; stage 1 has no 3-way merge) --
+                      UNLESS this same attempt's own earlier merge
+                      already wrote something different there, in which
+                      case the destination must instead still match
+                      exactly what THAT write put there, or
+                      StepFailed("merge_conflict_with_owner_edit")
+                      (an owner hand-edited an already-merged path
+                      during an owner stop -- e.g. an install pause --
+                      while this same attempt stayed active; see
+                      _attempt_already_applied_hashes).
                     A path in the project's current dirty_paths (the
                     owner's own pre-existing uncommitted edit, present
-                    before any copy was even made) is exempt from the
-                    merge_conflict_with_head check -- it is handled by
-                    apply_allowed_paths simply never touching it.
+                    before any copy was even made) is exempt from both
+                    of the above -- it is handled by apply_allowed_paths
+                    simply never touching it.
 apply_allowed_paths re-verifies every copy's changes against
                     collect_copies' frozen plan (same path set, same
                     hashes) before writing anything -> StepFailed
@@ -380,52 +389,95 @@ def _frozen_plan(ctx: StepContext) -> dict[str, dict[str, str | None]]:
 
 # ---- shared: destination must still match base for every touched path ---
 
-def _attempt_already_applied_paths(ctx: StepContext) -> set[str]:
-    """Every relative path an EARLIER merge.recorded event on THIS SAME
-    attempt_id already applied -- a destination mismatch against
-    base_head for one of these paths is this attempt's OWN earlier,
-    intentional change (e.g. a builder task re-merged, on the same
-    attempt/copy, after an owner-approved install -- see engine.
-    full_orbit._rerun_build_task_stages), never "someone else's
-    committed change landed there since this copy's base"
-    (merge_conflict_with_head's own reason for existing). This is safe
-    specifically because only ONE attempt per project is ever active at
-    a time (engine.state's own transitions) and nothing but merge
-    itself writes under these prefixes while an attempt is active --
-    so any destination drift from base_head that this attempt's own
-    history already accounts for cannot have come from anywhere else."""
-    applied: set[str] = set()
+def _attempt_already_applied_hashes(ctx: StepContext) -> dict[str, str | None]:
+    """{rel: sha256 or None} for every relative path an EARLIER
+    merge.recorded event on THIS SAME attempt_id already wrote to the
+    repo, carrying the hash of the bytes THAT write actually put there
+    (None for a deletion) -- never just the bare path, which used to
+    be enough by itself to exempt the path from _verify_destinations_
+    unchanged entirely. The exemption's old reasoning ("only one
+    attempt is ever active, and nothing but merge itself writes under
+    these prefixes while it is") does not hold across an owner stop:
+    engine.full_orbit's own install/owner-approval pause leaves THIS
+    SAME attempt active while the repo sits there waiting, and an
+    owner is free to hand-edit a file merge already wrote during that
+    window before approving continuation (codex-goal-review-4.md item
+    6 / codex-diff-review-s17.md "Repeated merging can overwrite owner
+    edits", engine/steps/merge.py:423) -- a later re-merge on the same
+    attempt must still catch that, not silently overwrite it just
+    because the path's NAME was already applied once before. Later
+    events for the same rel overwrite earlier ones (the hash of the
+    MOST RECENT write this attempt made, matching what
+    _verify_destinations_unchanged actually needs to compare against
+    right now)."""
+    hashes: dict[str, str | None] = {}
     for _seq, event in ctx.ledger.events(ctx.project, "merge.recorded"):
-        if event.attempt_id == ctx.attempt_id:
-            applied.update(str(p) for p in event.payload.get("paths", ()))
-    return applied
+        if event.attempt_id != ctx.attempt_id:
+            continue
+        hashes.update(event.payload.get("hashes", {}))
+    return hashes
 
 
 def _verify_destinations_unchanged(ctx: StepContext, rels: set[str]) -> None:
-    """For every rel a copy touches (outside dirty_paths and outside
-    this SAME attempt's own already-applied paths -- see
-    _attempt_already_applied_paths), the destination file as it stands
-    in the repo right NOW must still equal base_head's content for
-    that path. If it does not, someone else's committed change landed
-    there since this copy's base -> StepFailed("merge_conflict_with_
-    head") (stage 1 has no 3-way merge). Called both at check time and
-    again immediately before apply writes anything, so a commit
-    landing on the destination during the gap between the two is still
-    caught (#10/#11 remainder)."""
+    """For every rel a copy touches (outside dirty_paths): if this same
+    attempt's own earlier merge already wrote something to this path
+    (_attempt_already_applied_hashes), the destination right NOW must
+    equal exactly what THAT write put there -- checked FIRST, and
+    checked regardless of what the destination's bytes happen to
+    equal right now, including base_head's own content. Only a rel
+    this attempt has NEVER applied before falls back to the plain
+    "does the destination still equal base_head" comparison.
+
+    The order matters (codex-diff-review-s18.md G6: "merge.py:453
+    accepts destination equal to base BEFORE checking the last applied
+    digest"): checking "current == base_content" first, and only
+    consulting the last-applied hash on a MISMATCH against base, means
+    an owner who reverts an already-merged path back to its base_head
+    content (undoing this attempt's own earlier write, on purpose)
+    makes current == base_content true again -- short-circuiting
+    straight past the already-applied check and right into "nothing
+    to see here", so apply_allowed_paths silently overwrites that
+    deliberate revert with whatever the copy has now. Checking the
+    last-applied hash FIRST, for every already-applied rel, catches
+    this: current no longer equals the hash THIS attempt actually
+    wrote there, so it still fails with merge_conflict_with_owner_edit
+    even though current happens to equal base_head's bytes too.
+
+    Either mismatch means something outside this merge touched the
+    destination since the relevant reference point: someone else's
+    committed change landed there since this copy's base
+    (StepFailed("merge_conflict_with_head"), stage 1 has no 3-way
+    merge), or the owner edited (or reverted) a path this attempt
+    already merged, during an owner stop while this same attempt
+    stayed active (StepFailed("merge_conflict_with_owner_edit") --
+    never safe to silently overwrite, whether or not the edit happens
+    to coincide with base_head's own bytes). A rel this attempt
+    applied before but with no recorded hash for it (an older-format
+    merge.recorded event, from before hashes were tracked) gets NO
+    exemption at all and falls back to the plain base_head comparison
+    -- unknown provenance must never be assumed safe. Called both at
+    check time and again immediately before apply writes anything, so
+    a commit (or an owner's edit/revert) landing on the destination
+    during the gap between the two is still caught (#10/#11
+    remainder)."""
     repo = _repo(ctx)
     base_head = _base_head(ctx)
     dirty = set(ctx.ledger.project(ctx.project).dirty_paths)
-    already_applied: set[str] | None = None
+    already_applied = _attempt_already_applied_hashes(ctx)
     for rel in rels:
         if rel in dirty:
             continue
-        base_content = _ref_bytes(repo, base_head, rel)
-        if _dest_bytes(repo, rel) != base_content:
-            if already_applied is None:
-                already_applied = _attempt_already_applied_paths(ctx)
-            if rel in already_applied:
+        current = _dest_bytes(repo, rel)
+        if rel in already_applied:
+            expected_hash = already_applied[rel]
+            current_hash = None if current is None else _hash_bytes(current)
+            if current_hash == expected_hash:
                 continue
-            raise StepFailed("merge_conflict_with_head")
+            raise StepFailed("merge_conflict_with_owner_edit")
+        base_content = _ref_bytes(repo, base_head, rel)
+        if current == base_content:
+            continue
+        raise StepFailed("merge_conflict_with_head")
 
 
 def _rels_in(changes_or_plan: dict[str, dict[str, object]]) -> set[str]:
@@ -541,10 +593,24 @@ def _reconcile_apply(ctx: StepContext) -> bool:
 def _record(ctx: StepContext) -> dict[str, object]:
     plan = _frozen_plan(ctx)
     applied = _applied_list_from_plan(ctx, plan)
+    # The hash of what apply_allowed_paths actually wrote for each
+    # applied rel (None for a deletion) -- the frozen plan already
+    # carries exactly that, per role; a rel applied by more than one
+    # role here always agrees across roles (_check_conflicts' own
+    # "seen" dict already enforced that before apply ever ran), so any
+    # one role's hash for it is the right one. See
+    # _attempt_already_applied_hashes for why later merges on this
+    # same attempt need this, not just the bare path list.
+    hashes: dict[str, str | None] = {}
+    for role_plan in plan.values():
+        for rel in applied:
+            if rel in role_plan:
+                hashes[rel] = role_plan[rel]
     ctx.ledger.append(Event(
         project=ctx.project, kind="merge.recorded", actor_kind="processor",
         actor_id="processor", attempt_id=ctx.attempt_id,
-        payload={"request_id": ctx.request.request_id, "paths": applied},
+        payload={"request_id": ctx.request.request_id, "paths": applied,
+                  "hashes": hashes},
     ))
     return {}
 

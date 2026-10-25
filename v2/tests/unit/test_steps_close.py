@@ -96,6 +96,47 @@ def test_archive_commit_reconcile_true_when_dir_and_event_exist(workspace: Works
     assert _reconcile_archive_commit(ctx) is True
 
 
+def test_set_closed_resume_after_crash_between_its_two_effects_does_not_duplicate(
+    workspace: Workspace,
+) -> None:
+    """_run_set_closed's own run() does two durable things in order:
+    append 'attempt.finished', then state.transition CLOSING -> CLOSED.
+    A crash between them (simulated here: append attempt.finished
+    directly, leaving the project in CLOSING, exactly where the real
+    step would be caught mid-way) used to make a resumed call to
+    run() (the processor's own resume rule re-runs 'started' steps
+    whose reconcile is False -- _reconcile_set_closed is "project.state
+    == CLOSED", still False here) re-append a SECOND attempt.finished
+    event for an attempt that was already finished, rather than
+    noticing it and going straight to the state transition it never
+    got to the first time."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "job-crash",
+                          "full", roles=("builder",))
+    rid = submit(workspace.ledger, "alpha", attempt_id, "close", {"mode": "close"}, "owner")
+    request = workspace.ledger.request(rid)
+    ctx = StepContext(config=workspace.config, ledger=workspace.ledger,
+                      fakes=Fakes(FakePublisher(), FakeInstaller()),
+                      request=request, project="alpha", attempt_id=attempt_id)
+    # Move the project to CLOSING the same way set_closing's own run()
+    # does, then simulate the crash: only the FIRST of set_closed's two
+    # effects landed.
+    state.transition(workspace.ledger, "alpha", "close_job", "owner")
+    from engine.ledger import Event
+
+    workspace.ledger.append(Event(
+        project="alpha", kind="attempt.finished", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"attempt_id": attempt_id, "status": "closed"},
+    ))
+    assert workspace.ledger.project("alpha").state == "CLOSING"
+    assert workspace.ledger.attempt(attempt_id).status == "closed"
+
+    close_module._run_set_closed(ctx)
+
+    assert workspace.ledger.project("alpha").state == "CLOSED"
+    assert len(workspace.ledger.events("alpha", "attempt.finished")) == 1
+
+
 def test_verify_tree_eq_head_failure_leaves_project_stuck_in_closing(
     workspace: Workspace, monkeypatch
 ) -> None:

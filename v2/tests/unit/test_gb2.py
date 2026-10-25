@@ -908,16 +908,92 @@ def test_cmd_fix_calls_fixup_fix_with_the_app_and_extra_text(
     assert calls == [("demo", "also check the edge case")]
 
 
-def test_cmd_init_hides_the_source_repo_from_every_sandbox(
+def test_cmd_fix_strips_release_when_the_attempt_belongs_to_a_full_orbit_job(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The source repo can hold real environment files; the generated
-    config must list it in hidden_paths so worker, reviewer and bench
-    sandboxes only ever see the worktree."""
+    """The attempt being repaired belongs to a multi-task full-orbit job
+    (a full_orbit.cursor was recorded for its job_name) -- cmd_fix must
+    pass fixup.fix a config with this project's own `release` stripped,
+    so repairing ONE task never stops needs_owner for a per-task
+    release approval (engine.orbit's own commit-stage special case).
+    `resume_full_job_after_task_fix`, called right after, still gets the
+    ORIGINAL config (release intact) -- only the single call to
+    fixup.fix itself is affected."""
+    from engine import fixup as fixup_module
+    from engine import full_orbit as full_orbit_module
+    from engine import orbit as orbit_module
+
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    (workspace / "home").mkdir()
+    (workspace / "secrets").mkdir()
+    source_repo = _make_source_repo(tmp_path / "source" / "demo")
+    repo_dir = _worktree_repo(source_repo, workspace / "repo")
+
+    config = EngineConfig(
+        ledger_path=workspace / "ledger.sqlite", home=workspace / "home",
+        secrets_dir=workspace / "secrets",
+        projects={"demo": ProjectConfig(
+            "demo", repo_dir, release=ReleaseConfig(master_repo=source_repo, target="demo"),
+        )},
+        station_owners={},
+    )
+    config = write_json(config, workspace / "config.json")
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    # The attempt about to be repaired, already belonging to a job
+    # full_orbit has recorded a "task" cursor for -- is_full_orbit_job
+    # must see this and strip release before fixup.fix ever runs.
+    orig_attempt_id = open_job(config, ledger, "demo", "orig-job", "full", ())
+    full_orbit_module.record_cursor(
+        ledger, "demo", "orig-job", stage="task", next_action="run_station",
+        attempt_id=orig_attempt_id, task_id="t1", task_text="x", base_task_text="x",
+        fixing=False, remaining_task_ids=["t1"], max_fix_rounds=2,
+    )
+    ledger.close()
+
+    seen_release: list[object] = []
+
+    def _fake_fix(cfg, ledger_, project, extra, fakes_for, **kwargs):
+        seen_release.append(cfg.projects[project].release)
+        outcome = orbit_module.JobOutcome(
+            attempt_id=orig_attempt_id, status="done", failed_request=None, reason=None,
+        )
+        return fixup_module.FixResult(
+            old_attempt_id=orig_attempt_id, new_attempt_id=orig_attempt_id,
+            job_name="orig-job", task="composed task text", outcome=outcome,
+        )
+
+    monkeypatch.setattr(gb2.fixup, "fix", _fake_fix)
+
+    gb2.main(["fix", "demo"])
+
+    assert seen_release == [None]
+    # The ORIGINAL config (release intact) is what everything else in
+    # cmd_fix (resume_full_job_after_task_fix, _build_fakes) still uses.
+    assert config.projects["demo"].release is not None
+
+
+def test_cmd_init_hides_the_whole_apps_and_workspace_roots_from_every_sandbox(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The source repo can hold real environment files, and every OTHER
+    app's own source repo/engine workspace sits right alongside this
+    one's -- the generated config must hide the WHOLE apps root and the
+    WHOLE gb2 workspace root (not just this one app's own source repo)
+    so worker, reviewer and bench sandboxes for THIS app can never read
+    a sibling app's source or workspace either, only this job's own
+    re-exposed worktree/copy (see engine.sandbox.wrap's own ancestor-
+    hidden/descendant-re-exposed mount ordering)."""
     apps_root = tmp_path / "source"
     source_repo = _make_source_repo(apps_root / "demo")
     (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    workspace_root = tmp_path / "ws"
+    monkeypatch.setattr(gb2, "APPS_DIR", workspace_root / "apps")
     monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
     monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
     args = gb2._build_parser().parse_args(["init", "demo"])
@@ -926,8 +1002,10 @@ def test_cmd_init_hides_the_source_repo_from_every_sandbox(
 
     assert code == 0
     import json as _json
-    written = _json.loads((tmp_path / "ws" / "apps" / "demo" / "config.json").read_text(encoding="utf-8"))
-    assert written["projects"]["demo"]["hidden_paths"] == [str(source_repo.resolve())]
+    written = _json.loads((workspace_root / "apps" / "demo" / "config.json").read_text(encoding="utf-8"))
+    assert written["projects"]["demo"]["hidden_paths"] == [
+        str(apps_root.resolve()), str(workspace_root.resolve()),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1492,7 +1570,13 @@ def test_resolve_handles_a_publish_left_running_by_a_ctrl_c_interrupt(
 
     code = gb2.main(["resolve", "demo"])
 
-    assert code == 0
+    # Same shape `gb2 ship` already has for a genuine terminal publish
+    # failure (engine.full_orbit.finalize_release's own "failed" ->
+    # "release_rejected" decision) -- report/close still runs (the
+    # project ends CLOSED below), but the overall exit code reflects
+    # the release itself having failed, not the attempt's own
+    # bookkeeping.
+    assert code == 3
     assert check_log.exists()  # the check command DID run (just to inform the owner)
     ledger = Ledger.open(config.ledger_path)
     assert ledger.request(job["request_id"]).status == "failed"
@@ -1595,10 +1679,13 @@ def test_resolve_not_deployed_records_failed_and_closes_without_redeploy(
 
     code = gb2.main(["resolve", "demo"])
 
-    # the job's own report -> close followup still completes ("done")
-    # even though the publish request itself ends up "failed" below --
-    # same two-outcomes-at-once shape cmd_ship/cmd_skip_ship already have.
-    assert code == 0
+    # Routed through engine.full_orbit.finalize_release now (same
+    # finalizer `gb2 ship`/`gb2 skip-ship` use) -- report/close still
+    # runs (the project ends CLOSED below), but the exit code reflects
+    # the release itself having failed ("release_rejected"), matching
+    # `gb2 ship`'s own exit code for a genuine terminal publish
+    # failure.
+    assert code == 3
     assert check_log.exists()  # the check command DID run (just to inform the owner)
     ledger = Ledger.open(config.ledger_path)
     assert ledger.request(job["request_id"]).status == "failed"
@@ -1720,17 +1807,29 @@ _EARLY_DESIGN_INSTALL_REQUEST = {
     "change": {"dependencies": {"left-pad": "^1.0.0"}},
 }
 
+_EARLY_DESIGN_SCENE_SCRIPT_PATH = "tests/scenes/req_check.sh"
+
 _EARLY_DESIGN_PLAN_JSON = json.dumps({
-    "goal": "화면 하나", "ui": True, "scenes": [],
+    "goal": "화면 하나", "ui": True,
+    "scenes": [
+        {"id": "s1", "actor_does": "요구사항을 확인한다", "app_shows": "통과한다",
+         "where": "cli", "cmd": ["bash", _EARLY_DESIGN_SCENE_SCRIPT_PATH], "covers": ["R1"]},
+    ],
     "tasks": [{"id": "t1", "title": "첫 파일", "detail": "",
               "owns": ["src/extra1.py"], "depends_on": []}],
     "acceptance": ["요구사항대로 동작한다"],
+    "requirements": [{"id": "R1", "text": "요구사항대로 동작한다", "kind": "function"}],
 })
 
 _EARLY_DESIGN_STATION_OWNERS = {
     "facts": {"facts": (".gongbang/",)},
     "probe": {"prober": (".gongbang/",)},
-    "plan": {"planner": (".gongbang/",)},
+    # "tests/scenes/" too -- validate_plan (since the s17-evidence
+    # merge) requires every plan.json requirement to be covered by a
+    # real tests/scenes/ script; the planner role must be able to
+    # write it alongside plan.json, same as the real FULL_STATION_
+    # OWNERS["plan"]["planner"] does.
+    "plan": {"planner": (".gongbang/", "tests/scenes/")},
     "design": {"designer": (".gongbang/",)},
     "build": {"builder": ("src/",)},
     "review": {"reviewer": ("review.md",)},
@@ -1790,8 +1889,10 @@ def _setup_early_design_install_job(
     job_name = "early-design-job"
 
     queues = {
-        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n"}],
-        "plan": [{f".gongbang/{job_name}/plan.json": _EARLY_DESIGN_PLAN_JSON}],
+        "facts": [{f".gongbang/{job_name}/facts.md":
+                   "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [{f".gongbang/{job_name}/plan.json": _EARLY_DESIGN_PLAN_JSON,
+                 _EARLY_DESIGN_SCENE_SCRIPT_PATH: "exit 0\n"}],
     }
 
     def steps(ctx: StepContext) -> list[StepDef]:

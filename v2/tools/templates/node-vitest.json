@@ -96,7 +96,12 @@
       "builder": [
         "src/",
         "tests/",
-        "docs/ai/"
+        "docs/ai/",
+        "public/",
+        "index.html",
+        "vite.config.js",
+        "vite.config.ts",
+        "vite.config.mjs"
       ]
     }
   },

@@ -661,8 +661,11 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     # unsandboxed PATH lookup finds it fine). See sandbox.resolve_runtime's
     # own docstring for exactly what gets mounted and why; () for a
     # command not found via PATH at all (nothing to add).
+    symlinks: tuple[tuple[Path, Path], ...] = ()
     if argv:
-        readonly += sandbox.resolve_runtime(argv[0])
+        runtime = sandbox.resolve_runtime(argv[0])
+        readonly += runtime.readonly
+        symlinks += runtime.symlinks
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = _hidden_roots(ctx, repo) + _ledger_hidden_root(ctx)
     if real_home is not None:
@@ -670,8 +673,8 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     try:
         return sandbox.wrap(
             argv, cwd=spec.workdir, writable=writable, hidden=hidden,
-            readonly=readonly, net=True, mode=ctx.config.sandbox,
-            child_env=env,
+            readonly=readonly, symlinks=symlinks, net=True,
+            mode=ctx.config.sandbox, child_env=env,
         )
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc

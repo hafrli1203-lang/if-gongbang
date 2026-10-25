@@ -47,6 +47,16 @@ def test_load_app_board_builds_job_rows_with_status_stage_cost(tmp_path):
         project=project, kind="job.handoff_written", actor_kind="processor",
         actor_id="processor", attempt_id="job-1.1", payload={"job": "add-login"},
     ))
+    # handoff_written alone is never 완료 (see
+    # test_handoff_written_alone_is_not_yet_완료 below) -- a real
+    # completion also needs the release decision engine.full_orbit
+    # always records right after security passes (here: a project
+    # with no release track configured, "not_configured").
+    ledger.append(Event(
+        project=project, kind="full_orbit.release_decision", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "decision": "not_configured"},
+    ))
     ledger.close()
 
     board = load_app_board("alpha", ledger_path, project)
@@ -58,6 +68,30 @@ def test_load_app_board_builds_job_rows_with_status_stage_cost(tmp_path):
     assert job.status == "완료"
     assert job.stage == "build"
     assert job.cost_usd == pytest.approx(1.25)
+
+
+def test_handoff_written_alone_is_not_yet_완료(tmp_path):
+    """A crash right after handoff.write_handoff appends
+    'job.handoff_written' but before engine.full_orbit._finish_after_
+    handoff gets to record ANYTHING else (the app-wide security check
+    crashed, or never even started) must never read as 완료 -- security
+    and the release decision both still have to happen, and neither one
+    has, per the ledger's own evidence. See board._derive_job_status's
+    own docstring."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.handoff_written", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1", payload={"job": "add-login"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status != "완료"
+    assert board.jobs[0].status == "진행 중"
 
 
 def test_a_per_attempt_report_written_alone_does_not_mark_the_job_완료(tmp_path):
@@ -429,3 +463,30 @@ def test_ship_approval_refusal_still_shows_waiting_not_failed(tmp_path):
     board = load_app_board("alpha", ledger_path, project)
 
     assert board.jobs[0].status == "사람 확인 대기: release_approval"
+
+
+def test_security_fix_stop_after_handoff_shows_waiting_not_완료(tmp_path):
+    """The exact real-flow case: handoff is written, THEN the app-wide
+    security check actually runs and fails, recording its own
+    "awaiting_security_fix" progress stop. That later event's seq must
+    win -- the job is correctly still waiting on the owner to fix a
+    security finding, not 완료."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="job.handoff_written", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1", payload={"job": "add-login"},
+    ))
+    ledger.append(Event(
+        project=project, kind="full_orbit.progress", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"job": "add-login", "attempt_id": "job-1.1",
+                 "stage": "awaiting_security_fix", "stop_reason": "security_failed"},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].status == "사람 확인 대기: security_failed"

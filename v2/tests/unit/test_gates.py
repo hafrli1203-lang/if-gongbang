@@ -141,9 +141,14 @@ def test_facts_table_source_column_counts_as_source(tmp_path) -> None:
 
 # ---- check_probe_targets / check_probe ---------------------------------
 
-def test_check_probe_targets_empty_without_section(tmp_path: Path) -> None:
+def test_check_probe_targets_raises_when_section_missing_entirely(tmp_path: Path) -> None:
+    """facts.md existing with no "## 외부 대상" heading at all is an
+    error, never treated the same as an explicit "(없음)" -- see
+    check_probe_targets' own docstring."""
     _write_facts(tmp_path, "job", "- 요청 사항 요약: 통과 (출처: request)\n")
-    assert check_probe_targets(tmp_path, "job") == []
+    with pytest.raises(ProbeTargetsError) as exc:
+        check_probe_targets(tmp_path, "job")
+    assert exc.value.reason == "probe_targets_section_missing"
 
 
 def test_check_probe_targets_empty_without_facts_file(tmp_path: Path) -> None:

@@ -8,13 +8,33 @@ import pytest
 
 from engine import ids, procs, state
 from engine.approvals import grant
-from engine.evidence import sha256_file
+from engine.evidence import fingerprint as _repo_fingerprint
+from engine.evidence import record, sha256_file
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.faults import CrashInjected, Faults
+from engine.ledger import Event
 from engine.processor import Fakes, Processor, retry_unknown, submit
 from engine.steps.open_job import open_job, recover_job
 from tests.conftest import Workspace
+
+
+def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
+    """Record a passing full-suite bench AND a passing acceptance +
+    app_security certificate, bound to the project repo's CURRENT
+    fingerprint -- engine.steps.publish's call_publisher now requires
+    both of these unconditionally before any real dispatch (not only
+    when `release` is configured), see that module's own docstring."""
+    project_cfg = workspace.config.projects[project]
+    fp = _repo_fingerprint(project_cfg.repo, project_cfg.excludes)
+    record(workspace.ledger, project, attempt_id, "bench", fp,
+           payload={"passed": True, "scope": "full"})
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        workspace.ledger.append(Event(
+            project=project, kind=kind, actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"passed": True, "fingerprint": fp},
+        ))
 
 
 def _proc(workspace: Workspace, publisher: FakePublisher | None = None) -> Processor:
@@ -173,6 +193,7 @@ def test_midflight_request_of_interrupted_attempt_reconciles(workspace: Workspac
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher(fail_after_effect=True)
     n1 = _proc(workspace, publisher).run_once("beta")

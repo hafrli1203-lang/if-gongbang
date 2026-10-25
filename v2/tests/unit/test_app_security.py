@@ -64,6 +64,38 @@ def test_token_prefix_and_password_literal_are_found(workspace: Workspace) -> No
     assert not any("hunter22" in f or "sk-abcdefghijklmnop" in f for f in result.findings)
 
 
+def test_password_literal_found_in_json_and_js_object_syntax(workspace: Workspace) -> None:
+    """A real-world leak almost never shows up as a bare `password = `
+    assignment -- it is far more often a JSON config file's object
+    member or a JS object-literal property, both of which use `:`
+    instead of `=` for the key/value separator. Both quoted-key (JSON)
+    and bare-key (JS) forms must be caught the same way an `=`
+    assignment already is."""
+    leaky = workspace.alpha / "config.json"
+    leaky.write_text(
+        '{\n'
+        '  "password": "jsonSecretValue123"\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    js_leaky = workspace.alpha / "src" / "config.js"
+    js_leaky.write_text(
+        "module.exports = {\n"
+        "  password: \"jsSecretValue123\",\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    git(workspace.alpha, "add", "-A")
+    git(workspace.alpha, "commit", "-q", "-m", "add json/js leaks")
+
+    result = app_security.check(workspace.config, "alpha", "J-alpha-TEST#3b", plan=None)
+    assert result.passed is False
+    assert any(f.startswith("secret:password_literal:config.json:2") for f in result.findings)
+    assert any(f.startswith("secret:password_literal:src/config.js:2") for f in result.findings)
+    assert not any("jsonSecretValue123" in f or "jsSecretValue123" in f
+                  for f in result.findings)
+
+
 def test_untracked_file_is_never_scanned(workspace: Workspace, tmp_path: Path) -> None:
     (workspace.alpha / "scratch.py").write_text('password = "untracked1"\n', encoding="utf-8")
     config = _config_with_security(workspace, {"allow_no_lockfile": True}, tmp_path)
@@ -236,6 +268,153 @@ def test_lockfile_but_no_audit_cmd_configured_fails_closed(
     result = app_security.check(workspace.config, "alpha", "J-alpha-TEST#10", plan=None)
     assert result.passed is False
     assert "audit_unavailable:no_audit_cmd_configured" in result.findings
+
+
+# ---- non-Node (Python) dependency audit --------------------------------
+
+def _write_requirements(repo: Path) -> None:
+    (repo / "requirements.txt").write_text("requests==2.31.0\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add requirements.txt")
+
+
+def test_python_manifest_with_missing_pip_audit_binary_fails_closed_by_default(
+    workspace: Workspace,
+) -> None:
+    """The real, unconfigured case: no "security".python_audit_cmd
+    override, and (in this sandbox, as in a freshly scaffolded app) no
+    pip-audit binary actually installed -- the default command
+    (engine.app_security._default_python_audit_cmd) is still "pip-audit
+    ...", which subprocess.run cannot even spawn, so this must be
+    "unavailable" and fail closed exactly like Node's missing audit_cmd
+    does, never silently "passed"."""
+    _write_requirements(workspace.alpha)
+    result = app_security.check(workspace.config, "alpha", "J-alpha-TEST#18", plan=None)
+    assert result.passed is False
+    assert "python_dependency_audit" in result.ran
+    assert any(f.startswith("audit_unavailable:") for f in result.findings)
+
+
+def test_python_manifest_missing_pip_audit_allowed_when_configured(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    _write_requirements(workspace.alpha)
+    config = _config_with_security(
+        workspace, {"allow_audit_unavailable": True, "allow_no_lockfile": True}, tmp_path,
+    )
+    result = app_security.check(config, "alpha", "J-alpha-TEST#19", plan=None)
+    assert result.passed is True
+    assert any(f.startswith("audit_unavailable:") for f in result.findings)
+
+
+def test_python_audit_command_override_passes_when_it_exits_zero(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """"security".python_audit_cmd overrides the default pip-audit
+    invocation -- same override mechanism as Node's audit_cmd, used
+    here (since no real pip-audit binary is installed in this sandbox)
+    to exercise the "passed" state without actually invoking pip-audit."""
+    _write_requirements(workspace.alpha)
+    config = _config_with_security(
+        workspace,
+        {"python_audit_cmd": [sys.executable, "-c", "pass"], "allow_no_lockfile": True},
+        tmp_path,
+    )
+    result = app_security.check(config, "alpha", "J-alpha-TEST#20", plan=None)
+    assert result.passed is True
+    assert result.ran == ("secret_scan", "dependency_audit", "python_dependency_audit")
+    assert result.findings == ("audit_skipped:no_lockfile",)
+
+
+def test_python_audit_command_override_fails_on_real_vulnerabilities(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    _write_requirements(workspace.alpha)
+    config = _config_with_security(
+        workspace,
+        {"python_audit_cmd": [sys.executable, "-c",
+                              f"import sys; print({_REAL_VULN_JSON!r}); sys.exit(1)"],
+         "allow_audit_unavailable": True},
+        tmp_path,
+    )
+    result = app_security.check(config, "alpha", "J-alpha-TEST#21", plan=None)
+    assert result.passed is False
+    assert any(f.startswith("dependency_audit_failed:") for f in result.findings)
+
+
+def test_pyproject_toml_alone_also_triggers_python_dependency_audit(
+    workspace: Workspace,
+) -> None:
+    """requirements.txt is not required -- a pyproject.toml-only Python
+    project (poetry/pdm/etc.) must get the same audit category, not be
+    silently skipped just because it has no requirements.txt."""
+    (workspace.alpha / "pyproject.toml").write_text(
+        "[project]\nname = \"alpha\"\n", encoding="utf-8",
+    )
+    git(workspace.alpha, "add", "-A")
+    git(workspace.alpha, "commit", "-q", "-m", "add pyproject.toml")
+
+    result = app_security.check(workspace.config, "alpha", "J-alpha-TEST#22", plan=None)
+    assert "python_dependency_audit" in result.ran
+    assert result.passed is False  # no resolvable manifest, no override, no allow flag
+    assert "audit_unavailable:no_resolvable_python_manifest" in result.findings
+
+
+def test_pyproject_toml_alone_never_audits_the_engines_own_environment(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """The exact regression this fix closes: a pyproject-only app with
+    no python_audit_cmd override must NEVER fall back to a bare,
+    unscoped `pip-audit` call -- that would audit whatever Python
+    environment the ENGINE itself happens to run in, not the app under
+    audit, and could certify a clean pass for a totally unaudited app.
+    A fake "pip-audit" stand-in that always exits 0 proves this: if the
+    bug were still present, the default command would be exactly
+    `["pip-audit", "--format", "json", "--progress-spinner", "off"]`
+    (no `-r`) and this fake would make the check "pass" -- it must
+    instead report "unavailable" and fail closed WITHOUT ever being
+    invoked, because python_audit_cmd is never configured here."""
+    (workspace.alpha / "pyproject.toml").write_text(
+        "[project]\nname = \"alpha\"\n", encoding="utf-8",
+    )
+    git(workspace.alpha, "add", "-A")
+    git(workspace.alpha, "commit", "-q", "-m", "add pyproject.toml")
+
+    config = _config_with_security(workspace, {}, tmp_path)
+    import subprocess as _subprocess
+    from unittest.mock import patch
+
+    original_run = _subprocess.run
+
+    def _spy_run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        assert argv[0] != "pip-audit" or "-r" in argv, (
+            f"bare/unscoped pip-audit call: {argv!r}"
+        )
+        return original_run(argv, *args, **kwargs)
+
+    with patch("engine.app_security.subprocess.run", side_effect=_spy_run):
+        result = app_security.check(config, "alpha", "J-alpha-TEST#22b", plan=None)
+    assert result.passed is False
+    assert "audit_unavailable:no_resolvable_python_manifest" in result.findings
+
+
+def test_node_and_python_audits_both_run_for_a_mixed_repo(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """A repo with both package.json and requirements.txt gets both
+    audit categories -- neither ecosystem's manifest silently suppresses
+    the other's."""
+    _write_lockfile(workspace.alpha)
+    _write_requirements(workspace.alpha)
+    config = _config_with_security(
+        workspace,
+        {"audit_cmd": [sys.executable, "-c", "pass"],
+         "python_audit_cmd": [sys.executable, "-c", "pass"]},
+        tmp_path,
+    )
+    result = app_security.check(config, "alpha", "J-alpha-TEST#23", plan=None)
+    assert result.passed is True
+    assert result.ran == ("secret_scan", "dependency_audit", "python_dependency_audit")
 
 
 # ---- plan security-requirement coverage --------------------------------

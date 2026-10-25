@@ -191,6 +191,56 @@ def test_build_station_with_no_configured_skills_gets_none() -> None:
     assert sc.missing == ()
 
 
+def test_required_skill_missing_is_flagged_unmet(tmp_path: Path) -> None:
+    """A skill name ContextConfig.required_skills actually lists for
+    this station, but that is missing on disk, must surface as
+    required_missing/unmet_required() -- not just the existing
+    "없음" annotation that work continues past."""
+    root = tmp_path / "skills"
+    (root / "있는-스킬").mkdir(parents=True)
+    (root / "있는-스킬" / "SKILL.md").write_text("본문", encoding="utf-8")
+    config = _StubConfig(ContextConfig(
+        skill_roots=(str(root),),
+        station_skills={"build": ("있는-스킬", "필수-없는-스킬")},
+        required_skills={"build": ("필수-없는-스킬",)},
+    ))
+    sc = build(config, "alpha", "build", "질문")
+    assert sc.missing == ("필수-없는-스킬",)
+    assert sc.required_missing == ("필수-없는-스킬",)
+    assert sc.unmet_required() is True
+
+
+def test_missing_skill_not_marked_required_stays_unmet_false() -> None:
+    """Default behavior (no station listed in required_skills at all,
+    or that station listed but this particular name not in it) is
+    unchanged: a missing skill is still just an annotation, never a
+    stop -- MASTER_RULES' "기본값은 필수 아님"."""
+    config = _StubConfig(ContextConfig(station_skills={"build": ("없는-스킬",)}))
+    sc = build(config, "alpha", "build", "질문")
+    assert sc.missing == ("없는-스킬",)
+    assert sc.required_missing == ()
+    assert sc.unmet_required() is False
+
+
+def test_required_library_failure_is_flagged_unmet() -> None:
+    config = _StubConfig(ContextConfig(
+        library_mcp=_library_mcp_config(crash=True).library_mcp,
+        require_library=("alpha",),
+    ))
+    sc = build(config, "alpha", "facts", "질문")
+    assert sc.failed is True
+    assert sc.required_library_failed is True
+    assert sc.unmet_required() is True
+
+
+def test_library_failure_on_a_project_not_requiring_it_stays_unmet_false() -> None:
+    config = _StubConfig(_library_mcp_config(crash=True))  # require_library=() default
+    sc = build(config, "alpha", "facts", "질문")
+    assert sc.failed is True
+    assert sc.required_library_failed is False
+    assert sc.unmet_required() is False
+
+
 def test_build_appends_failure_line_on_library_crash() -> None:
     config = _StubConfig(_library_mcp_config(crash=True))
     sc = build(config, "alpha", "facts", "질문")

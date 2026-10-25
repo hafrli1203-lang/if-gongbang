@@ -5,9 +5,11 @@ happen to be on disk at process time)."""
 from __future__ import annotations
 
 from engine.approvals import grant
-from engine.evidence import sha256_file
+from engine.evidence import fingerprint as _repo_fingerprint
+from engine.evidence import record, sha256_file
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
+from engine.ledger import Event
 from engine.processor import Fakes, Processor, submit
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
@@ -17,6 +19,24 @@ def _proc(workspace: Workspace, publisher: FakePublisher) -> Processor:
     proc = Processor(workspace.config, workspace.ledger, Fakes(publisher, FakeInstaller()))
     proc.register_defaults()
     return proc
+
+
+def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
+    """Record a passing full-suite bench AND a passing acceptance +
+    app_security certificate, bound to the project repo's CURRENT
+    fingerprint -- engine.steps.publish's call_publisher now requires
+    both of these unconditionally before any real dispatch (not only
+    when `release` is configured), see that module's own docstring."""
+    project_cfg = workspace.config.projects[project]
+    fp = _repo_fingerprint(project_cfg.repo, project_cfg.excludes)
+    record(workspace.ledger, project, attempt_id, "bench", fp,
+           payload={"passed": True, "scope": "full"})
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        workspace.ledger.append(Event(
+            project=project, kind=kind, actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"passed": True, "fingerprint": fp},
+        ))
 
 
 def test_same_publish_payload_twice_dedupes_and_calls_once(workspace: Workspace) -> None:
@@ -63,6 +83,7 @@ def test_successful_publish_run_again_makes_no_second_call(workspace: Workspace)
                "artifact_hash": artifact_hash}
     rid = submit(workspace.ledger, "beta", attempt_id, "publish", payload, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     proc = _proc(workspace, publisher)

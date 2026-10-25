@@ -586,9 +586,31 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
         config_dict["projects"][app]["release"] = {
             "master_repo": str(source_repo), "target": app,
         }
-    # The source repo holds the app's real environment files; code the
-    # workers or the tests run must never see it, only the worktree.
-    config_dict["projects"][app]["hidden_paths"] = [str(source_repo.resolve())]
+    # Hide the WHOLE apps root and the WHOLE gb2 workspace root -- not
+    # just this app's own source repo (the previous, narrower shape of
+    # this list). This app's own source repo can hold real environment
+    # files, which is reason enough to hide it, but hiding only that
+    # one path left every OTHER app's own source repo under the same
+    # apps root, and every OTHER app's own engine workspace (its home/
+    # secrets/ledger under APPS_DIR.parent) fully readable to any
+    # worker/reviewer/bench sandbox run for THIS app -- both roots are
+    # mirrored read-only by every sandbox's own "--ro-bind / /" base
+    # the same way any other absolute host path is, since neither was
+    # ever named in `hidden` before. engine.sandbox.wrap's own
+    # depth-sort then re-exposes exactly what THIS job still needs,
+    # the same way it already re-exposes `repo` (this project's own
+    # worktree, nested under the workspace root) today: a writable or
+    # readonly mount of a DESCENDANT path is always applied after an
+    # ancestor's hidden mount, never the other way round (see
+    # engine.sandbox.wrap's own module docstring) -- station.py/
+    # review.py/bench_run.py/acceptance.py/installers.py each already
+    # mount their own job-specific descendant paths (the worker's own
+    # copy, the acceptance snapshot, `repo` itself for an install) this
+    # way, so nothing else needs to change for a job to keep seeing
+    # its own copy/snapshot once this list widens.
+    config_dict["projects"][app]["hidden_paths"] = [
+        str(_apps_root().resolve()), str(APPS_DIR.parent.resolve()),
+    ]
     config_path = workspace / "config.json"
     config_path.write_text(json.dumps(config_dict, ensure_ascii=False, indent=1),
                            encoding="utf-8")
@@ -675,6 +697,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 # change here, not an accident of what happens to be on disk.
 _NEW_APP_SKELETON_FILES = (
     "README.md", ".gitignore", "package.json", "tests/scenes/.gitkeep",
+    "index.html", "vite.config.js", "src/main.js",
 )
 
 
@@ -950,6 +973,99 @@ def _read_requirement(args: argparse.Namespace) -> str | None:
     return args.task
 
 
+def _summarize_small_outcome(config: EngineConfig, ledger: Ledger, app: str,
+                             outcome: "object", wall_sec: float) -> dict[str, object]:
+    """Same shape as `_summarize_full_outcome`, for engine.small_orbit's
+    own SmallOutcome, plus "durations_ms" (that module's own per-
+    station wall-clock timing -- see its SmallOutcome docstring)."""
+    attempt_id = getattr(outcome, "attempt_id", None)
+    commit_hash = None
+    changed_files: list[str] = []
+    if attempt_id is not None:
+        project = config.projects[app]
+        try:
+            commit_hash = _git(["rev-parse", "HEAD"], cwd=project.repo)
+        except subprocess.CalledProcessError:
+            pass
+        try:
+            base_head = None
+            for _seq, event in ledger.events(app, "job.opened"):
+                if event.payload.get("attempt_id") == attempt_id:
+                    base_head = event.payload.get("base_head")
+                    break
+            if base_head and commit_hash and base_head != commit_hash:
+                out = _git(["diff", "--name-only", f"{base_head}..{commit_hash}"],
+                          cwd=project.repo)
+                changed_files = [line for line in out.splitlines() if line]
+        except subprocess.CalledProcessError:
+            pass
+    durations = {k: round(v, 1) for k, v in dict(getattr(outcome, "durations_ms", {})).items()}
+    return {
+        "app": app, "attempt_id": attempt_id, "status": getattr(outcome, "status"),
+        "reason": getattr(outcome, "reason", None), "commit": commit_hash,
+        "changed_files": changed_files, "minutes": round(wall_sec / 60.0, 2),
+        "report_path": getattr(outcome, "report_path", None), "durations_ms": durations,
+    }
+
+
+def _run_small_job_and_report(args: argparse.Namespace, config: EngineConfig,
+                              job_name: str, request: str) -> int:
+    """`gb2 change <app> "..." --small`: engine.small_orbit.run_small_job
+    against this app's workspace. If small mode refuses outright --
+    engine.small_orbit.NEEDS_PROBE_REASON (facts.md names a real
+    external dependency) or UI_PLAN_REASON (plan.json sets "ui": true,
+    which needs the full job's own designer/approval gate) -- falls
+    back to the ordinary full job (engine.full_orbit.run_full_job),
+    via engine.small_orbit.maybe_full_fallback -- the SAME helper a
+    later `gb2 continue` (engine.small_orbit.resume_small_plan) calls
+    for this exact pair of refusals, so a fallback discovered on a
+    resume runs under the identical fallback job_name
+    (engine.small_orbit.fallback_job_name) this initial call would
+    have used. The owner still gets a real job out of a single
+    `gb2 change --small` call, just not the fast path. Both refusals
+    already closed+committed the small attempt themselves
+    (engine.small_orbit._close_preserving_evidence) before returning,
+    so the project is CLOSED again here and this fallback's own
+    open_job call succeeds. The printed summary carries "durations_ms"
+    (engine.small_orbit's own per-station timing) either way; a
+    fallback also carries "small_fallback_reason"."""
+    from engine import small_orbit
+
+    try:
+        config, fakes_for = _fakes_builder(config, args.app)
+    except ValueError as exc:
+        return _err_json(str(exc), 1)
+
+    ledger = Ledger.open(config.ledger_path)
+    start = time.monotonic()
+    try:
+        outcome = small_orbit.run_small_job(
+            config, ledger, fakes_for, args.app, job_name, request,
+            on_progress=_progress_printer,
+        )
+        full_outcome = small_orbit.maybe_full_fallback(
+            config, ledger, fakes_for, args.app, job_name, request, outcome,
+            on_progress=_progress_printer,
+        )
+        if full_outcome is not None:
+            job_name = small_orbit.fallback_job_name(job_name)
+            wall_sec = time.monotonic() - start
+            summary = _summarize_full_outcome(config, ledger, args.app, full_outcome, wall_sec)
+            summary["durations_ms"] = {
+                k: round(v, 1) for k, v in dict(outcome.durations_ms).items()
+            }
+            summary["small_fallback_reason"] = outcome.reason
+        else:
+            wall_sec = time.monotonic() - start
+            summary = _summarize_small_outcome(config, ledger, args.app, outcome, wall_sec)
+    finally:
+        ledger.close()
+
+    _append_run_log(args.app, {"job_name": job_name, **summary})
+    print(json.dumps(summary, ensure_ascii=False))
+    return _exit_code_for_full_outcome(str(summary["status"]))
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     """`gb2 new <app> "요구사항"`: refuse if the app folder already
     exists as a real, unrelated/complete app, else scaffold it from
@@ -1023,6 +1139,8 @@ def cmd_change(args: argparse.Namespace) -> int:
     config = EngineConfig.from_json(config_path)
 
     job_name = args.job_name or f"gb2-change-{int(time.time())}"
+    if args.small:
+        return _run_small_job_and_report(args, config, job_name, request)
     return _run_full_job_and_report(args, config, job_name, request)
 
 
@@ -1327,7 +1445,19 @@ def cmd_fix(args: argparse.Namespace) -> int:
     stage list through to done/needs_owner/failed, same as `run`.
     Refuses (exit 1, nothing changed) if the app's current attempt
     never reached a failed review/bench request with merge already
-    done -- engine.fixup.FixupError's message says which."""
+    done -- engine.fixup.FixupError's message says which.
+
+    If the fixed attempt belongs to a full-orbit job (`gb2 new`/`gb2
+    change`, as opposed to a plain `gb2 run` single-task job), the one
+    task fixup.fix() repairs is never the whole job -- once it ends
+    "done", this hands the result to engine.full_orbit.
+    resume_full_job_after_task_fix, which continues with whatever
+    plan.tasks are still queued behind it, then acceptance, the
+    requirement-coverage check, the handoff report, the app-wide
+    security check, and (only once, for the WHOLE job, never for this
+    one task) its single release request. For a plain single-task job
+    (no full-orbit cursor recorded for it), resume_full_job_after_task_fix
+    returns None and this behaves exactly as before."""
     config_path = app_workspace(args.app) / "config.json"
     if not config_path.exists():
         print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
@@ -1346,14 +1476,49 @@ def cmd_fix(args: argparse.Namespace) -> int:
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
+        from engine import full_orbit
+
+        # If the attempt about to be repaired belongs to a multi-task
+        # full-orbit job (`gb2 new`/`gb2 change`, not a plain single-task
+        # `gb2 run`), strip this project's own `release` before calling
+        # fixup.fix: fix() drives the repaired task through orbit.
+        # continue_job the same way any other attempt does, and engine.
+        # orbit's own commit-stage release special case would otherwise
+        # stop THIS ONE TASK needs_owner for a per-task release approval
+        # right after its commit -- the full-orbit contract makes
+        # exactly ONE release request for the WHOLE job, at the very
+        # end (full_orbit._maybe_release_or_done), never one per
+        # repaired task. A plain single-task job has no such contract
+        # to protect -- stopping needs_owner for release approval right
+        # after ITS one and only commit is the entire point, so `config`
+        # (unchanged) is used for it.
+        fix_config = config
+        current_attempt_id = ledger.project(args.app).current_attempt_id
+        if current_attempt_id is not None:
+            try:
+                current_job_name = _job_name_for_attempt(ledger, args.app, current_attempt_id)
+            except Exception:
+                current_job_name = None
+            if current_job_name is not None and full_orbit.is_full_orbit_job(
+                    ledger, args.app, current_job_name):
+                fix_config = full_orbit.config_without_release(config, args.app)
+
         try:
-            result = fixup.fix(config, ledger, args.app, extra, fakes_for,
+            result = fixup.fix(fix_config, ledger, args.app, extra, fakes_for,
                                on_progress=_progress)
         except fixup.FixupError as exc:
             return _err_json(str(exc), 1)
+
+        full_outcome = full_orbit.resume_full_job_after_task_fix(
+            config, ledger, fakes_for, args.app, result.job_name, result.outcome,
+            result.new_attempt_id, on_progress=_progress,
+        )
         wall_sec = time.monotonic() - start
-        summary = _summarize(config, ledger, args.app, result.new_attempt_id,
-                             result.outcome, wall_sec)
+        if full_outcome is not None:
+            summary = _summarize_full_outcome(config, ledger, args.app, full_outcome, wall_sec)
+        else:
+            summary = _summarize(config, ledger, args.app, result.new_attempt_id,
+                                 result.outcome, wall_sec)
         summary["old_attempt_id"] = result.old_attempt_id
         summary["task"] = result.task
     finally:
@@ -2027,16 +2192,33 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         retry_unknown(ledger, request_id, "owner")
         resolved_status = _drain(config, ledger, args.app, attempt_id, request_id)
 
+        # report -> close -> record_release_decision, through the SAME
+        # finalizer `gb2 ship`/`gb2 skip-ship`/continue_full_job's own
+        # STAGE_RELEASE_APPROVAL resume all use (engine.full_orbit.
+        # finalize_release) -- never report/close run directly here --
+        # so this job's `full_orbit.release_decision` is always
+        # recorded (the board, which reads that event, otherwise never
+        # learns this request was ever resolved) and a repeated `gb2
+        # resolve` call changes nothing: by the time the request is no
+        # longer unknown/running, `_find_unknown_publish`/
+        # `_find_running_publish` both return None above, and this
+        # whole block is never reached again.
+        from engine import full_orbit
+
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
         fakes = _build_fakes(config, args.app, attempt_id, None)
-        followup = orbit.release_followup_stages(job_name)
-        final_outcome = orbit.continue_job(config, ledger, fakes, args.app, attempt_id, followup)
+        release_progress = full_orbit.pending_release_progress(ledger, args.app, job_name)
+        report_path = str(release_progress.get("report_path", "")) if release_progress else ""
+        final_outcome = full_orbit.finalize_release(
+            config, ledger, fakes, args.app, attempt_id, job_name, request_id, report_path,
+        )
     finally:
         ledger.close()
 
     print(json.dumps({
         "resolved_request_id": request_id, "resolved_status": resolved_status,
-        **_outcome_dict(final_outcome),
+        "app": args.app, "attempt_id": final_outcome.attempt_id, "status": final_outcome.status,
+        "reason": final_outcome.reason, "report_path": final_outcome.report_path,
     }, ensure_ascii=False))
     return 0 if final_outcome.status == "done" else 3
 
@@ -2127,6 +2309,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_change.add_argument("task", nargs="?", default=None)
     p_change.add_argument("--task-file", default=None)
     p_change.add_argument("--job-name", default=None)
+    p_change.add_argument("--small", action="store_true",
+                          help="fast path for a small change: one combined "
+                               "facts+plan call instead of three separate "
+                               "stations (engine.small_orbit). Falls back "
+                               "to the full job automatically if facts.md "
+                               "ends up naming a real external dependency.")
 
     p_approve_design = sub.add_parser("approve-design")
     p_approve_design.add_argument("app")

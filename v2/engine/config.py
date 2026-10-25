@@ -748,7 +748,7 @@ def _parse_optional_fields(raw: dict[str, object], base: Path) -> dict[str, obje
 
 _KNOWN_CONTEXT_KEYS = frozenset({
     "skill_roots", "station_skills", "library_mcp", "decisions_paths", "lessons_app",
-    "direction_path",
+    "direction_path", "required_skills", "require_library",
 })
 _KNOWN_LIBRARY_MCP_KEYS = frozenset({"command", "timeout_sec"})
 
@@ -792,6 +792,18 @@ def _parse_context(raw: object, base: Path) -> "ContextConfig":
         isinstance(v, str) for v in lessons_raw.values()
     ):
         raise ValueError("context.lessons_app must be an object of strings")
+    # Same shape/convention as station_skills -- station name -> names,
+    # except these names are the SUBSET of that station's own skills
+    # that must actually load (engine.context.ContextConfig's own
+    # docstring: default {} means nothing is required anywhere).
+    required_skills_raw = raw.get("required_skills", {})
+    if not isinstance(required_skills_raw, dict):
+        raise ValueError("context.required_skills must be an object")
+    required_skills = {
+        str(station): tuple(_str_list(names))
+        for station, names in required_skills_raw.items()
+    }
+    require_library = tuple(_str_list(raw.get("require_library")))
     library_mcp_raw = raw.get("library_mcp")
     return ContextConfig(
         skill_roots=tuple(_str_list(raw.get("skill_roots"))),
@@ -800,6 +812,8 @@ def _parse_context(raw: object, base: Path) -> "ContextConfig":
         decisions_paths={str(k): str(v) for k, v in decisions_raw.items()},
         lessons_app={str(k): str(v) for k, v in lessons_raw.items()},
         direction_path=(str(raw["direction_path"]) if raw.get("direction_path") else None),
+        required_skills=required_skills,
+        require_library=require_library,
     )
 
 
@@ -944,6 +958,8 @@ def _context_to_json(context: "ContextConfig | None") -> dict[str, object] | Non
         "decisions_paths": dict(context.decisions_paths),
         "lessons_app": dict(context.lessons_app),
         "direction_path": context.direction_path,
+        "required_skills": {s: list(names) for s, names in context.required_skills.items()},
+        "require_library": list(context.require_library),
     }
 
 

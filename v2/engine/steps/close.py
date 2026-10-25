@@ -359,13 +359,26 @@ def _run_verify_tree_eq_head(ctx: StepContext) -> dict[str, object]:
 
 
 def _run_set_closed(ctx: StepContext) -> dict[str, object]:
+    """Two durable effects, in order: `attempt.finished` (flips the
+    attempt out of 'active') then `state.transition` (flips the project
+    CLOSING -> CLOSED). A crash between them used to leave the project
+    stuck CLOSING forever: this step's own reconcile (_reconcile_set_
+    closed) is "project.state == CLOSED", so the processor's resume rule
+    (module docstring) calls run() again from scratch -- which, before
+    this guard, re-appended a SECOND attempt.finished event for an
+    attempt that was already finished. Checking the attempt's own
+    current status first makes a resumed call skip straight to the
+    state transition it never got to the first time, rather than
+    redoing (and duplicating) the first effect too."""
     status = "closed" if ctx.request.kind == "close" else "abandoned"
-    ctx.ledger.append(Event(
-        project=ctx.project, kind="attempt.finished", actor_kind="processor",
-        actor_id="processor", attempt_id=ctx.attempt_id,
-        payload={"attempt_id": ctx.attempt_id, "status": status},
-    ))
-    state.transition(ctx.ledger, ctx.project, "finalized", "processor")
+    if ctx.ledger.attempt(ctx.attempt_id).status == "active":
+        ctx.ledger.append(Event(
+            project=ctx.project, kind="attempt.finished", actor_kind="processor",
+            actor_id="processor", attempt_id=ctx.attempt_id,
+            payload={"attempt_id": ctx.attempt_id, "status": status},
+        ))
+    if ctx.ledger.project(ctx.project).state != "CLOSED":
+        state.transition(ctx.ledger, ctx.project, "finalized", "processor")
     return {"status": status}
 
 

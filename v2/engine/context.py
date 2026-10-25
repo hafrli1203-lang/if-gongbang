@@ -77,6 +77,27 @@ class ContextConfig:
                          library's `lessons_for` tool (no entry: no
                          lessons lookup for that project, even with
                          library_mcp configured).
+    required_skills  -- station name -> names (a subset of that
+                         station's own station_skills/plan.tools names)
+                         that MUST be loaded for this job to proceed.
+                         Default empty: nothing is required anywhere --
+                         a missing skill is, by default, still only the
+                         existing "## 이 칸의 스킬 (없음)" annotation in
+                         the prompt text, work continues. Only a name
+                         explicitly listed here turns "missing" into
+                         StationContext.required_missing, which a
+                         caller (engine.full_orbit) can check to stop
+                         the job needs_owner instead of silently
+                         proceeding without it (an earlier round's own
+                         finding: "Missing required skills/company
+                         material ... failures still become annotations
+                         without stopping the job" -- see ENGINE.md).
+    require_library  -- project names for which a library_mcp lookup
+                         failure (Context.failed) must likewise count
+                         as a required-material gap
+                         (StationContext.required_library_failed), not
+                         just the existing "곳간 조회 실패" annotation.
+                         Default empty tuple: no project requires it.
     """
 
     skill_roots: tuple[str, ...] = ()
@@ -87,6 +108,8 @@ class ContextConfig:
     # into the facts and plan stations of every job.
     direction_path: str | None = None
     lessons_app: dict[str, str] = field(default_factory=dict)
+    required_skills: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    require_library: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +150,24 @@ class StationContext:
     # which from the job's own plan.tools (the planner's pick).
     base: tuple[str, ...] = ()
     planned: tuple[str, ...] = ()
+    # The subset of `missing` that ContextConfig.required_skills[station]
+    # actually named -- a plain "no SKILL.md found" for a name nobody
+    # marked required never appears here, only the names an owner
+    # explicitly declared mandatory for this station. Non-empty means
+    # this job should stop needs_owner rather than proceed, per this
+    # module's own ContextConfig.required_skills docstring.
+    required_missing: tuple[str, ...] = ()
+    # True iff `failed` AND this call's `project` is one of
+    # ContextConfig.require_library -- a library lookup failure on a
+    # project that did not mark the library required stays a plain
+    # "곳간 조회 실패" annotation, not a stop.
+    required_library_failed: bool = False
+
+    def unmet_required(self) -> bool:
+        """True iff this station is missing something ContextConfig
+        actually marked required -- the one check a caller needs to
+        decide "stop needs_owner" vs. "proceed with an annotation"."""
+        return bool(self.required_missing) or self.required_library_failed
 
 
 class McpClientError(Exception):
@@ -446,7 +487,9 @@ def build(config: "EngineConfig", project: str, station: str, request: str,
     failure -- the "곳간 조회 실패" line). The caller (engine.full_orbit)
     appends `.text` to its own prompt and records `.injected`/`.skills`/
     `.missing`/`.failed` as the `context.injected`/`context.failed`
-    ledger events."""
+    ledger events, and may check `.unmet_required()`/`.required_missing`/
+    `.required_library_failed` (from ContextConfig.required_skills/
+    require_library) to stop needs_owner instead of proceeding."""
     ctx_cfg = getattr(config, "context", None)
     ctx = gather(config, project, station, request)
     roots = ctx_cfg.skill_roots if ctx_cfg is not None else ()
@@ -456,6 +499,12 @@ def build(config: "EngineConfig", project: str, station: str, request: str,
     planned = tuple(n for n in dict.fromkeys(planned_skills) if n not in base)
     names = base + planned
     skills_text, loaded, missing = _skills_section(roots, names)
+
+    required_names = set(ctx_cfg.required_skills.get(station, ())) if ctx_cfg is not None else set()
+    required_missing = tuple(n for n in missing if n in required_names)
+    required_library_failed = bool(
+        ctx.failed and ctx_cfg is not None and project in ctx_cfg.require_library
+    )
 
     parts = []
     items_text = render_items(ctx.items)
@@ -468,7 +517,8 @@ def build(config: "EngineConfig", project: str, station: str, request: str,
     text = "\n\n".join(parts)
 
     return StationContext(base=base, planned=planned, text=text, injected=ctx.items, skills=loaded,
-                          missing=missing, failed=ctx.failed)
+                          missing=missing, failed=ctx.failed, required_missing=required_missing,
+                          required_library_failed=required_library_failed)
 
 
 __all__ = [

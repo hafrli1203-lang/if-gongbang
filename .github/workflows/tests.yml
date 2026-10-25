@@ -111,4 +111,4 @@ jobs:
         run: |
           git config --global user.name ci
           git config --global user.email ci
-          python -m pytest -p no:cacheprovider -rs tests/acceptance/test_t3_gb2_node_e2e.py tests/acceptance/test_t4_gb2_new_clean.py
+          python -m pytest -p no:cacheprovider -rs tests/acceptance/test_t3_gb2_node_e2e.py tests/acceptance/test_t4_gb2_new_clean.py tests/acceptance/test_t5_small_change.py

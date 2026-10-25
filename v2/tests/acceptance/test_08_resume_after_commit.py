@@ -16,9 +16,28 @@ from engine.evidence import fingerprint, record, sha256_file
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.faults import CrashInjected, Faults
+from engine.ledger import Event
 from engine.processor import Fakes, Processor, retry_unknown, submit
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
+
+
+def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
+    """Record a passing full-suite bench AND a passing acceptance +
+    app_security certificate, bound to the project repo's CURRENT
+    fingerprint -- engine.steps.publish's call_publisher now requires
+    both of these unconditionally before any real dispatch (not only
+    when `release` is configured), see that module's own docstring."""
+    project_cfg = workspace.config.projects[project]
+    fp = fingerprint(project_cfg.repo, project_cfg.excludes)
+    record(workspace.ledger, project, attempt_id, "bench", fp,
+           payload={"passed": True, "scope": "full"})
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        workspace.ledger.append(Event(
+            project=project, kind=kind, actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"passed": True, "fingerprint": fp},
+        ))
 
 
 def _rev_count(repo) -> int:
@@ -69,6 +88,7 @@ def test_resume_after_record_publish_before_report(workspace: Workspace) -> None
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(workspace.config, workspace.ledger, Fakes(publisher, FakeInstaller()),
@@ -97,6 +117,7 @@ def test_publisher_crash_after_effect_then_lookup_confirms_done(workspace: Works
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher(fail_after_effect=True)
     proc = Processor(workspace.config, workspace.ledger, Fakes(publisher, FakeInstaller()))
@@ -126,6 +147,7 @@ def test_publisher_lookup_failure_keeps_request_unknown(workspace: Workspace) ->
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher(fail_after_effect=True, lookup_fails=True)
     proc = Processor(workspace.config, workspace.ledger, Fakes(publisher, FakeInstaller()))

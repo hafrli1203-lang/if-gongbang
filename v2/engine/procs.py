@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from engine.ledger import Event, Ledger
 
@@ -119,13 +120,227 @@ def exit_file_for(stdout_path: Path) -> Path:
     return stdout_path.parent.parent / "exit" / (stdout_path.name + ".exit")
 
 
+def _matching(ledger: Ledger, project: str, kind: str, attempt_id: str,
+              station: str, request_id: str | None) -> list[dict[str, object]]:
+    return [event.payload for _seq, event in ledger.events(project, kind)
+            if event.attempt_id == attempt_id
+            and event.payload.get("station") == station
+            and event.payload.get("request_id") == request_id]
+
+
+def _has_unresolved_intent(ledger: Ledger, project: str, attempt_id: str,
+                           station: str, request_id: str | None) -> bool:
+    """True iff some EARLIER spawn() call for this exact (attempt_id,
+    station, request_id) appended proc.launch_intent but crashed before
+    its own proc.started could follow -- see spawn()'s own docstring.
+    A request_id of None still matches correctly (both sides compare
+    equal via plain `==`), the same identity shape _reconcile_spawn_
+    worker-style callers already key proc.started lookups on
+    elsewhere (engine.steps.station/review)."""
+    intents = _matching(ledger, project, "proc.launch_intent", attempt_id,
+                        station, request_id)
+    if not intents:
+        return False
+    started = _matching(ledger, project, "proc.started", attempt_id,
+                        station, request_id)
+    return not started
+
+
+def _find_live_pid_by_stdout(stdout_path: Path) -> int | None:
+    """The smallest live pid whose own fd 1 (stdout) resolves to
+    `stdout_path` -- the identity spawn() can still check even though
+    the crashed call never got to record a real pid: Popen always
+    opens `stdout_path` itself and hands the child a dup'd fd 1 onto
+    it (see spawn()'s own Popen call), and that fd is inherited
+    unchanged across both fork (a plain Unix guarantee) and exec (no
+    close-on-exec is ever set on it), so it still points there no
+    matter how deep the process actually spawned is in the `sh`/bwrap
+    wrapping chain spawn() builds. The SMALLEST matching pid is picked
+    deliberately: when more than one process in the same chain shares
+    this fd (e.g. the unsandboxed mode="none" fork case spawn()'s own
+    docstring describes), the outermost one spawn() itself started
+    (the `sh` wrapper, or the raw command with no wrapping at all) was
+    always forked earliest and so always has the lowest pid among
+    them -- the same one a non-crashed spawn() call would have
+    recorded as `pid` in its own proc.started event. None if nothing
+    on this host currently has that fd open on that path (the crash
+    happened before Popen ever ran, or the process has since exited --
+    either way there is nothing to adopt; the caller spawns fresh)."""
+    target = os.path.realpath(stdout_path)
+    try:
+        candidates = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return None
+    matches: list[int] = []
+    for pid in candidates:
+        try:
+            fd1 = os.readlink(f"/proc/{pid}/fd/1")
+        except OSError:
+            continue
+        if fd1 == target:
+            matches.append(pid)
+    return min(matches) if matches else None
+
+
+# A pid value no spawn() call's own real Popen can ever produce (a
+# kernel pid is always a small positive number, well under this on
+# every Linux pid_max setting -- the default is 4194304, and even the
+# documented maximum with a 64-bit pid_max is 2**22). Recorded as the
+# pid/pgid of a RECOVERED, already-finished dispatch (see
+# _recover_completed_dispatch) so every existing pid-keyed reader
+# (engine.procs.is_alive, engine.workers.base.wait_for_exit) reliably
+# finds "no such process" and falls back to the real evidence (the
+# exit file this never-forked-by-us dispatch already wrote) instead of
+# trying to supervise a process this process never actually started.
+_RECOVERED_PID = 2**31 - 1
+
+
+def _completed_receipt_code(exit_file: Path | None) -> int | None:
+    """The real exit code an EARLIER spawn() call's own exit-writer
+    wrapper already wrote to `exit_file`, if any -- None when the file
+    does not exist or does not hold a bare integer. Same read rule as
+    engine.workers.base._read_exit_file for the identical file,
+    duplicated rather than imported: engine.procs must not depend on
+    engine.workers (the reverse import direction already exists --
+    engine.workers.base imports exit_file_for from this module)."""
+    if exit_file is None:
+        return None
+    try:
+        text = exit_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _recover_completed_dispatch(ledger: Ledger, project: str, attempt_id: str,
+                                station: str, request_id: str | None,
+                                code: int) -> SimpleNamespace:
+    """Adopt a dispatch THIS process never actually forked, but whose
+    own exit-writer wrapper already ran to completion: an earlier
+    spawn() call's Popen succeeded and the real command finished and
+    wrote `code` to its exit file, before that call's own engine
+    process crashed strictly between Popen succeeding and its
+    proc.started append (see spawn()'s own docstring). Recording an
+    ordinary proc.started (pid/pgid=_RECOVERED_PID) -- immediately
+    followed by a matching proc.ended, since this dispatch is already
+    known, with certainty, to be over -- rather than deleting the real
+    exit file and the real, already-written stdout and launching a
+    SECOND, fully redundant process (the bug this closes). Pairing
+    started+ended right here, rather than leaving the row "live" for
+    some later close_station() to end, means engine.ledger.live_procs
+    never reports this station as having anything to signal/wait on
+    for a pid this process never actually owns.
+
+    Neither the exit file nor stdout_path is touched -- both are left
+    exactly as the original, completed run left them, since they ARE
+    the evidence this adopts rather than discards."""
+    ledger.append(Event(
+        project=project, kind="proc.started", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"pid": _RECOVERED_PID, "pgid": _RECOVERED_PID,
+                  "station": station, "request_id": request_id,
+                  "recovered_completed": True, "recovered_exit_code": code},
+    ))
+    ledger.append(Event(
+        project=project, kind="proc.ended", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"pid": _RECOVERED_PID},
+    ))
+    return SimpleNamespace(pid=_RECOVERED_PID)
+
+
+def _adopt_if_live(ledger: Ledger, project: str, attempt_id: str, station: str,
+                   request_id: str | None,
+                   stdout_path: Path | None) -> SimpleNamespace | None:
+    """None unless an earlier spawn() call for this exact identity left
+    an unresolved proc.launch_intent AND the real process it started
+    is still findable and alive (see _find_live_pid_by_stdout) -- in
+    which case this call must ADOPT that process (append proc.started
+    for it, with "adopted": True, so every existing proc.started-keyed
+    reconcile/liveness/close_station check sees it exactly as if a
+    non-crashed spawn() call had started it) rather than spawn a
+    SECOND, duplicate one. `stdout_path` is required for adoption
+    (None -- e.g. a caller with no stdout file at all -- always
+    returns None here, falling through to a normal, fresh Popen): with
+    no stdout file there is no identity left to search by at all.
+
+    The returned SimpleNamespace carries only `.pid` -- callers that
+    need more (`.wait()`, `.terminate()`) only ever do so on a FRESH
+    spawn() call's own real Popen, never on a resumed/reconciled one:
+    engine.steps.station/review's own spawn_worker steps read `.pid`
+    once and return, and every later interaction with the process
+    (liveness, close_station) goes through the ledger's proc.started
+    row and engine.procs' own pid/pgid-based helpers, not back through
+    this object."""
+    if stdout_path is None:
+        return None
+    if not _has_unresolved_intent(ledger, project, attempt_id, station, request_id):
+        return None
+    pid = _find_live_pid_by_stdout(stdout_path)
+    if pid is None:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return None
+    ledger.append(Event(
+        project=project, kind="proc.started", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"pid": pid, "pgid": pgid, "station": station,
+                  "request_id": request_id, "adopted": True},
+    ))
+    return SimpleNamespace(pid=pid)
+
+
 def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
           argv: list[str], cwd: Path, *, env: dict[str, str] | None = None,
           stdout_path: Path | None = None, exit_file: Path | None = None,
           stdin_devnull: bool = False,
-          request_id: str | None = None) -> subprocess.Popen[bytes]:
+          request_id: str | None = None) -> "subprocess.Popen[bytes] | SimpleNamespace":
     """Popen with start_new_session=True; append proc.started {pid, pgid,
     station, request_id}.
+
+    BEFORE any of that, this records a proc.launch_intent event for
+    this exact (attempt_id, station, request_id) identity, and checks
+    whether an EARLIER call already recorded one with no resolving
+    proc.started -- see _adopt_if_live. This closes a crash window
+    that otherwise left a real, running process with NO ledger record
+    at all: Popen succeeding and the proc.started append below are two
+    separate steps: an engine crash strictly between them used to mean
+    nothing ever recorded that pid, so a later retry of the same
+    station+request (engine.steps.station/review's own reconcile,
+    keyed on proc.started) found no matching event, saw nothing alive
+    by that account, and spawned a SECOND, duplicate process while the
+    first kept running, forever unsupervised (never reachable by
+    close_station's own pgid-keyed SIGTERM/SIGKILL, since nothing
+    recorded its pid/pgid at all). Recording intent first and checking
+    for a live, adoptable match on every call closes it: a retried
+    call either finds and adopts the still-running first process (no
+    duplicate spawned), or finds nothing alive to adopt and the
+    earlier command already finished and left a real exit-file
+    receipt (adopted via _recover_completed_dispatch instead of
+    discarded -- see below), or finds nothing alive AND no finished
+    receipt either, with no earlier intent at all to resolve, and
+    proceeds exactly as before (a fresh Popen).
+
+    A retry that finds an earlier unresolved intent but no live
+    process to adopt used to treat that identically to "no earlier
+    intent at all": delete whatever exit file/stdout existed and
+    spawn fresh -- which is correct when the earlier Popen's real
+    command was itself killed/crashed before finishing (nothing
+    finished to lose; see test_resume_after_a_killed_engine_sh_bwrap_
+    chain_leaves_no_orphan_and_no_duplicate for that already-safe
+    case, exercised against a real engine->sh->bwrap chain), but was
+    wrong when the earlier command had in fact already run its
+    exit-writer wrapper to completion: THAT case now checks the exit
+    file first and adopts its real, already-written code via
+    _recover_completed_dispatch instead of deleting the receipt and
+    launching a second, fully redundant process (the bug this
+    closes -- codex-diff-review-s17.md, "Launch recovery can execute
+    completed work twice").
 
     env=None inherits this process's own environment (Popen's default),
     exactly as before this parameter existed; a worker runner instead
@@ -199,6 +414,41 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     out of scope here; mode="bwrap" (where this IS fully closed) is
     the mode every worker/reviewer/bench sandbox actually runs under
     in production (engine.config.EngineConfig.sandbox)."""
+    adopted = _adopt_if_live(ledger, project, attempt_id, station, request_id,
+                             stdout_path)
+    if adopted is not None:
+        return adopted
+    if (stdout_path is not None
+            and _has_unresolved_intent(ledger, project, attempt_id, station, request_id)):
+        # _adopt_if_live already ruled out a still-live process for this
+        # exact identity -- an earlier call's launch_intent is still
+        # unresolved (no proc.started ever followed it) with nothing
+        # alive to adopt. Before falling through to the delete-exit-
+        # file/truncate-stdout/relaunch path below, check whether that
+        # earlier dispatch actually ran all the way to completion: its
+        # own exit-writer wrapper already wrote a real code to the
+        # exit file (see _recover_completed_dispatch for why that
+        # case must adopt the existing receipt rather than discard
+        # it). No valid receipt there means the earlier attempt did
+        # NOT run its wrapper to completion -- whether because Popen
+        # itself never ran, or because the real command was killed/
+        # crashed before finishing (the already-covered, intentional
+        # case this function's docstring and
+        # test_resume_after_a_killed_engine_sh_bwrap_chain_leaves_no_
+        # orphan_and_no_duplicate exercise against a REAL engine->sh->
+        # bwrap chain) -- either way there is nothing finished to lose
+        # by falling through to a fresh Popen below.
+        pending_exit_file = exit_file if exit_file is not None else exit_file_for(stdout_path)
+        code = _completed_receipt_code(pending_exit_file)
+        if code is not None:
+            return _recover_completed_dispatch(
+                ledger, project, attempt_id, station, request_id, code)
+    ledger.append(Event(
+        project=project, kind="proc.launch_intent", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"station": station, "request_id": request_id,
+                  "stdout_path": str(stdout_path) if stdout_path is not None else None},
+    ))
     if exit_file is None and stdout_path is not None:
         exit_file = exit_file_for(stdout_path)
     stdout_handle = None

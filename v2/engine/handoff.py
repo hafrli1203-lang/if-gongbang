@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from engine.acceptance import AcceptanceResult, acceptance_path
 from engine.config import EngineConfig
 from engine.ledger import Event, Ledger
-from engine.plan import classify_skill_tools
+from engine.plan import classify_skill_tools, plan_digest, plan_path as _plan_json_path
 
 if TYPE_CHECKING:
     from engine.plan import Plan
@@ -314,12 +314,22 @@ def write_handoff(config: EngineConfig, ledger: Ledger, project: str,
     acc_path = acceptance_path(config, project, job)
     _usable_skills, needs_install = classify_skill_tools(plan, config)
     reconciliation = reconcile_tools(ledger, project, job, plan, needs_install=needs_install)
+    # plan.json's own digest (engine.plan.plan_digest) right now -- the
+    # same value engine.full_orbit's record_plan_reviewed stored as
+    # plan.reviewed right after plan review passed, UNLESS a later
+    # build task touched plan.json or a scene file after that (then
+    # this one differs, which is itself a fact worth a reader seeing
+    # plainly rather than a stale "it was reviewed" number).
+    digest = plan_digest(_plan_json_path(config.projects[project].repo, job))
     body = f"""# 인계 보고 -- {job}
 
 attempt: {attempt_id}
 
 ## 목표
 {plan.goal}
+
+## 계획 다이제스트
+{digest}
 
 ## 요구사항 ↔ 통과 장면
 {_scene_table(plan, acc)}
@@ -340,13 +350,18 @@ attempt: {attempt_id}
 {_open_items(plan, acc)}
 """
     path.write_text(body, encoding="utf-8")
-    # The only ledger signal that the WHOLE job (not just one of its
-    # many attempts -- facts/plan/design/each task each open their own)
-    # is actually finished: every attempt's own "report" stage appends
-    # a generic 'report.written' event (engine.steps.report), so that
-    # kind alone cannot tell a job's final handoff apart from an
-    # in-progress task's per-attempt report. engine.board keys its
-    # "완료" status off this event instead.
+    # The only ledger signal that the WHOLE job's handoff report (not
+    # just one of its many attempts -- facts/plan/design/each task each
+    # open their own) has been written: every attempt's own "report"
+    # stage appends a generic 'report.written' event (engine.steps.
+    # report), so that kind alone cannot tell a job's final handoff
+    # apart from an in-progress task's per-attempt report. This event
+    # alone is NOT completion, though -- the app-wide security check
+    # and the job's release decision both still run after it
+    # (engine.full_orbit._finish_after_handoff); engine.board's own
+    # "완료" status is keyed off a later release_decision/failure event,
+    # never off this one by itself (see board._derive_job_status's own
+    # docstring for why).
     ledger.append(Event(
         project=project, kind="job.handoff_written", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id, payload={"job": job},

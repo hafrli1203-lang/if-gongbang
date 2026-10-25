@@ -15,16 +15,27 @@ def _write_plan(repo: Path, job: str, data: dict[str, object]) -> None:
     path = plan_path(repo, job)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
+    # _valid_plan_dict's own default scene claims R1 via
+    # tests/scenes/base.py -- create it unconditionally (harmless for
+    # every test that overrides "scenes" to something else, since none
+    # of them reference this filename) so validate_plan's own
+    # scene-script-exists check never fails for the default fixture.
+    scene_script = repo / "tests" / "scenes" / "base.py"
+    scene_script.parent.mkdir(parents=True, exist_ok=True)
+    if not scene_script.exists():
+        scene_script.write_text("pass\n", encoding="utf-8")
 
 
 def _valid_plan_dict(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "goal": "작은 수정", "ui": False,
         "scenes": [{"id": "s1", "actor_does": "클릭", "app_shows": "결과",
-                    "where": "home", "cmd": ["true"]}],
+                    "where": "home", "cmd": ["python3", "tests/scenes/base.py"],
+                    "covers": ["R1"]}],
         "tasks": [{"id": "t1", "title": "고치기", "detail": "...",
                    "owns": ["src/"], "depends_on": []}],
         "acceptance": ["요구사항대로 동작한다"],
+        "requirements": [{"id": "R1", "text": "요구사항대로 동작한다", "kind": "function"}],
     }
     base.update(overrides)
     return base
@@ -134,7 +145,7 @@ def test_validate_plan_existing_scene_script_is_fine(tmp_path: Path) -> None:
     scene_script.write_text("print('ok')\n", encoding="utf-8")
     data = _valid_plan_dict(scenes=[
         {"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
-         "cmd": ["python3", "tests/scenes/s1.py"]},
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
     ])
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
@@ -212,11 +223,18 @@ def test_ordered_tasks_cycle_raises(tmp_path: Path) -> None:
 
 # ---- requirements/covers ----------------------
 
+def _write_scene_script(repo: Path, rel: str = "tests/scenes/s1.py") -> None:
+    script = repo / rel
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("pass\n", encoding="utf-8")
+
+
 def test_requirement_covered_by_scene_is_valid(tmp_path: Path) -> None:
+    _write_scene_script(tmp_path)
     data = _valid_plan_dict(
         requirements=[{"id": "R1", "text": "클릭하면 결과가 나온다", "kind": "function"}],
         scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
-                 "cmd": ["true"], "covers": ["R1"]}],
+                 "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
@@ -228,6 +246,12 @@ def test_requirement_covered_by_scene_is_valid(tmp_path: Path) -> None:
 def test_requirement_not_covered_by_any_scene_or_task_is_a_problem(tmp_path: Path) -> None:
     data = _valid_plan_dict(
         requirements=[{"id": "R1", "text": "보안 점검", "kind": "security"}],
+        # A scene that claims no `covers` at all -- the default fixture's
+        # own R1-covering scene must not leak into this test, or R1
+        # would already be covered and the problem this test checks
+        # for would never appear.
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"]}],
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
@@ -245,6 +269,8 @@ def test_requirement_covered_by_task_only_is_not_enough(tmp_path: Path) -> None:
     gate (_uncovered_requirement_ids) -- so it must already fail here."""
     data = _valid_plan_dict(
         requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"]}],
         tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
                 "depends_on": [], "covers": ["R1"]}],
     )
@@ -257,10 +283,11 @@ def test_requirement_covered_by_task_only_is_not_enough(tmp_path: Path) -> None:
 def test_requirement_covered_by_task_and_scene_is_valid(tmp_path: Path) -> None:
     """A task MAY still also claim `covers` (kept for tracking), as
     long as some scene covers the same requirement too."""
+    _write_scene_script(tmp_path)
     data = _valid_plan_dict(
         requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
         scenes=[{"id": "s1", "actor_does": "입력", "app_shows": "검증 결과", "where": "home",
-                 "cmd": ["true"], "covers": ["R1"]}],
+                 "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
         tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
                 "depends_on": [], "covers": ["R1"]}],
     )
@@ -278,6 +305,40 @@ def test_scene_covers_unknown_requirement_is_a_problem(tmp_path: Path) -> None:
     plan = load_plan(tmp_path, "job")
     problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
     assert any("GHOST" in p for p in problems)
+
+
+def test_validate_plan_empty_requirements_is_a_problem(tmp_path: Path) -> None:
+    data = _valid_plan_dict(requirements=[])
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert "plan_requirements_missing" in problems
+
+
+def test_validate_plan_scene_claiming_coverage_without_a_scene_file_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+def test_validate_plan_scene_claiming_coverage_with_a_scene_file_is_fine(
+    tmp_path: Path,
+) -> None:
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
 
 
 def test_requirement_duplicate_ids_raise(tmp_path: Path) -> None:
@@ -456,3 +517,298 @@ def test_skill_catalog_text_never_lists_a_station_a_codex_runner_cannot_mcp() ->
     catalog = skill_catalog_text(config)
     assert "build" in catalog
     assert "review" not in catalog.split("### MCP 서버")[-1]
+
+
+# ---------------------------------------------------------------------------
+# plan_digest / scene_file_digests / record_plan_reviewed
+# ---------------------------------------------------------------------------
+
+def test_scene_file_digests_covers_every_distinct_scenes_file(tmp_path: Path) -> None:
+    from engine.plan import scene_file_digests
+
+    _write_scene_script(tmp_path, "tests/scenes/s1.py")
+    _write_scene_script(tmp_path, "tests/scenes/s2.py")
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+        {"id": "s2", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s2.py"]},
+    ])
+    _write_plan(tmp_path, "job", data)
+    digests = scene_file_digests(plan_path(tmp_path, "job"))
+    assert set(digests) == {"tests/scenes/s1.py", "tests/scenes/s2.py"}
+    assert all(digests.values())
+
+
+def test_scene_file_digests_missing_referenced_file_is_empty_string(tmp_path: Path) -> None:
+    from engine.plan import scene_file_digests
+
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/ghost.py"], "covers": ["R1"]},
+    ])
+    _write_plan(tmp_path, "job", data)
+    digests = scene_file_digests(plan_path(tmp_path, "job"))
+    assert digests == {"tests/scenes/ghost.py": ""}
+
+
+def test_plan_digest_changes_when_plan_json_changes(tmp_path: Path) -> None:
+    from engine.plan import plan_digest
+
+    _write_plan(tmp_path, "job", _valid_plan_dict())
+    before = plan_digest(plan_path(tmp_path, "job"))
+    _write_plan(tmp_path, "job", _valid_plan_dict(goal="다른 목표"))
+    after = plan_digest(plan_path(tmp_path, "job"))
+    assert before != after
+
+
+def test_plan_digest_changes_when_a_referenced_scene_file_changes(tmp_path: Path) -> None:
+    from engine.plan import plan_digest
+
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+    ])
+    _write_plan(tmp_path, "job", data)
+    before = plan_digest(plan_path(tmp_path, "job"))
+    (tmp_path / "tests" / "scenes" / "s1.py").write_text("print('changed')\n", encoding="utf-8")
+    after = plan_digest(plan_path(tmp_path, "job"))
+    assert before != after
+
+
+def test_plan_digest_stable_for_unreadable_plan_json(tmp_path: Path) -> None:
+    """A plan.json that cannot be read at all (job never ran, or the
+    attempt's own tree was reset) still yields SOME digest, never
+    raises -- a resume must always have something to compare."""
+    from engine.plan import plan_digest
+
+    digest = plan_digest(plan_path(tmp_path, "nope"))
+    assert isinstance(digest, str) and digest
+
+
+def test_record_plan_reviewed_appends_digest_and_scene_digests_event(tmp_path: Path) -> None:
+    from engine.ledger import Ledger
+    from engine.plan import plan_digest, record_plan_reviewed, scene_file_digests
+
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+    ])
+    _write_plan(tmp_path, "job", data)
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    record_plan_reviewed(ledger, "alpha", "attempt-1", tmp_path, "job")
+
+    events = [e for _seq, e in ledger.events("alpha", "plan.reviewed")]
+    assert len(events) == 1
+    event = events[0]
+    assert event.attempt_id == "attempt-1"
+    assert event.payload["digest"] == plan_digest(plan_path(tmp_path, "job"))
+    assert event.payload["scene_digests"] == scene_file_digests(plan_path(tmp_path, "job"))
+
+
+def test_record_plan_reviewed_also_records_requirement_and_task_ids(tmp_path: Path) -> None:
+    from engine.ledger import Ledger
+    from engine.plan import record_plan_reviewed
+
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(scenes=[
+        {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+         "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]},
+    ])
+    _write_plan(tmp_path, "job", data)
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    record_plan_reviewed(ledger, "alpha", "attempt-1", tmp_path, "job")
+
+    event = next(e for _seq, e in ledger.events("alpha", "plan.reviewed"))
+    assert event.payload["requirement_ids"] == ["R1"]
+    assert event.payload["task_ids"] == ["t1"]
+
+
+# ---- scene cmd must actually run its own scene script (not merely
+# mention its path) ---------------------------------------------------
+
+def test_scene_covering_a_requirement_via_a_no_op_runner_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    """`["true", "tests/scenes/x.py"]` must be rejected even though the
+    scene path appears in `cmd` -- `true` ignores its arguments and
+    exits 0 without ever running that script."""
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["true", "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+def test_scene_covering_a_requirement_via_node_is_fine(tmp_path: Path) -> None:
+    _write_scene_script(tmp_path, "tests/scenes/s1.js")
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["node", "tests/scenes/s1.js"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_scene_covering_a_requirement_via_npx_vitest_run_is_fine(tmp_path: Path) -> None:
+    _write_scene_script(tmp_path, "tests/scenes/s1.test.js")
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["npx", "vitest", "run", "tests/scenes/s1.test.js"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_scene_covering_a_requirement_via_full_interpreter_path_is_fine(
+    tmp_path: Path,
+) -> None:
+    """sys.executable (an absolute interpreter path, the shape real
+    acceptance-test fixtures use) must still count as the "python3"
+    runner."""
+    import sys
+
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": [sys.executable, "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+
+
+def test_scene_covering_a_requirement_with_scene_path_not_the_first_arg_is_a_problem(
+    tmp_path: Path,
+) -> None:
+    """A scene path buried behind other flags (never the runner's
+    first real argument) must not count either."""
+    _write_scene_script(tmp_path)
+    data = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",
+                 "cmd": ["python3", "-u", "tests/scenes/s1.py"], "covers": ["R1"]}],
+    )
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    assert any("scene_cmd_not_a_scene_file" in p for p in problems)
+
+
+# ---- check_resumed_plan ----------------------------------------------
+
+def _reviewed_ledger(tmp_path: Path, data: dict[str, object], job: str = "job"):
+    from engine.ledger import Ledger
+    from engine.plan import record_plan_reviewed
+
+    _write_plan(tmp_path, job, data)
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    record_plan_reviewed(ledger, "alpha", "attempt-1", tmp_path, job)
+    return ledger
+
+
+def test_check_resumed_plan_ok_when_unchanged_since_review(tmp_path: Path) -> None:
+    from engine.plan import check_resumed_plan
+
+    ledger = _reviewed_ledger(tmp_path, _valid_plan_dict())
+    assert check_resumed_plan(ledger, "alpha", "job", tmp_path) == []
+
+
+def test_check_resumed_plan_flags_never_reviewed(tmp_path: Path) -> None:
+    from engine.ledger import Ledger
+    from engine.plan import check_resumed_plan
+
+    _write_plan(tmp_path, "job", _valid_plan_dict())
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    problems = check_resumed_plan(ledger, "alpha", "job", tmp_path)
+    assert "plan_never_reviewed" in problems
+
+
+def test_check_resumed_plan_flags_plan_missing(tmp_path: Path) -> None:
+    from engine.ledger import Ledger
+    from engine.plan import check_resumed_plan
+
+    ledger = Ledger.create(tmp_path / "ledger.sqlite3")
+    problems = check_resumed_plan(ledger, "alpha", "nope", tmp_path)
+    assert any("plan_missing" in p for p in problems)
+
+
+def test_check_resumed_plan_flags_plan_changed_since_review(tmp_path: Path) -> None:
+    from engine.plan import check_resumed_plan
+
+    ledger = _reviewed_ledger(tmp_path, _valid_plan_dict())
+    _write_plan(tmp_path, "job", _valid_plan_dict(goal="owner-edited goal"))
+
+    problems = check_resumed_plan(ledger, "alpha", "job", tmp_path)
+    assert "plan_changed_since_review" in problems
+
+
+def test_check_resumed_plan_flags_requirement_removed_since_review(tmp_path: Path) -> None:
+    from engine.plan import check_resumed_plan
+
+    data = _valid_plan_dict(
+        scenes=[
+            {"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+             "cmd": ["python3", "tests/scenes/base.py"], "covers": ["R1"]},
+            {"id": "s2", "actor_does": "a", "app_shows": "b", "where": "home",
+             "cmd": ["python3", "tests/scenes/base.py"], "covers": ["R2"]},
+        ],
+        requirements=[
+            {"id": "R1", "text": "요구사항 1", "kind": "function"},
+            {"id": "R2", "text": "요구사항 2", "kind": "function"},
+        ],
+    )
+    ledger = _reviewed_ledger(tmp_path, data)
+
+    # The owner (or a compromised later stage) then narrows the plan
+    # back down to R1 only -- still internally valid on its own, but a
+    # requirement the reviewer already approved has vanished.
+    narrowed = _valid_plan_dict(
+        scenes=[{"id": "s1", "actor_does": "a", "app_shows": "b", "where": "home",
+                 "cmd": ["python3", "tests/scenes/base.py"], "covers": ["R1"]}],
+        requirements=[{"id": "R1", "text": "요구사항 1", "kind": "function"}],
+    )
+    _write_plan(tmp_path, "job", narrowed)
+
+    problems = check_resumed_plan(ledger, "alpha", "job", tmp_path)
+    assert "requirement_removed_since_review: R2" in problems
+
+
+def test_check_resumed_plan_flags_task_removed_since_review(tmp_path: Path) -> None:
+    from engine.plan import check_resumed_plan
+
+    data = _valid_plan_dict(tasks=[
+        {"id": "t1", "title": "하나", "detail": "", "owns": ["src/a.py"], "depends_on": []},
+        {"id": "t2", "title": "둘", "detail": "", "owns": ["src/b.py"], "depends_on": []},
+    ])
+    ledger = _reviewed_ledger(tmp_path, data)
+
+    narrowed = _valid_plan_dict(tasks=[
+        {"id": "t1", "title": "하나", "detail": "", "owns": ["src/a.py"], "depends_on": []},
+    ])
+    _write_plan(tmp_path, "job", narrowed)
+
+    problems = check_resumed_plan(ledger, "alpha", "job", tmp_path)
+    assert "task_removed_since_review: t2" in problems
+
+
+def test_check_resumed_plan_skips_owns_subset_check(tmp_path: Path) -> None:
+    """check_resumed_plan has no config/build_prefixes of its own --
+    an `owns` entry that would fail validate_plan's own build-prefix
+    check elsewhere must not, by itself, make check_resumed_plan
+    report a problem."""
+    from engine.plan import check_resumed_plan
+
+    data = _valid_plan_dict(tasks=[
+        {"id": "t1", "title": "x", "detail": "", "owns": ["totally/unowned/path.py"],
+         "depends_on": []},
+    ])
+    ledger = _reviewed_ledger(tmp_path, data)
+    assert check_resumed_plan(ledger, "alpha", "job", tmp_path) == []

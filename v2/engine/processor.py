@@ -480,8 +480,23 @@ def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
 
     Validates before touching the ledger (ValueError, no event appended):
     the project must be registered, the kind must be one of
-    KNOWN_KINDS, the attempt must exist, belong to that project, and be
-    'active', and payload must be a dict."""
+    KNOWN_KINDS, the attempt must exist and belong to that project, and
+    payload must be a dict. The attempt must additionally be 'active'
+    ONLY when this call is actually about to append a brand-new
+    request.submitted event -- never when it is merely reusing an
+    existing (non-'failed') request_id, checked further below. A
+    close/abandon request's OWN last step (engine.steps.close's
+    set_closed) flips the attempt to 'closed'/'abandoned' as part of
+    completing ITS OWN request, before that request's remaining steps
+    (open_queue) or its own terminal 'done' status are ever recorded --
+    a crash in exactly that window used to make every later call that
+    re-submits this SAME already-in-flight request (e.g.
+    engine.full_orbit.finalize_release/_close_attempt resuming after
+    such a crash) raise 'attempt_not_active' before it could even look
+    up the request it only meant to reuse, even though
+    engine.processor._check_allowed already has a dedicated carve-out
+    letting exactly this request's own later steps keep running on a
+    no-longer-active attempt."""
     try:
         ledger.project(project)
     except LedgerError as exc:
@@ -494,8 +509,6 @@ def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
         attempt = ledger.attempt(attempt_id)
     except LedgerError as exc:
         raise ValueError(f"unknown_attempt: {attempt_id!r}") from exc
-    if attempt.status != "active":
-        raise ValueError(f"attempt_not_active: {attempt_id!r} is {attempt.status!r}")
     if ledger.attempt_project(attempt_id) != project:
         raise ValueError(
             f"attempt {attempt_id!r} does not belong to project {project!r}"
@@ -514,6 +527,13 @@ def submit(ledger: Ledger, project: str, attempt_id: str, kind: str,
         retry_n += 1
         current_payload = ids.with_retry(payload, current_rid, retry_n)
         current_rid = ids.request_id(project, attempt_id, kind, current_payload)
+    # Reaching here means current_rid has never been submitted -- a
+    # genuinely NEW request.submitted event is about to be appended, so
+    # (unlike the lookups above) the attempt must still be active: there
+    # is no external effect yet for a closed/abandoned/interrupted
+    # attempt to dispatch.
+    if attempt.status != "active":
+        raise ValueError(f"attempt_not_active: {attempt_id!r} is {attempt.status!r}")
     ledger.append(Event(
         project=project, kind="request.submitted", actor_kind="owner",
         actor_id=actor_id, attempt_id=attempt_id,

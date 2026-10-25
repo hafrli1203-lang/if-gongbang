@@ -8,7 +8,8 @@ from engine import ids
 from engine.ledger import Event
 from engine.processor import submit
 from engine.state import TransitionError, transition
-from engine.steps.open_job import copy_root, open_job
+from engine.full_orbit import _commit_job_trail
+from engine.steps.open_job import _copies_dir, _make_copies, copy_root, open_job
 from tests.conftest import Workspace, git
 
 
@@ -125,6 +126,74 @@ def test_open_job_for_a_different_job_name_is_unaffected_by_an_unrelated_active_
     assert workspace.ledger.attempts_for_job_name("alpha", "job1") == [
         workspace.ledger.attempt(attempt_id),
     ]
+
+
+def test_crash_after_copies_made_but_before_job_opened_is_reconciled(
+    workspace: Workspace,
+) -> None:
+    """Fault injection for open_job's own "Note on (6a)" crash window:
+    job.open_intent lands and _make_copies' own atomic rename succeeds
+    (copies_dir now holds a real, complete copy on disk), but
+    job.opened never gets appended -- nothing else in the ledger ever
+    names this attempt_id at all. A later open_job call (for the SAME
+    job_name here) must start a genuinely new attempt (never reuse the
+    orphaned one) AND clean up the now-unreachable copies_dir left
+    behind, rather than leaving it on disk forever with nothing able
+    to find or remove it again."""
+    job_id = ids.new_job_id("alpha")
+    attempt_id = ids.attempt_id(job_id, 1)
+    workspace.ledger.append(Event(
+        project="alpha", kind="job.open_intent", actor_kind="owner",
+        actor_id="owner", attempt_id=attempt_id,
+        payload={"job_id": job_id, "job_name": "crashed-before-opened",
+                  "n": 1, "attempt_id": attempt_id,
+                  "copies_dir": str(_copies_dir(workspace.config, attempt_id))},
+    ))
+    project_config = workspace.config.projects["alpha"]
+    _make_copies(project_config, workspace.config, attempt_id, ("builder",))
+    copies_dir = _copies_dir(workspace.config, attempt_id)
+    assert copies_dir.exists()
+
+    resumed = open_job(workspace.config, workspace.ledger, "alpha",
+                       "crashed-before-opened", "full", ("builder",))
+
+    assert resumed != attempt_id  # a genuinely new attempt, not a reuse
+    assert not copies_dir.exists()  # the orphaned copy was cleaned up
+    new_copy = copy_root(workspace.config, resumed, "builder")
+    assert (new_copy / "src" / "app.py").exists()
+
+
+def test_crash_before_the_rename_leaves_only_a_tmp_staging_dir_to_clean_up(
+    workspace: Workspace,
+) -> None:
+    """Earlier sub-case of the same crash window: job.open_intent lands,
+    but the crash hits before _make_copies' own atomic rename even
+    runs -- only the `.tmp-{dirname}` staging directory exists, never
+    the final copies_dir. The reconciliation must remove that staging
+    directory too, not just the final one."""
+    job_id = ids.new_job_id("alpha")
+    attempt_id = ids.attempt_id(job_id, 1)
+    workspace.ledger.append(Event(
+        project="alpha", kind="job.open_intent", actor_kind="owner",
+        actor_id="owner", attempt_id=attempt_id,
+        payload={"job_id": job_id, "job_name": "crashed-before-rename",
+                  "n": 1, "attempt_id": attempt_id,
+                  "copies_dir": str(_copies_dir(workspace.config, attempt_id))},
+    ))
+    tmp_root = (workspace.config.home / "copies"
+               / f".tmp-{ids.attempt_dirname(attempt_id)}")
+    tmp_root.mkdir(parents=True)
+    (tmp_root / "partial-marker.txt").write_text("partial", encoding="utf-8")
+    copies_dir = _copies_dir(workspace.config, attempt_id)
+    assert tmp_root.exists()
+    assert not copies_dir.exists()
+
+    resumed = open_job(workspace.config, workspace.ledger, "alpha",
+                       "crashed-before-rename", "full", ("builder",))
+
+    assert resumed != attempt_id
+    assert not tmp_root.exists()
+    assert not copies_dir.exists()
 
 
 def test_dirty_paths_recorded(workspace: Workspace) -> None:
@@ -437,6 +506,53 @@ def test_copy_links_entry_under_an_earlier_links_symlink_is_skipped(
         {"role": "builder", "entry": "deps/pkg",
          "reason": "copy_link_parent_is_symlink"},
     ]
+
+
+def test_commit_job_trail_never_absorbs_an_unrelated_already_staged_file(
+    workspace: Workspace,
+) -> None:
+    """Regression for codex-goal-review-4.md item 4 / codex-diff-
+    review-s17.md "Ungated trail commits can absorb unrelated staged
+    source" (engine/full_orbit.py:472): this is a plain, UNGATED
+    engine-side commit (full_orbit._commit_job_trail's own docstring)
+    meant to cover only what the processor itself just wrote under
+    .gongbang/<job>/ -- it must never also commit some OTHER path the
+    owner (or anything else) had already `git add`ed before this ran.
+    A bare `git commit` with no pathspec commits every currently
+    staged change regardless of what `git add` was just given; this
+    checks the fix (passing the same path list to `commit -- <paths>`
+    that `add` used) leaves an unrelated already-staged file exactly
+    as staged as it was, never swept into this commit."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha",
+                          "trail-scope", "full", ("builder",))
+    job_name = "trail-scope"
+    gongbang_dir = workspace.alpha / ".gongbang" / job_name
+    gongbang_dir.mkdir(parents=True)
+    (gongbang_dir / "facts.md").write_text("facts\n", encoding="utf-8")
+
+    # The owner (or anything else) already staged an unrelated path
+    # before this trail commit runs.
+    (workspace.alpha / "owner_unrelated.txt").write_text("owner work\n", encoding="utf-8")
+    git(workspace.alpha, "add", "owner_unrelated.txt")
+    status_before = git(workspace.alpha, "status", "--porcelain")
+    owner_line_before = [l for l in status_before.splitlines()
+                         if "owner_unrelated.txt" in l][0]
+
+    _commit_job_trail(workspace.config, workspace.ledger, "alpha", attempt_id,
+                      job_name, "gongbang: trail-scope - facts")
+
+    # The unrelated file is still staged, exactly the same status line
+    # as before -- never committed, never unstaged.
+    status_after = git(workspace.alpha, "status", "--porcelain")
+    owner_lines_after = [l for l in status_after.splitlines()
+                         if "owner_unrelated.txt" in l]
+    assert owner_lines_after == [owner_line_before]
+
+    # The new commit's own tree only ever touched .gongbang/<job>/.
+    changed = git(workspace.alpha, "diff-tree", "--no-commit-id", "--name-only",
+                  "-r", "HEAD").splitlines()
+    assert changed == [f".gongbang/{job_name}/facts.md"]
+    assert "owner_unrelated.txt" not in changed
 
 
 def test_worker_copy_has_base_commit_so_status_shows_only_changes(workspace) -> None:

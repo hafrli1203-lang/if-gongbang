@@ -482,6 +482,147 @@ def test_merge_conflict_with_head_when_destination_diverged_from_base(workspace:
     assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('committed-elsewhere')\n"
 
 
+def test_remerge_on_same_attempt_catches_an_owner_edit_of_an_already_merged_path(
+    workspace: Workspace,
+) -> None:
+    """Regression for codex-goal-review-4.md item 6 / codex-diff-review-
+    s17.md "Repeated merging can overwrite owner edits"
+    (engine/steps/merge.py:423): a first merge on this attempt writes
+    src/app.py; the OWNER then hand-edits that same path directly
+    (simulating an owner-approval/install pause that leaves this same
+    attempt active -- engine.full_orbit's own owner stops), without
+    committing. A SECOND merge request on the SAME attempt_id/copy
+    (the builder continuing work on the same path -- exactly engine.
+    full_orbit._rerun_build_task_stages' own shape) must not silently
+    overwrite that edit just because this attempt already applied
+    this path's name once before -- the path's bare NAME being
+    "already applied" is not, by itself, proof that nothing else
+    touched it since. Before this fix, _attempt_already_applied_paths
+    exempted any such path from _verify_destinations_unchanged
+    entirely, so request 2 here would have silently clobbered the
+    owner's edit with the builder's new content and reported 'done'."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "reedit",
+                           "full", ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    (copy_a / "src" / "app.py").write_text("print('v1')\n", encoding="utf-8")
+
+    rid1 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid1).status == "done"
+    assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
+
+    # The owner hand-edits the already-merged path during an owner stop
+    # (an install/approval pause), WITHOUT committing -- this attempt
+    # stays active the whole time.
+    (workspace.alpha / "src" / "app.py").write_text("print('OWNER-EDIT')\n", encoding="utf-8")
+
+    # The builder keeps working on the same copy/path.
+    (copy_a / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
+
+    rid2 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+        "merge_retry_n": 1,
+    }, "owner")
+    n = proc.run_once("alpha")
+    assert n == 0
+    req2 = workspace.ledger.request(rid2)
+    assert req2.status == "failed"
+    assert req2.result == {"reason": "merge_conflict_with_owner_edit"}
+    # The owner's edit is still there -- never overwritten.
+    assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('OWNER-EDIT')\n"
+
+
+def test_remerge_on_same_attempt_catches_an_owner_revert_to_exactly_base_content(
+    workspace: Workspace,
+) -> None:
+    """Regression for codex-diff-review-s18.md G6: "merge.py:453
+    accepts destination equal to base BEFORE checking the last applied
+    digest. An owner reverting an engine edit is still overwritten."
+    Same shape as the owner-edit test above, but the owner's edit here
+    is specifically a REVERT back to exactly base_head's own bytes
+    (undoing this attempt's first merge on purpose), not some other
+    arbitrary content. _verify_destinations_unchanged used to check
+    "does the destination still equal base_head" FIRST and only
+    consult the last-applied hash on a mismatch -- a revert-to-base
+    makes that first check true again, short-circuiting straight past
+    the already-applied hash entirely and right past the owner's
+    revert, so the second merge would silently overwrite it. The fix
+    checks the last-applied hash FIRST for every already-applied rel,
+    regardless of what the destination's current bytes happen to
+    equal, so this is still caught."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "revert-to-base",
+                           "full", ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    base_content = (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8")
+    (copy_a / "src" / "app.py").write_text("print('v1')\n", encoding="utf-8")
+
+    rid1 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid1).status == "done"
+    assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
+
+    # The owner deliberately REVERTS the already-merged path back to
+    # exactly its base_head content, during an owner stop, WITHOUT
+    # committing -- this attempt stays active the whole time.
+    (workspace.alpha / "src" / "app.py").write_text(base_content, encoding="utf-8")
+
+    # The builder keeps working on the same copy/path.
+    (copy_a / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
+
+    rid2 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+        "merge_retry_n": 1,
+    }, "owner")
+    n = proc.run_once("alpha")
+    assert n == 0
+    req2 = workspace.ledger.request(rid2)
+    assert req2.status == "failed"
+    assert req2.result == {"reason": "merge_conflict_with_owner_edit"}
+    # The owner's revert is still there -- never overwritten with v2.
+    assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == base_content
+
+
+def test_remerge_on_same_attempt_of_an_untouched_already_applied_path_succeeds(
+    workspace: Workspace,
+) -> None:
+    """The safe counterpart of the test above: nobody touches the
+    destination between the two merges, so the second merge's
+    destination still equals exactly what the first merge itself
+    wrote -- re-applying (here, a second, different path from the
+    same copy) must still succeed, the same as before this fix."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "reedit-ok",
+                           "full", ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    (copy_a / "src" / "app.py").write_text("print('v1')\n", encoding="utf-8")
+
+    rid1 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace)
+    assert proc.run_once("alpha") == 1
+    assert workspace.ledger.request(rid1).status == "done"
+
+    # Nobody touches src/app.py; the builder adds a second change on
+    # the SAME path (still untouched by anyone else) in a later task.
+    (copy_a / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
+
+    rid2 = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a)}],
+        "merge_retry_n": 1,
+    }, "owner")
+    assert proc.run_once("alpha") == 1
+    assert workspace.ledger.request(rid2).status == "done"
+    assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('v2')\n"
+
+
 # ---- B-11/#10/#11 remainder: the copy must not be mutable between steps -
 
 def test_copy_mutated_after_check_conflicts_crash_fails_apply_nothing_written(

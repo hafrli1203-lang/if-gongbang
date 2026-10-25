@@ -8,10 +8,12 @@ from dataclasses import dataclass
 import pytest
 
 from engine.approvals import grant
+from engine.evidence import fingerprint as _repo_fingerprint
 from engine.evidence import record, sha256_file
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
 from engine.faults import CrashInjected, Faults
+from engine.ledger import Event
 from engine.processor import Fakes, Processor, StepContext, StepUnknown, submit
 from engine.steps.open_job import open_job
 from engine.steps.publish import _reconcile_call_publisher, _run_record_publish
@@ -25,6 +27,30 @@ def _proc(workspace: Workspace, publisher: FakePublisher | None = None) -> Proce
     return proc
 
 
+def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> str:
+    """Record a passing full-suite bench AND a passing acceptance +
+    app_security certificate, all bound to the project repo's CURRENT
+    fingerprint -- the evidence engine.steps.publish's call_publisher
+    now requires UNCONDITIONALLY before any real dispatch (see that
+    module's own docstring), not only when `release` happens to be
+    configured. None of these tests go through engine.full_orbit/
+    engine.acceptance/engine.app_security themselves, so this appends
+    the same shaped events those modules' own record functions do,
+    directly, the same way this file already seeds 'source'/'publish'
+    evidence by hand elsewhere. Returns the fingerprint it certified."""
+    project_cfg = workspace.config.projects[project]
+    fp = _repo_fingerprint(project_cfg.repo, project_cfg.excludes)
+    record(workspace.ledger, project, attempt_id, "bench", fp,
+           payload={"passed": True, "scope": "full"})
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        workspace.ledger.append(Event(
+            project=project, kind=kind, actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"passed": True, "fingerprint": fp},
+        ))
+    return fp
+
+
 def test_publish_succeeds_with_matching_approval_and_artifact(workspace: Workspace) -> None:
     attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job1",
                           "full", roles=("builder",))
@@ -33,6 +59,7 @@ def test_publish_succeeds_with_matching_approval_and_artifact(workspace: Workspa
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     proc = _proc(workspace, publisher)
@@ -60,6 +87,68 @@ def test_publish_fails_without_approval(workspace: Workspace) -> None:
     req = workspace.ledger.request(rid)
     assert req.status == "failed"
     assert req.result == {"reason": "no_approval"}
+    assert publisher.calls == []
+
+
+def test_publish_without_release_still_requires_full_bench_before_dispatch(
+    workspace: Workspace,
+) -> None:
+    """Regression for codex-goal-review-4.md item 13 / codex-diff-
+    review-s17.md "Whole-job verification is not a universal
+    deployment invariant" (engine/steps/publish.py:407,545): this
+    project has NO `release` configured at all -- before this fix, an
+    approved+artifact-matching publish reached the real publisher call
+    on nothing more than check_approval/check_artifact, with no full-
+    suite bench and no job certificate required, simply because
+    release_config was None. A passing approval and artifact hash
+    alone must no longer be enough."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job-no-bench",
+                          "full", roles=("builder",))
+    artifact_hash = sha256_file(workspace.beta / "dist" / "bundle.js")
+    rid = submit(workspace.ledger, "beta", attempt_id, "publish",
+                 {"target": "store", "artifact_path": "dist/bundle.js",
+                  "artifact_hash": artifact_hash}, "owner")
+    grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    # Deliberately no _certify_full(...) call here.
+
+    publisher = FakePublisher()
+    n = _proc(workspace, publisher).run_once("beta")
+
+    assert n == 0
+    req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "full_bench_missing"}
+    assert publisher.calls == []
+
+
+def test_publish_without_release_still_requires_job_certificate_before_dispatch(
+    workspace: Workspace,
+) -> None:
+    """Same finding as the bench test above, for the OTHER half of the
+    universal gate: a passing full-suite bench alone (no release
+    configured, and no acceptance/app_security certificate for this
+    job) must still refuse to dispatch."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "beta", "job-no-cert",
+                          "full", roles=("builder",))
+    artifact_hash = sha256_file(workspace.beta / "dist" / "bundle.js")
+    rid = submit(workspace.ledger, "beta", attempt_id, "publish",
+                 {"target": "store", "artifact_path": "dist/bundle.js",
+                  "artifact_hash": artifact_hash}, "owner")
+    grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+
+    project_cfg = workspace.config.projects["beta"]
+    fp = _repo_fingerprint(project_cfg.repo, project_cfg.excludes)
+    record(workspace.ledger, "beta", attempt_id, "bench", fp,
+           payload={"passed": True, "scope": "full"})
+    # Deliberately no acceptance.recorded/app_security.recorded events.
+
+    publisher = FakePublisher()
+    n = _proc(workspace, publisher).run_once("beta")
+
+    assert n == 0
+    req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "release_requires_job_certificate"}
     assert publisher.calls == []
 
 
@@ -244,6 +333,7 @@ def test_record_publish_crash_after_leaves_exactly_one_event(workspace: Workspac
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     proc1 = Processor(workspace.config, workspace.ledger, Fakes(publisher, FakeInstaller()),
@@ -280,6 +370,7 @@ def test_record_source_recomputes_fp_for_a_second_publish_after_source_change(
                  {"target": "store1", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid1, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
     n1 = _proc(workspace).run_once("beta")
     assert n1 == 1
 
@@ -296,6 +387,7 @@ def test_record_source_recomputes_fp_for_a_second_publish_after_source_change(
                   "artifact_hash": artifact_hash}, "owner")
     assert rid2 != rid1
     grant(workspace.ledger, "beta", rid2, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
     n2 = _proc(workspace).run_once("beta")
     assert n2 == 1
 
@@ -362,6 +454,7 @@ def test_publish_head_artifact_accepted_when_clean(workspace: Workspace) -> None
     rid = submit(workspace.ledger, "beta", attempt_id, "publish",
                  {"target": "store", "artifact_path": "@HEAD", "artifact_hash": head}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     n = _proc(workspace, publisher).run_once("beta")
@@ -445,6 +538,7 @@ def test_publish_head_approval_bound_to_a_different_request_is_rejected(
                    {"target": "store", "artifact_path": "@HEAD", "artifact_hash": head_a},
                    "owner")
     grant(workspace.ledger, "beta", rid_a, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     publisher = FakePublisher()
     proc = _proc(workspace, publisher)
@@ -485,6 +579,7 @@ def test_publish_records_dry_run_flag_from_publisher_receipt(workspace: Workspac
                  {"target": "store", "artifact_path": "dist/bundle.js",
                   "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
 
     n = _proc(workspace).run_once("beta")
     assert n == 1

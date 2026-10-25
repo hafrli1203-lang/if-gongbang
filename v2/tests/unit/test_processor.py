@@ -701,6 +701,49 @@ def test_cancel_request_refuses_a_request_belonging_to_another_project(workspace
     assert ledger.request(rid).status == "queued"
 
 
+def test_submit_reuses_existing_request_on_no_longer_active_attempt(tmp_path: Path) -> None:
+    """engine.steps.close's own set_closed flips the attempt to
+    'closed' as part of completing the close/report request's OWN
+    later steps -- a caller that re-submits that SAME, already-
+    existing request (e.g. engine.full_orbit.finalize_release resuming
+    after a crash in exactly that window) must get the existing
+    request_id back, not a ValueError. Before this fix, submit() raised
+    'attempt_not_active' unconditionally, even for a payload that
+    already has a request.submitted event and needs no new one."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid = submit(ledger, "alpha", attempt_id, "close", {}, "owner")
+    ledger.append(Event(
+        project="alpha", kind="attempt.finished", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"attempt_id": attempt_id, "status": "closed"},
+    ))
+    assert ledger.attempt(attempt_id).status == "closed"
+
+    rid2 = submit(ledger, "alpha", attempt_id, "close", {}, "owner")
+    assert rid2 == rid
+    assert len(ledger.events("alpha", "request.submitted")) == 1
+
+
+def test_submit_still_refuses_a_genuinely_new_request_on_inactive_attempt(
+    tmp_path: Path,
+) -> None:
+    """The active-attempt guard still applies to a request that has
+    NEVER been submitted before: there is no external effect for a
+    closed/abandoned/interrupted attempt to dispatch, so a brand-new
+    request.submitted event must still be refused."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    ledger.append(Event(
+        project="alpha", kind="attempt.finished", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"attempt_id": attempt_id, "status": "closed"},
+    ))
+    with pytest.raises(ValueError, match="attempt_not_active"):
+        submit(ledger, "alpha", attempt_id, "close", {"never": "submitted"}, "owner")
+    assert ledger.events("alpha", "request.submitted") == []
+
+
 def test_run_request_rejects_mismatched_project_before_any_mutation(workspace) -> None:
     """run_request(project, request_id) must refuse outright, with no
     ledger mutation and no lock acquired on either project, when

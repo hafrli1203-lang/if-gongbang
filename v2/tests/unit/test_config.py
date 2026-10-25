@@ -485,3 +485,58 @@ def test_hidden_paths_loaded_and_roundtrips_through_to_json_dict(tmp_path: Path)
     loaded = write_json(config, tmp_path / "out.json")
     assert loaded.projects["alpha"].hidden_paths == (original_src,)
     assert to_json_dict(config)["projects"]["alpha"]["hidden_paths"] == [str(original_src)]
+
+
+def test_context_required_skills_and_require_library_roundtrip(tmp_path: Path) -> None:
+    """engine.context.ContextConfig.required_skills/require_library (a
+    station's own mandatory skills, and projects where a library
+    lookup failure must also count as required-material missing) must
+    survive from_json -> to_json_dict -> from_json unchanged -- an
+    earlier round added both fields to the dataclass but never to
+    _parse_context/_KNOWN_CONTEXT_KEYS/_context_to_json, so no
+    production JSON config could actually set them (unknown-key
+    ValueError on load, silently dropped on save)."""
+    from engine.config import to_json_dict, write_json
+
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    config = EngineConfig.from_json(_write_config(tmp_path, {
+        "context": {
+            "station_skills": {"build": ["필수-스킬", "선택-스킬"]},
+            "required_skills": {"build": ["필수-스킬"]},
+            "require_library": ["alpha"],
+        },
+    }))
+    assert config.context is not None
+    assert config.context.required_skills == {"build": ("필수-스킬",)}
+    assert config.context.require_library == ("alpha",)
+
+    as_json = to_json_dict(config)
+    assert as_json["context"]["required_skills"] == {"build": ["필수-스킬"]}
+    assert as_json["context"]["require_library"] == ["alpha"]
+
+    loaded = write_json(config, tmp_path / "out.json")
+    assert loaded.context.required_skills == {"build": ("필수-스킬",)}
+    assert loaded.context.require_library == ("alpha",)
+
+
+def test_context_required_skills_defaults_to_empty_when_absent(tmp_path: Path) -> None:
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    config = EngineConfig.from_json(_write_config(tmp_path, {
+        "context": {"station_skills": {"build": ["스킬"]}},
+    }))
+    assert config.context.required_skills == {}
+    assert config.context.require_library == ()
+
+
+def test_context_rejects_a_required_skills_value_that_is_not_a_list_of_strings(
+    tmp_path: Path,
+) -> None:
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    bad = _write_config(tmp_path, {
+        "context": {"required_skills": {"build": "스킬"}},
+    })
+    try:
+        EngineConfig.from_json(bad)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "expected a list of strings" in str(exc)

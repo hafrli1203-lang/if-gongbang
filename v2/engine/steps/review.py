@@ -481,8 +481,11 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     # runner's own CLI, resolved from argv[0] by PATH, must stay visible
     # even though the real HOME (where it is usually installed) is hidden
     # below. See sandbox.resolve_runtime's docstring.
+    symlinks: tuple[tuple[Path, Path], ...] = ()
     if argv:
-        readonly += sandbox.resolve_runtime(argv[0])
+        runtime = sandbox.resolve_runtime(argv[0])
+        readonly += runtime.readonly
+        symlinks += runtime.symlinks
     writable += tuple(home_dir / sub for sub in subpaths)
     hidden = ((ctx.config.home, ctx.config.secrets_dir, _repo(ctx))
               + _other_project_repos(ctx) + _ledger_hidden_root(ctx)
@@ -492,8 +495,8 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     try:
         return sandbox.wrap(
             argv, cwd=spec.workdir, writable=writable, hidden=hidden,
-            readonly=readonly, net=True, mode=ctx.config.sandbox,
-            child_env=env,
+            readonly=readonly, symlinks=symlinks, net=True,
+            mode=ctx.config.sandbox, child_env=env,
         )
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc

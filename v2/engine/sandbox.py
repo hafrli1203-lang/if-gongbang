@@ -136,6 +136,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 _KNOWN_MODES = frozenset({"none", "bwrap"})
@@ -250,6 +251,7 @@ def _real(path: Path) -> Path:
 def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
          hidden: tuple[Path, ...] = (), readonly: tuple[Path, ...] = (),
          readonly_remap: tuple[tuple[Path, Path], ...] = (),
+         symlinks: tuple[tuple[Path, Path], ...] = (),
          net: bool = False, mode: str = "none",
          child_env: dict[str, str] | None = None) -> list[str]:
     """Build the argv engine.procs.spawn should actually exec. Callers
@@ -295,6 +297,23 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
     bind -- see the module docstring). The destination's depth is what
     sorting and the ancestor-of-hidden invariant check both use, since
     that is the sandbox-side location the mount actually shadows.
+
+    `symlinks`: (target, sandbox_dest) pairs, each emitted as bwrap's
+    own `--symlink <target> <sandbox_dest>` -- creates a symlink INSIDE
+    the sandbox at `sandbox_dest` whose content is the literal string
+    `target` (never resolved/realpath'd: that is the point -- see
+    engine.sandbox.resolve_runtime, the one caller that needs this).
+    Neither `target` nor `sandbox_dest` is required to exist on the
+    host; `sandbox_dest` is sorted into the same merged, depth-ordered
+    mount list as every other category (so a symlink nested under a
+    `hidden` ancestor is still created correctly, same as any other
+    nested bind -- see the module docstring), but it does not
+    participate in the hidden/writable conflict or ordering checks
+    below (a symlink is not itself exposing new host content -- only
+    `target`, wherever it resolves to when the sandboxed process later
+    follows it, matters for that, and that path must already be
+    covered by the caller's own `readonly`/`writable`/`readonly_remap`
+    if it needs to be reachable).
     """
     if mode not in _KNOWN_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
@@ -328,6 +347,16 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
         if not real.exists():
             continue
         mounts.append((_depth(real), "rw", real, real))
+    for target, dest in symlinks:
+        # `dest` is deliberately NOT passed through _real()/realpath:
+        # it typically does not exist on the host at all (it is a path
+        # being newly created inside the sandbox, e.g. recreating a
+        # symlink that lives under an ancestor directory this same
+        # call also `hidden`s), and even when a same-named path DOES
+        # exist on the host, resolving it here would defeat the one
+        # thing `--symlink` is for (see wrap()'s own docstring) --
+        # `target` is kept as given too, for the same reason.
+        mounts.append((_depth(dest), "symlink", target, dest))
 
     # Same destination requested as BOTH hidden and writable/readonly is
     # a direct contradiction, not an ordering question depth-sorting can
@@ -348,6 +377,22 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
     mounts.sort(key=lambda m: m[0])
 
     hide_dests = [dest for _d, k, _s, dest in mounts if k == "hide"]
+    # A `symlink` dest with no `hide`-kind ancestor in THIS SAME call
+    # is dropped here, silently: the base "--ro-bind / /" mirror
+    # already presents that exact host path (it was never hidden),
+    # so bwrap's own "--symlink" there would try to create a new node
+    # where one already exists and fail ("existing destination is
+    # ..."). A dest that DOES sit under one of this call's own hidden
+    # (tmpfs) ancestors has nothing there yet -- bwrap creates it
+    # fresh, which is exactly resolve_runtime's use case (recreating
+    # a CLI's own PATH-lookup symlink under an otherwise-hidden real
+    # HOME). This is a per-call check, not a host-filesystem one: the
+    # same dest could be legitimately re-created in one wrap() call
+    # (HOME hidden) and legitimately skipped in another (HOME not
+    # hidden there) depending only on what THIS call's own `hidden`
+    # tuple covers.
+    mounts = [m for m in mounts
+             if m[1] != "symlink" or any(_is_strict_ancestor(hd, m[3]) for hd in hide_dests)]
     rw_dests = [dest for _d, k, _s, dest in mounts if k == "rw"]
     for rw_dest in rw_dests:
         for hide_dest in hide_dests:
@@ -380,6 +425,8 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
                 args += ["--ro-bind", "/dev/null", str(dest)]
         elif kind == "ro":
             args += ["--ro-bind", str(source), str(dest)]
+        elif kind == "symlink":
+            args += ["--symlink", str(source), str(dest)]
         else:  # "rw"
             args += ["--bind", str(source), str(dest)]
 
@@ -501,92 +548,140 @@ def _shebang_interpreter(path: Path) -> str | None:
     return tokens[0]
 
 
-def _install_dir(resolved: Path) -> Path:
-    """The directory to mount read-only so `resolved` (and whatever it
-    needs alongside it) can actually run: `resolved`'s own parent,
-    UNLESS that parent is literally named "bin" -- the common npm-
-    global-install shape (confirmed on this host for both `claude` and
-    `codex`: each is a thin launcher at `<pkg_root>/bin/<name>` that
-    needs sibling `node_modules`/`package.json` under `<pkg_root>`
-    itself to run, not just the one launcher file) -- in which case
-    the GRANDPARENT (the package root) is returned instead."""
+def _npm_package_root(resolved: Path) -> Path | None:
+    """The npm-style package root containing `resolved`, if any --
+    checked at `resolved`'s own parent directory and, when that parent
+    is literally named "bin" (the common npm-global-install shape,
+    confirmed on this host for both `claude` and `codex`: each is a
+    thin launcher at `<pkg_root>/bin/<name>` that needs sibling
+    `node_modules`/`package.json` under `<pkg_root>` itself to run,
+    not just the one launcher file), at the grandparent too. A
+    directory only counts as a package root when it actually contains
+    a `package.json` FILE -- this is the narrower replacement for the
+    old, unconditional "mount the whole parent (or grandparent-of-bin)
+    directory" rule: that rule exposed every OTHER file placed
+    alongside the launcher/package (e.g. a sibling installed binary's
+    own secret, or -- the shape a `~/.cargo/bin`-style flat install
+    directory full of unrelated tools is -- every other tool's own
+    binary and config in the same directory), not just what this one
+    runtime actually needs. None if neither candidate has a
+    package.json -- the caller then mounts only the resolved
+    executable FILE itself, nothing wider."""
     parent = resolved.parent
+    candidates = [parent]
     if parent.name == "bin":
-        return parent.parent
-    return parent
+        candidates.append(parent.parent)
+    for candidate in candidates:
+        if (candidate / "package.json").is_file():
+            return candidate
+    return None
 
 
-def resolve_runtime(exe_name: str) -> tuple[Path, ...]:
-    """Read-only mounts that must stay visible inside a sandbox whose
-    `hidden` set includes the real operator HOME wholesale (see
+@dataclass(frozen=True)
+class RuntimeMounts:
+    """resolve_runtime()'s result: pass `.readonly` straight into
+    wrap()'s own `readonly` tuple (`+=`) and `.symlinks` into its
+    `symlinks` tuple (`+=`) -- both default to () so an unfound
+    command (RuntimeMounts()) can be added either way with no
+    special-casing at the call site."""
+    readonly: tuple[Path, ...] = ()
+    symlinks: tuple[tuple[Path, Path], ...] = ()
+
+    def __add__(self, other: "RuntimeMounts") -> "RuntimeMounts":
+        return RuntimeMounts(self.readonly + other.readonly,
+                             self.symlinks + other.symlinks)
+
+
+def _runtime_mounts_for(which_path: str) -> RuntimeMounts:
+    """One resolved command's own mounts -- factored out of
+    resolve_runtime so the one level of shebang-interpreter-chasing it
+    does can reuse exactly the same narrow-mount logic for the
+    interpreter itself, instead of a second, separately-maintained
+    copy of it."""
+    symlink_path = Path(which_path)
+    resolved = Path(os.path.realpath(symlink_path))
+    pkg_root = _npm_package_root(resolved)
+    readonly = (pkg_root if pkg_root is not None else resolved,)
+    # No `--symlink` needed when `which` already resolved straight to
+    # a real file (no symlink hop at all) -- the readonly mount above
+    # already covers the exact path PATH lookup will find.
+    symlinks = () if symlink_path == resolved else ((resolved, symlink_path),)
+    return RuntimeMounts(readonly=readonly, symlinks=symlinks)
+
+
+def resolve_runtime(exe_name: str) -> RuntimeMounts:
+    """Mounts that must stay visible inside a sandbox whose `hidden`
+    set includes the real operator HOME wholesale (see
     engine.steps.station/review's own worker/reviewer sandbox policy),
     so a CLI resolved by bare name through PATH (a runner's argv[0],
     e.g. "claude"/"codex") can still be found and started, without
-    ever re-exposing the real HOME itself: () if `exe_name` is not
-    found via shutil.which on THIS process's own PATH (same trusted-
-    os.environ reasoning as available()/launcher_env() -- never a
-    worker/case-controlled PATH).
+    ever re-exposing the real HOME itself: RuntimeMounts() (both
+    fields empty) if `exe_name` is not found via shutil.which on THIS
+    process's own PATH (same trusted-os.environ reasoning as
+    available()/launcher_env() -- never a worker/case-controlled
+    PATH).
 
-    Otherwise: the PARENT DIRECTORY of the path shutil.which resolved
-    (e.g. ~/.local/bin -- that path itself is usually a symlink, and
-    on every installation shape seen so far, SOMEWHERE under the real
-    HOME, hence invisible once HOME is hidden unless re-mounted
-    explicitly). The symlink's own parent directory, never the
-    symlink path by itself, is what gets mounted here: every other
-    mount this module builds (wrap()'s `readonly`/`writable`/`hidden`,
-    and even `readonly_remap`'s own destination) is keyed by
-    os.path.realpath, which -- run on the HOST, where the symlink
-    genuinely exists -- always follows it fully; asking wrap() to
-    mount "the symlink path" by that path alone therefore mounts its
-    REAL TARGET's location instead, never creating the symlink's own
-    directory entry inside the sandbox at all (confirmed empirically:
-    PATH lookup for the bare command then fails "No such file or
-    directory", even though the install directory below, and the
-    binary it actually points to, are both mounted and present).
-    Mounting the parent directory side-steps this entirely -- the
-    symlink (and anything else directly alongside it) is simply
-    PART of that directory's own content, nothing extra to resolve.
+    Otherwise: `.readonly` gets either `_npm_package_root(realpath(
+    that path))` (the whole package directory, when the resolved
+    target sits inside one -- the launcher needs sibling node_modules
+    to run) or, when there is no such package root, just the resolved
+    executable FILE itself -- NEVER the whole containing directory
+    (an earlier version of this function mounted `which`'s own
+    symlink's parent directory unconditionally, which re-exposed every
+    OTHER entry placed alongside it, e.g. a `~/.cargo/bin`-style flat
+    directory holding several unrelated tools' own binaries/secrets
+    right next to this one). `.symlinks` gets one (target, dest) pair
+    recreating the ORIGINAL symlink `which` found (e.g. ~/.local/bin/
+    claude -> .../claude-code/bin/claude.exe) via wrap()'s own
+    `--symlink` primitive -- needed because a bare-name PATH lookup
+    for "claude" inside the sandbox stats the exact path ~/.local/bin/
+    claude; mounting only the resolved FILE at its own, different real
+    location (the readonly mount above) leaves that PATH-lookup path
+    itself missing (confirmed empirically: execvp then fails "No such
+    file or directory" even though the real binary is mounted and
+    readable elsewhere) -- recreating just the one symlink, without
+    ever mounting its containing directory, is what lets PATH lookup
+    succeed while every sibling entry in that directory stays hidden
+    (also confirmed empirically: a second, unrelated file placed next
+    to the real symlink on the host stays unreadable through this
+    mount). Nothing is added when `which` already resolved straight to
+    a real file with no symlink hop (see _runtime_mounts_for).
 
-    PLUS _install_dir(realpath(that path)) -- the resolved target's
-    own directory (see _install_dir's docstring for the npm-global
-    "bin" special case). If the resolved target is itself a script
-    with a `#!` shebang (see _shebang_interpreter -- e.g. `codex`'s
-    own `codex.js`, `#!/usr/bin/env node`), the named interpreter is
-    resolved the SAME way (which + realpath) and ITS install
-    directory is mounted too -- one level of shebang-chasing only; an
-    interpreter that is itself another shebang script is not chased
-    further (nothing installed on this host, or described by the team
-    lead, is shaped that way).
+    If the resolved target is itself a script with a `#!` shebang (see
+    _shebang_interpreter -- e.g. `codex`'s own `codex.js`,
+    `#!/usr/bin/env node`), the named interpreter is resolved the SAME
+    way (which + realpath) and gets the identical narrow treatment --
+    one level of shebang-chasing only; an interpreter that is itself
+    another shebang script is not chased further (nothing installed
+    on this host, or described by the team lead, is shaped that way).
 
-    Every returned path is exactly what a caller should add to
-    sandbox.wrap's own `readonly` tuple -- never `writable`: none of
-    this is state the sandboxed CLI needs to modify, only its own
-    installed code, same reasoning as engine.steps.station.
-    ENGINE_ROOT's own readonly mount for this engine's own package.
+    `.readonly` is exactly what a caller should add to sandbox.wrap's
+    own `readonly` tuple -- never `writable`: none of this is state
+    the sandboxed CLI needs to modify, only its own installed code,
+    same reasoning as engine.steps.station.ENGINE_ROOT's own readonly
+    mount for this engine's own package.
 
     Verified directly on this host, under mode="bwrap", with the real
     operator HOME hidden wholesale: a sandboxed `claude --version` and
     `codex --version` both start and print their version (rc 0) with
     exactly these mounts added, while a sentinel file placed elsewhere
-    under the same real HOME stays unreadable."""
+    under the same real HOME -- and a second, unrelated file placed
+    directly alongside the real symlink in the same install/bin
+    directory -- both stay unreadable."""
     which_path = shutil.which(exe_name)
     if which_path is None:
-        return ()
-    symlink_path = Path(which_path)
-    resolved = Path(os.path.realpath(symlink_path))
-    mounts = [symlink_path.parent, _install_dir(resolved)]
+        return RuntimeMounts()
+    mounts = _runtime_mounts_for(which_path)
+    resolved = Path(os.path.realpath(which_path))
     interp_name = _shebang_interpreter(resolved)
     if interp_name is not None:
         interp_which = shutil.which(interp_name)
         if interp_which is not None:
-            interp_symlink = Path(interp_which)
-            interp_resolved = Path(os.path.realpath(interp_symlink))
-            mounts.append(interp_symlink.parent)
-            mounts.append(_install_dir(interp_resolved))
-    return tuple(mounts)
+            mounts = mounts + _runtime_mounts_for(interp_which)
+    return mounts
 
 
 __all__ = [
-    "SandboxUnavailable", "available", "exec_env", "launcher_env",
-    "prepare_worker_home", "resolve_runtime", "wrap",
+    "RuntimeMounts", "SandboxUnavailable", "available", "exec_env",
+    "launcher_env", "prepare_worker_home", "resolve_runtime", "wrap",
 ]

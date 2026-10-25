@@ -24,9 +24,18 @@ check_probe_targets  facts.md's optional "## 외부 대상" section ->
               to the same id too, since both get lowercased and every
               character outside [a-z0-9-] collapsed to "-" -- letting
               one probe script silently stand in for several distinct
-              targets). [] (no such section, or facts.md missing) means
-              the probe station is skipped entirely (engine.full_orbit).
-              A line in that section that is neither "(없음)"
+              targets). [] only when facts.md itself does not exist yet
+              (the facts gate -- check_facts -- already blocks the job
+              before this point for that case) OR the section's only
+              content is the sentinel "(없음)" (optionally bulleted
+              "- (없음)") -- engine.full_orbit treats either of these as
+              "this job touches no external API/CLI/file format" and
+              skips the probe station entirely. A facts.md that EXISTS
+              but has no "## 외부 대상" heading at all raises
+              ProbeTargetsError("probe_targets_section_missing") --
+              never treated the same as an explicit "(없음)": a section
+              a person simply forgot to write is a gap to fix, not "no
+              targets". A line in that section that is neither "(없음)"
               (explicitly "no targets") nor a well-formed "- name: url"
               bullet raises ProbeTargetsError -- a malformed line is
               never silently dropped, since a target engine.full_orbit
@@ -99,6 +108,14 @@ def _code_values_section(lines: list[str]) -> list[str]:
             break
     return lines[start:end]
 
+
+
+def _has_heading(lines: list[str], header_phrase: str) -> bool:
+    """True iff some line in `lines` is a heading line containing
+    `header_phrase` -- the presence check check_probe_targets uses to
+    tell "the section was never written" (an error) apart from "the
+    section was written and says (없음)" (no targets)."""
+    return any(_is_heading(line) and header_phrase in line for line in lines)
 
 
 def _heading_section(lines: list[str], header_phrase: str) -> list[str]:
@@ -190,15 +207,26 @@ def check_design_approved(ledger: Ledger, project: str, job: str) -> bool:
 
 
 def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
-    """facts.md's optional "## 외부 대상" section, parsed line by line:
+    """facts.md's "## 외부 대상" section, parsed line by line:
     "- <name>: <공식 문서 URL>" -> (name, url), in the order they
-    appear. [] (never raises for either of these) if facts.md does not
-    exist, has no such section at all, or the section's only content
-    is the sentinel "(없음)" (optionally bulleted "- (없음)") -- engine.
-    full_orbit treats any of these as "this job touches no external
-    API/CLI/file format" and skips the probe station entirely. Any
-    OTHER line in the section that is not a well-formed "- name: url"
-    bullet raises ProbeTargetsError rather than being silently
+    appear. [] (never raises) only if facts.md does not exist yet (the
+    facts gate already blocks the job before this point for that
+    case), or the section's only content is the sentinel "(없음)"
+    (optionally bulleted "- (없음)") -- engine.full_orbit treats that
+    as "this job touches no external API/CLI/file format" and skips
+    the probe station entirely. facts.md existing with NO "## 외부
+    대상" heading at all raises ProbeTargetsError
+    ("probe_targets_section_missing") -- a forgotten section is never
+    silently read as "no targets". A heading that IS present but whose
+    section has no real target bullet AND no explicit "(없음)" marker
+    (blank, or only whitespace) also raises ProbeTargetsError
+    ("probe_targets_section_empty") -- "no targets" must always be
+    SAID, never merely implied by writing nothing under the heading;
+    without this, a planner who simply forgot to fill the section in
+    would silently skip the probe station entirely, the same gap as
+    the missing-heading case this already guards against. Any OTHER
+    line in a present section that is not a well-formed "- name: url"
+    bullet also raises ProbeTargetsError rather than being silently
     skipped -- a malformed target line must stop the job, not quietly
     disappear from the list engine.full_orbit runs probes against."""
     path = _facts_path(repo, job)
@@ -206,7 +234,10 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return []
-    section = _heading_section(text.splitlines(), _PROBE_TARGETS_HEADER)
+    lines = text.splitlines()
+    if not _has_heading(lines, _PROBE_TARGETS_HEADER):
+        raise ProbeTargetsError("probe_targets_section_missing")
+    section = _heading_section(lines, _PROBE_TARGETS_HEADER)
     targets: list[tuple[str, str]] = []
     saw_empty_mark = False
     for line in section:
@@ -232,6 +263,11 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         raise ProbeTargetsError("probe_targets_mixed_empty_marker")
     if saw_empty_mark:
         return []
+    if not targets:
+        # The heading exists but the section said nothing at all -- not
+        # even the explicit "(없음)" that means "no targets". Writing
+        # nothing here must never be read the same as writing "(없음)".
+        raise ProbeTargetsError("probe_targets_section_empty")
     return targets
 
 

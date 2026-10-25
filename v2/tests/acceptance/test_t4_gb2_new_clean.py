@@ -135,14 +135,18 @@ def _plan_json() -> str:
         "scenes": [
             {"id": "s1", "actor_does": "이름을 넣고 인사말을 본다",
              "app_shows": "이름이 들어간 인사말이 보인다", "where": "cli",
-             "cmd": ["node", "tests/scenes/s1_greet.js"]},
+             "cmd": ["node", "tests/scenes/s1_greet.js"], "covers": ["R1"]},
         ],
         "tasks": [
             {"id": "t1", "title": "인사말 구현",
              "detail": "greet.js에 greet(name)을 만든다",
-             "owns": ["src/greet.js", "tests/greet.test.js"], "depends_on": []},
+             "owns": ["src/greet.js", "tests/greet.test.js"], "depends_on": [],
+             "covers": ["R1"]},
         ],
         "acceptance": ["이름을 받아 인사말을 돌려준다"],
+        "requirements": [
+            {"id": "R1", "text": "이름을 받아 인사말을 돌려준다", "kind": "function"},
+        ],
     }, ensure_ascii=False)
 
 
@@ -350,6 +354,10 @@ def test_gb2_new_against_an_empty_folder_installs_for_real_and_ships(
 
     report_text = (app_repo / ".gongbang" / _JOB_NAME / "report.md").read_text(encoding="utf-8")
     assert "통과" in report_text
+    # plan.json's own requirement (R1, covered by scene s1) must show
+    # up by id in the handoff's requirement<->scene table -- real
+    # requirement tracking end to end, not just a pass/fail string.
+    assert "R1" in report_text
 
     assert not deploy_log.exists()  # release still pending `gb2 ship`
 
@@ -372,3 +380,55 @@ def test_gb2_new_against_an_empty_folder_installs_for_real_and_ships(
     assert deploy_log.exists()
     deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()
     assert len(deploy_lines) == 1, deploy_lines
+
+
+def test_ci_engine_node_e2e_job_runs_t3_t4_and_t5() -> None:
+    """ci/engine-node-e2e.yml (the public GitHub Actions job snippet for
+    this whole file's CLI-level suite) must actually invoke this test
+    module too, not just T3 -- an earlier round left the checked-in job
+    running only test_t3_gb2_node_e2e.py, so T4's/T5's own CLI-level
+    coverage never ran in CI at all. Plain text containment, no YAML
+    parser dependency (pyyaml is not a project dependency here)."""
+    ci_path = Path(__file__).resolve().parents[2] / "ci" / "engine-node-e2e.yml"
+    text = ci_path.read_text(encoding="utf-8")
+    assert "test_t3_gb2_node_e2e.py" in text
+    assert "test_t4_gb2_new_clean.py" in text
+    assert "test_t5_small_change.py" in text
+    assert "GB2_REQUIRE_T3: \"1\"" in text
+    assert "GB2_TEST_NODE_MODULES" in text
+
+
+_TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "tools" / "templates"
+
+
+def test_new_app_template_provides_a_runnable_app_skeleton() -> None:
+    """Review finding: "Template cannot scaffold common web apps --
+    root application/configuration files remain outside builder
+    ownership." tools/templates/new-app/ must ship a real, bootable
+    Vite skeleton (index.html + src/main.js + vite.config.js + dev/
+    build/preview scripts), and node-vitest.json's own
+    station_owners.build.builder must list those exact root files so a
+    plan that owns them is accepted by engine.plan's own
+    "owns outside build prefixes" check -- see engine/plan.py's
+    _prefix_covers and its own "problems" list. This checks the
+    template files directly; it does NOT check that `gb2 new` actually
+    copies index.html/vite.config.js/src/main.js into a scaffolded repo
+    yet -- that copy list (tools/gb2's own _NEW_APP_SKELETON_FILES) is
+    outside this file's ownership and still needs updating separately
+    for the new files to reach a real scaffolded app."""
+    skeleton = _TEMPLATES_DIR / "new-app"
+    assert (skeleton / "index.html").is_file()
+    assert (skeleton / "vite.config.js").is_file()
+    assert (skeleton / "src" / "main.js").is_file()
+
+    package = json.loads((skeleton / "package.json").read_text(encoding="utf-8"))
+    scripts = package["scripts"]
+    assert scripts["dev"] == "vite"
+    assert scripts["build"] == "vite build"
+    assert scripts["preview"] == "vite preview"
+    assert "vite" in package["devDependencies"]
+
+    config = json.loads((_TEMPLATES_DIR / "node-vitest.json").read_text(encoding="utf-8"))
+    builder_owns = config["station_owners"]["build"]["builder"]
+    for root_file in ("index.html", "vite.config.js", "vite.config.ts", "vite.config.mjs"):
+        assert root_file in builder_owns

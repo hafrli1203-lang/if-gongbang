@@ -260,10 +260,21 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
       still show 실패, not keep repeating "사람 확인 대기" for a
       request that will never be approved again.
     - a job.handoff_written event (there is at most one per job --
-      engine.handoff.write_handoff -- deliberately NOT 'report.written',
-      which every attempt's own "report" stage appends; keying off that
-      would mark a job 완료 as soon as its very first task's report
-      stage ran) -> 완료.
+      engine.handoff.write_handoff) is deliberately NOT a 완료 candidate
+      on its own: handoff always runs BEFORE the app-wide security
+      check and the job's release decision (engine.full_orbit.
+      _finish_after_handoff), so a crash between "handoff written" and
+      either of those two later steps would otherwise read as 완료 while
+      the job is still, in fact, stuck mid-security or never released.
+      완료 (and every other terminal label below) comes only from a
+      LATER event that this module can trace back to the final
+      certificate the job actually reached -- a release_decision, or a
+      job.metrics failure, or a still-open "awaiting_*" stop. A job
+      whose latest event is simply its own handoff_written (security
+      crashed right after, before recording anything) therefore falls
+      through to the "진행 중"/"중단" fallback below, same as a job
+      that has not reached handoff at all -- which is honest: from the
+      ledger's own evidence alone, "완료" is not yet known to be true.
     - the LAST "job.metrics" event whose payload["outcome"] == "failed"
       (engine.orbit's own per-attempt outcome record, written right
       before a stage-list call returns early -- including a release
@@ -291,8 +302,6 @@ def _derive_job_status(job_events: tuple[EventRow, ...],
                 label = (f"사람 확인 대기: {reason}" if isinstance(reason, str) and reason
                         else "사람 확인 대기")
                 candidates.append((event.seq, label))
-        elif event.kind == "job.handoff_written":
-            candidates.append((event.seq, "완료"))
         elif event.kind == "job.metrics":
             outcome = event.payload.get("outcome")
             if outcome == "failed":

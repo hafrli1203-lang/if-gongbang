@@ -11,12 +11,14 @@ open_job():
      right now (user's pre-existing changes; close must never reset them)
   4. base_head = `git rev-parse HEAD` of the project repo, recorded on
      job.opened (the sha the worker copies are made from; merge reads it)
-  5. make every role's worker copy (git archive | tar) under a temporary
+  5. append job.open_intent {attempt_id, job_id, job_name, n, copies_dir}
+     -- BEFORE any copy is made (see note on (6a) below)
+  6. make every role's worker copy (git archive | tar) under a temporary
      staging directory, then atomically rename it into
-     config.home/copies/{attempt_id} — all BEFORE any ledger write (see
+     config.home/copies/{attempt_id} — all BEFORE job.opened itself (see
      note on (6) below)
-  6. generation = project.generation + 1
-  7. append job.opened, then state.changed OPEN
+  7. generation = project.generation + 1
+  8. append job.opened, then state.changed OPEN
 
 Note on (1): state.transition('open_job') enforces these same guards, but
 only AFTER whatever the caller already appended. Appending job.opened
@@ -35,6 +37,28 @@ staging directory first and renaming it into place only once ALL of them
 have succeeded means: the ledger is never touched until copies are known
 good, and a failure cleans up its own temp directory and raises — no
 attempt row, no generation bump, no OPEN state.
+
+Note on (6a): (6)'s own fix closed the "broken/partial copies" case, but
+left a NARROWER crash window open: a crash strictly AFTER `_make_copies`'
+own atomic rename succeeded (so config.home/copies/{attempt_id} now
+holds a complete, good copy on disk) but BEFORE job.opened is appended
+leaves that directory on disk with NOTHING in the ledger naming it at
+all -- job_id/attempt_id/n were only ever computed in-memory this call,
+never journaled before the rename. The NEXT open_job call for the same
+job_name sees no trace of this attempt (nothing was ever appended for
+it) and simply computes a brand-new job_id/attempt_id, leaving the old
+copies/{attempt_id} directory behind forever: no event names it, so
+nothing could ever clean it up. Recording job.open_intent first, BEFORE
+`_make_copies` runs at all, closes this the same way engine.procs.spawn's
+own proc.launch_intent closes its analogous crash window (Popen
+succeeding before proc.started is appended): _reconcile_orphaned_intents
+(called early in open_job, before this call's own new attempt is even
+computed) finds any job.open_intent with no matching job.opened for the
+project and removes that intent's own copies_dir (and its `.tmp-` staging
+dir, in case the crash landed even earlier, before the rename) if either
+is still present -- safe unconditionally, since no job.opened ever
+pointed at it, so nothing else in the ledger could possibly still
+reference that attempt_id's copies.
 """
 from __future__ import annotations
 
@@ -115,6 +139,40 @@ def _reconcile_pending_open(ledger: Ledger, project: str, job_name: str,
     return attempt_id
 
 
+def _reconcile_orphaned_intents(ledger: Ledger, project: str, config: EngineConfig) -> None:
+    """Clean up config.home/copies/{attempt_id} directories left behind
+    by an open_job call that crashed strictly after _make_copies' own
+    atomic rename but before job.opened was appended -- see the module
+    docstring's "Note on (6a)". For every job.open_intent event for
+    this project with no job.opened sharing its own attempt_id, both
+    `_copies_dir(config, attempt_id)` (the renamed-into-place result)
+    and its own `.tmp-` staging root (in case the crash landed even
+    earlier, before the rename itself) are removed if either is still
+    present. Always safe: no job.opened ever named that attempt_id, so
+    nothing else in the ledger -- no attempt row (job.opened's handler
+    is the only thing that ever inserts one), no request, no proc --
+    could possibly still reference its copies. Idempotent (a directory
+    an earlier call already removed is simply not there), and run
+    UNCONDITIONALLY near the top of every open_job call -- including
+    one for a completely different job_name -- since an intent's own
+    orphan status depends only on whether job.opened for ITS OWN
+    attempt_id ever landed, never on which job_name the CURRENT call
+    is opening."""
+    opened_attempt_ids = {
+        event.payload.get("attempt_id")
+        for _seq, event in ledger.events(project, "job.opened")
+    }
+    for _seq, event in ledger.events(project, "job.open_intent"):
+        attempt_id = event.payload.get("attempt_id")
+        if attempt_id is None or attempt_id in opened_attempt_ids:
+            continue
+        copies_root = config.home / "copies"
+        dirname = ids.attempt_dirname(str(attempt_id))
+        for candidate in (copies_root / dirname, copies_root / f".tmp-{dirname}"):
+            if candidate.exists():
+                shutil.rmtree(candidate, ignore_errors=True)
+
+
 def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
              kind: str, roles: tuple[str, ...], actor_id: str = "owner") -> str:
     """Return the new attempt_id.
@@ -132,6 +190,7 @@ def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
     if not ledger.acquire_lock(project, holder):
         raise state.TransitionError("open_job refused: project_busy")
     try:
+        _reconcile_orphaned_intents(ledger, project, config)
         reconciled = _reconcile_pending_open(ledger, project, job_name, actor_id)
         if reconciled is not None:
             return reconciled
@@ -158,6 +217,18 @@ def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
             git_argv(project_config.repo, "rev-parse", "HEAD"),
             check=True, capture_output=True, text=True,
         ).stdout.strip()
+        # Recorded BEFORE _make_copies runs at all (so before its own
+        # atomic rename, let alone before job.opened below) -- see the
+        # module docstring's "Note on (6a)" for the crash window this
+        # closes and _reconcile_orphaned_intents for how a later
+        # open_job call cleans up after it if this one never finishes.
+        ledger.append(Event(
+            project=project, kind="job.open_intent", actor_kind="owner",
+            actor_id=actor_id, attempt_id=new_attempt_id,
+            payload={"job_id": job_id, "job_name": job_name, "n": n,
+                      "attempt_id": new_attempt_id,
+                      "copies_dir": str(_copies_dir(config, new_attempt_id))},
+        ))
         copy_links_skipped, copy_git_config_sha256 = _make_copies(
             project_config, config, new_attempt_id, roles)
         generation = ledger.project(project).generation + 1
@@ -387,8 +458,18 @@ def dirty_paths(repo: Path, excludes: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sorted(p for p in paths if not is_excluded(p)))
 
 
+def _copies_dir(config: EngineConfig, attempt_id: str) -> Path:
+    """config.home/copies/{attempt_id} -- the directory `_make_copies`
+    atomically renames its `.tmp-` staging root into, holding every
+    role's own subdirectory. Factored out so job.open_intent's own
+    payload (open_job) and _reconcile_orphaned_intents' cleanup (same
+    module) compute the exact same path `_make_copies` itself does,
+    never a second, separately-maintained copy of this join."""
+    return config.home / "copies" / ids.attempt_dirname(attempt_id)
+
+
 def copy_root(config: EngineConfig, attempt_id: str, role: str) -> Path:
-    return config.home / "copies" / ids.attempt_dirname(attempt_id) / role
+    return _copies_dir(config, attempt_id) / role
 
 
 def copy_git_config_matches_recorded(ledger: Ledger, project: str, attempt_id: str,
@@ -451,7 +532,7 @@ def _make_copies(project_config: ProjectConfig, config: EngineConfig,
             for entry, reason in role_skipped:
                 skipped.append({"role": role, "entry": entry, "reason": reason})
             git_config_sha256[role] = sha256
-        tmp_root.rename(copies_root / dirname)
+        tmp_root.rename(_copies_dir(config, attempt_id))
     except BaseException:
         shutil.rmtree(tmp_root, ignore_errors=True)
         raise

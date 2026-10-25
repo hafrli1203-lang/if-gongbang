@@ -9,11 +9,18 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from engine import sandbox
 from engine.acceptance import acceptance_path, run_acceptance, run_probe_scripts
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
 from tests.fixtures.sample_app import make_sample
 from tests.plan_stub import Plan, Scene
+
+_needs_bwrap = pytest.mark.skipif(
+    not sandbox.available(), reason="bwrap not available on this host",
+)
 
 
 def _sample_workspace(workspace: Workspace) -> Workspace:
@@ -194,15 +201,25 @@ def test_scene_mutation_runs_against_a_snapshot_not_the_real_repo(
     assert events[0].payload["reason"] is None
 
 
-def test_scene_patching_a_tracked_file_fails_acceptance_and_stops_the_run(
+def test_scene_patching_a_tracked_file_fails_the_scene_outright(
     workspace: Workspace,
 ) -> None:
     """A scene is free to create a new, untracked scratch file (previous
-    test), but patching a file the snapshot's own HEAD already tracks
-    must not be allowed to stick for a later scene or the full suite:
-    this would certify code the fixed-before-any-scene fingerprint
-    never actually covered. The second scene and the full suite must
-    never run once the first scene mutates a tracked path."""
+    test), but a scene that tries to open-for-write a file the
+    snapshot's own HEAD already tracks must never get far enough to
+    actually change it: _lock_tracked_files (engine.acceptance) strips
+    every tracked file's write bit before any scene runs, so the
+    `open(..., 'w')` itself raises PermissionError and the scene fails
+    right there -- not "fails later once _tracked_mutated_paths
+    notices a diff" (the old, now-closed shape of this bug: a scene
+    could patch, observe its own result, then restore the bytes before
+    anything re-checked `git status`, leaving no diff at all to catch).
+    A plain failed scene does not by itself stop the next scene or the
+    full suite from running (same as any other scene assertion
+    failure) -- only an actual tracked mutation
+    (_tracked_mutated_paths) does that; s2 here is an unrelated no-op
+    and both it and the full suite still run and pass, but the job as
+    a whole is still not accepted because s1 failed."""
     ws = _sample_workspace(workspace)
     attempt_id = _open(ws)
     plan = Plan(
@@ -220,21 +237,172 @@ def test_scene_patching_a_tracked_file_fails_acceptance_and_stops_the_run(
 
     acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
 
-    assert acc.snapshot_mutated is True
+    assert acc.scenes[0].passed is False
+    assert "PermissionError" in acc.scenes[0].tail or "Permission denied" in acc.scenes[0].tail
+    assert acc.snapshot_mutated is False
     assert acc.passed is False
-    assert len(acc.scenes) == 1  # s2 never ran
-    assert acc.full_suite_passed is False  # the full suite never ran either
+    assert len(acc.scenes) == 2  # s2 still ran (s1 failing is not a mutation)
+    assert acc.scenes[1].passed is True
+    assert acc.full_suite_passed is True  # the full suite ran too, against clean code
     # The real repo's own tracked file was never touched.
     assert "Hello" in (ws.alpha / "src" / "greeter" / "__init__.py").read_text(encoding="utf-8")
 
     data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
-    assert data["snapshot_mutated"] is True
+    assert data["snapshot_mutated"] is False
     assert data["passed"] is False
-    assert len(data["scenes"]) == 1
+    assert len(data["scenes"]) == 2
 
     events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
-    assert events[0].payload["snapshot_mutated"] is True
-    assert events[0].payload["reason"] == "snapshot_mutated"
+    assert events[0].payload["snapshot_mutated"] is False
+    assert events[0].payload["reason"] == "scenes_or_suite_failed"
+
+
+def test_scene_that_tries_to_patch_and_restore_src_now_fails_outright(
+    workspace: Workspace,
+) -> None:
+    """Regression for the "acceptance certifies different executed
+    code" finding (engine/acceptance.py module docstring, codex-
+    goal-review-4.md item 12): a scene that patches a tracked file,
+    runs (anything) against the patched version, then restores the
+    original bytes before anything re-checks `git status` used to
+    leave no HEAD-tracked diff, so _tracked_mutated_paths alone could
+    never catch it -- the scene's own command had, in fact, run
+    against code different from what later gets committed and
+    certified. _lock_tracked_files now makes every tracked file
+    read-only in each stage's own fresh snapshot before the scene
+    runs at all, so the very first `write_text` call here raises
+    PermissionError and the scene fails outright (never gets to
+    "restore" anything, let alone leave a marker behind for s2)."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "import pathlib; "
+                      "p = pathlib.Path('src/greeter/__init__.py'); "
+                      "orig = p.read_text(); "
+                      "p.write_text('def greet(name): return \"POISON\"'); "
+                      "pathlib.Path('left_behind_marker.txt').write_text('x'); "
+                      "p.write_text(orig)")),
+            Scene(id="s2", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "import pathlib, sys; "
+                      "assert not pathlib.Path('left_behind_marker.txt').exists(); "
+                      "sys.path.insert(0, 'src'); from greeter import greet; "
+                      "assert greet('World') == 'Hello, World'")),
+        ),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is False
+    assert "PermissionError" in acc.scenes[0].tail or "Permission denied" in acc.scenes[0].tail
+    assert acc.snapshot_mutated is False
+    assert acc.passed is False
+    # s1's own script raised on the very first write_text call, before
+    # the marker write or the restore it never reached -- so s2 (which
+    # still runs; a failed-but-not-mutated scene does not stop the
+    # loop) finds no marker and the original, untouched implementation.
+    assert len(acc.scenes) == 2
+    assert acc.scenes[1].passed is True
+
+
+@_needs_bwrap
+def test_scene_cannot_delete_and_recreate_a_tracked_file_under_bwrap(
+    workspace: Workspace,
+) -> None:
+    """The one gap plain chmod (_lock_tracked_files) cannot close on
+    its own: unlink is governed by the PARENT directory's write
+    permission, not the file's own mode, so a scene could delete a
+    tracked file and write a new one back at the same path -- an
+    "untracked substitute" standing in for the certified implementation
+    without ever tripping _tracked_mutated_paths's bare-untracked
+    exemption differently than a legitimate new scratch file. Under
+    sandbox="bwrap", the tracked file is ALSO bind-mounted read-only
+    directly (run_acceptance's extra_readonly), and a bind-mounted path
+    cannot be unlinked either (EBUSY) -- this closes that remaining
+    gap; test_scene_that_tries_to_patch_and_restore_src_now_fails_outright
+    already covers the plain in-place write under every sandbox mode,
+    including "none"."""
+    ws = _sample_workspace(workspace)
+    ws = Workspace(ws.root, replace(ws.config, sandbox="bwrap"), ws.ledger,
+                  ws.alpha, ws.beta)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "import pathlib; "
+                      "p = pathlib.Path('src/greeter/__init__.py'); "
+                      "p.unlink(); "
+                      "p.write_text('def greet(name): return \"POISON\"')")),
+        ),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is False
+    assert acc.passed is False
+
+
+def test_scene_that_drops_an_untracked_config_file_does_not_leak_into_the_next_scene(
+    workspace: Workspace,
+) -> None:
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "open('config.override.json', 'w').write('{}')")),
+            Scene(id="s2", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "import pathlib; "
+                      "assert not pathlib.Path('config.override.json').exists()")),
+        ),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert acc.scenes[1].passed is True
+    assert acc.passed is True
+    # Never reached the real repo either.
+    assert not (ws.alpha / "config.override.json").exists()
+
+
+def test_scene_that_poisons_a_cache_dir_does_not_leak_into_the_full_suite(
+    workspace: Workspace,
+) -> None:
+    """Same guarantee as the two tests above, exercised against the
+    full suite's own fresh snapshot instead of a second scene."""
+    ws = _sample_workspace(workspace)
+    attempt_id = _open(ws)
+    plan = Plan(
+        goal="x", ui=False,
+        scenes=(
+            Scene(id="s1", actor_does="x", app_shows="x", where="cli",
+                 cmd=(sys.executable, "-c",
+                      "import pathlib; "
+                      "d = pathlib.Path('.pytest_cache_poison'); d.mkdir(); "
+                      "(d / 'poison.txt').write_text('bad')")),
+        ),
+        tasks=(), acceptance=("x",),
+    )
+
+    acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
+
+    assert acc.scenes[0].passed is True
+    assert acc.full_suite_passed is True
+    assert acc.passed is True
+    assert not (ws.alpha / ".pytest_cache_poison").exists()
 
 
 def test_unchanged_tree_keeps_tree_changed_false(workspace: Workspace) -> None:
@@ -263,8 +431,10 @@ def test_run_probe_scripts_runs_existing_script_and_records_evidence(
     probe_dir.mkdir(parents=True)
     # "t1" -- 1-based position in the targets list (engine.gates.
     # probe_target_id), never derived from the target's own name.
+    # _probe_observed requires the marker AND this exact target's own
+    # url on the same stdout line, not just the bare marker.
     (probe_dir / "t1.py").write_text(
-        "print('PROBE OK')\n", encoding="utf-8",
+        "print('PROBE OK https://docs.stripe.com/api')\n", encoding="utf-8",
     )
 
     results = run_probe_scripts(
@@ -332,7 +502,8 @@ def test_run_probe_scripts_colliding_names_get_distinct_ids_and_scripts(
     attempt_id = _open(ws)
     probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.py").write_text("print('PROBE OK')\n", encoding="utf-8")
+    # _probe_observed requires the marker AND this target's own url.
+    (probe_dir / "t1.py").write_text("print('PROBE OK https://a')\n", encoding="utf-8")
     # t2 has no script at all -- must be reported missing, not silently
     # covered by t1's passing script.
 

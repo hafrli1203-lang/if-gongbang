@@ -12,5 +12,8 @@ requested, what passed, how to run the app, and what is still open.
 ```
 npm install   # install dependencies (owner-approved by the engine's
               # own install-request flow, not run by gb2 new itself)
+npm run dev   # start the Vite dev server
+npm run build # production build (output: dist/)
+npm run preview # serve the production build locally
 npm test      # run the test suite (vitest)
 ```

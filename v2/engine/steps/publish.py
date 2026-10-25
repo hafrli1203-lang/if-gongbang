@@ -60,7 +60,20 @@ call_publisher   re-verifies the artifact hash and the used approval's
                  directly from that working tree) -- same "re-check
                  right before dispatch" pattern as the artifact/approval
                  re-checks, for the same crash-and-resume-gap reason.
-                 fakes.publisher.publish(key=request_id, target, hash)
+                 UNCONDITIONALLY, regardless of whether release is
+                 configured at all, this step ALSO requires a passing,
+                 non-stale FULL-suite bench for the project repo's
+                 current fingerprint (StepFailed("full_bench_missing")
+                 if not) AND this job's own acceptance+app_security
+                 certificate for that same fingerprint
+                 (StepFailed(<job_certificate_status's own reason>) if
+                 not) -- "release" is only this project's opt-in to the
+                 master_repo fast-forward dance, never a toggle for
+                 whether a real deploy call needs the whole suite and
+                 this job's certificate to have passed first (codex-
+                 goal-review-4.md item 13 / codex-diff-review-s17.md
+                 "Whole-job verification is not a universal deployment
+                 invariant"). fakes.publisher.publish(key=request_id, target, hash)
                  on PublisherCrashed: request status -> unknown, stop
                  reconcile: the publisher's own receipt decides -- the
                  ONLY success is a receipt whose status is "done" AND
@@ -413,22 +426,33 @@ def _run_call_publisher(ctx: StepContext) -> dict[str, object]:
             raise StepFailed("master_not_advanced")
         if not release_mod.master_is_clean(release_config.master_repo):
             raise StepFailed("master_not_clean")
-        # Same re-check-right-before-dispatch reasoning as the two
-        # guards just above: advance_master's own full_bench_missing
-        # check is journaled 'done' well before this point and never
-        # re-run, so evidence invalidated (e.g. an install) in the gap
-        # between advance_master and call_publisher must not go
-        # unnoticed -- never dispatch on stale say-so.
-        if not _full_bench_passed_for_release(ctx):
-            raise StepFailed("full_bench_missing")
-        # Same re-check-right-before-dispatch reasoning as the bench
-        # guard just above, for the job certificate advance_master
-        # already required (see that step's own comment and engine.
-        # release.job_certificate_status) -- never dispatch on stale
-        # say-so if evidence was invalidated in the gap since.
-        ok, reason = _job_certificate_ok_for_release(ctx)
-        if not ok:
-            raise StepFailed(reason)
+
+    # Full bench + job certificate, UNCONDITIONALLY -- never only when
+    # release_config happens to be set (codex-goal-review-4.md item 13 /
+    # codex-diff-review-s17.md "Whole-job verification is not a universal
+    # deployment invariant", engine/steps/publish.py:407,545): a project
+    # with no `release` configured at all used to reach the real
+    # publisher call right above check_approval/check_artifact alone --
+    # "release" is this project's opt-in path to the master_repo
+    # fast-forward dance (advance_master), never a toggle for whether a
+    # real deploy needs the whole suite and this job's own acceptance/
+    # app_security certificate to have passed first. Both
+    # _full_bench_passed_for_release and _job_certificate_ok_for_release
+    # are plain functions of (ledger, attempt_id/project, repo,
+    # fingerprint) -- nothing about them actually requires a
+    # ReleaseConfig to exist, only their (pre-existing, release-only)
+    # names do; this call site needs no new helper, just no longer
+    # skipping them when release_config is None. Same re-check-right-
+    # before-dispatch reasoning as every guard above: an earlier step
+    # (or, with no release configured, nothing at all) may have checked
+    # this long before now, so evidence invalidated in the gap (e.g. an
+    # install) must still be caught here, immediately before the one
+    # call that actually ships something.
+    if not _full_bench_passed_for_release(ctx):
+        raise StepFailed("full_bench_missing")
+    ok, reason = _job_certificate_ok_for_release(ctx)
+    if not ok:
+        raise StepFailed(reason)
 
     key = ctx.request.request_id
     try:

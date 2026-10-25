@@ -335,6 +335,24 @@ def test_parallel_review_bench_overlap_and_failed_bench_still_records_review(
     assert workspace.ledger.project("alpha").state == "OPEN"
 
 
+def _certify_full(workspace: Workspace, project: str, attempt_id: str) -> None:
+    """Record a passing full-suite bench AND a passing acceptance +
+    app_security certificate, bound to the project repo's CURRENT
+    fingerprint -- engine.steps.publish's call_publisher now requires
+    both of these unconditionally before any real dispatch (not only
+    when `release` is configured), see that module's own docstring."""
+    project_cfg = workspace.config.projects[project]
+    fp = evidence.fingerprint(project_cfg.repo, project_cfg.excludes)
+    evidence.record(workspace.ledger, project, attempt_id, "bench", fp,
+                    payload={"passed": True, "scope": "full"})
+    for kind in ("acceptance.recorded", "app_security.recorded"):
+        workspace.ledger.append(Event(
+            project=project, kind=kind, actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"passed": True, "fingerprint": fp},
+        ))
+
+
 def test_blocked_by_unrelated_unknown_request_is_pending(workspace: Workspace) -> None:
     """orbit must not treat a stage as completed when run_once refuses to
     process anything at all because some OTHER request for this project
@@ -348,6 +366,7 @@ def test_blocked_by_unrelated_unknown_request_is_pending(workspace: Workspace) -
                 {"target": "store", "artifact_path": "dist/bundle.js",
                  "artifact_hash": artifact_hash}, "owner")
     grant(workspace.ledger, "beta", rid, ttl_sec=3600)
+    _certify_full(workspace, "beta", attempt_id)
     fakes = Fakes(publisher=FakePublisher(fail_after_effect=True, lookup_fails=True),
                  installer=FakeInstaller())
     proc = Processor(workspace.config, workspace.ledger, fakes)

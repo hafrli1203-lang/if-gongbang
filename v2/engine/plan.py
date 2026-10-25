@@ -10,9 +10,24 @@ means the scene passed. Scene scripts referenced from `cmd` live under
 tests/scenes/ in the same repo -- the planner may write them; a builder
 station must never touch tests/scenes/ (see engine.full_orbit and
 EngineConfig.station_owners for each role's own write prefixes there).
+
+A scene that `covers` a requirement must actually RUN its scene
+script, not merely mention its path somewhere in `cmd` -- `cmd` must
+start with one of the supported scene runners below, and the token
+right after that runner must be the tests/scenes/ script itself (see
+validate_plan/_scene_script_arg). This is why `["true",
+"tests/scenes/x.py"]` is rejected even though "tests/scenes/x.py"
+appears in `cmd`: `true` ignores its arguments and exits 0 without
+ever executing that script, which would let a scene claim a
+requirement is demonstrated when nothing was ever run against it.
+Supported runners (matched on cmd[0]'s basename, so a full
+interpreter path like sys.executable still counts as "python3"):
+"python3", "python", "node", "bash", "sh", and "npx vitest run" (the
+three-token prefix, for a Node test file used as a scene).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 from dataclasses import dataclass
@@ -20,6 +35,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from engine.ledger import Event, Ledger
 from engine.skills import skill_path_in_root
 
 if TYPE_CHECKING:
@@ -113,6 +129,105 @@ class Plan:
 
 def plan_path(repo: Path, job: str) -> Path:
     return repo / ".gongbang" / job / "plan.json"
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def scene_file_digests(path: Path) -> dict[str, str]:
+    """{scene file path (exactly as it appears in that scene's own
+    `cmd`, relative to the repo) -> sha256 hex digest of its current
+    bytes}, one entry per DISTINCT tests/scenes/ file any scene's cmd
+    in the plan.json at `path` references -- "" for a referenced file
+    that cannot be read (missing/unreadable), never raising, so a
+    scene script that disappears after review still changes the
+    digest plan_digest folds this into, rather than silently keeping
+    the old one. {} if plan.json itself cannot be read/parsed (the
+    same tolerant shape plan_digest needs: a resume must always get
+    SOME digest to compare, never an exception, even for a job whose
+    plan.json went missing between attempts)."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    repo = path.parent.parent.parent  # repo/.gongbang/<job>/plan.json
+    scene_paths: set[str] = set()
+    for scene in raw.get("scenes", []) if isinstance(raw.get("scenes"), list) else []:
+        if not isinstance(scene, dict):
+            continue
+        cmd = scene.get("cmd", [])
+        if not isinstance(cmd, list):
+            continue
+        for token in cmd:
+            if isinstance(token, str) and token.startswith("tests/scenes/"):
+                scene_paths.add(token)
+    return {p: _file_sha256(repo / p) for p in sorted(scene_paths)}
+
+
+def plan_digest(path: Path) -> str:
+    """sha256 hex digest over plan.json's own raw bytes (at `path`)
+    plus every distinct tests/scenes/ file any scene's cmd references
+    (scene_file_digests, folded in sorted path order as
+    "<path>:<sha256>") -- a later edit to plan.json OR to any scene
+    script it names changes this digest. engine.full_orbit's own
+    record_plan_reviewed stores this (plus the per-file breakdown)
+    in a plan.reviewed ledger event right after plan review passes; a
+    resume (engine.full_orbit.continue_full_job) recomputes it and
+    compares against that recorded value to decide whether the plan
+    needs reviewing again. Never raises: an unreadable plan.json folds
+    in as b"", same tolerant shape scene_file_digests already uses, so
+    a resume always has SOME digest to compare rather than crashing."""
+    try:
+        plan_bytes = path.read_bytes()
+    except OSError:
+        plan_bytes = b""
+    hasher = hashlib.sha256(plan_bytes)
+    for scene_path, file_digest in scene_file_digests(path).items():
+        hasher.update(f"\n{scene_path}:{file_digest}".encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
+                         repo: Path, job: str) -> None:
+    """Appends one plan.reviewed ledger event ({"job": job, "digest":
+    plan_digest(...), "scene_digests": scene_file_digests(...),
+    "requirement_ids": [...], "task_ids": [...]}) for this (project,
+    job) attempt -- engine.full_orbit calls this once, right after the
+    planner's own plan review Stage comes back "done" (ENGINE.md: plan
+    -> plan review -> commit), so plan.reviewed always names the exact
+    plan.json + scene files that review actually judged, never a later
+    edit. A resume reads the latest such event for this job back and
+    recomputes plan_digest against the CURRENT plan.json/scene files
+    to decide whether the plan changed since it was last reviewed (see
+    plan_digest's own docstring). requirement_ids/task_ids (plan order,
+    read via load_plan -- [] if the plan cannot be loaded at all, which
+    should never happen here since review already ran against this
+    same plan.json) are the ids check_resumed_plan compares against a
+    LATER plan.json to catch a requirement or task quietly removed
+    (rather than changed) since this review -- a case plan_digest alone
+    would also catch (any edit changes the digest), but naming exactly
+    which id disappeared is more useful than just "the plan changed"."""
+    path = plan_path(repo, job)
+    try:
+        plan = load_plan(repo, job)
+        requirement_ids = [r.id for r in plan.requirements]
+        task_ids = [t.id for t in plan.tasks]
+    except PlanError:
+        requirement_ids, task_ids = [], []
+    ledger.append(Event(
+        project=project, kind="plan.reviewed", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"job": job, "digest": plan_digest(path),
+                 "scene_digests": scene_file_digests(path),
+                 "requirement_ids": requirement_ids, "task_ids": task_ids},
+    ))
 
 
 def _require_str(obj: dict[str, object], key: str, where: str) -> str:
@@ -313,16 +428,64 @@ def requirement_coverers(plan: Plan) -> dict[str, tuple[tuple[str, str], ...]]:
     return {rid: tuple(pairs) for rid, pairs in coverers.items()}
 
 
-def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> list[str]:
+# Scene cmd runners a `covers`-claiming scene is allowed to use (see
+# the module docstring for why this exists). Each entry is the fixed
+# prefix of tokens `cmd` must start with; cmd[0] is compared by its
+# basename (Path(cmd[0]).name) so a full interpreter path -- e.g.
+# sys.executable in a test fixture -- still matches "python3", while
+# every later prefix token ("vitest", "run") is compared literally,
+# since those are never path-qualified in a scene cmd.
+_SUPPORTED_SCENE_RUNNERS: tuple[tuple[str, ...], ...] = (
+    ("python3",), ("python",), ("node",), ("bash",), ("sh",),
+    ("npx", "vitest", "run"),
+)
+
+
+def _scene_script_arg(cmd: tuple[str, ...]) -> str | None:
+    """The tests/scenes/ path `cmd` actually runs -- the token right
+    after a matched _SUPPORTED_SCENE_RUNNERS prefix, iff that token
+    starts with "tests/scenes/". None if `cmd` does not start with any
+    supported runner, or the runner's first real argument is something
+    else (a flag, a different path, or the scene path buried behind
+    other tokens) -- `cmd` mentioning "tests/scenes/..." ANYWHERE else
+    does not count (see module docstring: `["true",
+    "tests/scenes/x.py"]` must return None here, since `true` never
+    runs that script)."""
+    if not cmd:
+        return None
+    runner0 = Path(cmd[0]).name
+    for prefix in _SUPPORTED_SCENE_RUNNERS:
+        n = len(prefix)
+        if len(cmd) <= n or runner0 != prefix[0] or tuple(cmd[1:n]) != prefix[1:]:
+            continue
+        arg = cmd[n]
+        if arg.startswith("tests/scenes/"):
+            return arg
+    return None
+
+
+def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | None") -> list[str]:
     """[] iff `plan` is internally consistent and safe to run:
       - every task's `owns` is non-empty and a subset of
         `build_prefixes` (the project's configured build-station write
         prefixes, EngineConfig.station_owners["build"][<builder role>])
+        -- SKIPPED when `build_prefixes` is None, for a caller (engine.
+        plan.check_resumed_plan) that re-validates a plan with no
+        config/build_prefixes of its own to check this against; every
+        other check below still runs even then, since none of them
+        depend on build_prefixes
       - every task's `depends_on` names a real task id, with no cycle
         (ordered_tasks does the actual topological check)
       - every scene's `cmd` that names a tests/scenes/ script
         references a file that actually exists in `repo` (the planner
         owns writing that file)
+      - every scene that `covers` a requirement actually RUNS its own
+        tests/scenes/ script -- `cmd` must start with a supported
+        runner (_SUPPORTED_SCENE_RUNNERS) whose first real argument IS
+        that script (_scene_script_arg), not merely mention its path
+        somewhere in `cmd` (see module docstring: `["true",
+        "tests/scenes/x.py"]` is rejected even though that path
+        appears in `cmd`, because `true` never runs it)
       - every scene/task `covers` entry names a real requirement id,
         and every requirement is covered by at least one SCENE
         (requirement_coverers) -- a task-only `covers` is kept for
@@ -338,16 +501,37 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
     here -- load_plan already raised PlanError for those before a Plan
     object could exist."""
     problems: list[str] = []
-    for task in plan.tasks:
-        for entry in task.owns:
-            if not any(_prefix_covers(prefix, entry) for prefix in build_prefixes):
-                problems.append(
-                    f"task {task.id}: owns {entry!r} is outside build prefixes {list(build_prefixes)!r}"
-                )
+    if not plan.requirements:
+        # A plan with no requirements at all would otherwise sail
+        # through every other check here with zero problems -- yet
+        # name nothing for the handoff's own requirement<->scene table
+        # (engine.handoff._scene_table) or engine.full_orbit's runtime
+        # completion gate (_uncovered_requirement_ids) to ever check
+        # against. Required for every plan, full-job and `--small`
+        # alike (per the owner's design, same rule as the probe
+        # station's own facts.md evidence requirement).
+        problems.append("plan_requirements_missing")
+    if build_prefixes is not None:
+        for task in plan.tasks:
+            for entry in task.owns:
+                if not any(_prefix_covers(prefix, entry) for prefix in build_prefixes):
+                    problems.append(
+                        f"task {task.id}: owns {entry!r} is outside build prefixes {list(build_prefixes)!r}"
+                    )
     for scene in plan.scenes:
         for token in scene.cmd:
             if token.startswith("tests/scenes/") and not (repo / token).exists():
                 problems.append(f"scene {scene.id}: script not found: {token}")
+        if scene.covers and _scene_script_arg(scene.cmd) is None:
+            # A scene claiming it demonstrates a requirement must
+            # actually RUN a planner-owned script under tests/scenes/
+            # via a supported runner -- ["true", "tests/scenes/x.py"]
+            # (or any other cmd whose runner is not in
+            # _SUPPORTED_SCENE_RUNNERS, or whose first real argument is
+            # not that script) passing trivially proves nothing about
+            # the requirement's real behavior, so it can never be
+            # allowed to claim `covers` on its own.
+            problems.append(f"scene {scene.id}: scene_cmd_not_a_scene_file")
     try:
         ordered_tasks(plan)
     except PlanError as exc:
@@ -370,6 +554,80 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: tuple[str, ...]) -> li
                 f"requirement {requirement.id}: not covered by any scene "
                 "(a task-only `covers` is kept for tracking but is never enough)"
             )
+    return problems
+
+
+def check_resumed_plan(ledger: Ledger, project: str, job_name: str, repo: Path) -> list[str]:
+    """[] iff the CURRENT plan.json (+ scene files) for `job_name` at
+    `repo` is still, in every sense that matters, the plan a reviewer
+    last approved -- the check every resume point in engine.full_orbit/
+    engine.small_orbit must run before trusting a job's plan to keep
+    going with build/merge/commit work under it -- previously only the
+    STAGE_DESIGN_APPROVAL resume ever re-checked this; a task/
+    security/cursor resume accepted a plan.json edited since review
+    with no check at all.
+
+    Problems, in order:
+      - plan.json fails to load/parse: [f"plan:{PlanError.reason}"],
+        nothing else is checked (there is no Plan to check further)
+      - validate_plan(plan, repo, build_prefixes=None) -- every
+        prefix-INDEPENDENT structural rule (scene cmd shape, scene
+        file existence, requirement/scene/task coverage, dependency
+        cycles); build_prefixes=None skips the owns-subset check,
+        since this function has no config of its own to get a real
+        build_prefixes from (a caller that also needs the owns check
+        still has validate_plan itself, called with the real one)
+      - "plan_never_reviewed" if no "plan.reviewed" ledger event exists
+        yet for this (project, job_name) -- a resume reaching a point
+        that needs a reviewed plan with none on record is itself a
+        problem, not something to silently pass
+      - "plan_changed_since_review" if the plan's current plan_digest
+        no longer matches the latest plan.reviewed event's digest --
+        plan.json or some scene file it references was edited since
+        that review
+      - "requirement_removed_since_review: <id>" / "task_removed_
+        since_review: <id>" for any requirement/task id the latest
+        plan.reviewed event recorded (record_plan_reviewed's own
+        requirement_ids/task_ids) that is no longer in the CURRENT
+        plan -- reported even when, for some reason, the digest check
+        above did not already catch the same edit, so a shrunk plan is
+        never accepted on an id-by-id basis either.
+
+    Never raises. [] means the caller may trust this job's plan.json
+    as-is and keep going; any other return is a reason to stop and
+    treat the job as needs_owner, the same way a first-pass plan
+    review failure already does."""
+    try:
+        plan = load_plan(repo, job_name)
+    except PlanError as exc:
+        return [f"plan:{exc.reason}"]
+
+    problems = validate_plan(plan, repo, None)
+
+    reviewed_digest: str | None = None
+    reviewed_requirement_ids: tuple[str, ...] = ()
+    reviewed_task_ids: tuple[str, ...] = ()
+    for _seq, event in ledger.events(project, "plan.reviewed"):
+        if event.payload.get("job") == job_name:
+            reviewed_digest = event.payload.get("digest")
+            reviewed_requirement_ids = tuple(event.payload.get("requirement_ids", ()))
+            reviewed_task_ids = tuple(event.payload.get("task_ids", ()))
+
+    if reviewed_digest is None:
+        problems.append("plan_never_reviewed")
+        return problems
+
+    if reviewed_digest != plan_digest(plan_path(repo, job_name)):
+        problems.append("plan_changed_since_review")
+
+    current_requirement_ids = {r.id for r in plan.requirements}
+    current_task_ids = {t.id for t in plan.tasks}
+    for rid in reviewed_requirement_ids:
+        if rid not in current_requirement_ids:
+            problems.append(f"requirement_removed_since_review: {rid}")
+    for tid in reviewed_task_ids:
+        if tid not in current_task_ids:
+            problems.append(f"task_removed_since_review: {tid}")
     return problems
 
 
@@ -610,5 +868,6 @@ def validate_tools(plan: Plan, config: "EngineConfig") -> list[str]:
 __all__ = [
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "validate_tools", "tools_for_station", "classify_skill_tools",
-    "ordered_tasks", "requirement_coverers",
+    "ordered_tasks", "requirement_coverers", "plan_digest", "scene_file_digests",
+    "record_plan_reviewed", "check_resumed_plan",
 ]
