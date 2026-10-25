@@ -1,5 +1,4 @@
-"""P6 (docs/flow-map.md 사 "설정·문서는 같은 커밋에서 같이 바꾼다, CI가
-어긋남을 잡는다"): README.md and docs/ENGINE.md must stay in sync with
+"""README.md and docs/ENGINE.md must stay in sync with
 the real code, not just read well. Every command the README tells an
 operator to type must exist in the actual argparse parser (`tools/gb2`
 or `engine.cli`), and every test_*.py file either doc cites must exist
@@ -11,7 +10,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent.parent
+if not (ROOT / "docs" / "ENGINE.md").is_file():
+    # The published copy ships its own shorter README/ENGINE.md; these
+    # checks cover the engine repository's operator docs.
+    pytest.skip("engine repository docs not present in this checkout",
+                allow_module_level=True)
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 ENGINE_MD = (ROOT / "docs" / "ENGINE.md").read_text(encoding="utf-8")
 GB2_SOURCE = (ROOT / "tools" / "gb2").read_text(encoding="utf-8")
