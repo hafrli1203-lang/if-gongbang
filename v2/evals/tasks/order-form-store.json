@@ -1,0 +1,23 @@
+{
+  "id": "order-form-store",
+  "industry": "retail_store",
+  "request": "작은 반찬가게용 주문서 앱을 만들어줘. 손님이 메뉴와 수량을 골라 주문을 넣고, 사장님이 오늘 들어온 주문 목록을 합계와 함께 볼 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "손님이 메뉴를 고르고 수량을 입력해 주문을 생성할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "사장님이 오늘 들어온 주문 목록과 합계 금액을 볼 수 있다", "kind": "function"},
+    {"id": "R3", "text": "수량이 0 이하면 주문이 거부된다", "kind": "function"}
+  ],
+  "industry_terms": ["반찬", "가게", "사장님", "품절"],
+  "pass_criteria": {
+    "required_paths": ["*order*", "*주문*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "합계 금액 계산이 눈에 바로 들어오는가",
+    "다른 종류의 가게(빵집·정육점)로 메뉴만 바꿔도 코드가 그대로 돌아가는가",
+    "주문 목록이 오래 쌓였을 때도 화면이 느려지지 않는가"
+  ]
+}

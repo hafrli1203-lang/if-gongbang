@@ -1,0 +1,23 @@
+{
+  "id": "ad-report-dashboard",
+  "industry": "marketing_agency",
+  "request": "광고 대행사가 쓸 광고 성과 대시보드를 만들어줘. 캠페인별로 지출·클릭·전환 수를 입력하면 CPA와 전환율을 자동으로 계산해 표로 보여줘야 해.",
+  "requirements": [
+    {"id": "R1", "text": "캠페인별 지출·클릭·전환 수를 입력할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "입력한 값으로 CPA(전환당 비용)와 전환율을 자동 계산해 보여준다", "kind": "function"},
+    {"id": "R3", "text": "전환 수가 0이면 CPA 계산에서 0으로 나누지 않고 안내만 보여준다", "kind": "function"}
+  ],
+  "industry_terms": ["캠페인", "CPA", "전환율", "광고주", "집행"],
+  "pass_criteria": {
+    "required_paths": ["*report*", "*dashboard*", "*campaign*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "CPA·전환율 계산식이 광고 업계 관례와 맞는가",
+    "숫자가 0일 때 에러 화면 대신 안내가 뜨는가",
+    "플랫폼(메타·당근 등) 이름이 코드에 박혀 있지 않고 입력값으로 처리되는가"
+  ]
+}

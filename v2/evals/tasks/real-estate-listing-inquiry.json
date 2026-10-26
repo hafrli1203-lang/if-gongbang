@@ -1,0 +1,23 @@
+{
+  "id": "real-estate-listing-inquiry",
+  "industry": "real_estate",
+  "request": "동네 공인중개사무소용 매물 문의 앱을 만들어줘. 손님이 관심 매물과 연락처를 남겨 문의하고, 중개사가 들어온 문의 목록을 매물별로 볼 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "손님이 관심 매물과 연락처를 남겨 문의를 생성할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "중개사가 매물별로 들어온 문의 목록을 볼 수 있다", "kind": "function"},
+    {"id": "R3", "text": "연락처가 비어 있으면 문의가 거부된다", "kind": "function"}
+  ],
+  "industry_terms": ["매물", "중개사", "전세", "월세", "공인중개사"],
+  "pass_criteria": {
+    "required_paths": ["*inquiry*", "*listing*", "*문의*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "매물별로 문의가 잘 묶여 보이는가",
+    "연락처 형식 검증이 과하게 막지 않는가",
+    "다른 중개 업종(차량 매매 등)으로 바꿔도 코드가 재사용되는가"
+  ]
+}

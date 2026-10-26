@@ -1,0 +1,23 @@
+{
+  "id": "gym-membership-tracker",
+  "industry": "fitness",
+  "request": "동네 헬스장용 회원권 관리 앱을 만들어줘. 직원이 회원 이름과 등록일·이용 기간을 입력해 회원권을 등록하고, 이용 기간이 끝나가는 회원 목록을 볼 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "직원이 회원 이름·등록일·이용 기간을 입력해 회원권을 등록할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "이용 기간이 7일 이내로 남은 회원 목록을 볼 수 있다", "kind": "function"},
+    {"id": "R3", "text": "이용 기간이 0일 이하면 등록이 거부된다", "kind": "function"}
+  ],
+  "industry_terms": ["헬스장", "회원권", "PT", "운동", "트레이너"],
+  "pass_criteria": {
+    "required_paths": ["*member*", "*회원*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "만료 임박 회원이 눈에 바로 들어오는가",
+    "다른 정기권 업종(요가원·필라테스)으로 바꿔도 구조가 그대로 통하는가",
+    "날짜 계산이 시간대와 무관하게 정확한가"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "inquiry-form-clinic",
+  "industry": "clinic",
+  "request": "동네 병원용 진료 문의 앱을 만들어줘. 환자가 증상과 희망 방문 시간을 적어 문의를 남기고, 접수 담당자가 문의 목록을 확인 처리할 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "환자가 증상과 희망 방문 시간을 적어 문의를 생성할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "접수 담당자가 문의 목록을 보고 처리 완료로 표시할 수 있다", "kind": "function"},
+    {"id": "R3", "text": "환자 개인정보(이름·연락처)는 접수 담당자 화면에서만 보인다", "kind": "security"}
+  ],
+  "industry_terms": ["병원", "환자", "진료", "접수", "증상"],
+  "pass_criteria": {
+    "required_paths": ["*inquiry*", "*문의*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "환자 개인정보가 꼭 필요한 화면에만 보이는가",
+    "증상 입력칸이 너무 길거나 복잡하지 않은가",
+    "다른 병·의원(치과 등)으로 바꿔도 구조를 그대로 쓸 수 있는가"
+  ]
+}

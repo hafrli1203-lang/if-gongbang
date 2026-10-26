@@ -1,0 +1,23 @@
+{
+  "id": "booking-salon",
+  "industry": "beauty_salon",
+  "request": "미용실 예약 앱을 만들어줘. 손님이 날짜·시간·시술 종류를 골라 예약을 넣고, 직원이 그날 예약 목록을 볼 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "손님이 날짜·시간·시술 종류를 선택해 예약을 생성할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "직원이 날짜별 예약 목록을 볼 수 있다", "kind": "function"},
+    {"id": "R3", "text": "같은 시간대에 이미 예약이 있으면 새 예약이 거부된다", "kind": "function"}
+  ],
+  "industry_terms": ["미용실", "헤어", "펌", "시술", "헤어샵", "염색"],
+  "pass_criteria": {
+    "required_paths": ["*book*", "*reserv*", "*예약*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "예약 시간이 겹칠 때 안내 문구가 사용자에게 자연스러운가",
+    "직원용 목록 화면이 실제 매장에서 바로 쓸 만한가",
+    "미용실이 아닌 다른 업종(네일샵 등)으로 바꿔도 코드 구조를 그대로 재사용할 수 있는가"
+  ]
+}

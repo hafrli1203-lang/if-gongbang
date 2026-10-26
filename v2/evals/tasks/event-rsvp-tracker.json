@@ -1,0 +1,23 @@
+{
+  "id": "event-rsvp-tracker",
+  "industry": "events",
+  "request": "소규모 행사 주최자용 참석 신청 앱을 만들어줘. 참가자가 이름과 참석 여부를 남겨 신청하고, 주최자가 참석 확정 인원 수를 한눈에 볼 수 있어야 해.",
+  "requirements": [
+    {"id": "R1", "text": "참가자가 이름과 참석 여부를 남겨 신청할 수 있다", "kind": "function"},
+    {"id": "R2", "text": "주최자가 참석 확정 인원 수를 합계로 볼 수 있다", "kind": "function"},
+    {"id": "R3", "text": "이름이 비어 있으면 신청이 거부된다", "kind": "function"}
+  ],
+  "industry_terms": ["행사", "주최자", "참석", "RSVP", "초청"],
+  "pass_criteria": {
+    "required_paths": ["*rsvp*", "*event*", "*참석*"],
+    "forbidden_cross_industry_terms": true,
+    "scenes_must_pass": true,
+    "arch_check_must_be_clean": true,
+    "build_must_pass": true
+  },
+  "human_review": [
+    "참석 확정 인원 합계가 실시간으로 맞게 보이는가",
+    "참석/불참 선택이 직관적인가",
+    "다른 종류 행사(세미나·동호회 모임)로 바꿔도 코드가 그대로 돌아가는가"
+  ]
+}
