@@ -1,5 +1,3 @@
-"""Worker runners: launch a child process (Claude CLI, Codex CLi, or a
-deterministic scripted fake) for one station, and parse its result.
-See engine/steps/station.py and engine/steps/review.py for how a runner
-is invoked.
-"""
+"""Compatibility package: the worker runners now live in
+`engine.infrastructure.workers` (docs/standards/engine-layout.md). Each
+module here is an alias of its new module."""

@@ -89,16 +89,18 @@ def _seed_task_commit_via_job_position(ws: Workspace, job: str, attempt_id: str,
 
 def _seed_plan_reviewed(ws: Workspace, job: str, *,
                         requirement_ids: tuple[str, ...] = (),
-                        task_ids: tuple[str, ...] = ()) -> None:
-    """Mirrors engine.plan.record_plan_reviewed's own 'plan.reviewed'
-    event shape -- the FROZEN manifest engine.evidence_graph.build()
-    checks the live `plan` argument's requirement ids against (see
-    build()'s own docstring, 'plan.reviewed' bullet)."""
+                        task_ids: tuple[str, ...] = (),
+                        probe_target_ids: tuple[str, ...] = ()) -> None:
+    """Mirrors engine.plan_review.record_plan_reviewed's own
+    'plan.reviewed' event shape -- the FROZEN manifest engine.
+    evidence_graph.build() walks as its own inventory (see build()'s
+    own docstring, 'plan.reviewed' bullet)."""
     ws.ledger.append(Event(
         project="alpha", kind="plan.reviewed", actor_kind="processor",
         actor_id="processor", attempt_id=None,
         payload={"job": job, "digest": "stub-digest", "scene_digests": {},
-                 "requirement_ids": list(requirement_ids), "task_ids": list(task_ids)},
+                 "requirement_ids": list(requirement_ids), "task_ids": list(task_ids),
+                 "probe_target_ids": list(probe_target_ids)},
     ))
 
 
@@ -320,7 +322,7 @@ def test_a_scene_that_passed_in_a_different_snapshot_than_the_certificate_blocks
     graph = evidence_graph.EvidenceGraph(
         job="job1", plan_reviewed=True, fingerprint="fp-certificate",
         acceptance_passed=True, certificate_fingerprint="sec-fp",
-        certificate_policy_hash="sec-hash", probe_ok=True, tasks=(),
+        certificate_policy_hash="sec-hash", probe_targets=(), tasks=(),
         requirements=(
             RequirementEvidence(
                 requirement_id="R1", scene_ids=("s1",),
@@ -499,6 +501,30 @@ def test_requirement_added_after_review_blocks_even_with_a_passing_scene(
     assert not any(gap.startswith("R1:") for gap in gaps)
 
 
+def test_requirement_removed_after_review_blocks_release(workspace: Workspace) -> None:
+    """B1 (docs/flow-map.md 「재설계 반영 상태」 P4 row): R2 was reviewed
+    (frozen requirement_ids has it) but the CURRENT plan.json no longer
+    declares it at all -- build() must still produce a RequirementEvidence
+    for it (not silently drop it just because iterating plan.requirements
+    alone would never find it), and missing() must refuse it by its own
+    id, never quietly let it disappear."""
+    attempt_id = _open(workspace, "job1")
+    plan = _plan_one_requirement()  # only R1 in the CURRENT plan
+    _seed_plan_reviewed(workspace, "job1", requirement_ids=("R1", "R2"))  # R2 was reviewed
+    _seed_acceptance(workspace, attempt_id, "job1", passed=True,
+                     scenes=[{"id": "s1", "passed": True}], fingerprint="fp-1")
+    _seed_app_security(workspace, attempt_id)
+
+    graph = evidence_graph.build(workspace.ledger, "alpha", "job1", plan)
+    gaps = evidence_graph.missing(graph)
+
+    by_id = {r.requirement_id: r for r in graph.requirements}
+    assert by_id["R2"].removed_since_review is True
+    assert by_id["R2"].scenes == ()
+    assert "R2: removed since review" in gaps
+    assert not any(gap.startswith("R1:") for gap in gaps)
+
+
 def test_task_without_a_commit_blocks_release_job_wide(workspace: Workspace) -> None:
     """A task with no commit.recorded event at all blocks release even
     though the requirement it has nothing to do with (R1) already has
@@ -571,7 +597,31 @@ def test_probe_target_that_never_verified_blocks_release(workspace: Workspace) -
     gaps = evidence_graph.missing(graph)
 
     assert not any(gap.startswith("R1:") for gap in gaps)
-    assert "probe: external target not verified" in gaps
+    assert "probe t1: not verified" in gaps
+
+
+def test_declared_probe_target_that_never_ran_blocks_release(workspace: Workspace) -> None:
+    """B1 (docs/flow-map.md 「재설계 반영 상태」 P4 row): facts.md declared
+    "t1" at review time (it is in plan.reviewed's own frozen
+    probe_target_ids), but no attempt ever actually recorded a
+    probe.executed event for it at all -- missing() must refuse it as
+    "never ran", not silently treat "no event" as "nothing to check"."""
+    attempt_id = _open(workspace, "job1")
+    plan = _plan_one_requirement()
+    _seed_plan_reviewed(workspace, "job1", requirement_ids=("R1",),
+                        probe_target_ids=("t1",))
+    _seed_acceptance(workspace, attempt_id, "job1", passed=True,
+                     scenes=[{"id": "s1", "passed": True}], fingerprint="fp-1")
+    _seed_app_security(workspace, attempt_id)
+    # No probe.executed event ever seeded for "t1" at all.
+
+    graph = evidence_graph.build(workspace.ledger, "alpha", "job1", plan)
+    gaps = evidence_graph.missing(graph)
+
+    by_target = {t.target_id: t for t in graph.probe_targets}
+    assert by_target["t1"].ran is False
+    assert not any(gap.startswith("R1:") for gap in gaps)
+    assert "probe t1: never ran" in gaps
 
 
 # ---------------------------------------------------------------------

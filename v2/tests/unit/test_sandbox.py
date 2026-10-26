@@ -35,6 +35,22 @@ _needs_bwrap = pytest.mark.skipif(
 )
 
 
+def _run_sandboxed(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+    """subprocess.run with `pass_fds` wired automatically from
+    sandbox.pass_fds_for(argv) -- every test here that actually execs
+    a wrap()-built argv goes through this, never a bare
+    subprocess.run(argv, ...), since a `child_env` argument to wrap()
+    (even an empty dict, which station/review's own callers always
+    pass under mode="bwrap") embeds it via an inherited pipe fd that
+    Python would otherwise close before the sandboxed process reads
+    it (see sandbox.pass_fds_for's own docstring)."""
+    pass_fds = sandbox.pass_fds_for(argv)
+    try:
+        return subprocess.run(argv, pass_fds=pass_fds, **kwargs)  # type: ignore[arg-type]
+    finally:
+        sandbox.close_fds(pass_fds)
+
+
 # ---------------------------------------------------------------------------
 # mode="none": pure passthrough, no bwrap involvement at all.
 # ---------------------------------------------------------------------------
@@ -183,7 +199,7 @@ def test_write_inside_writable_path_succeeds(tmp_path: Path) -> None:
         ["sh", "-c", f"echo hi > {target}"], cwd=writable_dir,
         writable=(writable_dir,), mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert target.read_text() == "hi\n"
 
@@ -199,7 +215,7 @@ def test_write_outside_writable_path_fails(tmp_path: Path) -> None:
         ["sh", "-c", f"echo hi > {target}"], cwd=writable_dir,
         writable=(writable_dir,), mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert not target.exists()
 
@@ -219,7 +235,7 @@ def test_hidden_dir_appears_empty(tmp_path: Path) -> None:
         ["ls", "-A", str(hidden_dir)], cwd=work,
         writable=(work,), hidden=(hidden_dir,), mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert result.stdout.strip() == ""
     # The file is still on the real host, untouched.
@@ -248,7 +264,7 @@ def test_hidden_dir_is_remounted_read_only(tmp_path: Path) -> None:
          f"mv {home}/jobs/attempt1 {home}/jobs/attempt1-moved 2>/dev/null; echo mv=$?"],
         cwd=tmp_path, hidden=(home,), mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert "mkdir=1" in result.stdout
     assert "mv=1" in result.stdout
@@ -281,7 +297,7 @@ def test_gate_ro_dir_cannot_be_renamed_or_written_but_reads_fine(tmp_path: Path)
         readonly=(gate_ro_dir,),
         hidden=(home,), mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert '{"ok": true}' in result.stdout
     assert "write=denied" in result.stdout
@@ -303,7 +319,7 @@ def test_hidden_file_unreadable(tmp_path: Path) -> None:
         ["cat", str(secret)], cwd=work, writable=(work,), hidden=(secret,),
         mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert secret.read_text() == "s"
 
@@ -355,7 +371,7 @@ def test_readonly_remap_exposes_real_path_inside_sandboxed_home(tmp_path: Path) 
         readonly_remap=((cache, sandboxed_home / ".cache" / "ms-playwright"),),
         mode="bwrap", child_env={"HOME": str(sandboxed_home)},
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
     assert "binary" in result.stdout
     assert "WRITE_DENIED" in result.stdout
@@ -372,7 +388,7 @@ def test_net_false_blocks_outbound_connection(tmp_path: Path) -> None:
         [sys.executable, "-c", code], cwd=work, writable=(work,),
         net=False, mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
 
 
@@ -386,7 +402,7 @@ def test_net_true_allows_outbound_connection(tmp_path: Path) -> None:
         [sys.executable, "-c", code], cwd=work, writable=(work,),
         net=True, mode="bwrap",
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0
 
 
@@ -441,7 +457,7 @@ def test_hiding_apps_and_workspace_roots_still_lets_a_cargo_style_runtime_start(
             symlinks=runtime.symlinks,
             net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
         )
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
         assert result.returncode == 0
         assert "mytool-1.0" in result.stdout
 
@@ -453,7 +469,7 @@ def test_hiding_apps_and_workspace_roots_still_lets_a_cargo_style_runtime_start(
                 symlinks=runtime.symlinks,
                 net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
             )
-            cat_result = subprocess.run(cat_argv, capture_output=True, text=True, timeout=10)
+            cat_result = _run_sandboxed(cat_argv, capture_output=True, text=True, timeout=10)
             assert cat_result.returncode != 0
 
         _cannot_read(neighbor_app / "secret.txt")
@@ -467,7 +483,7 @@ def test_hiding_apps_and_workspace_roots_still_lets_a_cargo_style_runtime_start(
             symlinks=runtime.symlinks,
             net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
         )
-        can_read_result = subprocess.run(can_read_argv, capture_output=True, text=True, timeout=10)
+        can_read_result = _run_sandboxed(can_read_argv, capture_output=True, text=True, timeout=10)
         assert can_read_result.returncode == 0
         assert "app_a content" in can_read_result.stdout
     finally:
@@ -517,7 +533,7 @@ def test_resolve_runtime_lets_a_home_installed_launcher_start_under_a_hidden_hom
             symlinks=runtime.symlinks,
             net=False, mode="bwrap", child_env={"PATH": os.environ["PATH"]},
         )
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
         assert result.returncode == 0
         assert "tool-version-1.0" in result.stdout
 
@@ -527,7 +543,7 @@ def test_resolve_runtime_lets_a_home_installed_launcher_start_under_a_hidden_hom
             net=False, mode="bwrap",
             child_env={"PATH": os.environ["PATH"]},
         )
-        cat_result = subprocess.run(cat_argv, capture_output=True, text=True, timeout=10)
+        cat_result = _run_sandboxed(cat_argv, capture_output=True, text=True, timeout=10)
         assert cat_result.returncode != 0
     finally:
         sandbox._reset_available_cache()
@@ -555,7 +571,7 @@ def test_resolve_runtime_claude_starts_under_a_hidden_real_home() -> None:
         readonly=runtime.readonly, symlinks=runtime.symlinks, net=False, mode="bwrap",
         child_env={"PATH": os.environ.get("PATH", "")},
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0
     assert result.stdout.strip() == host.stdout.strip()
 
@@ -578,7 +594,7 @@ def test_resolve_runtime_codex_starts_under_a_hidden_real_home() -> None:
         readonly=runtime.readonly, symlinks=runtime.symlinks, net=False, mode="bwrap",
         child_env={"PATH": os.environ.get("PATH", "")},
     )
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0
     assert result.stdout.strip() == host.stdout.strip()
 
@@ -740,16 +756,16 @@ def test_station_sandbox_hides_sibling_copy_secrets_and_ledger(
         return station._sandboxed_argv(ctx, spec, argv, {}, _NoHomeWritableRunner())
 
     secret = workspace.config.secrets_dir / "prod.key"
-    cat = subprocess.run(wrapped(["sh", "-c", f"cat {secret}"]),
+    cat = _run_sandboxed(wrapped(["sh", "-c", f"cat {secret}"]),
                          capture_output=True, text=True, timeout=10)
     assert cat.returncode != 0
     assert "SECRET" not in cat.stdout
 
-    ls = subprocess.run(wrapped(["sh", "-c", f"ls {sibling_copy} 2>&1"]),
+    ls = _run_sandboxed(wrapped(["sh", "-c", f"ls {sibling_copy} 2>&1"]),
                         capture_output=True, text=True, timeout=10)
     assert ls.returncode != 0 or "sibling.txt" not in ls.stdout
 
-    write_copy = subprocess.run(
+    write_copy = _run_sandboxed(
         wrapped(["sh", "-c", f"echo hi > {own_copy}/out.txt"]),
         capture_output=True, text=True, timeout=10,
     )
@@ -758,21 +774,21 @@ def test_station_sandbox_hides_sibling_copy_secrets_and_ledger(
 
     workspace.config.ledger_path.write_text("LEDGER-SECRET-BYTES\n", encoding="utf-8")
 
-    cat_ledger = subprocess.run(
+    cat_ledger = _run_sandboxed(
         wrapped(["sh", "-c", f"cat {workspace.config.ledger_path}"]),
         capture_output=True, text=True, timeout=10,
     )
     assert cat_ledger.returncode != 0
     assert "LEDGER-SECRET-BYTES" not in cat_ledger.stdout
 
-    write_ledger = subprocess.run(
+    write_ledger = _run_sandboxed(
         wrapped(["sh", "-c", f"echo overwritten > {workspace.config.ledger_path}"]),
         capture_output=True, text=True, timeout=10,
     )
     assert write_ledger.returncode != 0
     assert workspace.config.ledger_path.read_text(encoding="utf-8") == "LEDGER-SECRET-BYTES\n"
 
-    sqlite_probe = subprocess.run(
+    sqlite_probe = _run_sandboxed(
         wrapped([sys.executable, "-c",
                 f"import sqlite3; sqlite3.connect('{workspace.config.ledger_path}')"
                 ".execute('select 1')"]),
@@ -865,14 +881,14 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
 
     # The real HOME's own path is invisible outright, not merely
     # read-only -- writing OR reading it by its real absolute path fails.
-    outside_write = subprocess.run(
+    outside_write = _run_sandboxed(
         wrapped(["sh", "-c", f"echo hi > {fake_home}/some_new_file"]),
         capture_output=True, text=True, timeout=10,
     )
     assert outside_write.returncode != 0
     assert not (fake_home / "some_new_file").exists()
 
-    sentinel_read = subprocess.run(
+    sentinel_read = _run_sandboxed(
         wrapped(["sh", "-c", f"cat {sentinel}/id_rsa"]),
         capture_output=True, text=True, timeout=10,
     )
@@ -880,7 +896,7 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
     assert "SENTINEL-SSH-KEY" not in sentinel_read.stdout
 
     # $HOME itself now resolves to a FRESH directory -- never fake_home.
-    home_check = subprocess.run(
+    home_check = _run_sandboxed(
         wrapped(["sh", "-c", f'test "$HOME" != {fake_home} && echo DIFFERENT_HOME']),
         capture_output=True, text=True, timeout=10,
     )
@@ -889,7 +905,7 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
 
     # The real CLI's own login files WERE copied into that fresh $HOME
     # (ClaudeRunner's .claude/.credentials.json and .claude.json).
-    login_read = subprocess.run(
+    login_read = _run_sandboxed(
         wrapped(["sh", "-c",
                  'cat "$HOME/.claude/.credentials.json" && cat "$HOME/.claude.json"']),
         capture_output=True, text=True, timeout=10,
@@ -900,7 +916,7 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
 
     # Everything else under the real HOME (not a login file) was NOT
     # copied in -- unreachable via $HOME either.
-    sentinel_via_home = subprocess.run(
+    sentinel_via_home = _run_sandboxed(
         wrapped(["sh", "-c", 'cat "$HOME/.ssh/id_rsa" 2>&1']),
         capture_output=True, text=True, timeout=10,
     )
@@ -908,7 +924,7 @@ def test_station_sandbox_home_writable_only_under_runner_subpaths(
     assert "SENTINEL-SSH-KEY" not in sentinel_via_home.stdout
 
     # home_writable_subpaths (".claude") is writable under the fresh HOME.
-    inside = subprocess.run(
+    inside = _run_sandboxed(
         wrapped(["sh", "-c", 'echo hi > "$HOME/.claude/session.json"']),
         capture_output=True, text=True, timeout=10,
     )
@@ -952,7 +968,7 @@ def test_station_sandbox_codex_auth_not_visible_to_claude_worker(
         )
         ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
         argv = station._sandboxed_argv(ctx, spec, ["true"], dict(env), runner)
-        result = subprocess.run(argv, capture_output=True, timeout=10)
+        result = _run_sandboxed(argv, capture_output=True, timeout=10)
         assert result.returncode == 0
         return (workspace.config.home / "jobs" / ids.attempt_dirname(attempt_id)
                 / "worker-home" / "build" / role)
@@ -994,34 +1010,44 @@ def test_review_sandbox_mounts_snapshot_readonly_hides_repo_and_ledger(
         result_path=workspace.root / "r.json", config_path=None,
     )
     workspace.config.ledger_path.write_text("LEDGER-SECRET-BYTES\n", encoding="utf-8")
-    argv = review._sandboxed_argv(ctx, spec, ["true"], {}, _NoHomeWritableRunner())
+
+    def _argv_for(cmd: list[str]) -> list[str]:
+        # A fresh wrap() call per invocation, never a shared base argv
+        # re-run more than once: a mode="bwrap" argv's env (even the
+        # empty {} here) is carried by a ONE-SHOT pipe fd
+        # (sandbox.pass_fds_for) that is already closed after its
+        # first exec -- reusing the same built argv for a second
+        # subprocess.run would fail with bwrap's own "Can't read
+        # --args data: Bad file descriptor".
+        return review._sandboxed_argv(ctx, spec, cmd, {}, _NoHomeWritableRunner())
 
     snapshot_str = str(snapshot)
-    ro_idx = argv.index(snapshot_str)
-    assert argv[ro_idx - 1] == "--ro-bind"
+    probe_argv = _argv_for(["true"])
+    ro_idx = probe_argv.index(snapshot_str)
+    assert probe_argv[ro_idx - 1] == "--ro-bind"
 
-    write_result = subprocess.run(
-        argv[:-1] + ["sh", "-c", f"echo hi > {snapshot_str}/probe.txt"],
+    write_result = _run_sandboxed(
+        _argv_for(["sh", "-c", f"echo hi > {snapshot_str}/probe.txt"]),
         capture_output=True, text=True, timeout=10,
     )
     assert write_result.returncode != 0
     assert not (snapshot / "probe.txt").exists()
 
-    read_snapshot = subprocess.run(
-        argv[:-1] + ["sh", "-c", f"cat {snapshot_str}/frozen.txt"],
+    read_snapshot = _run_sandboxed(
+        _argv_for(["sh", "-c", f"cat {snapshot_str}/frozen.txt"]),
         capture_output=True, text=True, timeout=10,
     )
     assert read_snapshot.returncode == 0
     assert "SNAPSHOT-CONTENT" in read_snapshot.stdout
 
-    cat_repo = subprocess.run(
-        argv[:-1] + ["sh", "-c", f"cat {workspace.alpha}/package.json"],
+    cat_repo = _run_sandboxed(
+        _argv_for(["sh", "-c", f"cat {workspace.alpha}/package.json"]),
         capture_output=True, text=True, timeout=10,
     )
     assert cat_repo.returncode != 0
 
-    cat_ledger = subprocess.run(
-        argv[:-1] + ["sh", "-c", f"cat {workspace.config.ledger_path}"],
+    cat_ledger = _run_sandboxed(
+        _argv_for(["sh", "-c", f"cat {workspace.config.ledger_path}"]),
         capture_output=True, text=True, timeout=10,
     )
     assert cat_ledger.returncode != 0
@@ -1081,7 +1107,7 @@ def test_station_sandbox_never_mounts_copy_link_that_escapes_to_secrets(
     assert flags == {"--tmpfs", "--remount-ro"}
 
     secret_file = workspace.config.secrets_dir / "prod.key"
-    result = subprocess.run(
+    result = _run_sandboxed(
         argv[:-1] + ["sh", "-c", f"cat {secret_file}"],
         capture_output=True, text=True, timeout=10,
     )
@@ -1139,7 +1165,7 @@ def test_station_sandbox_reexposes_ordinary_copy_link_readonly(
     assert skipped == []
 
     probe = f"cat {own_copy}/node_modules/f.txt && ! touch {own_copy}/node_modules/w"
-    result = subprocess.run(
+    result = _run_sandboxed(
         argv[:-1] + ["sh", "-c", probe],
         capture_output=True, text=True, timeout=10,
     )
@@ -1181,7 +1207,7 @@ def test_bench_readonly_paths_remap_works_when_bench_home_is_readonly(
         {},
     )
     popen_env = sandbox.exec_env(config.sandbox, child_env)
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=popen_env)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10, env=popen_env)
     assert result.returncode == 0, result.stderr
     assert "binary" in result.stdout
     assert "npm-cache-content" in result.stdout
@@ -1213,7 +1239,7 @@ def test_bench_readonly_paths_remap_and_writable_bench_home_both_work(
         {},
     )
     popen_env = sandbox.exec_env(config.sandbox, child_env)
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=popen_env)
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10, env=popen_env)
     assert result.returncode == 0, result.stderr
     assert "npm-cache-content" in result.stdout
     assert "ALL_OK" in result.stdout
@@ -1268,14 +1294,14 @@ def test_copy_link_writable_subpaths_gives_scratch_write_under_readonly_entry(
     def wrapped(argv: list[str]) -> list[str]:
         return station._sandboxed_argv(ctx, spec, argv, {}, _NoHomeWritableRunner())
 
-    scratch_write = subprocess.run(
+    scratch_write = _run_sandboxed(
         wrapped(["sh", "-c", f"mkdir -p {node_modules}/.vite-temp "
                               f"&& touch {node_modules}/.vite-temp/x"]),
         capture_output=True, text=True, timeout=10,
     )
     assert scratch_write.returncode == 0, scratch_write.stderr
 
-    ordinary_write = subprocess.run(
+    ordinary_write = _run_sandboxed(
         wrapped(["sh", "-c", f"touch {node_modules}/y"]),
         capture_output=True, text=True, timeout=10,
     )
@@ -1288,3 +1314,86 @@ def test_copy_link_writable_subpaths_gives_scratch_write_under_readonly_entry(
     assert not (real_node_modules / "y").exists()
     assert (real_node_modules / "pkg" / "index.js").read_text(encoding="utf-8") \
         == "module.exports = 1;\n"
+
+
+# ---------------------------------------------------------------------------
+# B7: child_env secrets must never appear in this process's own argv (the
+# command line any local user can read via `ps`/`/proc/<pid>/cmdline`),
+# only in the sandboxed child's actual environment.
+# ---------------------------------------------------------------------------
+
+def test_wrap_mode_bwrap_puts_no_setenv_value_in_the_returned_argv(tmp_path: Path) -> None:
+    """Pure argv-shape check, no bwrap execution needed: a secret VALUE
+    (and the old literal "--setenv"/"--clearenv" tokens that used to
+    carry it) must not appear anywhere in the list wrap() returns --
+    the env is carried through `--args <fd>` instead, an integer that
+    names neither the variable nor its value."""
+    secret_value = "sk-SYNTHETIC-SECRET-value-should-never-leak"
+    argv = sandbox.wrap(
+        ["true"], cwd=tmp_path, mode="bwrap",
+        child_env={"PATH": "/usr/bin:/bin", "MY_SECRET": secret_value},
+    )
+    assert secret_value not in argv
+    assert "--setenv" not in argv
+    assert "--clearenv" not in argv
+    assert "--args" in argv
+
+
+@_needs_bwrap
+def test_child_env_secret_never_in_argv_but_sandboxed_child_sees_it(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: build a real sandboxed argv carrying a synthetic
+    secret, assert the secret is absent from the argv list wrap()
+    returned (exactly what Popen would expose via this process's own
+    `/proc/<pid>/cmdline` -- the vulnerability this closes), then
+    actually run it and confirm the sandboxed CHILD still sees the
+    real value in its own environment."""
+    work = tmp_path / "work"
+    work.mkdir()
+    secret_value = "sk-SYNTHETIC-SECRET-" + "x" * 40
+
+    argv = sandbox.wrap(
+        ["sh", "-c", "echo got:$MY_SECRET"],
+        cwd=work, writable=(work,), mode="bwrap",
+        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                  "MY_SECRET": secret_value},
+    )
+    assert secret_value not in argv, "secret value leaked into argv"
+    assert secret_value not in " ".join(argv), "secret value leaked into argv"
+
+    result = _run_sandboxed(argv, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert f"got:{secret_value}" in result.stdout
+
+
+@_needs_bwrap
+def test_pass_fds_for_round_trips_the_env_pipe_fd(tmp_path: Path) -> None:
+    """sandbox.pass_fds_for(argv) finds the exact fd wrap() embedded,
+    and engine.sandbox.close_fds (called via _run_sandboxed's own
+    finally) leaves it closed afterward -- a second close must not
+    raise (idempotent)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    argv = sandbox.wrap(
+        ["true"], cwd=work, writable=(work,), mode="bwrap",
+        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    pass_fds = sandbox.pass_fds_for(argv)
+    assert len(pass_fds) == 1
+    result = _run_sandboxed(argv, capture_output=True, timeout=10)
+    assert result.returncode == 0
+    sandbox.close_fds(pass_fds)  # already closed by _run_sandboxed -- must not raise
+
+
+def test_pass_fds_for_is_empty_under_mode_none(tmp_path: Path) -> None:
+    none_argv = sandbox.wrap(["true"], cwd=tmp_path, mode="none")
+    assert sandbox.pass_fds_for(none_argv) == ()
+
+
+@_needs_bwrap
+def test_pass_fds_for_is_empty_under_mode_bwrap_with_no_child_env(
+    tmp_path: Path,
+) -> None:
+    bwrap_no_env_argv = sandbox.wrap(["true"], cwd=tmp_path, mode="bwrap")
+    assert sandbox.pass_fds_for(bwrap_no_env_argv) == ()

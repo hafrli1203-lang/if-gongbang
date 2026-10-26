@@ -349,7 +349,14 @@ def test_sandboxed_spawn_dies_with_parent_through_the_sh_exit_wrapper(
     argv = sandbox.wrap(
         ["sleep", "50"], cwd=workspace.alpha, mode="bwrap",
         writable=(workspace.alpha,),
-        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        # No child_env: this test is about process-death/survivor
+        # tracking, not environment contents. The sandboxed child
+        # inherits PATH from bwrap's own unclearenv'd launcher env
+        # (sandbox.launcher_env(), already {"PATH": ...}) exactly as
+        # it would via an explicit child_env of the same value --
+        # only the explicit form needs the one-shot pipe fd
+        # (sandbox.pass_fds_for), which a JSON-serialized argv handed
+        # to an unrelated process could never carry anyway.
     )
     exit_file = tmp_path / "exit" / "r.exit"
     proc = procs.spawn(
@@ -399,7 +406,14 @@ def test_engine_death_leaves_no_survivor_under_bwrap(
     sandboxed_argv = sandbox.wrap(
         ["sleep", "50"], cwd=workspace.alpha, mode="bwrap",
         writable=(workspace.alpha,),
-        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        # No child_env: this test is about process-death/survivor
+        # tracking, not environment contents. The sandboxed child
+        # inherits PATH from bwrap's own unclearenv'd launcher env
+        # (sandbox.launcher_env(), already {"PATH": ...}) exactly as
+        # it would via an explicit child_env of the same value --
+        # only the explicit form needs the one-shot pipe fd
+        # (sandbox.pass_fds_for), which a JSON-serialized argv handed
+        # to an unrelated process could never carry anyway.
     )
     argv_json.write_text(json.dumps(sandboxed_argv), encoding="utf-8")
     standin_script.write_text(
@@ -495,7 +509,14 @@ def test_resume_after_a_killed_engine_sh_bwrap_chain_leaves_no_orphan_and_no_dup
     sandboxed_argv = sandbox.wrap(
         ["sleep", "50"], cwd=workspace.alpha, mode="bwrap",
         writable=(workspace.alpha,),
-        child_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        # No child_env: this test is about process-death/survivor
+        # tracking, not environment contents. The sandboxed child
+        # inherits PATH from bwrap's own unclearenv'd launcher env
+        # (sandbox.launcher_env(), already {"PATH": ...}) exactly as
+        # it would via an explicit child_env of the same value --
+        # only the explicit form needs the one-shot pipe fd
+        # (sandbox.pass_fds_for), which a JSON-serialized argv handed
+        # to an unrelated process could never carry anyway.
     )
     argv_json.write_text(json.dumps(sandboxed_argv), encoding="utf-8")
     standin_ledger = tmp_path / "standin_ledger.sqlite"

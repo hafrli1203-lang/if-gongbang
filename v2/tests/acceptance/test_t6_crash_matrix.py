@@ -245,31 +245,18 @@ def test_harness_drives_the_engines_own_flow_boundary_list() -> None:
 # engine.position.resume_job must finish the job cleanly. Names this
 # job infrastructure cannot reach are listed explicitly with a reason,
 # never silently dropped.
+# The 8 named groups (plus "position.record.design", recorded a step
+# before the "awaiting_design_approval" stop, and "position.record.
+# small_plan", found genuinely broken the same way "position.record.
+# facts" already is) that used to be "not built in this pass" here are
+# now built -- see tests/acceptance/test_t8_flow_boundary_stops.py.
 _FLOW_BOUNDARY_UNREACHABLE_REASONS: dict[str, str] = {
-    "position.record.design": "needs a UI plan (plan.ui=True) -- not built in this pass",
-    "position.record.awaiting_design_approval": "needs a UI plan stopped at design "
-        "approval -- tests/acceptance/test_t7_config_matrix.py's own design-wait test "
-        "covers the SAME stop via a different mechanism (a run_station crash after "
-        "design.approved, not this boundary itself)",
-    "position.record.awaiting_probe_retry": "needs a probe-retry (external target + "
-        "a failing probe run) job script -- not built in this pass",
-    "position.record.awaiting_plan_review": "needs a plan-review-failure job script "
-        "-- not built in this pass",
-    "position.record.awaiting_requirements_review": "needs a requirements-coverage-"
-        "failure job script -- not built in this pass",
-    "position.record.awaiting_security_fix": "needs an app_security failure job "
-        "script -- not built in this pass",
-    "position.record.awaiting_early_station_owner": "needs a facts/probe/plan/design "
-        "station that itself stops needs_owner (worker_stuck/context gap/owner "
-        "request) -- not built in this pass",
     "full_orbit.context_failed": "needs a required skill/company-library lookup that "
         "never loads (unmet_required) -- no skill config in any job script here",
     "position.record.single_task": "`gb2 run`'s own single-task entry -- this harness "
         "only drives full-job entry points (run_full_job/continue_full_job/"
         "resume_job), same documented gap as test_t7_config_matrix.py's "
         "gb2_run_single_task_plus_release row",
-    "position.record.small_plan": "`gb2 change --small`'s own entry -- not built in "
-        "this pass",
     "fixup.fix.opening_failed": "only fires when open_job() itself raises while "
         "opening the fix's replacement attempt (e.g. the project is unexpectedly not "
         "CLOSED) -- not reproduced by this harness's plain one-review-failure fix "
@@ -294,13 +281,6 @@ _FLOW_BOUNDARY_UNREACHABLE_REASONS: dict[str, str] = {
         "`gb2 ship`/`gb2 skip-ship`/`gb2 resolve` -- this harness's own publish-"
         "boundary test (test_crash_at_every_publish_boundary_recovers_once) drives "
         "publish's own processor steps directly instead of through finalize_release; "
-        "not built in this pass",
-    "position.record.awaiting_release_approval": "reaching this stop needs "
-        "app_security.recorded/acceptance.recorded ALREADY on the ledger before the "
-        "ONE run that must also have the fault armed from the start (the driver's "
-        "own app_security stub is a no-op by design -- test_crash_at_every_publish_"
-        "boundary_recovers_once's own _release_stopped_job appends those AFTER a "
-        "crash-free run, which cannot be reused here without also undoing that run); "
         "not built in this pass",
     "small_orbit.plan_reviewed": "`gb2 change --small`'s own entry -- not built in "
         "this pass",
@@ -448,6 +428,13 @@ def test_every_flow_boundary_is_either_tested_or_documented_as_unreachable() -> 
         "fixup.fix.started", "fixup.fix.closed_old", "fixup.fix.opening_new",
         "fixup.fix.opened_new", "fixup.fix.restored", "fixup.fix.submitted",
         "fixup.fix.finished", "position.record.awaiting_task_owner",
+        # tested in tests/acceptance/test_t8_flow_boundary_stops.py, not here:
+        "position.record.design", "position.record.awaiting_design_approval",
+        "position.record.awaiting_probe_retry", "position.record.awaiting_plan_review",
+        "position.record.awaiting_requirements_review",
+        "position.record.awaiting_security_fix",
+        "position.record.awaiting_early_station_owner",
+        "position.record.awaiting_release_approval", "position.record.small_plan",
     }
     documented = set(_FLOW_BOUNDARY_UNREACHABLE_REASONS)
     assert set(_position.FLOW_BOUNDARIES) == tested | documented, (

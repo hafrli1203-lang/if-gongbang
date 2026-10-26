@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import faults, full_orbit, position, small_orbit
+from engine import faults, full_orbit, full_orbit_runner, position, small_orbit
 from engine.processor import Processor
 from tests.conftest import Workspace
 from tests.unit.test_full_orbit import (
@@ -83,7 +83,7 @@ def test_a_crash_right_after_the_first_attempt_opens_resumes(
     job_name = "intent-first-open"
     stub = _one_task_stub(job_name)
     _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
-    _crash_after_open(monkeypatch, full_orbit, _EARLY_ROLES)
+    _crash_after_open(monkeypatch, full_orbit_runner, _EARLY_ROLES)
     with pytest.raises(faults.CrashInjected):
         full_orbit.run_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
                                 "파일 하나 만들어줘", processor_factory=_factory(stub))
@@ -105,7 +105,7 @@ def test_a_crash_right_after_the_release_attempt_opens_resumes(
     stub = _one_task_stub(job_name)
     _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True),
                                                        _FakeAcceptanceResult(passed=True)])
-    _crash_after_open(monkeypatch, full_orbit, ())
+    _crash_after_open(monkeypatch, full_orbit_runner, ())
     with pytest.raises(faults.CrashInjected):
         full_orbit.run_full_job(config, ws.ledger, _fakes(), "alpha", job_name,
                                 "파일 하나 만들어줘", processor_factory=_factory(stub))
@@ -132,7 +132,7 @@ def test_a_crash_right_after_the_small_attempt_opens_resumes(
         "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
     })
     _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
-    _crash_after_open(monkeypatch, full_orbit, (small_orbit.PLANNING_ROLE,))
+    _crash_after_open(monkeypatch, full_orbit_runner, (small_orbit.PLANNING_ROLE,))
     with pytest.raises(faults.CrashInjected):
         small_orbit.run_small_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
                                   "값 하나만 바꿔줘", processor_factory=_factory(stub))
@@ -666,3 +666,79 @@ def test_final_4_a_repeated_identical_proposal_can_be_fulfilled_again(
         assert position.pending_owner_requests(workspace.ledger, "alpha", "repeat",
                                                repo=workspace.alpha) == (), n
     assert request_ids[0] != request_ids[1]
+
+
+# ---- every station, plan review and task review included, is gated -----
+
+def _review_required(config):
+    from dataclasses import replace as _replace
+
+    from engine.context import ContextConfig
+
+    return _replace(config, context=ContextConfig(
+        station_skills={"review": ("필수-검토-스킬",)},
+        required_skills={"review": ("필수-검토-스킬",)}))
+
+
+def test_gate_a_missing_review_skill_stops_the_full_job_before_its_plan_review(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    job_name = "review-gate-full"
+    stub = _one_task_stub(job_name)
+    reviews: list[str] = []
+
+    def factory(cfg, ledger, fakes) -> Processor:
+        proc = Processor(cfg, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+
+        def _review(ctx):
+            reviews.append("called")
+            return _review_always_passes_steps(ctx)
+        proc.register("review", _review)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+    gated = _review_required(ws.config)
+    outcome = full_orbit.run_full_job(gated, ws.ledger, _fakes(), "alpha", job_name,
+                                      "파일 하나 만들어줘", processor_factory=factory)
+
+    assert outcome.status == "needs_owner", outcome
+    assert outcome.reason is not None and "필수-검토-스킬" in outcome.reason
+    assert ("plan", "planner") not in stub.calls
+    assert reviews == []
+
+    done = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
+                                        processor_factory=factory)
+    assert done.status == "done", done
+
+
+def test_gate_a_missing_review_skill_stops_the_small_job_before_any_worker(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _full_orbit_workspace(workspace)
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _small_plan_json())],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    outcome = small_orbit.run_small_job(_review_required(ws.config), ws.ledger, _fakes(),
+                                        "alpha", _SMALL_JOB, "값 하나만 바꿔줘",
+                                        processor_factory=_factory(stub))
+
+    assert outcome.status == "needs_owner", outcome
+    assert outcome.reason is not None and "필수-검토-스킬" in outcome.reason
+    assert stub.calls == []
+
+
+def test_gate_a_task_gate_includes_the_task_review(workspace: Workspace) -> None:
+    from engine.full_orbit_tasks import build_task_gate
+    from engine.plan import Plan
+
+    ws = _full_orbit_workspace(workspace)
+    plan = Plan(goal="g", ui=False, scenes=(), tasks=(), acceptance=("a",))
+    gate = build_task_gate(_review_required(ws.config), ws.ledger, "alpha", plan, "작업")
+    assert gate.unmet is not None and "필수-검토-스킬" in gate.unmet
+    assert build_task_gate(ws.config, ws.ledger, "alpha", plan, "작업").unmet is None

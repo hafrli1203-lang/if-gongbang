@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import fixup, full_orbit, orbit, position
+from engine import fixup, full_orbit, full_orbit_early, orbit, position
 from engine import plan as plan_module
 from engine.app_security import security_policy_hash
 from engine.config import McpServerConfig, ReleaseConfig
@@ -761,7 +761,7 @@ def test_facts_changed_after_the_facts_gate_never_reach_the_planner(
         "facts": [{f".gongbang/{job_name}/facts.md":
                   "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
     })
-    real_run_probe = full_orbit._run_probe
+    real_run_probe = full_orbit_early._run_probe
 
     def _probe_then_tamper(*args, **kwargs):
         result = real_run_probe(*args, **kwargs)
@@ -770,7 +770,10 @@ def test_facts_changed_after_the_facts_gate_never_reach_the_planner(
             "## 외부 대상\n(없음)\n", encoding="utf-8")
         return result
 
-    monkeypatch.setattr(full_orbit, "_run_probe", _probe_then_tamper)
+    # run_full_job lives in engine.full_orbit_early now (facade re-export is
+    # the same function object) -- it resolves `_run_probe` through that
+    # module's own globals, so the patch must target it there, not the facade.
+    monkeypatch.setattr(full_orbit_early, "_run_probe", _probe_then_tamper)
 
     outcome = full_orbit.run_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
@@ -797,14 +800,17 @@ def test_probe_log_changed_after_its_check_stops_before_the_planner(
                   "https://docs.stripe.com/api\nPROBE OK\n"}],
     })
     _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
-    real_capture = full_orbit._capture_probe_logs
+    real_capture = full_orbit_early._capture_probe_logs
 
     def _capture_then_tamper(repo, job, targets):
         captured = real_capture(repo, job, targets)
         (repo / f".gongbang/{job}/probe/t1.log").write_text("injected\n", encoding="utf-8")
         return captured
 
-    monkeypatch.setattr(full_orbit, "_capture_probe_logs", _capture_then_tamper)
+    # Same reasoning as the facts-tamper test above: _run_probe (which
+    # calls _capture_probe_logs by its bare name) lives in
+    # engine.full_orbit_early, so the patch must target that module.
+    monkeypatch.setattr(full_orbit_early, "_capture_probe_logs", _capture_then_tamper)
 
     outcome = full_orbit.run_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, "stripe 결제 붙여줘",

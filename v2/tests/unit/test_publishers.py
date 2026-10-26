@@ -38,6 +38,18 @@ def _write_sleeper(tmp_path: Path) -> Path:
     return path
 
 
+def _write_verify_echo(tmp_path: Path) -> Path:
+    """A verify_cmd probe: argv is the digest to print to stdout (so a
+    test picks "matching" vs "mismatching" purely by what it passes on
+    the command line, never by writing a second script)."""
+    path = tmp_path / "verify_echo.py"
+    path.write_text(dedent("""\
+        import sys
+        print(sys.argv[1])
+    """), encoding="utf-8")
+    return path
+
+
 def test_publish_runs_dry_run_argv_by_default_and_logs_argv(tmp_path: Path) -> None:
     probe = _write_probe(tmp_path)
     real_log = tmp_path / "real.log"
@@ -385,3 +397,112 @@ def test_write_receipt_cleans_up_tmp_file_on_write_failure(
     monkeypatch.setattr(os, "replace", real_replace)
 
     assert list(receipts_dir.iterdir()) == []  # the .tmp-* file was removed
+
+
+# ---------------------------------------------------------------------------
+# verify_cmd: measuring what was actually deployed, not just echoing the
+# approved artifact_hash back (B3).
+# ---------------------------------------------------------------------------
+
+def test_publish_verify_cmd_matching_digest_marks_verified_true(tmp_path: Path) -> None:
+    probe = _write_probe(tmp_path)
+    verify = _write_verify_echo(tmp_path)
+    real_log = tmp_path / "real.log"
+    digest = "d" * 64
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        dry_run_argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=False,
+    )
+    result = publisher.publish(
+        key="R-verify-match", target="search", artifact_hash="f" * 40,
+        artifact_path="dist", artifact_digest=digest,
+        verify_cmd=(sys.executable, str(verify), digest),
+    )
+    assert result == {"id": "R-verify-match", "status": "ok"}
+
+    receipt = publisher.lookup("R-verify-match")
+    assert receipt is not None
+    assert receipt["status"] == "done"
+    assert receipt["verified"] is True
+    assert receipt["artifact_path"] == "dist"
+    assert receipt["artifact_digest"] == digest
+
+
+def test_publish_verify_cmd_mismatched_digest_fails_the_publish(tmp_path: Path) -> None:
+    probe = _write_probe(tmp_path)
+    verify = _write_verify_echo(tmp_path)
+    real_log = tmp_path / "real.log"
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        dry_run_argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=False,
+    )
+    with pytest.raises(PublisherCrashed):
+        publisher.publish(
+            key="R-verify-mismatch", target="search", artifact_hash="f" * 40,
+            artifact_path="dist", artifact_digest="expected" * 8,
+            verify_cmd=(sys.executable, str(verify), "different" * 7),
+        )
+
+    receipt = publisher.lookup("R-verify-mismatch")
+    assert receipt is not None
+    # The deploy command itself exited 0 -- only the post-deploy digest
+    # check disagreed -- but the overall receipt must still read "failed",
+    # never "done", so a later retry_unknown/resolve never treats this as
+    # a successful deploy.
+    assert receipt["status"] == "failed"
+    assert receipt["verified"] is False
+    assert receipt["returncode"] == 0
+    assert "deploy_digest_mismatch" in receipt["tail"]
+
+
+def test_publish_without_verify_cmd_configured_marks_verified_false(tmp_path: Path) -> None:
+    """No verify_cmd at all (the default, `()`) -- a real deploy with
+    nothing configured to check it must still succeed; the receipt just
+    cannot claim "verified" for something it never measured."""
+    probe = _write_probe(tmp_path)
+    real_log = tmp_path / "real.log"
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        dry_run_argv_template=(sys.executable, str(probe), str(real_log), "0", "{target}"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=False,
+    )
+    result = publisher.publish(
+        key="R-no-verify", target="search", artifact_hash="f" * 40,
+        artifact_path="dist", artifact_digest="e" * 64,
+    )
+    assert result == {"id": "R-no-verify", "status": "ok"}
+
+    receipt = publisher.lookup("R-no-verify")
+    assert receipt is not None
+    assert receipt["status"] == "done"
+    assert receipt["verified"] is False
+    assert receipt["artifact_digest"] == "e" * 64
+
+
+def test_publish_dry_run_skips_verify_cmd_even_when_configured(tmp_path: Path) -> None:
+    """A dry run never actually deploys anything real, so verify_cmd must
+    not even be invoked for it -- a dry-run receipt stays "done" and
+    "verified": False regardless of what verify_cmd would have printed."""
+    probe = _write_probe(tmp_path)
+    verify = _write_verify_echo(tmp_path)
+    dry_log = tmp_path / "dry.log"
+    publisher = ShellPublisher(
+        argv_template=(sys.executable, str(probe), str(dry_log), "0", "{target}"),
+        dry_run_argv_template=(sys.executable, str(probe), str(dry_log), "0", "{target}"),
+        receipts_dir=tmp_path / "receipts",
+        dry_run=True,
+    )
+    result = publisher.publish(
+        key="R-dry-verify", target="search", artifact_hash="f" * 40,
+        artifact_digest="x" * 64,
+        verify_cmd=(sys.executable, str(verify), "y" * 64),
+    )
+    assert result == {"id": "R-dry-verify", "status": "ok"}
+    receipt = publisher.lookup("R-dry-verify")
+    assert receipt["status"] == "done"
+    assert receipt["verified"] is False

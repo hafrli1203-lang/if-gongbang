@@ -149,7 +149,7 @@ def test_cmd_new_refuses_when_app_folder_already_exists(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     (source_root / "demo").mkdir(parents=True)
@@ -170,7 +170,7 @@ def test_cmd_new_refuses_unsafe_app_names(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
 
@@ -191,7 +191,7 @@ def test_cmd_new_requires_requirement_text(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
 
@@ -207,7 +207,7 @@ def test_cmd_new_scaffolds_repo_workspace_and_calls_run_full_job(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     run_calls, _ = _install_fake_full_orbit(
@@ -269,12 +269,12 @@ def test_cmd_new_exits_2_and_never_calls_run_full_job_when_bootstrap_fails(
     started) so a retry resumes instead of refusing app_exists."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
     from engine.bootstrap import BootstrapResult
-    monkeypatch.setattr(gb2, "ensure_installed", lambda repo, install_cmd, **kwargs:
+    monkeypatch.setattr(gb2.workspace, "ensure_installed", lambda repo, install_cmd, **kwargs:
                         BootstrapResult(ran=True, ok=False, detail="install_failed:boom"))
 
     code = gb2.main(["new", "demo", "요구사항"])
@@ -295,7 +295,7 @@ def test_cmd_new_resumes_an_interrupted_init_via_its_marker(
     workspace, and run the orbit -- instead of refusing app_exists."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     source_repo = source_root / "demo"
     source_repo.mkdir(parents=True)
@@ -324,7 +324,7 @@ def test_cmd_new_resume_never_commits_the_marker_file(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     _install_fake_full_orbit(monkeypatch)
@@ -345,7 +345,7 @@ def test_cmd_new_still_refuses_a_real_app_folder_without_the_marker(
     never silently adopt an unrelated directory."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     source_repo = source_root / "demo"
     source_repo.mkdir(parents=True)
@@ -366,7 +366,7 @@ def test_cmd_new_reports_needs_owner_with_exit_code_2(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     _install_fake_full_orbit(
         monkeypatch,
@@ -401,7 +401,7 @@ def test_cmd_new_without_env_keeps_the_real_claude_codex_runners(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     monkeypatch.delenv("GB2_SCRIPTED_WORKERS", raising=False)
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
@@ -419,7 +419,7 @@ def test_cmd_new_with_scripted_workers_env_rewrites_every_role(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
     scripts_dir = _write_scripted_worker_dir(tmp_path)
@@ -455,7 +455,7 @@ def test_cmd_new_with_scripted_workers_env_refuses_when_a_role_file_is_missing(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
     scripts_dir = tmp_path / "scripts"
@@ -481,7 +481,7 @@ def test_cmd_new_leaves_the_marker_when_the_engine_never_actually_started(
     environment problem is fixed."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
@@ -522,12 +522,12 @@ def test_cmd_new_refuses_before_touching_anything_when_a_required_tool_is_missin
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
     monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "codex" else "/usr/bin/" + name)
-    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2.ops, "_doctor_bwrap_runs", lambda: (True, "ok"))
 
     code = gb2.main(["new", "demo", "요구사항"])
 
@@ -547,7 +547,7 @@ def test_doctor_checks_skip_claude_codex_when_scripted_workers_set(
         gb2.shutil, "which",
         lambda name: None if name in ("claude", "codex", "node") else "/usr/bin/" + name,
     )
-    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2.ops, "_doctor_bwrap_runs", lambda: (True, "ok"))
 
     checks = gb2._doctor_checks()
 
@@ -563,7 +563,7 @@ def test_doctor_checks_require_claude_codex_when_scripted_workers_unset(
 ) -> None:
     monkeypatch.delenv("GB2_SCRIPTED_WORKERS", raising=False)
     monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "claude" else "/usr/bin/" + name)
-    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2.ops, "_doctor_bwrap_runs", lambda: (True, "ok"))
 
     checks = gb2._doctor_checks()
 
@@ -577,7 +577,7 @@ def test_cmd_change_refuses_when_a_required_tool_is_missing(
     apps_dir = _init_demo_app(gb2, tmp_path, monkeypatch)
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
     monkeypatch.setattr(gb2.shutil, "which", lambda name: None if name == "claude" else "/usr/bin/" + name)
-    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2.ops, "_doctor_bwrap_runs", lambda: (True, "ok"))
 
     code = gb2.main(["change", "demo", "뭔가 바꿔줘"])
 
@@ -595,7 +595,7 @@ def _init_demo_app(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPa
     `gb2 change` has something initialized to work against."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     source_root = tmp_path / "source"
     monkeypatch.setenv("GB2_APPS_ROOT", str(source_root))
     source_repo = source_root / "demo"
@@ -615,7 +615,7 @@ def test_cmd_change_refuses_when_app_not_initialized(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     run_calls, _ = _install_fake_full_orbit(monkeypatch)
 

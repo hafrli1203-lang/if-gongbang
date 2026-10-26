@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import faults, fixup, full_orbit, position
+from engine import faults, fixup, full_orbit, full_orbit_runner, position
 from engine.ledger import Event
 from engine.processor import Processor, StepContext, StepDef, StepFailed
 from tests.conftest import Workspace
@@ -29,7 +29,7 @@ from tests.unit.test_full_orbit import (
     _RunStationStub,
 )
 
-_ENGINE = Path(__file__).resolve().parents[2] / "engine"
+_ENGINE = Path(__file__).resolve().parents[2] / "engine" / "application"
 _FACTS_MD = "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"
 
 
@@ -401,7 +401,11 @@ def _crash_after_builder_open(monkeypatch: pytest.MonkeyPatch) -> None:
             raise faults.CrashInjected("after open_job")
         return attempt_id
 
-    monkeypatch.setattr(full_orbit, "open_job", _open)
+    # A build task's open_job call is made from engine.full_orbit_runner's
+    # own _open_with_intent (the facade re-exports the same function
+    # object, but it resolves `open_job` through that module's own
+    # globals), so the patch has to target it there, not the facade.
+    monkeypatch.setattr(full_orbit_runner, "open_job", _open)
 
 
 def test_crash_after_open_job_before_the_task_position_adopts_the_open_attempt(
@@ -445,9 +449,12 @@ def test_crash_before_open_job_opens_the_task_attempt_on_resume(
             raise faults.CrashInjected("before open_job")
         return real_open(config, ledger, project, job, kind, roles)
 
-    monkeypatch.setattr(full_orbit, "open_job", _open_crashing_on_t1)
+    # See _crash_after_builder_open's own comment: the build task's
+    # open_job call is made from engine.full_orbit_runner's own
+    # _open_with_intent, so that is what must be patched.
+    monkeypatch.setattr(full_orbit_runner, "open_job", _open_crashing_on_t1)
     factory, stub = _two_task_job_crashing_at(ws, monkeypatch, job_name, "never-armed")
-    monkeypatch.setattr(full_orbit, "open_job", real_open)
+    monkeypatch.setattr(full_orbit_runner, "open_job", real_open)
     assert ws.ledger.project("alpha").state == "CLOSED"
     pos = position.load_position(ws.ledger, "alpha", job_name)
     assert pos is not None and pos.stage == position.STAGE_TASK and pos.attempt_id is None
@@ -498,7 +505,7 @@ def test_every_flow_boundary_in_the_code_is_listed() -> None:
     for path in [*_ENGINE.glob("*.py"), *(_ENGINE / "steps").glob("*.py")]:
         used.update(literal.findall(path.read_text(encoding="utf-8")))
     fix_kinds = re.findall(r'_append_fix_event\(\s*ledger, project, "(fix\.[a-z_]+)"',
-                           (_ENGINE / "fixup.py").read_text(encoding="utf-8"))
+                           (_ENGINE / "repair.py").read_text(encoding="utf-8"))
     used.update(f"fixup.{kind}" for kind in fix_kinds)
     assert used, "no boundaries found"
     assert used <= set(position.FLOW_BOUNDARIES), sorted(used - set(position.FLOW_BOUNDARIES))

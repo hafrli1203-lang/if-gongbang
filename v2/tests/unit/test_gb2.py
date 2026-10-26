@@ -93,17 +93,23 @@ def _fake_install_cmd() -> list[str]:
 
 
 def _patch_fake_install_cmd(module: ModuleType) -> None:
-    """Wrap `module.render_config` so every config a test in this file
-    renders for a fresh app gets `_fake_install_cmd()` in place of the
-    template's real `npm install` -- applied once, in the `gb2`
-    fixture, so every test here that drives `cmd_init` end to end
-    never reaches the network. The original is kept at
-    `module._real_render_config` for the one named exception
-    (test_cmd_init_bootstraps_the_source_repo_and_journals_it) that
-    checks the real npm argv -- it restores this via monkeypatch and
-    pairs it with a fake `npm` on PATH instead, so even that test never
-    reaches the network."""
-    real_render_config = module.render_config
+    """Wrap `module.workspace.render_config` so every config a test in
+    this file renders for a fresh app gets `_fake_install_cmd()` in
+    place of the template's real `npm install` -- applied once, in the
+    `gb2` fixture, so every test here that drives `cmd_init` end to end
+    never reaches the network. `cmd_init` (gb2lib.workspace._setup_app
+    _workspace) calls `render_config` as a bare name resolved in its
+    own module's globals, so the patch target is `module.workspace`
+    (the gb2lib.workspace submodule), not `module` itself -- `module
+    .render_config` stays a separate, unpatched flat re-export (see
+    tools/gb2's own module docstring) for the handful of tests that
+    call `gb2.render_config(...)` directly to test the pure function.
+    The original is kept at `module._real_render_config` for the one
+    named exception (test_cmd_init_bootstraps_the_source_repo_and_
+    journals_it) that checks the real npm argv -- it restores this via
+    monkeypatch and pairs it with a fake `npm` on PATH instead, so even
+    that test never reaches the network."""
+    real_render_config = module.workspace.render_config
 
     def _fake_render_config(template: dict[str, object],
                             app_name: str) -> dict[str, object]:
@@ -111,7 +117,7 @@ def _patch_fake_install_cmd(module: ModuleType) -> None:
         rendered["projects"][app_name]["install_cmd"] = _fake_install_cmd()
         return rendered
 
-    module.render_config = _fake_render_config
+    module.workspace.render_config = _fake_render_config
     module._real_render_config = real_render_config
 
 
@@ -238,7 +244,7 @@ def test_findings_by_severity_counts(gb2: ModuleType) -> None:
 
 
 def test_run_log_roundtrip(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path)
     (tmp_path / "shortform").mkdir()
     assert gb2._read_run_log("shortform") == []
     gb2._append_run_log("shortform", {"job_name": "a", "status": "done"})
@@ -281,7 +287,7 @@ def _setup_release_job(gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.Monk
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -667,7 +673,7 @@ def test_sync_rebases_worktree_onto_current_master(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = _make_source_repo(tmp_path / "source" / "demo")
     repo_dir = _worktree_repo(source_repo, apps_dir / "demo" / "repo")
@@ -692,7 +698,7 @@ def test_sync_refuses_when_worktree_is_dirty(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = _make_source_repo(tmp_path / "source" / "demo")
     repo_dir = _worktree_repo(source_repo, apps_dir / "demo" / "repo")
@@ -716,7 +722,7 @@ def test_sync_refuses_when_worktree_is_dirty(
 def test_app_workspace_rejects_unsafe_app_names(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_name: str,
 ) -> None:
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path / "apps")
     with pytest.raises(ValueError):
         gb2.app_workspace(bad_name)
 
@@ -724,7 +730,7 @@ def test_app_workspace_rejects_unsafe_app_names(
 def test_app_workspace_accepts_a_safe_name(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path / "apps")
     workspace = gb2.app_workspace("my-app_1.2")
     assert workspace == (tmp_path / "apps" / "my-app_1.2").resolve()
 
@@ -737,7 +743,7 @@ def test_cmd_init_refuses_when_workspace_and_source_repo_coincide(
     workspace double as its source repo."""
     shared_root = tmp_path / "shared"
     shared_root.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", shared_root)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", shared_root)
     monkeypatch.setenv("GB2_APPS_ROOT", str(shared_root))
     args = gb2._build_parser().parse_args(["init", "demo"])
 
@@ -789,7 +795,7 @@ def test_cmd_run_drives_continue_job_exactly_once_with_the_full_stage_list(
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -836,7 +842,7 @@ def test_cmd_fix_refuses_when_there_is_no_failed_attempt(
     one JSON error line on stderr), never an unhandled traceback."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -876,7 +882,7 @@ def test_cmd_fix_calls_fixup_fix_with_the_app_and_extra_text(
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -930,7 +936,7 @@ def test_cmd_fix_leaves_the_release_decision_to_fixup_and_continues_the_full_job
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -995,9 +1001,9 @@ def test_cmd_init_hides_the_whole_apps_and_workspace_roots_from_every_sandbox(
     source_repo = _make_source_repo(apps_root / "demo")
     (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
     workspace_root = tmp_path / "ws"
-    monkeypatch.setattr(gb2, "APPS_DIR", workspace_root / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", workspace_root / "apps")
     monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
-    monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(gb2.workspace, "_copy_node_modules", lambda *a, **k: None, raising=False)
     args = gb2._build_parser().parse_args(["init", "demo"])
 
     code = gb2.cmd_init(args)
@@ -1029,10 +1035,10 @@ def test_cmd_init_bootstraps_the_source_repo_and_journals_it(
     apps_root = tmp_path / "source"
     source_repo = _make_source_repo(apps_root / "demo")
     (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path / "ws" / "apps")
     monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
-    monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(gb2, "render_config", gb2._real_render_config)
+    monkeypatch.setattr(gb2.workspace, "_copy_node_modules", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(gb2.workspace, "render_config", gb2._real_render_config)
 
     fake_bin = tmp_path / "fakebin"
     fake_bin.mkdir()
@@ -1045,13 +1051,13 @@ def test_cmd_init_bootstraps_the_source_repo_and_journals_it(
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
 
     calls: list[tuple] = []
-    real_ensure_installed = gb2.ensure_installed
+    real_ensure_installed = gb2.workspace.ensure_installed
 
     def _spy_ensure_installed(repo, install_cmd, **kwargs):
         calls.append((repo, install_cmd))
         return real_ensure_installed(repo, install_cmd, **kwargs)
 
-    monkeypatch.setattr(gb2, "ensure_installed", _spy_ensure_installed)
+    monkeypatch.setattr(gb2.workspace, "ensure_installed", _spy_ensure_installed)
     args = gb2._build_parser().parse_args(["init", "demo"])
 
     code = gb2.cmd_init(args)
@@ -1082,10 +1088,10 @@ def test_cmd_init_exits_2_when_bootstrap_install_fails(
     apps_root = tmp_path / "source"
     source_repo = _make_source_repo(apps_root / "demo")
     (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path / "ws" / "apps")
     monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
-    monkeypatch.setattr(gb2, "_copy_node_modules", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(gb2, "ensure_installed", lambda repo, install_cmd, **kwargs:
+    monkeypatch.setattr(gb2.workspace, "_copy_node_modules", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(gb2.workspace, "ensure_installed", lambda repo, install_cmd, **kwargs:
                         BootstrapResult(ran=True, ok=False, detail="install_failed:boom"))
     args = gb2._build_parser().parse_args(["init", "demo"])
 
@@ -1202,7 +1208,7 @@ def test_cmd_init_against_a_main_only_repo_uses_main_as_worktree_base(
     (source_repo / "package.json").write_text("{}\n", encoding="utf-8")
     _rgit(source_repo, "add", "-A")
     _rgit(source_repo, "commit", "-q", "-m", "init")
-    monkeypatch.setattr(gb2, "APPS_DIR", tmp_path / "ws" / "apps")
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", tmp_path / "ws" / "apps")
     monkeypatch.setenv("GB2_APPS_ROOT", str(apps_root))
     args = gb2._build_parser().parse_args(["init", "demo"])
 
@@ -1262,7 +1268,7 @@ def test_doctor_release_apps_lists_only_apps_with_release_configured(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     apps_dir = tmp_path / "ws" / "apps"
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     (apps_dir / "with-release").mkdir(parents=True)
     (apps_dir / "with-release" / "config.json").write_text(json.dumps({
         "projects": {"with-release": {"repo": "repo", "release": {
@@ -1285,7 +1291,7 @@ def test_doctor_release_apps_excludes_an_explicit_null_release(
     EVERY such app as release-configured and demand a deploy script for
     it. Only a non-null "release" value counts."""
     apps_dir = tmp_path / "ws" / "apps"
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     (apps_dir / "no-release").mkdir(parents=True)
     (apps_dir / "no-release" / "config.json").write_text(json.dumps({
         "projects": {"no-release": {"repo": "repo", "release": None}},
@@ -1313,8 +1319,8 @@ def test_cmd_doctor_exit_0_when_everything_present(
     gb2: ModuleType, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gb2.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(gb2, "_doctor_bwrap_runs", lambda: (True, "ok"))
-    monkeypatch.setattr(gb2, "_doctor_release_apps", lambda: [])
+    monkeypatch.setattr(gb2.ops, "_doctor_bwrap_runs", lambda: (True, "ok"))
+    monkeypatch.setattr(gb2.ops, "_doctor_release_apps", lambda: [])
     monkeypatch.setenv("GB2_APPS_ROOT", "/tmp/apps-root")
     args = gb2._build_parser().parse_args(["doctor"])
 
@@ -1343,7 +1349,7 @@ def test_cmd_init_rewrites_stale_bench_cases_signature(
 ) -> None:
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = tmp_path / "source" / "demo"
     source_repo.mkdir(parents=True)
@@ -1378,7 +1384,7 @@ def test_cmd_init_refuses_unrelated_existing_repo_before_writing_config(
     worktree must refuse without ever creating config.json."""
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     source_repo = tmp_path / "source" / "demo"
     source_repo.mkdir(parents=True)
@@ -1861,7 +1867,7 @@ def _setup_early_design_install_job(
 
     apps_dir = tmp_path / "apps"
     apps_dir.mkdir()
-    monkeypatch.setattr(gb2, "APPS_DIR", apps_dir)
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
     monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
     workspace = apps_dir / "demo"
     workspace.mkdir()
@@ -2052,7 +2058,7 @@ def test_approve_install_offers_every_owner_request_kind_not_only_installs(
         return "R-approved"
 
     monkeypatch.setattr(owner_module, "approve_pending", _approve)
-    monkeypatch.setattr(gb2, "_drain", lambda *a, **k: "done")
+    monkeypatch.setattr(gb2.runner, "_drain", lambda *a, **k: "done")
     monkeypatch.setattr(full_orbit_module, "continue_full_job",
                         lambda *a, **k: full_orbit_module.FullOutcome(
                             "needs_owner", "design_approval", job["attempt_id"], None))
@@ -2061,3 +2067,43 @@ def test_approve_install_offers_every_owner_request_kind_not_only_installs(
 
     assert approved == [scripts_request]
     assert code == 2, code
+
+
+@pytest.mark.parametrize("answer,status,code", [("deployed", "done", 0),
+                                                ("not deployed", "failed", 3)])
+def test_resolve_accepts_a_running_publish_with_no_receipt_as_unknown(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    answer: str, status: str, code: int,
+) -> None:
+    """The publish request was left 'running' after call_publisher was
+    journaled started but before the publisher wrote any receipt. resolve
+    treats it as unknown: runs the check command, takes the owner's
+    answer, and never runs the deploy command."""
+    job = _setup_release_job(gb2, tmp_path, monkeypatch)
+    passing_check = tmp_path / "passing_check.py"
+    passing_check.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    config = replace(job["config"], publisher_dry_run_argv=(sys.executable, str(passing_check)))
+    config = write_json(config, job["config"].ledger_path.parent / "config.json")
+    from engine.faults import CrashInjected, Faults
+
+    ledger = Ledger.open(config.ledger_path)
+    grant(ledger, "demo", job["request_id"], ttl_sec=3600)
+    fakes = gb2._build_fakes(config, "demo", job["attempt_id"], None)
+    proc = Processor(config, ledger, fakes, Faults(crash_before={"call_publisher"}))
+    proc.register_defaults()
+    with pytest.raises(CrashInjected):
+        proc.run_once("demo")
+    assert ledger.request(job["request_id"]).status == "running"
+    ledger.close()
+    assert not (config.home / "publish" / f"{job['request_id']}.json").exists()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": answer)
+
+    result = gb2.main(["resolve", "demo"])
+
+    assert result == code
+    ledger = Ledger.open(config.ledger_path)
+    assert ledger.request(job["request_id"]).status == status
+    assert ledger.project("demo").state == "CLOSED"
+    ledger.close()
+    assert not job["deploy_log"].exists()  # the deploy command never ran

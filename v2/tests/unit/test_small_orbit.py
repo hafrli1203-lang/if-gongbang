@@ -984,3 +984,39 @@ def test_resume_small_plan_rejects_a_cursor_from_another_stage() -> None:
             position.JobPosition(job=_JOB, stage="facts", attempt_id="x",
                                  extra={"request": "r"}),
         )
+
+
+def test_small_planning_stops_needs_owner_when_a_required_skill_is_missing(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The combined planning station gates on its required context the
+    same way the full job's stations do: no worker runs, the job stops
+    needs_owner, and continue rechecks before dispatching."""
+    from dataclasses import replace
+
+    from engine.context import ContextConfig
+
+    ws = _full_orbit_workspace(workspace)
+    gap_config = replace(ws.config, context=ContextConfig(
+        station_skills={"plan": ("필수-없는-스킬",)},
+        required_skills={"plan": ("필수-없는-스킬",)}))
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _small_plan_json())],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = small_orbit.run_small_job(gap_config, ws.ledger, _fakes(), "alpha", _JOB,
+                                      "값 하나만 바꿔줘", processor_factory=_processor_factory(stub))
+
+    assert first.status == "needs_owner", first
+    assert first.reason is not None and "필수-없는-스킬" in first.reason
+    assert stub.calls == []
+
+    still = full_orbit.continue_full_job(gap_config, ws.ledger, _fakes(), "alpha", _JOB,
+                                         processor_factory=_processor_factory(stub))
+    assert still.status == "needs_owner" and stub.calls == []
+
+    done = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", _JOB,
+                                        processor_factory=_processor_factory(stub))
+    assert done.status == "done", done

@@ -21,7 +21,7 @@ if not (ROOT / "docs" / "ENGINE.md").is_file():
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 ENGINE_MD = (ROOT / "docs" / "ENGINE.md").read_text(encoding="utf-8")
 GB2_SOURCE = (ROOT / "tools" / "gb2").read_text(encoding="utf-8")
-CLI_SOURCE = (ROOT / "engine" / "cli.py").read_text(encoding="utf-8")
+CLI_SOURCE = (ROOT / "engine" / "interface" / "cli.py").read_text(encoding="utf-8")
 
 _ADD_PARSER = re.compile(r'sub\.add_parser\("([a-z-]+)"')
 _README_GB2_LINE = re.compile(r"^tools/gb2 (\S+)", re.MULTILINE)
