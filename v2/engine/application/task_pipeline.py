@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from engine.infrastructure import evidence
 from engine.infrastructure import gitutil
@@ -419,6 +422,13 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
     # must land in the repo first) has also completed, not immediately --
     # see the module docstring for why the stop is deferred one stage.
     pending_from_station: list[dict[str, object]] = []
+    # The seq of the station.finished event `pending_from_station` came
+    # from -- needed (결함 61) to tell blocking_station_requests which
+    # proposal to check "fulfilled since" against. A resumed/reused
+    # request_id's own station.finished can be from an EARLIER call
+    # than "now", so this is never assumed to be the newest matching
+    # proposal the way job_state_requests.proposal_seq itself would.
+    pending_from_station_seq = 0
     idx = 0
     while idx < len(stages):
         stage = stages[idx]
@@ -532,11 +542,16 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
                 completed=tuple(completed),
             )
         if stage.kind == "run_station":
-            pending_from_station = _station_pending_requests(ledger, project, rid)
+            pending_from_station_seq, pending_from_station = _station_pending_requests(
+                ledger, project, rid)
             idx += 1
             continue
         if pending_from_station:
-            still_pending = blocking_station_requests(pending_from_station, request_filter)
+            still_pending = blocking_station_requests(
+                pending_from_station, request_filter, ledger=ledger, project=project,
+                attempt_id=attempt_id, after_seq=pending_from_station_seq,
+                repo=config.projects[project].repo,
+            )
             if still_pending:
                 _record_job_metrics_failure(
                     ledger, project, attempt_id, durations_ms,
@@ -651,28 +666,56 @@ def _record_job_metrics_failure(ledger: Ledger, project: str, attempt_id: str,
 
 
 def blocking_station_requests(requests: list[dict[str, object]],
-                              request_filter: "RequestFilter | None") -> list[dict[str, object]]:
+                              request_filter: "RequestFilter | None", *,
+                              ledger: Ledger | None = None, project: str | None = None,
+                              attempt_id: str | None = None, after_seq: int | None = None,
+                              repo: "Path | None" = None) -> list[dict[str, object]]:
     """The station requests that really stop the job for the owner.
     A `kind="note"` request is informational and is dropped HERE, for
     every caller -- not only when a caller happens to pass a
     request_filter (결함 33b, sample-app T5: the `gb2 fix` path
-    passes none, so a note stopped it)."""
+    passes none, so a note stopped it).
+
+    결함 61: when `ledger`/`project`/`after_seq` are given (every real
+    caller -- _run_stages below; tests calling this directly with just
+    the first two positional args keep the old note-only behavior,
+    unchanged), a request this exact `requests` list carries is ALSO
+    dropped when job_state_requests.request_fulfilled already shows it
+    answered after `after_seq` -- the seq of the station.finished event
+    `requests` itself came from, which processor.submit's own
+    idempotency can leave pointing at an EARLIER call than "now" (a
+    resumed/reused request_id's stale station.finished), so an install
+    the owner approved well after that stale proposal was made no
+    longer wedges the job on every later continue."""
     blocking = [r for r in requests
                 if not (isinstance(r, dict) and r.get("kind") == NOTE_REQUEST_KIND)]
+    if ledger is not None and project is not None and after_seq is not None:
+        from engine.application.job_state_requests import request_fulfilled
+
+        proposal = f"{attempt_id}:{after_seq}"
+        blocking = [
+            r for r in blocking
+            if not (isinstance(r, dict) and request_fulfilled(
+                ledger, project, r, after_seq=after_seq, repo=repo, proposal=proposal))
+        ]
     return request_filter(blocking) if request_filter is not None else blocking
 
 
 def _station_pending_requests(ledger: Ledger, project: str,
-                              request_id: str) -> list[dict[str, object]]:
-    """The "requests" a station.finished event (matching request_id) asked
-    the owner to submit on its behalf -- empty if the station had nothing
-    to ask for, or if no such event exists yet (a kind registered without
+                              request_id: str) -> tuple[int, list[dict[str, object]]]:
+    """(seq, requests): the "requests" a station.finished event (matching
+    request_id) asked the owner to submit on its behalf, and that
+    event's own seq (결함 61 -- blocking_station_requests' "fulfilled
+    since" check needs exactly THIS proposal's seq, never a freshly
+    recomputed "newest matching" one, since `request_id` itself can be
+    a reused, stale one). (0, []) if the station had nothing to ask
+    for, or if no such event exists yet (a kind registered without
     ever appending one, e.g. a test's incomplete stub)."""
-    for _seq, event in ledger.events(project, "station.finished"):
+    for seq, event in ledger.events(project, "station.finished"):
         if event.payload.get("request_id") == request_id:
             requests = event.payload.get("requests", [])
-            return list(requests) if isinstance(requests, list) else []
-    return []
+            return seq, (list(requests) if isinstance(requests, list) else [])
+    return 0, []
 
 
 __all__ = [

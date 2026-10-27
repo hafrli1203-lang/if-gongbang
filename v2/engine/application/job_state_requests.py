@@ -150,6 +150,23 @@ def request_fulfilled(ledger: "Ledger", project: str, request: dict, *, after_se
                                        task_id=task_id, after_seq=after_seq)
     if kind not in PENDING_KIND_WHITELIST:
         return False
+    # 결함 57 (a live app run): a whitelisted-kind request (install/
+    # scripts_change/test_config_change) whose own `manifest` can never
+    # pass validate_pending (e.g. a path outside the project's repo) has
+    # no approval route at all -- `gb2 fix <app> --decline <manifest>`
+    # (repair_approval.approve_pending_edit) is the owner's only way out,
+    # recorded with the SAME task.request_declined event an edit
+    # request's own `path` decline uses (repair_target.
+    # record_request_declined), just keyed by `manifest` instead of
+    # `path`. Checked here, same as _edit_request_fulfilled's own
+    # decline check, so a declined install/scripts_change/
+    # test_config_change request stops appearing in outstanding_requests
+    # once resolved -- never submitted to any processor either way.
+    if job_name is not None and task_id is not None:
+        raw_manifest = request.get("manifest")
+        if (isinstance(raw_manifest, str) and raw_manifest
+                and request_declined(ledger, project, job_name, task_id, raw_manifest, after_seq)):
+            return True
     manifest = _normalized_manifest(request.get("manifest"))
     change = request.get("change")
     applied = any(

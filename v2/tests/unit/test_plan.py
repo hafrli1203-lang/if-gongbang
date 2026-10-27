@@ -128,6 +128,47 @@ def test_validate_plan_owns_outside_build_prefixes_is_a_problem(tmp_path: Path) 
     assert "t1" in problems[0]
 
 
+def test_validate_plan_owns_tests_scenes_is_reserved_for_planner(tmp_path: Path) -> None:
+    # 결함 56: a build task's owns naming a tests/scenes/
+    # path passes the owns-subset check whenever "tests/" is itself a
+    # configured build prefix (the normal case, for a builder's own
+    # unit tests) -- the real incident this closes let such a plan
+    # sail through plan review, burn a full build station turn, and
+    # only fail at merge.denied("tests_scenes_reserved_for_planner"),
+    # since merge.py's own floor (tests/scenes/ reserved for the
+    # planner role) was never checked here too.
+    data = _valid_plan_dict(tasks=[
+        {"id": "t1", "title": "a", "detail": "",
+         "owns": ["src/greet.ts", "tests/greet.test.ts",
+                  "tests/scenes/greet-welcome.scene.test.ts"],
+         "depends_on": []},
+    ])
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/"))
+    assert len(problems) == 1
+    assert "tests/scenes/greet-welcome.scene.test.ts" in problems[0]
+    assert "t1" in problems[0]
+
+
+def test_validate_plan_owns_tests_scenes_reserved_even_without_build_prefixes(
+    tmp_path: Path,
+) -> None:
+    # Same floor, but for the check_resumed_plan caller that passes
+    # build_prefixes=None (re-validating an already-reviewed plan) --
+    # merge.py's floor is config-independent, so this check must not
+    # be skipped just because build_prefixes isn't given either.
+    data = _valid_plan_dict(tasks=[
+        {"id": "t1", "title": "a", "detail": "",
+         "owns": ["tests/scenes/greet-welcome.scene.test.ts"],
+         "depends_on": []},
+    ])
+    _write_plan(tmp_path, "job", data)
+    plan = load_plan(tmp_path, "job")
+    problems = validate_plan(plan, tmp_path, build_prefixes=None)
+    assert any("tests/scenes/greet-welcome.scene.test.ts" in p for p in problems)
+
+
 def test_validate_plan_missing_scene_script_is_a_problem(tmp_path: Path) -> None:
     data = _valid_plan_dict(scenes=[
         {"id": "s1", "actor_does": "클릭", "app_shows": "결과", "where": "home",

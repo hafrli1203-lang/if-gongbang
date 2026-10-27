@@ -182,8 +182,10 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
         gate_config_path=(gate_config_copy_path(ctx) if runner.needs_gate else None),
         mcp_servers=allowed_mcp_servers(ctx, station),
     )
-    test_cmd = ctx.config.projects[ctx.project].test_cmd
-    full_task = build_prompt(base_spec, prefixes, patterns, test_cmd)
+    project_config = ctx.config.projects[ctx.project]
+    test_cmd = project_config.test_cmd
+    full_task = build_prompt(base_spec, prefixes, patterns, test_cmd,
+                              manifest=project_config.manifest)
     spec = dataclasses.replace(base_spec, task=full_task)
     return spec, worker, runner
 

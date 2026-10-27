@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from engine.domain.install_request_shape import install_request_shape_text
 from engine.domain.plan_model import SCENES_PREFIX
 from engine.infrastructure.workers.base import WorkerSpec
 
@@ -17,13 +18,6 @@ from engine.infrastructure.workers.base import WorkerSpec
 # (including the reviewer, which reads this prompt too) can open.
 _ENGINE_ROOT = Path(__file__).resolve().parents[3]
 _ARCHITECTURE_STANDARD_PATH = _ENGINE_ROOT / "docs" / "standards" / "architecture.md"
-
-_INSTALL_REQUEST_SHAPE = (
-    '{"kind": "install", "manifest": "<rel path>", '
-    '"change": {"add_lines": ["<name>==<version>", ...]}} -- each line is a plain '
-    'requirement specifier (package name, optional ==version); URLs, file paths, '
-    'options and markers are rejected'
-)
 
 _ARCHITECTURE_RULE_NOTE = (
     "For new code, also flag any violation of "
@@ -77,19 +71,32 @@ def write_verdict_schema(path: Path) -> None:
 
 def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
                   terminal_patterns: tuple[str, ...],
-                  test_cmd: tuple[str, ...] = ()) -> str:
+                  test_cmd: tuple[str, ...] = (),
+                  manifest: str | None = None) -> str:
     """A builder's full prompt: the task body plus the hard limits a
     PreToolUse gate (engine.interface.hook_gate) will actually enforce -- the allowed
     write path prefixes and the allowed terminal command patterns -- and
     the exact shape of the final JSON reply, including how to ask the
     owner for something outside those limits (e.g. a dependency change
-    on a protected manifest) instead of trying to edit it directly."""
+    on a protected manifest) instead of trying to edit it directly.
+
+    `manifest` (the project's configured manifest path, e.g.
+    ctx.config.projects[project].manifest) decides WHICH install-request
+    shape the instruction below describes -- a JSON manifest's
+    dependency-section shape or a line-list manifest's add_lines shape
+    (engine.domain.install_request_shape.install_request_shape_text,
+    shared with the matching owner_approval.validate_pending check: a
+    request built exactly as instructed here is guaranteed to pass that
+    check, by construction -- 결함 58, where this always described
+    add_lines even for a .json manifest, whose gate only ever accepts
+    a dependency section and rejected every such request)."""
     prefixes_text = ", ".join(allowed_prefixes) if allowed_prefixes else "(none)"
     patterns_text = ", ".join(terminal_patterns) if terminal_patterns else "(none)"
     test_text = (
         f"Run the project's tests with exactly this command: "
         f"{' '.join(test_cmd)}\n" if test_cmd else ""
     )
+    install_request_shape = install_request_shape_text(manifest)
     return (
         f"{spec.task}\n\n"
         f"{test_text}"
@@ -100,7 +107,7 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
         "If the task needs something outside those limits (for example, "
         "a new dependency added to a manifest file you cannot write), do "
         "not try to edit that file yourself. Instead add an entry to "
-        f'"requests" in your final JSON shaped like: {_INSTALL_REQUEST_SHAPE}\n'
+        f'"requests" in your final JSON shaped like: {install_request_shape}\n'
         f"{_FINAL_JSON_INSTRUCTION}"
     )
 

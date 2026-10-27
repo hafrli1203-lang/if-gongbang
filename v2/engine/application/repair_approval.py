@@ -32,6 +32,7 @@ from engine.application.repair_target import (
     FixupError, is_owns_scope_request, record_owns_extension, record_request_declined,
     validate_also_own,
 )
+from engine.application.owner_approval import PENDING_KIND_WHITELIST
 from engine.application.processor import Fakes
 from engine.application.job_state import (
     STAGE_TASK_OWNER, hand_off_later_task_requests, load_position, outstanding_requests, resume_job,
@@ -114,10 +115,29 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
     job_state.outstanding_requests's own "edit" branch) -- there is no
     separate "fulfilled" ledger to fall out of sync with it.
 
-    `declined` (결함 43): pending edit paths the owner refuses instead
-    (FixupError("decline_not_requested:<path>") for one that was not
-    asked for). Each is recorded as task.request_declined -- never
-    granted -- so it stops blocking the resume."""
+    `declined` (결함 43, widened by 결함 57): pending requests the owner
+    refuses instead of granting (FixupError("decline_not_requested:<id>")
+    for one that was not asked for). `--also-own`'s `paths` can only ever
+    grant an owns-scope `kind="edit"` report's own `path` (is_owns_scope_
+    request) -- an owner cannot "widen ownership" into a whitelisted
+    kind's install/scripts_change/test_config_change at all, that is not
+    what `owns` means for it. `declined` is wider: it also accepts a
+    whitelisted-kind pending request's own `manifest` as its identifier
+    (결함 57, a live app run: a build task's own pending "install"
+    request whose `manifest` names a path outside the project's repo --
+    e.g. a shared-kit manifest -- can never pass `gb2 approve-install`'s
+    own validate_pending (correctly: "path_traversal", a real security
+    floor this never weakens), yet before this the owner had no way to
+    say "don't install this, continue anyway" either -- NOT_TASK_OWNER_
+    EDIT_STOP always won because `pending_edit_paths` never looked past
+    is_owns_scope_request items, so the classic add_also_own+fix()
+    fallback then refused with "no_failed_attempt" -- the attempt never
+    failed, it is simply stopped. Each declined identifier is recorded
+    as task.request_declined -- never granted, never submitted to any
+    processor -- so it stops blocking the resume (job_state_requests.
+    request_fulfilled checks the SAME decline record for a whitelisted
+    kind's own `manifest`, just as it already did for an edit request's
+    own `path`)."""
     if not paths and not declined:
         raise FixupError("also_own_no_paths")
     found = _job_name_for_current_attempt(ledger, project)
@@ -128,17 +148,27 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
     if pos is None or pos.stage != STAGE_TASK_OWNER or pos.attempt_id != attempt_id \
             or pos.task_id is None:
         raise FixupError(NOT_TASK_OWNER_EDIT_STOP)
+    outstanding = outstanding_requests(ledger, project, pos, repo=None)
     pending_edit_paths = {
-        str(r["path"]) for r in outstanding_requests(ledger, project, pos, repo=None)
-        if is_owns_scope_request(r)
+        str(r["path"]) for r in outstanding if is_owns_scope_request(r)
     }
-    if not pending_edit_paths:
+    # Declinable identifiers: an owns-scope edit request's own `path`,
+    # or a whitelisted kind's own `manifest` (결함 57) -- never both for
+    # the SAME request (is_owns_scope_request already tells the two
+    # apart; a whitelisted kind is never also an owns-scope report, see
+    # that function's own docstring).
+    pending_declinable_ids = set(pending_edit_paths) | {
+        str(r["manifest"]) for r in outstanding
+        if not is_owns_scope_request(r) and r.get("kind") in PENDING_KIND_WHITELIST
+        and isinstance(r.get("manifest"), str) and r["manifest"]
+    }
+    if not pending_edit_paths and not pending_declinable_ids:
         raise FixupError(NOT_TASK_OWNER_EDIT_STOP)
     for path in paths:
         if path not in pending_edit_paths:
             raise FixupError(f"also_own_not_requested:{path}")
     for path in declined:
-        if path not in pending_edit_paths:
+        if path not in pending_declinable_ids:
             raise FixupError(f"decline_not_requested:{path}")
 
     from engine.domain.plan import PlanError, load_plan

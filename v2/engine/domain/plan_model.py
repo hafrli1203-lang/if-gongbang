@@ -498,6 +498,22 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
         config/build_prefixes of its own to check this against; every
         other check below still runs even then, since none of them
         depend on build_prefixes
+      - no task's `owns` names a path under SCENES_PREFIX
+        ("tests/scenes/") -- NEVER skipped, build_prefixes or not: this
+        is the plan-time half of engine.application.steps.merge's own
+        config-independent floor (_deny_if_planner_reserved,
+        "tests/scenes/ 계획자 전용"). Before this check existed (결함
+        56,, a plan whose build task named a tests/scenes/
+        path in `owns` sailed through this function whenever `tests/`
+        was itself a configured build prefix (the ordinary case, for a
+        builder's own unit tests under tests/) -- _prefix_covers("tests/",
+        "tests/scenes/x.test.ts") is true, so the owns-subset check
+        right below never caught it. The plan then passed review, a
+        full build station turn ran (real cost, real worker time), and
+        only THEN did merge refuse the write
+        (StepFailed("tests_scenes_reserved_for_planner")), failing the
+        whole job. Catching it here instead costs nothing and tells
+        the planner immediately, before any builder is spawned.
       - every task's `depends_on` names a real task id, with no cycle
         (ordered_tasks does the actual topological check)
       - every scene's `cmd` that names a tests/scenes/ script
@@ -535,6 +551,13 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
         # alike (per the owner's design, same rule as the probe
         # station's own facts.md evidence requirement).
         problems.append("plan_requirements_missing")
+    for task in plan.tasks:
+        for entry in task.owns:
+            if _prefix_covers(SCENES_PREFIX, entry):
+                problems.append(
+                    f"task {task.id}: owns {entry!r} is reserved for the planner "
+                    f"({SCENES_PREFIX} is never a build task's own owns)"
+                )
     if build_prefixes is not None:
         for task in plan.tasks:
             for entry in task.owns:

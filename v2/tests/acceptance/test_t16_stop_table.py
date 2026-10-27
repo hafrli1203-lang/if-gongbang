@@ -123,12 +123,15 @@ OWNER_STOP_TABLE: dict[str, dict[str, object]] = {
                       "test_internal_crash_at_a_build_task_is_retried_by_continue_not_stuck")],
     },
     job_state.STAGE_TASK_OWNER: {
-        "command": "설치면 gb2 approve-install -> gb2 continue; owns-scope edit는 "
-                    "gb2 fix --also-own/--decline; 그 외는 gb2 continue",
+        "command": "설치면 gb2 approve-install -> gb2 continue, 승인이 "
+                    "안 되면(예: 앱 밖 경로) gb2 fix --decline <manifest>로 거절; "
+                    "owns-scope edit는 gb2 fix --also-own/--decline; 그 외는 gb2 continue",
         "evidence": [("tests.acceptance.test_t9d_also_own",
                       "test_28_also_own_approves_both_pending_edit_requests_and_resumes_the_same_attempt"),
                      ("tests.acceptance.test_t9d_also_own",
-                      "test_43_decline_resolves_an_edit_request_that_cannot_be_granted")],
+                      "test_43_decline_resolves_an_edit_request_that_cannot_be_granted"),
+                     ("tests.acceptance.test_t9d_also_own",
+                      "test_57_decline_resolves_an_install_request_that_can_never_be_approved")],
         "note": "docs/ENGINE.md 601행 '확인 필요': crash=False 경로의 "
                 "rerun_task_owner_stop은 outstanding_requests만 보고 unknown "
                 "요청은 안 푼다 -- 설치 승인 drain 중 internal 크래시로 "

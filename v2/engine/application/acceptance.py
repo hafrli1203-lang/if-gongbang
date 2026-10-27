@@ -154,8 +154,18 @@ class AcceptanceResult:
     snapshot_mutated: bool = False
 
 
+# The filename run_acceptance writes under .gongbang/<job>/ -- exposed
+# as a constant (rather than left as acceptance_path's own literal) so
+# engine.application.steps.review can recognize and strip a STALE copy of
+# this exact file from a reviewer's snapshot (결함 62): this stage
+# always runs AFTER build+review+bench already passed, so whatever
+# this filename holds in the live tree at review time is necessarily
+# a prior attempt's leftover, never the current diff's own result.
+ACCEPTANCE_JSON_FILENAME = "acceptance.json"
+
+
 def acceptance_path(config: EngineConfig, project: str, job_name: str) -> Path:
-    return config.projects[project].repo / ".gongbang" / job_name / "acceptance.json"
+    return config.projects[project].repo / ".gongbang" / job_name / ACCEPTANCE_JSON_FILENAME
 
 
 def _job_name(ledger: Ledger, project: str, attempt_id: str) -> str:

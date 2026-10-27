@@ -2259,6 +2259,131 @@ def test_owner_request_resume_reruns_builder_after_install_then_reviews(
     assert "src/greeter/extra1.py" in build_task_texts[1]
 
 
+# ---- 12b. a resume after an install submits a FRESH build request, not --
+# ---- the same stale non-progressing one, and drops requests the ledger --
+# ---- already shows fulfilled (결함 61, 마케팅 채팅 attempt #36) ---------
+
+def test_second_resume_after_an_install_submits_a_fresh_request_and_drops_fulfilled(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """결함 61: a builder that keeps re-reporting an install request the
+    owner already approved (never checking for itself) used to wedge
+    the job forever. First resume (after install #1 is approved) runs
+    the builder again -- fine, it is a genuinely new request -- but the
+    builder makes no further file change and asks for a SECOND install
+    instead. The job stops again. Once that second install is also
+    approved, a THIRD call (the second resume on this exact stop) must
+    still actually run the builder -- before the fix, its own followup
+    text was byte-identical to the SECOND resume's own already-'done'
+    request (same unchanged dirty_paths, same base_task_text), so
+    processor.submit's ordinary idempotency silently reused that old,
+    already-finished request_id instead of submitting a new one -- no
+    request.submitted event, no worker dispatch, and
+    _station_pending_requests kept replaying that old request's own
+    stale 'requests' list (the by-then-approved second install) as if
+    it were still outstanding, forever."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "resume-resubmit-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+    })
+    install_1 = {"kind": "install", "manifest": "package.json",
+                "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    install_2 = {"kind": "install", "manifest": "package.json",
+                "change": {"dependencies": {"right-pad": "^1.0.0"}}}
+    build_calls = {"n": 0}
+
+    def _build_steps(ctx: StepContext) -> list[StepDef]:
+        if str(ctx.request.payload.get("station")) != "build":
+            return stub.steps(ctx)
+
+        def _run(ctx: StepContext) -> dict[str, object]:
+            build_calls["n"] += 1
+            copy = copy_root(ctx.config, ctx.attempt_id, "builder")
+            target = copy / "src/greeter/extra1.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if build_calls["n"] == 1:
+                target.write_text("VALUE_1 = 1\n", encoding="utf-8")
+                requests: list[dict[str, object]] = [install_1]
+            elif build_calls["n"] == 2:
+                # No further file change -- the builder just asks for a
+                # second install instead, without ever using the first.
+                requests = [install_2]
+            else:
+                requests = []
+            changed = dirty_paths(copy, ())
+            ctx.ledger.append(Event(
+                project=ctx.project, kind="station.finished", actor_kind="processor",
+                actor_id="processor", attempt_id=ctx.attempt_id,
+                payload={
+                    "request_id": ctx.request.request_id, "station": "build",
+                    "role": "builder", "ok": True, "summary": "stub", "cost_usd": 0.0,
+                    "turns": 1, "changed_paths": list(changed), "requests": requests,
+                },
+            ))
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            for _seq, event in ctx.ledger.events(ctx.project, "station.finished"):
+                if event.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_station", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", _build_steps)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True)],
+    )
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "owner_request"
+    assert build_calls["n"] == 1
+
+    # Install #1 approved -- first resume: a genuinely new follow-up
+    # text (it now carries the "install done" note the first request
+    # never had), so the builder really runs again. It asks for a
+    # second install instead of finishing.
+    _record_install(ws, first.attempt_id, install_1, "r-install-1")
+    second = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert second.status == "needs_owner"
+    assert second.reason == "owner_request"
+    assert build_calls["n"] == 2, "the first resume must still dispatch the builder"
+
+    # Install #2 approved -- SECOND resume on this same stop. Nothing in
+    # the copy changed since build_calls["n"] == 2 (no new file write),
+    # so the follow-up text this resume computes is byte-identical to
+    # the one the FIRST resume already submitted (and which is already
+    # 'done', not 'failed') -- exactly the collision 결함 61 names.
+    _record_install(ws, first.attempt_id, install_2, "r-install-2")
+    third = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert build_calls["n"] == 3, (
+        "the second resume must submit a FRESH request and actually "
+        "dispatch the builder a third time, not silently reuse the "
+        "first resume's already-done request"
+    )
+    assert third.status == "done", third
+
+
 # ---- 13-48. a resumed builder's task text must re-inject FRESH company --
 # ---- library context, not replay the first attempt's own stale block --
 # ---- (결함 48, appX live attempts #49/#50) --------------------------

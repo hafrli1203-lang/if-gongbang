@@ -223,14 +223,15 @@ def test_prepare_worker_home_heals_a_truncated_login_file_left_by_a_killed_attem
     assert (dest / ".claude.json").read_text(encoding="utf-8") == "REAL-CLAUDE-JSON\n"
 
 
-def test_prepare_worker_home_still_leaves_real_cli_written_state_untouched(
+def test_prepare_worker_home_still_leaves_non_login_session_state_untouched(
     tmp_path: Path,
 ) -> None:
     """The flip side of the fix above: a NON-empty file already at `dest`
-    (session/credential state the real CLI itself wrote into this
-    worker's own, already-isolated home on an earlier attempt/retry of
-    the same request) must still never be clobbered -- only an empty
-    (truncated-copy) file is healed."""
+    that is NOT one of `login_files` (session state the real CLI itself
+    wrote into this worker's own, already-isolated home on an earlier
+    attempt/retry of the same request) must still never be touched --
+    only an empty (truncated-copy) LOGIN file is healed, and (결함 59b,
+    see below) a login file is always mirrored from the host."""
     real_home = tmp_path / "realhome"
     (real_home / ".claude").mkdir(parents=True)
     (real_home / ".claude" / ".credentials.json").write_text(
@@ -238,13 +239,114 @@ def test_prepare_worker_home_still_leaves_real_cli_written_state_untouched(
 
     dest = tmp_path / "worker-home"
     (dest / ".claude").mkdir(parents=True)
-    (dest / ".claude" / ".credentials.json").write_text(
-        "CLI-REFRESHED-CREDENTIALS\n", encoding="utf-8")
+    (dest / ".claude" / "session-state.json").write_text(
+        "CLI-OWN-SESSION-STATE\n", encoding="utf-8")
 
     sandbox.prepare_worker_home(dest, real_home, (".claude/.credentials.json",), (".claude",))
 
+    assert (dest / ".claude" / "session-state.json").read_text(
+        encoding="utf-8") == "CLI-OWN-SESSION-STATE\n"
+
+
+# ---------------------------------------------------------------------------
+# prepare_worker_home: a login file copied into a worker HOME on an earlier
+# spawn must be refreshed from the host on a LATER spawn of the same
+# request once the host's own copy is newer (결함 59,: build
+# attempts #50/#36 failed "OAuth session expired" because the worker HOME's
+# login copy was from a spawn a day earlier -- this function only ever
+# copied once, at first-HOME-creation, and never again for a non-empty
+# target, so a long-running/resumed request kept using a stale, by-then-
+# expired token even after the host's own login had refreshed).
+# ---------------------------------------------------------------------------
+
+def test_prepare_worker_home_refreshes_a_stale_login_copy_when_host_is_newer(
+    tmp_path: Path,
+) -> None:
+    import time
+
+    real_home = tmp_path / "realhome"
+    (real_home / ".claude").mkdir(parents=True)
+    cred = real_home / ".claude" / ".credentials.json"
+    cred.write_text("OLD-TOKEN\n", encoding="utf-8")
+
+    dest = tmp_path / "worker-home"
+    (dest / ".claude").mkdir(parents=True)
+    (dest / ".claude" / ".credentials.json").write_text(
+        "OLD-TOKEN\n", encoding="utf-8")
+    # Also simulate the CLI's own non-login session state living next to
+    # it in the SAME worker HOME -- this must never be touched by a
+    # login-file refresh.
+    (dest / ".claude" / "session-state.json").write_text(
+        "WORKER-OWN-STATE\n", encoding="utf-8")
+
+    # mtimes on some filesystems have only 1s resolution -- make sure the
+    # host's refreshed login is unambiguously newer than the worker's copy.
+    time.sleep(1.1)
+    cred.write_text("NEW-TOKEN-AFTER-HOST-REFRESH\n", encoding="utf-8")
+
+    sandbox.prepare_worker_home(
+        dest, real_home, (".claude/.credentials.json",), (".claude",))
+
     assert (dest / ".claude" / ".credentials.json").read_text(
-        encoding="utf-8") == "CLI-REFRESHED-CREDENTIALS\n"
+        encoding="utf-8") == "NEW-TOKEN-AFTER-HOST-REFRESH\n"
+    assert (dest / ".claude" / "session-state.json").read_text(
+        encoding="utf-8") == "WORKER-OWN-STATE\n"
+
+
+# ---------------------------------------------------------------------------
+# prepare_worker_home: the login copy is mirrored from the host on EVERY
+# spawn, even when the WORKER's own copy is the newer one by mtime (결함
+# 59b,/28: live attempt #36 failed the same "OAuth session
+# expired and could not be refreshed" -- live stat showed the WORKER
+# HOME's own .claude/.credentials.json (5165 bytes) was NEWER than the
+# host's own login (5393 bytes, from before that spawn); reproduced on
+# this host with the engine's own prepare_worker_home/sandboxed claude -p:
+# a sandboxed claude CLI that fails to silently refresh its token in
+# place still re-writes the credentials file -- bumping its mtime past
+# the host's -- before reporting the auth failure, so 결함 59's own "only
+# refresh when host is STRICTLY newer" rule can never recover: a failed
+# in-sandbox refresh's mtime is, by construction, always newer than the
+# host copy that was there when that spawn started, so every later spawn
+# of the SAME worker HOME (station._run_spawn_worker's resume path keeps
+# one) kept "refreshing" nothing and stayed poisoned forever). The fix:
+# a login file is no longer compared by mtime at all -- it is mirrored
+# from the host unconditionally, skipped only when its bytes already
+# match the host's (an ordinary no-op optimization, not a staleness
+# judgment).
+# ---------------------------------------------------------------------------
+
+def test_prepare_worker_home_always_mirrors_host_login_even_when_worker_copy_is_newer(
+    tmp_path: Path,
+) -> None:
+    import time
+
+    real_home = tmp_path / "realhome"
+    (real_home / ".claude").mkdir(parents=True)
+    cred = real_home / ".claude" / ".credentials.json"
+    cred.write_text("HOST-GOOD-TOKEN\n", encoding="utf-8")
+
+    dest = tmp_path / "worker-home"
+    (dest / ".claude").mkdir(parents=True)
+    (dest / ".claude" / "session-state.json").write_text(
+        "WORKER-OWN-STATE\n", encoding="utf-8")
+
+    # Simulate a sandboxed CLI that failed to refresh its own token in
+    # place: it still re-wrote the login file (different, bad content),
+    # landing STRICTLY NEWER than the host's own copy above.
+    time.sleep(1.1)
+    (dest / ".claude" / ".credentials.json").write_text(
+        "WORKER-FAILED-REFRESH-GARBAGE\n", encoding="utf-8")
+    worker_mtime = (dest / ".claude" / ".credentials.json").stat().st_mtime
+    host_mtime = cred.stat().st_mtime
+    assert worker_mtime > host_mtime  # the exact shape that defeated 결함 59's fix
+
+    sandbox.prepare_worker_home(
+        dest, real_home, (".claude/.credentials.json",), (".claude",))
+
+    assert (dest / ".claude" / ".credentials.json").read_text(
+        encoding="utf-8") == "HOST-GOOD-TOKEN\n"
+    assert (dest / ".claude" / "session-state.json").read_text(
+        encoding="utf-8") == "WORKER-OWN-STATE\n"
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,11 @@ from engine.config import EngineConfig
 from engine.infrastructure.installers import InstallFailed, validate_add_lines
 from engine.domain.records import Event
 from engine.domain.policy import SHELL_METACHARS as _SHELL_METACHARS
+from engine.domain.install_request_shape import (
+    JSON_INSTALL_SECTIONS as _JSON_INSTALL_SECTIONS,
+    PACKAGE_NAME_RE as _PACKAGE_NAME_RE,
+    VERSION_SPECIFIER_RE as _VERSION_SPECIFIER_RE,
+)
 from engine.application.processor import submit
 
 if TYPE_CHECKING:
@@ -101,23 +106,15 @@ def _unsafe_string_reason(text: str) -> str | None:
 # A JSON manifest's `change` (install kind only -- scripts_change/
 # test_config_change legitimately write other sections, e.g. "scripts",
 # of the same package.json and are NOT restricted by this allowlist)
-# may only touch these top-level sections. Rejecting "scripts" here
+# may only touch these top-level sections (_JSON_INSTALL_SECTIONS,
+# imported above from engine.domain.install_request_shape -- the SAME
+# constant engine.infrastructure.workers.prompts' build_prompt reads to
+# tell a worker what shape to ask for, so the two can never drift
+# apart, see that module's docstring, 결함 58). Rejecting "scripts" here
 # closes a real exploit: an "install" request whose `change` was really
 # `{"scripts": {"postinstall": "<shell>"}}` would otherwise validate as
 # an ordinary dependency bump and then run through the unsandboxed
 # RealInstaller.
-_JSON_INSTALL_SECTIONS = frozenset(
-    {"dependencies", "devDependencies", "optionalDependencies"}
-)
-# npm package name: optional "@scope/" prefix, then lowercase
-# alphanumerics/._- (conservative; real npm allows a few more corner
-# cases, but this is a validator, not a registry mirror).
-_PACKAGE_NAME_RE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$")
-# A version SPECIFIER's allowed character set, not a full semver-range
-# grammar: deliberately excludes ":" and "/", so none of "file:",
-# "git+ssh://", "http://", "link:", "workspace:" can ever match --
-# all of them need at least one of those two characters.
-_VERSION_SPECIFIER_RE = re.compile(r"^[A-Za-z0-9.^~<>=*x+,|\- ]+$")
 
 
 def _validate_json_install_change(change: dict) -> tuple[bool, str]:

@@ -191,7 +191,40 @@ def _export_review_snapshot(ctx: StepContext, repo: Path, fp: str) -> Path:
         evidence.export_tree(repo, fp, dest)
     except evidence.TreeExportError as exc:
         raise StepFailed("review_snapshot_path_unsafe") from exc
+    _strip_stale_acceptance_records(dest)
     return dest
+
+
+def _strip_stale_acceptance_records(dest: Path) -> None:
+    """Removes every `.gongbang/<job>/acceptance.json` export_tree just
+    copied into the reviewer's own snapshot (결함 62): engine.application.
+    acceptance.run_acceptance writes that exact file only AFTER
+    build+review+bench already passed for some attempt, so whatever
+    the live repo tree carries under this name at REVIEW time -- i.e.
+    before this diff's own bench has even run -- is always a prior
+    attempt's leftover. A reviewer is a real AI worker whose workdir
+    IS this snapshot (see _full_spec's WorkerSpec(workdir=snapshot)),
+    so it can open this file directly with its own Read/Grep tools,
+    not only read the diff text the prompt sends it -- and did exactly
+    that in the wild, reporting the current attempt as failing an
+    acceptance run that, for it, had not happened yet
+    (R-fc1adf80f9d70852). The job's OTHER .gongbang/<job>/ records
+    (facts.md, plan.json, scenes) are left untouched -- those stay
+    legitimate context for a plan-review diff (see _is_plan_review_diff
+    in engine.infrastructure.workers.prompts).
+
+    Imports ACCEPTANCE_JSON_FILENAME lazily (not at module level):
+    engine.application.acceptance imports engine.application.steps (for
+    bench_env/suite_snapshot helpers), and engine.application.steps'
+    own __init__ imports this module -- a module-level import here
+    would close that into a circular import."""
+    from engine.application.acceptance import ACCEPTANCE_JSON_FILENAME
+
+    gongbang_dir = dest / ".gongbang"
+    if not gongbang_dir.is_dir():
+        return
+    for stale in gongbang_dir.glob(f"*/{ACCEPTANCE_JSON_FILENAME}"):
+        stale.unlink()
 
 
 def _diff_text(ctx: StepContext, fp: str) -> str:

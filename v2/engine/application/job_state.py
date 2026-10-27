@@ -424,12 +424,21 @@ def stages_spec(stages: "list[orbit.Stage]") -> list[dict]:
 
 def stages_from_spec(spec: list[dict], config: "EngineConfig", attempt_id: str, *,
                      task_text: str | None = None,
-                     merge_retry_n: int = 0) -> "list[orbit.Stage]":
+                     merge_retry_n: int = 0, resume_n: int = 0) -> "list[orbit.Stage]":
     """The recorded stages for `attempt_id`: every payload as recorded,
     with each merge copy pointed at this attempt's own copy of its role.
     `task_text` replaces the run_station task (a fix's composed task, or
-    a continuation note) and `merge_retry_n` marks a re-merge on the same
-    attempt -- the only two deliberate differences from the spec."""
+    a continuation note), `merge_retry_n` marks a re-merge on the same
+    attempt, and `resume_n` (결함 61) is metadata-only -- never shown to
+    the worker, it exists purely to make this run_station payload hash
+    to a request_id distinct from an earlier owner-request resume on
+    this same attempt whose own followup text happened to come out
+    byte-identical (same unchanged dirty_paths, same base_task_text):
+    without it, processor.submit's own idempotency (same request_id,
+    not 'failed' -> return the existing id, no new event) silently
+    reuses that earlier, already-finished request and the worker is
+    never actually dispatched again. The only deliberate differences
+    from the spec."""
     from engine.application import task_pipeline as orbit
     from engine.application.steps.open_job import copy_root
 
@@ -439,6 +448,8 @@ def stages_from_spec(spec: list[dict], config: "EngineConfig", attempt_id: str, 
         payload = dict(entry["payload"])
         if kind == "run_station" and task_text is not None:
             payload["task"] = task_text
+            if resume_n:
+                payload["resume_n"] = resume_n
         if kind == "merge":
             payload["copies"] = [
                 {**copy, "path": str(copy_root(config, attempt_id, str(copy["role"])))}

@@ -165,3 +165,51 @@ def test_d_tool_itself_failing_to_run_fails_bench(workspace: Workspace) -> None:
     # Never got far enough to record ANY bench evidence -- run_arch_check
     # itself raised, before record_bench's evidence.record ever runs.
     assert ws.ledger.evidence(attempt_id, "bench") == []
+
+
+def test_e_arch_check_cmd_outside_repo_survives_the_projects_own_hidden_paths(
+    workspace: Workspace,
+) -> None:
+    """결함 60: arch_check_cmd may point at a tool that lives OUTSIDE
+    this project's repo (e.g. a shared tool checked out once, reused
+    by every project configured for bench -- an app config pointing at the
+    engine's own tools/arch_check.py does exactly this). This
+    project's OWN hidden_paths (meant to hide sibling apps'
+    repos/secrets from ITS bench sandbox, for example a list covering
+    the shared apps root) must never also
+    hide the arch_check tool itself just because the tool happens to
+    live under one of those hidden roots -- worker_sandbox.py already
+    protects the exact same engine-own-code case for the
+    builder/reviewer sandbox (`readonly += (ENGINE_ROOT,)`); the bench
+    sandbox (_bench_sandbox_argv) must do the same for arch_check_cmd's
+    own script path, or the tool "fails to run" (StepFailed
+    arch_check_failed) on every project that hides a root containing
+    it, regardless of whether the repo itself has any real violation."""
+    sample = make_sample(workspace.root / "t12e", 1, Path(sys.executable))
+    # The tool lives under a separate tree this project's OWN
+    # hidden_paths hides wholesale -- never under `sample.repo`, so
+    # this reproduces hidden_paths shadowing a path OTHER than the
+    # repo itself (the repo stays visible regardless, via its own
+    # deeper `writable` mount).
+    apps_root = workspace.root / "other_apps_root"
+    tool_dir = apps_root / "shared-engine" / "tools"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "arch_check_tool.py").write_text(
+        "import json\nprint(json.dumps({'violations': []}))\n", encoding="utf-8")
+    project = replace(
+        workspace.config.projects["alpha"],
+        repo=sample.repo, test_cmd=sample.test_cmd, install_cmd=sample.install_cmd,
+        manifest=sample.manifest, bench_cases=sample.bench_cases,
+        arch_check_cmd=(sys.executable, str(tool_dir / "arch_check_tool.py")),
+        hidden_paths=(apps_root,),
+    )
+    config = replace(workspace.config, sandbox="bwrap",
+                     projects={**workspace.config.projects, "alpha": project})
+    ws = Workspace(workspace.root, config, workspace.ledger, sample.repo, workspace.beta)
+
+    attempt_id, rid = _run_bench(ws)
+    req = ws.ledger.request(rid)
+    assert req.status == "done"
+    payload = ws.ledger.evidence(attempt_id, "bench")[0].payload
+    assert payload["arch"]["configured"] is True
+    assert payload["arch"]["new_violations"] == []

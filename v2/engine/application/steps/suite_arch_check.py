@@ -23,6 +23,39 @@ from engine.infrastructure import sandbox
 SandboxArgvFn = Callable[..., tuple[list[str], dict[str, str]]]
 
 
+def tool_readonly_paths(project: ProjectConfig) -> tuple[Path, ...]:
+    """Every absolute-path token inside project.arch_check_cmd that
+    exists on the host -- e.g. a shared arch_check tool checked out
+    once, outside this project's own repo (for example an app config whose arch_check_cmd points at
+    the engine's own tools/arch_check.py) -- for a caller to
+    expose read-only inside the bench sandbox, on top of whatever this
+    project's OWN hidden_paths hides (hidden_paths
+    exists to hide SIBLING projects' repos/secrets from this project's
+    bench sandbox, never the tool this project itself configured bench
+    to run -- an app whose hidden_paths cover the shared apps root tmpfs's the exact directory the arch_check
+    tool lives under, so `python3 .../arch_check.py` failed with "No
+    such file or directory", a non-JSON stdout StepFailed
+    ("arch_check_failed") read as the tool itself being broken
+    regardless of exit code -- when the real repo had zero new
+    violations the whole time. Reproduced directly with bwrap,
+   , byte-identical error text. worker_sandbox.py already
+    makes the same exception for the engine's own source tree via
+    `readonly += (ENGINE_ROOT,)` -- this generalizes that one
+    hardcoded case to whatever directory arch_check_cmd's own
+    absolute-path token actually resolves to, so it works for ANY
+    project's externally-located tool, not only one living under this
+    engine's own checkout. A relative token (a script committed
+    inside the repo, e.g. the T12 tests' own "fake_arch.py") is
+    already covered by `repo` itself and is left untouched here --
+    exposing its parent would just re-expose `repo` a second time."""
+    paths: tuple[Path, ...] = ()
+    for token in project.arch_check_cmd:
+        candidate = Path(token)
+        if candidate.is_absolute() and candidate.exists():
+            paths += (candidate.parent,)
+    return paths
+
+
 def run(ctx: StepContext, *, project: ProjectConfig, repo: Path,
         extra_readonly: tuple[Path, ...], env: dict[str, str], timeout_sec: float,
         sandbox_mode: str, sandbox_argv_fn: SandboxArgvFn) -> dict[str, object]:

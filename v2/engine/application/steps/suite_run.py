@@ -540,9 +540,11 @@ def _failed_test_files(text: str) -> list[str]:
 
 def _run_run_arch_check(ctx: StepContext) -> dict[str, object]:
     project = _project_config(ctx)
+    extra_readonly = (_bench_immutable_source(ctx)
+                       + suite_arch_check.tool_readonly_paths(project))
     return suite_arch_check.run(
         ctx, project=project, repo=_repo(ctx),
-        extra_readonly=_bench_immutable_source(ctx), env=_bench_env(ctx),
+        extra_readonly=extra_readonly, env=_bench_env(ctx),
         timeout_sec=_timeout_sec(ctx), sandbox_mode=ctx.config.sandbox,
         sandbox_argv_fn=_bench_sandbox_argv,
     )

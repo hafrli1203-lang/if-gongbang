@@ -721,6 +721,46 @@ def test_export_review_snapshot_ignores_export_attributes(workspace: Workspace) 
     assert (dest / "ver.txt").read_text(encoding="utf-8") == "$Format:%H$\n"
 
 
+def test_export_review_snapshot_strips_stale_acceptance_json(
+    workspace: Workspace,
+) -> None:
+    """engine.application.acceptance writes `.gongbang/<job>/acceptance.json`
+    only AFTER build+review+bench already passed for some earlier
+    attempt (결함 62) -- so whatever that file says at REVIEW time is
+    always a prior attempt's leftover, never this diff's own result.
+    A reviewer is a real AI worker with filesystem access to its own
+    snapshot (workdir=dest), not just the diff text passed in the
+    prompt, so a stale acceptance.json left in the snapshot gets read
+    as if it were this attempt's evidence (R-fc1adf80f9d70852: a P1
+    "acceptance 결과가 이전 작업의 실패 기록 그대로" that no builder change
+    could ever satisfy). _export_review_snapshot must strip every
+    acceptance.json under .gongbang/ from the snapshot it hands the
+    reviewer, while leaving the job's OTHER .gongbang/ records
+    (facts.md, plan.json) untouched -- those are still legitimate
+    context for a plan-review diff."""
+    ws = _review_workspace(workspace)
+    stale_dir = ws.alpha / ".gongbang" / "chunkA-planning-loop"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "acceptance.json").write_text(
+        json.dumps({"job": "chunkA-planning-loop", "passed": False}),
+        encoding="utf-8",
+    )
+    (stale_dir / "facts.md").write_text("# facts\n", encoding="utf-8")
+    git(ws.alpha, "add", "-A")
+    git(ws.alpha, "commit", "-q", "-m", "stale acceptance.json leftover")
+    attempt_id, rid = _submit_review(ws)
+
+    fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes)
+    req = ws.ledger.request(rid)
+    ctx = StepContext(config=ws.config, ledger=ws.ledger, fakes=None,
+                      request=req, project="alpha", attempt_id=attempt_id)
+    dest = review._export_review_snapshot(ctx, ws.alpha, fp)
+
+    assert not (dest / ".gongbang" / "chunkA-planning-loop" / "acceptance.json").exists()
+    assert (dest / ".gongbang" / "chunkA-planning-loop" / "facts.md").read_text(
+        encoding="utf-8") == "# facts\n"
+
+
 def test_review_prompt_includes_new_untracked_file(workspace: Workspace) -> None:
     """End-to-end through the real review step: a brand-new file present
     when the review request runs must show up in the reviewer's prompt

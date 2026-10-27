@@ -151,3 +151,38 @@ def test_build_and_review_prompts_have_no_industry_or_brand_words(tmp_path: Path
     ]
     for text in samples:
         _assert_no_banned_words(text)
+
+
+def test_build_prompt_json_manifest_requests_a_dependency_section_shape(
+    tmp_path: Path,
+) -> None:
+    """결함 58: a .json manifest's install request must be instructed
+    in the shape owner_approval's validate_pending actually accepts
+    for it (a dependencies/devDependencies/optionalDependencies
+    section), not the add_lines shape -- which it always rejects for a
+    JSON manifest with manifest_section_not_allowed."""
+    spec = _spec(tmp_path)
+    text = build_prompt(spec, ("src/",), (r"ls",), ("pytest",), manifest="package.json")
+    assert "add_lines" not in text
+    assert "dependencies" in text
+    assert "devDependencies" in text
+    assert "optionalDependencies" in text
+
+
+def test_build_prompt_line_list_manifest_still_requests_add_lines(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    text = build_prompt(
+        spec, ("src/",), (r"ls",), ("pytest",), manifest="requirements.txt",
+    )
+    assert "add_lines" in text
+    assert "dependencies" not in text
+
+
+def test_build_prompt_with_no_manifest_falls_back_to_add_lines(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    text = build_prompt(spec, ("src/",), (r"ls",), ("pytest",))
+    assert "add_lines" in text

@@ -196,9 +196,19 @@ def rerun_task_owner_stop(run: Run, pos: JobPosition, plan: Plan, *,
         run_station_text = install_followup_task_text(task_text, build_copy)
     merge_retry_n = sum(1 for _seq, event in run.ledger.events(run.project, "merge.recorded")
                         if event.attempt_id == attempt_id)
+    # 결함 61: how many run_station requests this attempt has already
+    # submitted (its first attempt plus every owner-request resume
+    # since) -- busts this resume's own payload hash so it never
+    # collides with an earlier resume's followup text that happened to
+    # come out byte-identical (same unchanged dirty_paths, same
+    # base_task_text -- see stages_from_spec's own docstring).
+    resume_n = sum(
+        1 for _seq, event in run.ledger.events(run.project, "request.submitted")
+        if event.attempt_id == attempt_id and event.payload.get("kind") == "run_station"
+    )
     stages = widen_stage_owns(
         stages_from_spec(spec, run_config, attempt_id, task_text=run_station_text,
-                         merge_retry_n=merge_retry_n),
+                         merge_retry_n=merge_retry_n, resume_n=resume_n),
         extra_owns,
     )
     return continue_task_stages(run, pos, plan, run_config, stages, task_text)

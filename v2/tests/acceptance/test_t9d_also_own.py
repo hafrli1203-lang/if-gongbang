@@ -574,6 +574,124 @@ def test_43_decline_resolves_an_edit_request_that_cannot_be_granted(
     assert [d.get("path") for d in declined] == [_EDIT_PATH_B]
 
 
+# ---- 결함 57 (a live app run,: a build task's own
+# pending "install" request (owner_approval.PENDING_KIND_WHITELIST, not
+# an owns-scope "edit" report) stops the job at STAGE_TASK_OWNER exactly
+# like a 결함 28 edit request does -- but when its `manifest` points
+# outside the project's own repo (a shared-kit manifest), `gb2
+# approve-install` can never approve it (owner_approval.validate_pending's
+# own `_unsafe_string_reason` correctly refuses "path_traversal" -- that
+# check is NOT weakened by this fix). Before this fix, `gb2 fix <app>
+# --decline <manifest>` fell straight through to NOT_TASK_OWNER_EDIT_STOP
+# (approve_pending_edit's own `pending_edit_paths` only ever looked at
+# is_owns_scope_request items, never a whitelisted kind's own `manifest`)
+# and the classic add_also_own+fix() fallback then raised
+# "no_failed_attempt" (the attempt never failed -- it is still active,
+# simply stopped) -- leaving the owner with neither an approve path nor a
+# decline path: a permanent stop. ----------------------------------------
+
+_SHARED_INSTALL_MANIFEST = "../_shared/kit/package.json"
+_SHARED_INSTALL_REQUEST = {
+    "kind": "install", "manifest": _SHARED_INSTALL_MANIFEST,
+    "change": {"dependencies": {"pg": "8.23.0"}},
+}
+
+
+def _install_request_stop(workspace: Workspace, job_name: str):
+    """Runs a single-task plan to its own needs_owner stop on ONE pending
+    kind="install" request whose manifest lives outside the project's
+    repo -- the same shape `_edit_requests_stop` builds for a kind="edit"
+    report, just a whitelisted kind instead."""
+    ws = _tfo._full_orbit_workspace(workspace)
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "필드 정리", "detail": "",
+         "owns": [_TASK_OWNED_PATH], "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [{_TASK_OWNED_PATH: "VALUE_A = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_requests(
+        queues, "build", [_SHARED_INSTALL_REQUEST],
+    )
+    review_steps, review_calls = _review_queue_steps([(True, []), (True, [])])
+
+    def factory(config, ledger, fakes):
+        proc = _tfo.Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", review_steps)
+        return proc
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "설치가 필요한 결과 반영 확인",
+        processor_factory=factory,
+    )
+    return ws, first, factory, review_calls
+
+
+def test_57_approve_install_still_refuses_a_manifest_outside_the_repo(
+    workspace: Workspace,
+) -> None:
+    """The security floor this fix must never weaken: validate_pending
+    rejects the shared-kit manifest as path_traversal regardless of the
+    decline path added below."""
+    from engine import owner as owner_module
+
+    job_name = "install-stop-security-job"
+    ws, first, _factory, _review_calls = _install_request_stop(workspace, job_name)
+    assert first.status == "needs_owner", first
+
+    ok, reason = owner_module.validate_pending(ws.config, "alpha", _SHARED_INSTALL_REQUEST)
+    assert (ok, reason) == (False, "path_traversal")
+
+
+def test_57_decline_resolves_an_install_request_that_can_never_be_approved(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_name = "install-stop-decline-job"
+    ws, first, factory, _review_calls = _install_request_stop(workspace, job_name)
+    assert first.status == "needs_owner", first
+    stopped_attempt_id = first.attempt_id
+
+    pos = load_position(ws.ledger, "alpha", job_name)
+    assert pos is not None and pos.stage == STAGE_TASK_OWNER
+    assert [r.get("kind") for r in outstanding_requests(ws.ledger, "alpha", pos)] == ["install"]
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    # Before this fix: raised NOT_TASK_OWNER_EDIT_STOP (install-kind
+    # requests were invisible to approve_pending_edit's own pending set).
+    with pytest.raises(fixup.FixupError, match="decline_not_requested:not-the-manifest"):
+        fixup.approve_pending_edit(ws.config, ws.ledger, "alpha", (), fakes_for,
+                                   declined=("not-the-manifest",))
+    pos = load_position(ws.ledger, "alpha", job_name)
+    assert len(outstanding_requests(ws.ledger, "alpha", pos)) == 1
+
+    _tfo._install_fake_acceptance_and_handoff(
+        monkeypatch, [_tfo._FakeAcceptanceResult(passed=True)],
+    )
+    outcome = fixup.approve_pending_edit(
+        ws.config, ws.ledger, "alpha", (), fakes_for,
+        declined=(_SHARED_INSTALL_MANIFEST,), decline_note="곳간 패키지는 별도로 설치한다",
+        processor_factory=factory,
+    )
+    assert outcome.status == "done", outcome
+    # The SAME attempt was reused -- nothing here ever failed.
+    assert outcome.attempt_id == stopped_attempt_id
+
+    declined = [e.payload for _s, e in ws.ledger.events("alpha", "task.request_declined")]
+    assert [d.get("path") for d in declined] == [_SHARED_INSTALL_MANIFEST]
+    assert declined[0].get("note") == "곳간 패키지는 별도로 설치한다"
+
+    # P5: the declined install request never stays pending once resolved.
+    pos = load_position(ws.ledger, "alpha", job_name)
+    if pos is not None and pos.stage == STAGE_TASK_OWNER:
+        assert outstanding_requests(ws.ledger, "alpha", pos) == ()
+
+
 def test_45_decline_note_reaches_the_resumed_worker(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -124,6 +124,7 @@ from engine.domain.policy import (
     prefix_covers as _prefix_covers,
 )
 from engine.domain.stage_checks import other_station_record_violation
+from engine.domain.plan_model import SCENES_PREFIX as _PLANNER_ONLY_PREFIX
 from engine.application.processor import StepContext, StepDef, StepFailed
 from engine.application.steps.open_job import copy_root, dirty_paths, job_name_for
 from engine.infrastructure.skills import SKIP_DIRS as _DEPENDENCY_DIR_NAMES
@@ -133,8 +134,11 @@ from engine.infrastructure.skills import SKIP_DIRS as _DEPENDENCY_DIR_NAMES
 # a hard, config-independent floor, never trusted to station_owners alone:
 # an operator config that (by mistake or overlap) gives some other role a
 # prefix wide enough to also cover this path must still never let that
-# role's merge actually land a write under it.
-_PLANNER_ONLY_PREFIX = "tests/scenes/"
+# role's merge actually land a write under it. The same single-source
+# constant (engine.domain.plan_model.SCENES_PREFIX, itself re-exported
+# from engine.domain.plan_paths) is now also checked plan-side, at
+# validate_plan time (결함 56, -- this floor here stays as
+# the final backstop, never weakened or removed by that earlier check.
 _PLANNER_ROLE = "planner"
 
 
