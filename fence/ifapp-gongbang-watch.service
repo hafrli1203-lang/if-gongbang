@@ -1,0 +1,23 @@
+[Unit]
+Description=IF 공방 멈춤 감시 (gb2 watch --loop --resume, G30)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=<apps-root>/if-gongbang-v2
+Environment=GB2_APPS_ROOT=<apps-root>
+Environment=GB2_WORKSPACE=<apps-root>/live-workspace
+Environment=PATH=<home>/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=<apps-root>/if-gongbang-v2/.venv/bin/python tools/gb2 watch --loop --resume
+Restart=always
+RestartSec=30
+SuccessExitStatus=143
+# 백그라운드 감시 전용 — 서버를 많이 쓰지 않도록 뒤로 돌린다(다른 ifapp-* worker 유닛 관례).
+Nice=15
+CPUWeight=10
+IOSchedulingClass=idle
+MemoryHigh=1G
+MemoryMax=1500M
+
+[Install]
+WantedBy=default.target

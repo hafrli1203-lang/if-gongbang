@@ -50,8 +50,23 @@ from engine.application.acceptance_bench import run_in_bench_sandbox
 from engine.infrastructure.workers.base import WorkerSpec
 from tests.conftest import Workspace, git
 
+def _node_runs_in_bwrap() -> bool:
+    """True iff a plain bwrap sandbox (root bound read-only, fresh /tmp) can exec `node` on this
+    host. Some CI runners keep node where such a sandbox cannot reach it; there the real-sandbox
+    node checks below cannot say anything about file deps, so they skip with that reason."""
+    if not sandbox.available():
+        return False
+    try:
+        proc = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+             "--", "node", "-e", "0"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 needs_bwrap = pytest.mark.skipif(
-    not sandbox.available(), reason="bwrap not available on this host",
+    not _node_runs_in_bwrap(), reason="bwrap unavailable, or node not runnable inside bwrap on this host",
 )
 
 
