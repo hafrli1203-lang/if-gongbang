@@ -90,6 +90,35 @@ def test_claude_argv_has_no_user_settings(tmp_path: Path) -> None:
     assert hook["timeout"] == 30
 
 
+def test_claude_argv_settings_has_effort_level_when_worker_has_reasoning(tmp_path: Path) -> None:
+    """G11: the station's reasoning level (today only wired to the codex
+    runner's -c model_reasoning_effort, see test_codex_argv below) must
+    also reach a claude worker -- as the documented `effortLevel`
+    settings key (code.claude.com/docs/en/settings-reference#effortlevel,
+    values low/medium/high/xhigh; confirmed accepted by `claude --help`
+    too, which also allows "max"), carried in the same --settings JSON
+    this runner already writes (never a second --settings flag -- the
+    CLI only reads the last one)."""
+    spec = _spec(tmp_path)
+    worker = WorkerConfig(runner="claude", reasoning="low")
+    argv = ClaudeRunner().argv(spec, worker)
+
+    assert argv.count("--settings") == 1
+    settings_raw = argv[argv.index("--settings") + 1]
+    settings = json.loads(settings_raw)
+    assert settings["effortLevel"] == "low"
+
+
+def test_claude_argv_settings_has_no_effort_level_when_worker_has_none(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    worker = WorkerConfig(runner="claude")
+    argv = ClaudeRunner().argv(spec, worker)
+
+    settings_raw = argv[argv.index("--settings") + 1]
+    settings = json.loads(settings_raw)
+    assert "effortLevel" not in settings
+
+
 def test_claude_argv_has_no_mcp_config_when_spec_has_no_mcp_servers(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))

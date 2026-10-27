@@ -187,6 +187,67 @@ def test_available_caches_result(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# prepare_worker_home: a resumed/retried attempt must heal a login file an
+# earlier, killed attempt left truncated -- not treat it as already-seeded
+# state (결함 55,: a build worker killed mid-spawn left a 0-byte
+# $HOME/.claude/.credentials.json; the resumed retry's own call then saw
+# `target.exists()` and skipped re-copying, so every retry kept running
+# with an empty credentials file and failed "Not logged in").
+# ---------------------------------------------------------------------------
+
+def test_prepare_worker_home_heals_a_truncated_login_file_left_by_a_killed_attempt(
+    tmp_path: Path,
+) -> None:
+    real_home = tmp_path / "realhome"
+    (real_home / ".claude").mkdir(parents=True)
+    (real_home / ".claude" / ".credentials.json").write_text(
+        "REAL-CLAUDE-CREDENTIALS\n", encoding="utf-8")
+    (real_home / ".claude.json").write_text("REAL-CLAUDE-JSON\n", encoding="utf-8")
+
+    dest = tmp_path / "worker-home"
+    # Simulate a SIGTERM landing mid-copy on a previous spawn of the SAME
+    # request (station._run_spawn_worker's own resume path calls this
+    # again, with the SAME dest, on every retry): the destination login
+    # file exists but is empty, exactly what an interrupted shutil.copy2
+    # (open+truncate the dest, then get killed before writing any bytes)
+    # leaves on disk.
+    (dest / ".claude").mkdir(parents=True)
+    (dest / ".claude" / ".credentials.json").touch()
+    assert (dest / ".claude" / ".credentials.json").stat().st_size == 0
+
+    sandbox.prepare_worker_home(
+        dest, real_home, (".claude/.credentials.json", ".claude.json"), (".claude", ".claude.json"))
+
+    assert (dest / ".claude" / ".credentials.json").read_text(
+        encoding="utf-8") == "REAL-CLAUDE-CREDENTIALS\n"
+    assert (dest / ".claude.json").read_text(encoding="utf-8") == "REAL-CLAUDE-JSON\n"
+
+
+def test_prepare_worker_home_still_leaves_real_cli_written_state_untouched(
+    tmp_path: Path,
+) -> None:
+    """The flip side of the fix above: a NON-empty file already at `dest`
+    (session/credential state the real CLI itself wrote into this
+    worker's own, already-isolated home on an earlier attempt/retry of
+    the same request) must still never be clobbered -- only an empty
+    (truncated-copy) file is healed."""
+    real_home = tmp_path / "realhome"
+    (real_home / ".claude").mkdir(parents=True)
+    (real_home / ".claude" / ".credentials.json").write_text(
+        "REAL-CLAUDE-CREDENTIALS\n", encoding="utf-8")
+
+    dest = tmp_path / "worker-home"
+    (dest / ".claude").mkdir(parents=True)
+    (dest / ".claude" / ".credentials.json").write_text(
+        "CLI-REFRESHED-CREDENTIALS\n", encoding="utf-8")
+
+    sandbox.prepare_worker_home(dest, real_home, (".claude/.credentials.json",), (".claude",))
+
+    assert (dest / ".claude" / ".credentials.json").read_text(
+        encoding="utf-8") == "CLI-REFRESHED-CREDENTIALS\n"
+
+
+# ---------------------------------------------------------------------------
 # Real sandboxed execution: writable vs. hidden vs. outside, net isolation.
 # ---------------------------------------------------------------------------
 

@@ -44,7 +44,13 @@ class WorkerConfig:
     max_turns: int | None = None  # None: no turn cap; timeout_sec still stops a hung worker
     budget_usd: float | None = None  # None: no per-run spend cap (subscription use)
     timeout_sec: float = 900.0
-    reasoning: str | None = None  # codex: model_reasoning_effort
+    # codex: -c model_reasoning_effort="<value>". claude: the --settings
+    # JSON's "effortLevel" key (code.claude.com/docs/en/settings-
+    # reference#effortlevel; accepted values low/medium/high/xhigh, and
+    # "max" per `claude --help`'s --effort flag). Not validated here --
+    # each runner passes it through verbatim; an unknown value is each
+    # CLI's own concern, not this dataclass's.
+    reasoning: str | None = None
 
     def __post_init__(self) -> None:
         if not is_known_runner(self.runner):

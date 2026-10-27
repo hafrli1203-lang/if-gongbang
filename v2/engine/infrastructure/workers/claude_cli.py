@@ -148,8 +148,19 @@ def _write_mcp_config_file(spec: WorkerSpec, mcp_servers: dict[str, McpServerCon
     return path
 
 
-def _gate_settings() -> str:
-    return json.dumps({
+def _gate_settings(worker: WorkerConfig) -> str:
+    """The single --settings JSON this runner passes (never a second
+    flag -- the CLI only reads the last --settings it is given).
+    `effortLevel` is added only when worker.reasoning is set, so a
+    worker with none keeps today's settings JSON byte-identical
+    (tested by test_claude_argv_settings_has_no_effort_level_when_worker_has_none).
+    Key name and accepted values (low/medium/high/xhigh) are from
+    code.claude.com/docs/en/settings-reference#effortlevel (confirmed
+   ; `claude --help` additionally accepts "max" for its
+    per-session `--effort` flag, so any of worker.reasoning's values is
+    passed through verbatim rather than validated against a narrower
+    list here."""
+    settings: dict[str, object] = {
         "hooks": {
             "PreToolUse": [{
                 "matcher": "",
@@ -160,7 +171,10 @@ def _gate_settings() -> str:
                 }],
             }],
         },
-    })
+    }
+    if worker.reasoning is not None:
+        settings["effortLevel"] = worker.reasoning
+    return json.dumps(settings)
 
 
 class ClaudeRunner:
@@ -197,7 +211,7 @@ class ClaudeRunner:
             "--output-format", "json",
             "--no-session-persistence",
             "--setting-sources", "",
-            "--settings", _gate_settings(),
+            "--settings", _gate_settings(worker),
             "--tools", tools,
             "--permission-mode", "manual",
             "--system-prompt", _SYSTEM_PROMPT,
