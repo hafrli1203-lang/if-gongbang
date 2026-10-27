@@ -27,6 +27,17 @@ whole request (StepFailed("symlink_in_copy")) rather than being
 followed. File content is compared and copied as bytes, never text, so
 binary files never raise UnicodeDecodeError.
 
+A path claimed, by engine.domain.stage_checks.station_record_prefixes,
+as some OTHER station's own record (e.g. a "probe" copy touching
+facts.md, station "facts"'s own record) fails the whole request
+(StepFailed("wrote_other_station_record:<path>")) UNLESS this copy's
+own request payload named an explicit "owns" -- see
+_deny_if_other_station_record. This is a config-INDEPENDENT floor,
+same role _PLANNER_ONLY_PREFIX plays for tests/scenes/ below:
+station_owners' own shared ".gongbang/" prefix (every early station's
+config entry) stays the ceiling, but this table decides who may
+actually write INTO it (결함 12,.
+
 collect_copies      validates copies/paths and computes, for each copy
                     index, the files under its config-derived allowed
                     prefixes whose content differs from the copy's BASE
@@ -108,8 +119,9 @@ from pathlib import Path
 
 from engine.domain.records import Event
 from engine.domain.policy import Policy, owns_within_prefixes as _owns_within_prefixes
+from engine.domain.stage_checks import other_station_record_violation
 from engine.application.processor import StepContext, StepDef, StepFailed
-from engine.application.steps.open_job import copy_root, dirty_paths
+from engine.application.steps.open_job import copy_root, dirty_paths, job_name_for
 
 # Reserved for the planner role ONLY (engine.domain.plan's own module docstring:
 # "a builder station must never touch tests/scenes/") -- enforced here as
@@ -194,6 +206,52 @@ def _validate_copy_path(ctx: StepContext, copy_path: Path, role: str) -> None:
         raise StepFailed("copy_path_mismatch")
 
 
+def _job_name(ctx: StepContext) -> str:
+    """This attempt's own job_name -- the station_record_prefixes table
+    (engine.domain.stage_checks) is job-namespaced (".gongbang/<job>/
+    facts.md" etc.), so every candidate path's job must be resolved to
+    check it, same way facts_path/probe's own job-scoped paths are."""
+    attempt = ctx.ledger.attempt(ctx.attempt_id)
+    return job_name_for(ctx.ledger, ctx.project, attempt.job_id)
+
+
+def _deny_if_other_station_record(ctx: StepContext, station: str, job: str, rel: str,
+                                   explicit_owns: tuple[str, ...] | None) -> None:
+    """StepFailed("wrote_other_station_record:<rel>") if `rel` is some
+    OTHER station's own record (engine.domain.stage_checks.
+    other_station_record_violation) -- journaled first (merge.denied),
+    same as _deny_if_planner_reserved, so the denial is visible rather
+    than a silently-dropped write. See stage_checks' own module comment
+    for the actual incident (결함 12, this closes: a
+    prober's copy carried an edited facts.md (station "facts"'s own
+    record, not "probe"'s), and merge's config-driven ".gongbang/"
+    prefix alone never caught it.
+
+    `explicit_owns`, when given (this copy's own request payload named
+    an explicit "owns" list -- see _owner_prefixes), exempts the whole
+    check: an explicit owns is an engine-authored, reviewed declaration
+    of exactly what THIS call may touch (e.g. a UI build task's own
+    owns naming .gongbang/<job>/screens/ alongside its src/ paths, or
+    quick_pipeline's combined facts+plan turn naming both facts.md and
+    plan.json) -- never something a worker can forge on its own (see
+    this function's module-level docstring note above), so it is
+    trusted to state a deliberate cross-station grant that the DEFAULT,
+    unnarrowed station prefix must never imply on its own."""
+    if explicit_owns is not None:
+        return
+    offending = other_station_record_violation(station, job, rel)
+    if offending is None:
+        return
+    ctx.ledger.append(Event(
+        project=ctx.project, kind="merge.denied", actor_kind="processor",
+        actor_id="processor", attempt_id=ctx.attempt_id,
+        payload={"request_id": ctx.request.request_id, "station": station,
+                 "path": rel, "owner_prefix": offending,
+                 "reason": "wrote_other_station_record"},
+    ))
+    raise StepFailed(f"wrote_other_station_record:{rel}")
+
+
 def _deny_if_planner_reserved(ctx: StepContext, role: str, rel: str) -> None:
     """StepFailed("tests_scenes_reserved_for_planner") for any role other
     than the planner touching tests/scenes/ -- journaled first (a denial
@@ -215,8 +273,10 @@ def _deny_if_planner_reserved(ctx: StepContext, role: str, rel: str) -> None:
     raise StepFailed("tests_scenes_reserved_for_planner")
 
 
-def _validate_rel(ctx: StepContext, repo: Path, policy: Policy, rel: str, role: str) -> None:
+def _validate_rel(ctx: StepContext, repo: Path, policy: Policy, rel: str, role: str,
+                   station: str, job: str, explicit_owns: tuple[str, ...] | None) -> None:
     _deny_if_planner_reserved(ctx, role, rel)
+    _deny_if_other_station_record(ctx, station, job, rel, explicit_owns)
     rel_path = Path(rel)
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise StepFailed("path_rejected")
@@ -244,7 +304,10 @@ def _base_head(ctx: StepContext) -> str:
 def _ref_bytes(repo: Path, ref: str, rel: str) -> bytes | None:
     """Content of rel at git ref `ref`, or None if it does not exist there."""
     result = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{ref}:{rel}"],
+        # cat-file, never `git show`: show reads `[adv]` in a Next.js path
+        # as a pattern and exits 0 with empty output for a missing file
+        # (결함 36, sample-app T7.
+        ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{rel}"],
         capture_output=True,
     )
     if result.returncode != 0:
@@ -318,11 +381,15 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
     repo = _repo(ctx)
     policy = Policy(ctx.config, ctx.ledger)
     base_head = _base_head(ctx)
+    job = _job_name(ctx)
     excludes = ctx.config.projects[ctx.project].excludes
     changes: dict[str, dict[str, str]] = {}
     for index, copy in enumerate(_copies(ctx)):
         key = str(index)
         role = str(copy.get("role", ""))
+        station = str(copy.get("station", ""))
+        raw_owns = copy.get("owns")
+        explicit_owns = tuple(raw_owns) if isinstance(raw_owns, list) else None
         prefixes = _owner_prefixes(ctx, copy)
         copy_path = Path(str(copy["path"]))
         _validate_copy_path(ctx, copy_path, role)
@@ -335,7 +402,7 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
                 # gone from the copy's working tree now -- handled by
                 # the base_head walk below instead of read here.
                 continue
-            _validate_rel(ctx, repo, policy, rel, role)
+            _validate_rel(ctx, repo, policy, rel, role, station, job, explicit_owns)
             base_bytes = _ref_bytes(repo, base_head, rel)
             copy_bytes = target.read_bytes()
             if base_bytes is None:
@@ -345,7 +412,7 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
         for prefix in prefixes:
             for rel in _ref_rels_under_prefix(repo, base_head, prefix):
                 if not (copy_path / rel).exists():
-                    _validate_rel(ctx, repo, policy, rel, role)
+                    _validate_rel(ctx, repo, policy, rel, role, station, job, explicit_owns)
                     role_changes[rel] = "deleted"
         changes[key] = role_changes
     return changes

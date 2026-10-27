@@ -107,6 +107,15 @@ class WorkerRunner(Protocol):
     # writable, never the whole HOME. Empty for a runner whose CLI needs
     # no writable HOME state (ScriptedRunner).
     home_writable_subpaths: tuple[str, ...]
+    # True: this runner's argv() never embeds spec.task (a real CLI's
+    # full prompt can be hundreds of KB -- far past Linux's
+    # MAX_ARG_STRLEN as a single argv element, which fails exec itself
+    # with E2BIG); the caller (engine.application.steps.worker_step/review)
+    # must instead write spec.task to a file (procs.write_stdin_file)
+    # and spawn the process with that file as procs.spawn's stdin_path.
+    # False (ScriptedRunner): the prompt reaches argv() some other way
+    # (its own --inline argument) and spawn() keeps using stdin_devnull.
+    prompt_via_stdin: bool
 
     def argv(self, spec: WorkerSpec, worker: WorkerConfig) -> list[str]: ...
 

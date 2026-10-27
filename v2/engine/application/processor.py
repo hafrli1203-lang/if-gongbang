@@ -291,12 +291,14 @@ class Processor:
                 # let the owner resubmit and dispatch it again. 'unknown'
                 # routes this through retry_unknown, which reconciles
                 # instead of re-dispatching.
-                self._set_status(request, "unknown",
-                                  {"reason": f"internal:{type(exc).__name__}"})
+                self._set_status(request, "unknown", {
+                    "reason": f"internal:{type(exc).__name__}",
+                    "detail": str(exc)[:300],
+                })
                 return None
             self._set_status(request, "failed", {
                 "reason": f"internal:{type(exc).__name__}",
-                "detail": str(exc)[:200],
+                "detail": str(exc)[:300],
             })
             return False
         if not completed:

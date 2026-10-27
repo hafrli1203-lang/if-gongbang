@@ -11,13 +11,15 @@ not a second, divergent one.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 from engine.infrastructure import sandbox
 from engine.config import EngineConfig
-from engine.application.steps.suite_run import TAIL_CHARS, bench_sandbox_argv
+from engine.application.steps.suite_run import TAIL_CHARS, bench_home_dir, bench_sandbox_argv
+from engine.application.steps.worker_sandbox import cli_runtime_mounts
 
 
 def bench_ctx(config: EngineConfig, project: str, attempt_id: str) -> SimpleNamespace:
@@ -30,6 +32,7 @@ def run_in_bench_sandbox(
     config: EngineConfig, project: str, attempt_id: str, repo: Path,
     argv: list[str], env: dict[str, str], timeout_sec: float, *, net: bool = False,
     extra_readonly: tuple[Path, ...] = (),
+    runtime_clis: tuple[str, ...] = (),
 ) -> tuple[int, str]:
     """(returncode, tail) for one command run exactly the way
     engine.application.steps.suite_run.run_tests runs the real suite. A command
@@ -44,11 +47,40 @@ def run_in_bench_sandbox(
     since `repo` in THIS function is the disposable snapshot (see
     engine.application.acceptance's module docstring), not the real repo any
     copy_links symlink inside it (bench_snapshot.link_snapshot_deps)
-    actually points to."""
+    actually points to.
+
+    runtime_clis: bare CLI names (e.g. "claude") that `argv` itself may
+    spawn as a CHILD of the command run here -- e.g. a probe script
+    that shells out to a real CLI (engine.application.acceptance_probe's own
+    project.probe_runtime_clis). This bench sandbox otherwise hides
+    the real HOME wholesale and never mounts any CLI's own installed
+    binary or login files (unlike engine.application.steps.worker_sandbox.
+    sandboxed_argv, which a real worker/reviewer process goes through
+    instead) -- without this, such a CLI fails inside the sandbox with
+    a bare "command not found" (ENOENT), which proves nothing about
+    whatever the CLI itself would have done. For each name here,
+    engine.application.steps.worker_sandbox.cli_runtime_mounts (the SAME
+    function a real worker uses) seeds this run's own, already-
+    isolated bench $HOME (suite_run.bench_home_dir -- never the real
+    operator HOME) with that CLI's minimal login files and returns the
+    binary/symlink mounts to add; empty (default) changes nothing
+    about the mounts bench_sandbox_argv already builds."""
+    extra_symlinks: tuple[tuple[Path, Path], ...] = ()
+    extra_writable: tuple[Path, ...] = ()
+    if runtime_clis:
+        home_dir = bench_home_dir(bench_ctx(config, project, attempt_id))
+        real_home_str = os.environ.get("HOME")
+        real_home = Path(real_home_str) if real_home_str else None
+        for cli_name in runtime_clis:
+            readonly, symlinks, writable = cli_runtime_mounts(cli_name, home_dir, real_home)
+            extra_readonly += readonly
+            extra_symlinks += symlinks
+            extra_writable += writable
     try:
         wrapped_argv, child_env = bench_sandbox_argv(
             bench_ctx(config, project, attempt_id), repo, argv, env, net=net,
-            extra_readonly=extra_readonly)
+            extra_readonly=extra_readonly, extra_symlinks=extra_symlinks,
+            extra_writable=extra_writable)
     except sandbox.SandboxUnavailable as exc:
         return -1, f"sandbox_unavailable: {exc}"
     popen_env = sandbox.exec_env(config.sandbox, child_env)

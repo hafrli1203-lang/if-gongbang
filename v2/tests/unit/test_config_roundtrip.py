@@ -25,6 +25,7 @@ _OMIT = config_mod._OMIT  # the module's own "leave this key out" sentinel
 
 def _full_project_dict(tmp_path: Path) -> dict[str, object]:
     (tmp_path / "repo").mkdir(exist_ok=True)
+    (tmp_path / "reference-material").mkdir(exist_ok=True)
     return {
         "repo": "repo",
         "excludes": ["node_modules"],
@@ -41,6 +42,9 @@ def _full_project_dict(tmp_path: Path) -> dict[str, object]:
         "copy_link_writable_subpaths": {"node_modules": [".vite-temp", ".vite"]},
         "release": {"master_repo": "master-repo", "target": "myapp"},
         "hidden_paths": [str(tmp_path / "original-src")],
+        "reference_paths": [str(tmp_path / "reference-material")],
+        "probe_runtime_clis": ["claude"],
+        "file_dep_targets": [["../_shared/kit", str(tmp_path / "shared" / "kit")]],
     }
 
 

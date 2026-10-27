@@ -206,10 +206,21 @@ def _run_spawn_worker(ctx: StepContext) -> dict[str, object]:
     # never `env` itself -- `env` can carry worker-controlled values
     # that must never reach the process that execs bwrap.
     popen_env = sandbox.exec_env(ctx.config.sandbox, env)
+    # A runner whose CLI reads its prompt from stdin (prompt_via_stdin --
+    # ClaudeRunner/CodexRunner; see that attribute's own docstring for the
+    # MAX_ARG_STRLEN/E2BIG incident this avoids) gets spec.task written to
+    # a file instead of /dev/null on stdin; a runner that already embeds
+    # the prompt in argv some other way (ScriptedRunner's own --inline)
+    # keeps the original stdin_devnull=True behavior unchanged.
+    stdin_path = None
+    if getattr(runner, "prompt_via_stdin", False):
+        stdin_path = procs.stdin_file_for(stdout_path(ctx))
+        procs.write_stdin_file(stdin_path, spec.task)
     proc = procs.spawn(
         ctx.ledger, ctx.project, ctx.attempt_id, spec.station, argv,
         cwd=spec.workdir, env=popen_env, stdout_path=stdout_path(ctx),
-        stdin_devnull=True, request_id=ctx.request.request_id,
+        stdin_path=stdin_path, stdin_devnull=(stdin_path is None),
+        request_id=ctx.request.request_id,
         pass_fds=sandbox.pass_fds_for(argv),
     )
     return {"pid": proc.pid, "station": spec.station}

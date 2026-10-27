@@ -113,8 +113,8 @@ from engine.application import task_pipeline as orbit
 from engine.application import release as release_mod
 from engine.config import EngineConfig
 from engine.application.repair_target import (
-    ARCHIVE_MARKER_FILES, FixTarget, FixupError, compose_fix_task, find_fix_target,
-    requests_for_attempt,
+    ARCHIVE_MARKER_FILES, FixTarget, FixupError, compose_fix_task, extended_owns_for_task,
+    find_fix_target, record_owns_extension, requests_for_attempt, validate_also_own,
 )
 from engine.domain.records import Event
 from engine.application.processor import Fakes, Processor, submit
@@ -392,22 +392,84 @@ def _full_job_task_config(config: EngineConfig, project: str, job_name: str) -> 
     return full_orbit.task_attempt_config(config, project, job_name, plan)
 
 
+def _widen_owns(owns: list, extra_owns: tuple[str, ...]) -> list[str]:
+    widened = list(owns)
+    for path in extra_owns:
+        if path not in widened:
+            widened.append(path)
+    return widened
+
+
+def _also_own_for_task(ledger: Ledger, project: str, job_name: str) -> tuple[str, ...]:
+    """Every path a past `gb2 fix <app> --also-own <path>` call granted
+    to the job's CURRENT task position -- () if the position carries no
+    task_id at all (a plain single-task job) or nothing was ever
+    granted."""
+    pos = load_position(ledger, project, job_name)
+    if pos is None or pos.task_id is None:
+        return ()
+    return extended_owns_for_task(ledger, project, job_name, pos.task_id)
+
+
 def _fix_spec(pos: "JobPosition | None", old_attempt_id: str, config: EngineConfig,
-              new_attempt_id: str, task: str) -> list[dict] | None:
+              new_attempt_id: str, task: str,
+              extra_owns: tuple[str, ...] = ()) -> list[dict] | None:
     """The replaced task's own recorded stage spec, for the replacement
     attempt, with the composed fix task given to the builder and the
-    reviewer. None when the replaced attempt has no recorded spec."""
+    reviewer -- and, when `extra_owns` is non-empty (결함 26: an owner's
+    `--also-own` grant for this task, see repair_target.add_also_own,
+    engine.application.repair_target module docstring), that task's own
+    run_station "owns" and merge copies' own "owns" widened by exactly
+    those paths -- never plan.json's `owns` itself, and never any
+    OTHER task's. This is the one place both the live gate (run_station
+    payload's "owns", read by engine.application.steps.worker_gate_log.
+    task_owns) and merge's own re-check (engine.application.steps.merge.
+    _owner_prefixes' "owns") actually see a widened allowance: the SAME
+    payload field each already trusted before this grant existed. None
+    when the replaced attempt has no recorded spec."""
     if pos is None or pos.attempt_id != old_attempt_id:
         return None
     spec = pos.get("stages")
     if not isinstance(spec, list):
         return None
     stages = stages_from_spec(spec, config, new_attempt_id, task_text=task)
-    return [
-        {"kind": stage.kind,
-         "payload": ({**stage.payload, "task": task} if stage.kind == "review" else stage.payload)}
-        for stage in stages
-    ]
+    out: list[dict] = []
+    for stage in stages:
+        payload = stage.payload
+        if stage.kind == "review":
+            payload = {**payload, "task": task}
+        elif stage.kind == "run_station" and extra_owns and isinstance(payload.get("owns"), list):
+            payload = {**payload, "owns": _widen_owns(payload["owns"], extra_owns)}
+        elif stage.kind == "merge" and extra_owns:
+            payload = {**payload, "copies": [
+                ({**copy, "owns": _widen_owns(copy["owns"], extra_owns)}
+                 if isinstance(copy.get("owns"), list) else copy)
+                for copy in payload.get("copies", [])
+            ]}
+        out.append({"kind": stage.kind, "payload": payload})
+    return out
+
+
+def _fix_request_filter(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
+                        pos: object, attempt_id: str, full_job: bool,
+                        ) -> "orbit.RequestFilter | None":
+    """The same later-task hand-off the first run and resume use (결함 31),
+    for the `gb2 fix` path too -- 결함 40 (sample-app T7,: a
+    request for a path a later task owns stopped the fix for the owner.
+    None for a plain single-task job or a plan that cannot be loaded (the
+    notes-never-block rule still applies -- task_pipeline drops them)."""
+    task_id = getattr(pos, "task_id", None)
+    if not full_job or not task_id:
+        return None
+    from engine.application.pipeline_tasks import handoff_request_filter
+    from engine.domain.plan import PlanError, load_plan
+    try:
+        plan = load_plan(config.projects[project].repo, job_name)
+    except PlanError:
+        return None
+    later = tuple(t for t in (getattr(pos, "remaining_task_ids", None) or ()) if t != task_id)
+    return handoff_request_filter(ledger, project, job_name, plan, task_id, attempt_id,
+                                  later, None)
 
 
 def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
@@ -447,7 +509,7 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         target = find_fix_target(ledger, project)
         old_attempt_id = target.attempt_id
         job_name = target.job_name
-        task = compose_fix_task(target, extra)
+        task = compose_fix_task(target, extra, _also_own_for_task(ledger, project, job_name))
         builder_role = target.builder_role
         reviewer_role = target.reviewer_role
         archive_source = str(target.carried_archive) if target.carried_archive is not None else None
@@ -537,9 +599,10 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         # position onto it, so no crash can leave the position on the
         # closed attempt while the replacement is already open.
         faults.flow_boundary("fixup.fix.opened_new")
+        extra_owns = _also_own_for_task(ledger, project, job_name)
         record_position(ledger, project, fix_opened_position(
             pos, job_name, old_attempt_id, new_attempt_id, task,
-            stages=_fix_spec(pos, old_attempt_id, config, new_attempt_id, task)))
+            stages=_fix_spec(pos, old_attempt_id, config, new_attempt_id, task, extra_owns)))
         pos = load_position(ledger, project, job_name)
     # Otherwise the replacement is already open and recorded: NEVER call
     # open_job again, which would fork a second, orphaned attempt.
@@ -585,6 +648,8 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
     outcome = orbit.continue_job(
         config, ledger, new_fakes, project, new_attempt_id, stages,
         processor_factory=processor_factory, on_progress=on_progress,
+        request_filter=_fix_request_filter(config, ledger, project, job_name, pos,
+                                           new_attempt_id, full_job),
     )
     if (full_job and pos is not None and pos.stage == STAGE_TASK
             and pos.attempt_id == new_attempt_id
@@ -601,9 +666,74 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
     )
 
 
+# ---------------------------------------------------------------------
+# --also-own: `gb2 fix <app> --also-own <path>` (repeatable), run
+# BEFORE fix() itself -- see repair_target's own module-level comment
+# for 결함 26, the real incident this exists for.
+# ---------------------------------------------------------------------
+
+def add_also_own(config: EngineConfig, ledger: Ledger, project: str,
+                 paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Owner-only: widen the write prefixes of the task CURRENTLY being
+    fixed (the project's current OPEN, active, fixable attempt -- the
+    exact eligibility find_fix_target itself requires) by `paths`, on
+    top of plan.json's own `owns` for that task -- plan.json itself is
+    never edited (frozen evidence). The grant is recorded as its own
+    ledger event (repair_target.record_owns_extension) and only takes
+    effect the next time fix() opens a NEW replacement attempt for this
+    task (_fix_spec folds it into that attempt's own run_station/merge
+    "owns") -- it never reaches back into an attempt already open.
+
+    Raises FixupError, with NOTHING recorded, if:
+      - there is no current attempt eligible to fix at all (whatever
+        find_fix_target itself refuses for);
+      - the current attempt belongs to a plain single-task `gb2 run`
+        job, or a full job whose plan.json cannot be loaded, or whose
+        plan no longer lists this task's own id -- none of these have
+        a per-task `owns` to widen in the first place ("no task
+        currently being fixed");
+      - `paths` is empty, or validate_also_own refuses any one entry
+        (a path another task already owns, a path outside the repo/
+        absolute/".."/hidden component, or an engine record path --
+        see that function's own docstring).
+
+    Returns every path now granted to that task (this call's own, plus
+    any earlier one)."""
+    if not paths:
+        raise FixupError("also_own_no_paths")
+    target = find_fix_target(ledger, project)
+    pos = load_position(ledger, project, target.job_name)
+    if pos is None or pos.attempt_id != target.attempt_id or pos.task_id is None:
+        raise FixupError("no_task_being_fixed")
+    from engine.domain.plan import PlanError, load_plan
+
+    try:
+        plan = load_plan(config.projects[project].repo, target.job_name)
+    except PlanError:
+        raise FixupError("no_task_being_fixed") from None
+    if not any(t.id == pos.task_id for t in plan.tasks):
+        raise FixupError("no_task_being_fixed")
+    normalized = validate_also_own(
+        ledger, project, target.job_name, plan, pos.task_id, paths,
+        station_prefixes=tuple(config.station_owners.get("build", {}).get(target.builder_role, ())))
+    record_owns_extension(ledger, project, target.job_name, pos.task_id, target.attempt_id,
+                          normalized)
+    return extended_owns_for_task(ledger, project, target.job_name, pos.task_id)
+
+
+# approve_pending_edit (결함 28, sample-app T4, -- a pending
+# `kind="edit"` request find_fix_target can never see, since this
+# attempt never failed at all) lives in engine.application.repair_approval,
+# a separate module purely to keep this one under the repo's 800-line
+# budget (docs/standards/architecture.md) -- re-exported here so
+# `fixup.approve_pending_edit` (tools/gb2lib/runner.py's own cmd_fix)
+# needs no second import path.
+from engine.application.repair_approval import approve_pending_edit  # noqa: E402
+
 __all__ = [
     "FixupError", "FixTarget", "FixResult", "find_fix_target",
-    "compose_fix_task", "close_failed_attempt", "fix", "original_task",
+    "compose_fix_task", "close_failed_attempt", "fix", "original_task", "add_also_own",
+    "approve_pending_edit",
 ]
 
 

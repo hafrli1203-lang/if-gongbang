@@ -12,8 +12,12 @@ from typing import TYPE_CHECKING
 
 from engine.domain import ids
 from engine.infrastructure import sandbox
+from engine.infrastructure.reference_snapshot import ensure_snapshot_for_attempt
+from engine.infrastructure.workers.claude_cli import ClaudeRunner
+from engine.infrastructure.workers.codex_cli import CodexRunner
 from engine.domain.records import Event
 from engine.application.processor import StepContext, StepFailed
+from engine.application.steps import file_deps
 from engine.application.steps.worker_paths import stations_dir
 
 if TYPE_CHECKING:
@@ -150,7 +154,7 @@ def _ledger_hidden_root(ctx: StepContext) -> tuple[Path, ...]:
     return (ctx.config.ledger_path.parent,)
 
 
-RUNNER_LOGIN_FILES: dict[str, tuple[str, ...]] = {
+CLI_LOGIN_FILES: dict[str, tuple[str, ...]] = {
     # The SMALLEST set of real-HOME-relative files each real CLI needs
     # copied into its own fresh, per-attempt worker HOME (see
     # _worker_home_dir/sandbox.prepare_worker_home below) to actually
@@ -159,15 +163,94 @@ RUNNER_LOGIN_FILES: dict[str, tuple[str, ...]] = {
     # apps, other CLIs' own credentials, ssh keys, ...) must stay
     # invisible to a worker and to any code it runs, which a wholesale
     # readonly mount of the real HOME (this module's previous approach)
-    # did not achieve. A runner class absent from this table (e.g.
+    # did not achieve. Keyed by the CLI's own bare executable name
+    # (argv[0]/PATH lookup name, e.g. "claude"/"codex") -- the single
+    # source of truth RUNNER_LOGIN_FILES below and cli_runtime_mounts
+    # (engine.application.acceptance_probe's own, separately configured
+    # probe_runtime_clis) both reuse, rather than each keeping its own
+    # copy of the same literal file lists. A CLI absent from this table
+    # (e.g. a scripted test double) needs none.
+    "claude": (".claude/.credentials.json", ".claude.json"),
+    "codex": (".codex/auth.json",),
+}
+
+RUNNER_LOGIN_FILES: dict[str, tuple[str, ...]] = {
+    # Runner CLASS NAME -> the same CLI_LOGIN_FILES entry for that
+    # runner's own CLI -- kept as its own table since _login_files_for
+    # is looked up from a runner INSTANCE (type(runner).__name__), not
+    # a bare CLI name. A runner class absent from this table (e.g.
     # ScriptedRunner, a test double) needs none.
-    "ClaudeRunner": (".claude/.credentials.json", ".claude.json"),
-    "CodexRunner": (".codex/auth.json",),
+    "ClaudeRunner": CLI_LOGIN_FILES["claude"],
+    "CodexRunner": CLI_LOGIN_FILES["codex"],
 }
 
 
 def _login_files_for(runner: object) -> tuple[str, ...]:
     return RUNNER_LOGIN_FILES.get(type(runner).__name__, ())
+
+
+# Bare CLI name (same keys as CLI_LOGIN_FILES) -> that CLI's own
+# runner's home_writable_subpaths (ClaudeRunner.home_writable_subpaths,
+# CodexRunner.home_writable_subpaths) -- read straight off the runner
+# classes rather than re-typed here, so this table can never drift from
+# what sandboxed_argv already grants a REAL worker running that same
+# CLI (결함 20,: cli_runtime_mounts used to pass `()` for
+# writable_subpaths unconditionally, so a probe script's own `codex
+# exec` -- cli_runtime_mounts is run_in_bench_sandbox's only mount
+# policy for a probe_runtime_clis entry -- got its disposable probe
+# $HOME mounted wholesale read-only with no ".codex" writable inside
+# it, and failed "Read-only file system (os error 30)" trying to
+# initialize its own app-server client there; a real worker never hits
+# this because sandboxed_argv's own writable tuple already includes
+# `home_dir / sub for sub in subpaths`).
+CLI_HOME_WRITABLE_SUBPATHS: dict[str, tuple[str, ...]] = {
+    "claude": ClaudeRunner.home_writable_subpaths,
+    "codex": CodexRunner.home_writable_subpaths,
+}
+
+
+def cli_runtime_mounts(
+    cli_name: str, home_dir: Path, real_home: Path | None,
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, Path], ...], tuple[Path, ...]]:
+    """Public helper: the SAME CLI-visibility policy `sandboxed_argv`
+    below applies for a real worker runner -- the CLI's own installed
+    binary mounted via sandbox.resolve_runtime, plus its minimal
+    login-file set (CLI_LOGIN_FILES) copied into `home_dir` via
+    sandbox.prepare_worker_home -- generalized here to a bare CLI name
+    (e.g. "claude") instead of a runner instance, so a caller that has
+    no WorkerSpec/runner at all (engine.application.acceptance_probe, for a
+    probe script that itself spawns a real CLI, per that project's own
+    configured probe_runtime_clis) gets the IDENTICAL narrow exposure
+    a worker gets -- never a second, divergent reimplementation of it.
+
+    Returns (readonly, symlinks, writable) -- the three tuples a
+    caller should add to its own sandbox.wrap()-bound readonly/
+    symlinks/writable tuples (`+=`; see sandbox.resolve_runtime's own
+    docstring for what each readonly/symlinks mount is for). `home_dir`
+    is appended to the returned `readonly` tuple so a caller does not
+    also have to remember to re-add it (home_dir itself is created, if
+    missing, and seeded with login files as a side effect of this
+    call, via sandbox.prepare_worker_home). The returned `writable`
+    tuple is `home_dir / sub for sub in CLI_HOME_WRITABLE_SUBPATHS[
+    cli_name]` -- the SAME per-CLI subpaths (sandbox.wrap's own "a
+    deeper mount always wins" rule, identical to sandboxed_argv's own
+    `writable += tuple(home_dir / sub for sub in subpaths)`) a real
+    worker running this CLI already gets writable under ITS OWN fresh
+    home; a caller that skips mounting this writable (결함 20) leaves
+    `home_dir` read-only everywhere a CLI like `codex` needs to write
+    its own session/credential state (e.g. ".codex/..."), which fails
+    closed as a sandbox error, not as anything the CLI itself did
+    wrong. An unrecognized `cli_name` (not in CLI_LOGIN_FILES/
+    CLI_HOME_WRITABLE_SUBPATHS) still gets its binary mounted (if found
+    on PATH) but no login files copied and no writable subpath --
+    same "needs none" shape as a runner class absent from
+    RUNNER_LOGIN_FILES."""
+    login_files = CLI_LOGIN_FILES.get(cli_name, ())
+    subpaths = CLI_HOME_WRITABLE_SUBPATHS.get(cli_name, ())
+    sandbox.prepare_worker_home(home_dir, real_home, login_files, subpaths)
+    runtime = sandbox.resolve_runtime(cli_name)
+    writable = tuple(home_dir / sub for sub in subpaths)
+    return runtime.readonly + (home_dir,), runtime.symlinks, writable
 
 
 def _worker_home_dir(ctx: StepContext, spec: WorkerSpec) -> Path:
@@ -263,7 +346,19 @@ def sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     env["HOME"] = str(home_dir)
     writable = (spec.copy_root, stations_dir(ctx))
     safe_copy_link_mounts = _safe_copy_link_mounts(ctx, spec, repo)
-    readonly = tuple(target for _entry, target in safe_copy_link_mounts) + (home_dir,)
+    # reference_paths (ProjectConfig): NEVER mounted/read directly -- only
+    # the engine-owned, read-only SNAPSHOT (engine.infrastructure.
+    # reference_snapshot) a worker may open (facts/plan/build all hint at
+    # this material by path -- see engine.infrastructure.context's own
+    # "참고 자료 폴더" prompt item). Re-exposed the same way every other
+    # deeper-than-hidden readonly mount here is: sandbox.wrap sorts all
+    # mounts by path depth, so this wins over the real-HOME/home/
+    # secrets_dir hides below (the snapshot itself lives under
+    # config.home, also hidden by default). () immediately, no directory
+    # even created, when this project has no reference_paths configured.
+    snapshot_entries = ensure_snapshot_for_attempt(ctx.config, ctx.project, ctx.attempt_id)
+    readonly = (tuple(target for _entry, target in safe_copy_link_mounts)
+                + (home_dir,) + tuple(entry.path for entry in snapshot_entries))
     if spec.gate_facts_path is not None:
         # The whole gate-ro directory (gate_facts.json + a copy of the
         # engine config the gate needs for GB_CONFIG -- see
@@ -313,10 +408,21 @@ def sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     hidden = _hidden_roots(ctx, repo) + _ledger_hidden_root(ctx)
     if real_home is not None:
         hidden += (real_home,)
+    # 결함 17: same project.file_dep_targets remap
+    # suite_run._bench_sandbox_argv applies for bench/acceptance, here
+    # re-mapped onto THIS worker's own copy_root instead of the real
+    # repo -- see engine.application.steps.file_deps' module docstring.
+    # 결함 35 (sample-app T5,: a copy_links entry (node_modules)
+    # is a symlink into the REAL repo, so a relative link inside it
+    # (node_modules/@sample-app/kit -> ../../../_shared/kit) resolves
+    # against the repo's own parent, never the copy's -- the pair is
+    # mapped for BOTH roots or the builder sees an empty package.
+    readonly_remap = file_deps.remap_pairs_for_roots(
+        (spec.copy_root, repo), ctx.config.projects[ctx.project].file_dep_targets)
     try:
         return sandbox.wrap(
             argv, cwd=spec.workdir, writable=writable, hidden=hidden,
-            readonly=readonly, symlinks=symlinks, net=True,
+            readonly=readonly, readonly_remap=readonly_remap, symlinks=symlinks, net=True,
             mode=ctx.config.sandbox, child_env=env,
         )
     except sandbox.SandboxUnavailable as exc:

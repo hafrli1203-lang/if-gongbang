@@ -12,6 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from engine.application.steps import file_deps
 from engine.bootstrap import ensure_installed, record_bootstrap
 from engine.config import EngineConfig
 from engine.ledger import Ledger
@@ -397,6 +398,26 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
     config_dict["projects"][app]["hidden_paths"] = [
         str(shared.apps_root().resolve()), str(shared.APPS_DIR.parent.resolve()),
     ]
+    # 결함 17: resolve every package.json `file:../...`
+    # dependency that escapes source_repo -- while source_repo is still
+    # the REAL, un-mirrored checkout, the one place this can be done
+    # correctly at all (engine.application.steps.file_deps' own module
+    # docstring) -- and persist (relspec, already-validated absolute
+    # target) pairs so every later sandbox build (bench/acceptance/
+    # worker, against the gb2/work worktree, a worker copy, or a
+    # disposable snapshot) can remap the SAME relspec onto whichever
+    # root it is actually running against, instead of re-walking it and
+    # landing one nesting level short. `forbidden_roots=(workspace,)`:
+    # this app's own engine home/secrets/ledger all nest under
+    # `workspace`, and a target that happens to land there (e.g. a
+    # package.json hand-edited to point `file:` at this app's own
+    # engine state) must never be exposed read-only in a sandbox.
+    file_dep_targets: list[list[str]] = []
+    for relspec in file_deps.discover_escaping_file_deps(source_repo):
+        target = file_deps.resolve_escaping_target(source_repo, relspec)
+        file_deps.validate_escaping_target(target, forbidden_roots=(workspace,))
+        file_dep_targets.append([relspec, str(target)])
+    config_dict["projects"][app]["file_dep_targets"] = file_dep_targets
     config_path = workspace / "config.json"
     config_path.write_text(json.dumps(config_dict, ensure_ascii=False, indent=1),
                            encoding="utf-8")

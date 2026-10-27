@@ -36,6 +36,8 @@ node_modules) still resolves.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,8 +84,16 @@ class ProbeEvidence:
 
 
 _PROBE_EXTENSIONS = (".py", ".sh", ".js")
+# ".py" is deliberately absent here -- see _resolve_system_python/
+# _probe_python_blocked below: sys.executable is THIS ENGINE PROCESS's
+# own interpreter, which for this app's checked-in venv resolves under
+# the engine's own hidden app root (engine.application.steps.worker_sandbox.
+# ENGINE_ROOT), a path the probe's own bench sandbox never mounts
+# (confirmed live: `bwrap: execvp .../.venv/bin/python: No such file or
+# directory`) -- a static per-extension table cannot express "resolve
+# at run time, then check the result", which running sys.executable
+# unconditionally never did.
 _PROBE_INTERPRETERS: dict[str, tuple[str, ...]] = {
-    ".py": (sys.executable,),
     ".sh": ("sh",),
     ".js": ("node",),
 }
@@ -98,8 +108,67 @@ def _probe_script_path(repo: Path, job: str, probe_id: str) -> Path | None:
     return None
 
 
-def _probe_argv(script: Path) -> list[str]:
-    return [*_PROBE_INTERPRETERS[script.suffix], str(script)]
+def _resolve_system_python() -> str:
+    """A python3 OUTSIDE this engine's own venv, resolved the same way
+    a probe script's own `#!/usr/bin/env python3` shebang would be:
+    shutil.which("python3") on THIS process's own PATH. Falls back to
+    os.path.realpath(sys.executable) only when PATH has no python3 at
+    all -- never silently preferred over `which`, and still checked
+    against the probe's own hidden roots by _probe_python_blocked
+    either way, so a fallback that lands back inside the hidden venv
+    is caught, not run anyway."""
+    which = shutil.which("python3")
+    if which is not None:
+        return os.path.realpath(which)
+    return os.path.realpath(sys.executable)
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _probe_hidden_roots(config: EngineConfig, project: str) -> tuple[Path, ...]:
+    """The hidden-root set THIS project's own probe bench sandbox
+    actually hides (engine.application.steps.suite_run.bench_sandbox_argv,
+    via run_in_bench_sandbox below) -- config.home, config.secrets_dir,
+    config.ledger_path.parent, every OTHER project's repo, this
+    project's own hidden_paths, and the real operator HOME -- reused
+    here to catch a resolved python3 that would be invisible inside
+    that same sandbox BEFORE ever spawning it (see
+    _resolve_system_python: an execvp "No such file or directory" is
+    not evidence of anything, so this must be caught first, not
+    discovered from a bwrap failure's own text)."""
+    project_cfg = config.projects[project]
+    other_repos = tuple(p.repo for name, p in config.projects.items() if name != project)
+    roots = ((config.home, config.secrets_dir, config.ledger_path.parent)
+             + other_repos + project_cfg.hidden_paths)
+    real_home = os.environ.get("HOME")
+    if real_home:
+        roots += (Path(real_home),)
+    return roots
+
+
+def _probe_python_blocked(python_path: str, hidden_roots: tuple[Path, ...]) -> bool:
+    """True iff the resolved python3 interpreter sits at or under any
+    of `hidden_roots` -- i.e. the probe's own bench sandbox would hide
+    it, so running it would fail closed (execvp ENOENT) rather than
+    actually probing anything. Checked by REAL path on both sides
+    (os.path.realpath), never the raw strings, so a symlink hop on
+    either side cannot hide a match."""
+    real_python = Path(os.path.realpath(python_path))
+    for root in hidden_roots:
+        real_root = Path(os.path.realpath(root))
+        if real_python == real_root or _is_within(real_python, real_root):
+            return True
+    return False
+
+
+def _probe_argv(script: Path, interpreter: tuple[str, ...]) -> list[str]:
+    return [*interpreter, str(script)]
 
 
 def _probe_snapshot_dir(config: EngineConfig, attempt_id: str, probe_id: str) -> Path:
@@ -223,6 +292,20 @@ def run_probe_scripts(
                 id=probe_id, name=name, script="", returncode=-1,
                 stdout_tail="script_missing", ok=False, url=url, fingerprint=fp))
             continue
+        if script.suffix == ".py":
+            python_path = _resolve_system_python()
+            if _probe_python_blocked(python_path, _probe_hidden_roots(config, project)):
+                _record_probe_executed(ledger, project, attempt_id, probe_id, name,
+                                       str(script), -1, "python_runtime_hidden",
+                                       url=url, fingerprint=fp)
+                results.append(ProbeEvidence(
+                    id=probe_id, name=name, script=str(script), returncode=-1,
+                    stdout_tail="python_runtime_hidden", ok=False, url=url,
+                    fingerprint=fp))
+                continue
+            interpreter: tuple[str, ...] = (python_path,)
+        else:
+            interpreter = _PROBE_INTERPRETERS[script.suffix]
         # Capture the script's bytes from THIS snapshot, then verify
         # them again immediately before the sandbox actually executes
         # it -- never a single read trusted to still hold at exec time
@@ -257,8 +340,9 @@ def run_probe_scripts(
                 sha256=script_sha256, fingerprint=fp))
             continue
         returncode, tail = run_in_bench_sandbox(
-            config, project, attempt_id, snapshot, _probe_argv(script), env, timeout_sec,
-            net=True, extra_readonly=(repo,))
+            config, project, attempt_id, snapshot, _probe_argv(script, interpreter), env,
+            timeout_sec, net=True, extra_readonly=(repo,),
+            runtime_clis=project_cfg.probe_runtime_clis)
         ok = _probe_observed(returncode, tail, url) and script.exists()
         _record_probe_executed(ledger, project, attempt_id, probe_id, name,
                                str(script), returncode, tail, url=url,

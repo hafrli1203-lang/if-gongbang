@@ -176,7 +176,15 @@ def commit_paths(repo: Path, paths: list[str], message: str) -> None:
     """An ungated orchestrator commit of exactly `paths` (a no-op when
     none of them changed)."""
     env = {**os.environ, **ORCHESTRATOR_GIT_IDENTITY}
-    subprocess.run(git_argv(repo, "add", "--", *paths), check=True, capture_output=True, env=env)
+    # Engine records under .gongbang/ are added with -f so an app's
+    # .gitignore (e.g. "*.log") cannot silently drop them; nothing else
+    # is ever force-added.
+    records = [p for p in paths if p == ".gongbang" or p.startswith(".gongbang/")]
+    others = [p for p in paths if p not in records]
+    if others:
+        subprocess.run(git_argv(repo, "add", "--", *others), check=True, capture_output=True, env=env)
+    if records:
+        subprocess.run(git_argv(repo, "add", "-f", "--", *records), check=True, capture_output=True, env=env)
     status = subprocess.run(
         git_argv(repo, "status", "--porcelain", "--", *paths),
         capture_output=True, text=True, env=env,
@@ -242,7 +250,8 @@ def build_station_context(config: EngineConfig, ledger: Ledger, project: str,
     required_skills/require_library -- see that module's own
     docstring) BEFORE ever submitting run_station can do so without
     building/recording the context a second time."""
-    sc = context_mod.build(config, project, station, query, planned_skills)
+    sc = context_mod.build(config, project, station, query, planned_skills,
+                           attempt_id=attempt_id)
     record_context(ledger, project, attempt_id, station, sc)
     return sc
 
@@ -305,7 +314,8 @@ def station_context_gate(config: EngineConfig, ledger: Ledger, project: str,
     if sc.unmet_required():
         return ContextGate(sc, unmet_context_reason(sc))
     if review_query is not None:
-        review_sc = context_mod.build(config, project, "review", review_query, review_skills)
+        review_sc = context_mod.build(config, project, "review", review_query, review_skills,
+                                      attempt_id=attempt_id)
         if review_sc.unmet_required():
             return ContextGate(sc, unmet_context_reason(review_sc))
     return ContextGate(sc, None)
@@ -451,8 +461,17 @@ def run_and_merge(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: s
     Never commits/report/close -- the caller does, once it knows this
     station's own gate passed (see commit_job_trail). `extra_payload`
     (the design call site's own plan.tools table, see
-    engine.domain.plan.tools_for_station) is merged into the run_station
-    payload on top of the fixed station/role/task keys. `task_text`
+    engine.domain.plan.tools_for_station -- or an early station's own
+    explicit "owns", see quick_pipeline's combined facts+plan call)
+    is merged into the run_station payload on top of the fixed
+    station/role/task keys; an "owns" entry in it is ALSO carried onto
+    the merge stage's own copies entry below (not just the run_station
+    payload) -- engine.application.steps.merge._owner_prefixes/
+    _deny_if_other_station_record both read the merge request's OWN
+    "owns", never the run_station payload's, so an owns that only
+    reached run_station would narrow the live worker's write access
+    but never narrow (or, for a deliberate cross-station grant, declare)
+    what merge itself actually re-checks and lands. `task_text`
     already differs on a STAGE_PROBE_RETRY/STAGE_PLAN_REVIEW resume
     (the caller appends the previous attempt's own log/plan.json as
     context -- see _run_probe/_run_plan_and_review), so run_station's
@@ -469,8 +488,11 @@ def run_and_merge(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: s
     copy = str(copy_root(config, attempt_id, role))
     merge_retry_n = sum(1 for _seq, event in ledger.events(project, "merge.recorded")
                         if event.attempt_id == attempt_id)
+    copy_entry: dict[str, object] = {"role": role, "station": station, "path": copy}
+    if extra_payload and "owns" in extra_payload:
+        copy_entry["owns"] = extra_payload["owns"]
     merge_payload: dict[str, object] = {
-        "copies": [{"role": role, "station": station, "path": copy}],
+        "copies": [copy_entry],
     }
     if merge_retry_n:
         merge_payload["merge_retry_n"] = merge_retry_n

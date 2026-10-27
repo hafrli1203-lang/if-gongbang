@@ -152,6 +152,16 @@ def cmd_fix(args: argparse.Namespace) -> int:
     never reached a failed review/bench request with merge already
     done -- engine.fixup.FixupError's message says which.
 
+    `--also-own <path>` (repeatable), run BEFORE fix() itself (engine.
+    fixup.add_also_own): widens the task currently being fixed with an
+    extra write path on top of plan.json's own `owns` for it --
+    plan.json itself is never edited. For the repeated P1 this exists
+    for (결함 26, sample-app: a build task removed a field another file
+    outside its own `owns` still read, so the fix a review demanded
+    could never actually land -- merge drops a write outside `owns`
+    silently, never a failure), the OWNER must widen the task before
+    retrying `gb2 fix`, same as this flag does.
+
     If the fixed attempt belongs to a full-orbit job (`gb2 new`/`gb2
     change`, as opposed to a plain `gb2 run` single-task job), the one
     task fixup.fix() repairs is never the whole job -- once it ends
@@ -169,6 +179,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     workspace.verify_app_repo_identity(args.app)
     config = EngineConfig.from_json(config_path)
     extra = args.extra or ""
+    also_own = tuple(getattr(args, "also_own", None) or ())
 
     def fakes_for(attempt_id: str):
         return _build_fakes(config, args.app, attempt_id, None)
@@ -177,6 +188,47 @@ def cmd_fix(args: argparse.Namespace) -> int:
     start = time.monotonic()
     try:
         from engine import position
+        from engine.application.repair_approval import NOT_TASK_OWNER_EDIT_STOP
+
+        # 결함 28 (sample-app T4,: a pending kind="edit" request
+        # (OWNS_SCOPE_REQUEST_RULE) never reaches fixup.find_fix_target at
+        # all -- the attempt never failed, it is simply stopped at
+        # STAGE_TASK_OWNER waiting on the owner. Try that path FIRST; it
+        # raises NOT_TASK_OWNER_EDIT_STOP (the one reason meaning "this
+        # isn't case 28") when the attempt is not actually stopped that
+        # way, and only then does this fall back to the classic
+        # add_also_own+fix() flow below. Every OTHER FixupError here (an
+        # unrequested path, or whatever validate_also_own itself refuses
+        # for) is a REAL refusal and is reported as-is.
+        if also_own:
+            attempt_id = ledger.project(args.app).current_attempt_id
+            try:
+                full_outcome = fixup.approve_pending_edit(
+                    config, ledger, args.app, also_own, fakes_for,
+                    on_progress=shared.progress_printer,
+                )
+            except fixup.FixupError as exc:
+                if str(exc) != NOT_TASK_OWNER_EDIT_STOP:
+                    return shared.err_json(str(exc), 1)
+            else:
+                wall_sec = time.monotonic() - start
+                job_name = (_job_name_for_attempt(ledger, args.app, attempt_id)
+                           if attempt_id is not None else "")
+                summary = shared.summarize_full_outcome(
+                    config, ledger, args.app, full_outcome, wall_sec)
+                shared.append_run_log(args.app, {"job_name": job_name, **summary})
+                print(json.dumps(summary, ensure_ascii=False))
+                return shared.exit_code_for_full_outcome(str(summary["status"]))
+
+        # --also-own widens the task currently being fixed BEFORE
+        # fixup.fix ever runs -- nothing it records is undone by a
+        # refusal below; see engine.fixup.add_also_own's own docstring
+        # for the four refusal cases.
+        if also_own:
+            try:
+                fixup.add_also_own(config, ledger, args.app, also_own)
+            except fixup.FixupError as exc:
+                return shared.err_json(str(exc), 1)
 
         # fixup.fix decides on its own whether this task belongs to a
         # full-orbit job (and so must not release per task);
@@ -359,7 +411,19 @@ def cmd_continue(args: argparse.Namespace) -> int:
     engine.full_orbit.continue_full_job -- used after the owner has
     cleared whatever `needs_owner` reason stopped it last (an install
     approval, a release approval, anything other than the design-
-    approval gate, which has its own `gb2 approve-design`)."""
+    approval gate, which has its own `gb2 approve-design`).
+
+    `--from facts|probe|plan` (결함 24, -- see
+    engine.full_orbit.force_reopen_station's own docstring) instead
+    reopens from that EARLIER early station -- the ordinary resume
+    only ever reruns the station the job is already stopped at (or the
+    one after), so an owner/foreman decision made after facts.md was
+    written that needs facts.md ITSELF redone (e.g. dropping a probe
+    target from scope) had no way back without this. Refused (exit 1,
+    nothing changed), via engine.full_orbit.ForceReopenError, if the
+    job is not currently stopped at an early station, or if the named
+    station is later than the one it is stopped at; never used during
+    the build stage."""
     config_path = shared.app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return shared.err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
@@ -372,6 +436,8 @@ def cmd_continue(args: argparse.Namespace) -> int:
 
     from engine import full_orbit
 
+    from_station = getattr(args, "from_station", None)
+
     ledger = Ledger.open(config.ledger_path)
     try:
         project_row = ledger.project(args.app)
@@ -381,9 +447,19 @@ def cmd_continue(args: argparse.Namespace) -> int:
         job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
 
         start = time.monotonic()
-        outcome = full_orbit.continue_full_job(
-            config, ledger, fakes_for, args.app, job_name, on_progress=shared.progress_printer,
-        )
+        try:
+            if from_station is not None:
+                outcome = full_orbit.continue_full_job_from(
+                    config, ledger, fakes_for, args.app, job_name, from_station,
+                    on_progress=shared.progress_printer,
+                )
+            else:
+                outcome = full_orbit.continue_full_job(
+                    config, ledger, fakes_for, args.app, job_name,
+                    on_progress=shared.progress_printer,
+                )
+        except full_orbit.ForceReopenError as exc:
+            return shared.err_json(f"force_reopen_refused: {exc}", 1)
         wall_sec = time.monotonic() - start
         summary = shared.summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
     finally:

@@ -121,7 +121,8 @@ from engine.application.pipeline_resume import (
     resumed_plan as _resumed_plan,
     stop_for_resumed_plan_problems as _stop_for_resumed_plan_problems,
     task_attempt_committed as _task_attempt_committed, task_for as _task_for, RESUME_TABLE,
-    continue_full_job, resumed_plan_stop,
+    continue_full_job, resumed_plan_stop, force_reopen_station, ForceReopenError,
+    continue_full_job_from,
 )
 from engine.application.pipeline_stages import (
     ORCHESTRATOR_GIT_IDENTITY as _ORCHESTRATOR_GIT_IDENTITY, attempt_has_requests,
@@ -203,5 +204,5 @@ __all__ = [
     "REVIEWER_ROLE",
     "STAGE_DESIGN_APPROVAL", "STAGE_TASK_OWNER", "STAGE_PROBE_RETRY", "STAGE_PLAN_REVIEW",
     "STAGE_REQUIREMENTS_REVIEW", "STAGE_SECURITY_FIX", "STAGE_RELEASE_APPROVAL",
-    "STAGE_EARLY_STATION",
+    "STAGE_EARLY_STATION", "force_reopen_station", "ForceReopenError", "continue_full_job_from",
 ]

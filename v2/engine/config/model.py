@@ -212,6 +212,75 @@ class ProjectConfig:
     # a nonexistent one is silently skipped at mount time, same as any
     # other `hidden` entry (engine.infrastructure.sandbox.wrap).
     hidden_paths: tuple[Path, ...] = ()
+    # Absolute host paths (or "~/..." expanded with the ENGINE PROCESS's
+    # own os.environ["HOME"]) naming folders of reference material (past
+    # deliverables, style guides, benchmarking briefs, ...) an owner wants
+    # a worker/reviewer for THIS project to be able to open and read
+    # directly instead of paraphrasing from a prompt alone (team lead
+    #: a worker sandbox hid these folders entirely).
+    #
+    # NEITHER directory-ness/`.env*` content NOR overlap with any
+    # protected area is checked here, or anywhere in engine.config --
+    # see engine.config.fields._project_reference_paths's own docstring
+    # for why (a P1: a host-filesystem check at config-parse
+    # time made a worker's gate hook, which re-parses the whole engine
+    # config on every tool call, die with exit code 2 -- denying every
+    # tool call for every OTHER project too -- whenever any one
+    # project's reference folder was momentarily unreachable).
+    #
+    # The real checks run exactly once, in
+    # engine.infrastructure.reference_snapshot.snapshot_references, right
+    # before a worker/reviewer first needs this project's snapshot for an
+    # attempt (not at config load, and not repeated per tool call): each
+    # entry is realpath()'d and rejected if it overlaps (ancestor, equal,
+    # OR descendant) config.home/secrets_dir/the ledger directory/ANY
+    # project's repo/this engine's own source tree, or if it is the real
+    # HOME itself or one of this project's own hidden_paths (descendants
+    # of those two ARE allowed -- a reference folder commonly lives
+    # somewhere under the operator's HOME), UNLESS some component of its
+    # path is itself a dot-prefixed (hidden) folder, which is rejected
+    # unconditionally. Only files that pass that are ever copied into a
+    # read-only, engine-owned snapshot directory that the worker/reviewer
+    # sandbox actually mounts -- the configured path here is NEVER itself
+    # mounted or read by a worker/reviewer.
+    #
+    # A ProjectConfig built directly in Python (bypassing engine.config.
+    # fields entirely) goes through that SAME snapshot_references call
+    # and gets the SAME checks -- there is exactly one place these rules
+    # are enforced, not a second, weaker one here.
+    reference_paths: tuple[Path, ...] = ()
+    # Bare CLI names (e.g. "claude") a probe script for THIS project may
+    # itself spawn as a real CLI, during run_probe_scripts' own actual
+    # re-execution of that script (engine.application.acceptance_probe --
+    # never the worker/builder sandbox, which already mounts every
+    # runner's own CLI unconditionally). The probe's bench sandbox
+    # otherwise hides the real operator HOME wholesale and mounts no
+    # CLI binary at all (unlike a worker), so a probe script that spawns
+    # one (e.g. `claude -p ...`) fails there with a bare "command not
+    # found" that proves nothing about whatever the CLI itself would
+    # have done. Each name here gets the SAME narrow exposure a worker
+    # gets (engine.application.steps.worker_sandbox.cli_runtime_mounts --
+    # its own installed binary plus its minimal login files, never the
+    # rest of the real HOME). Default empty: no project opts into this,
+    # byte-identical to before this field existed.
+    probe_runtime_clis: tuple[str, ...] = ()
+    # (relspec, absolute_target) pairs for every package.json `file:`
+    # dependency that points outside this project's repo (결함 17,
+    #: a worktree-managed project nests one directory level
+    # deeper than its real source checkout, so the SAME relative "../"
+    # escape a copy/worktree/snapshot preserves byte-for-byte lands one
+    # level short of the real target). `relspec` is the dependency's
+    # own path exactly as written after `file:` (e.g. "../_shared/kit");
+    # `target` is that path already resolved against the REAL source
+    # checkout and validated (engine.application.steps.file_deps,
+    # called once by `gb2 init` -- tools/gb2lib/workspace.py -- which is
+    # the only place that still knows the real, un-mirrored location).
+    # Deliberately NOT re-validated here (no filesystem I/O in
+    # __post_init__, same reasoning as reference_paths' own deferred
+    # checks): engine.application.steps.file_deps.remap_pairs_for_root
+    # is the one place a later sandbox build actually uses this value,
+    # and it already drops a pair whose target no longer exists.
+    file_dep_targets: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.bench_scope not in _KNOWN_BENCH_SCOPES:
@@ -228,6 +297,12 @@ class ProjectConfig:
         for entry in self.hidden_paths:
             if not entry.is_absolute():
                 raise ValueError(f"hidden_paths entry must be an absolute path: {entry!r}")
+        for pair in self.file_dep_targets:
+            if len(pair) != 2:
+                raise ValueError(f"file_dep_targets entry must be (relspec, target): {pair!r}")
+            relspec, target = pair
+            if not target.startswith("/"):
+                raise ValueError(f"file_dep_targets target must be absolute: {target!r}")
 
 
 @dataclass(frozen=True)
@@ -426,6 +501,15 @@ class EngineConfig:
             for root in forbidden_roots:
                 if _is_ancestor_or_equal(entry, root):
                     raise ValueError("bench_readonly_path_forbidden")
+        # reference_paths is deliberately NOT validated here -- see
+        # ProjectConfig.reference_paths's own docstring: the real checks
+        # (overlap with secrets_dir/home/ledger/repos/hidden_paths/real
+        # HOME, hidden path components) run once, in
+        # engine.infrastructure.reference_snapshot.snapshot_references,
+        # never at config load (a P1 fix -- a host-filesystem
+        # check here made a worker's gate hook die re-parsing the whole
+        # config on every tool call whenever any project's reference
+        # folder was momentarily unreachable).
         # station_mcp_allow is an upper bound ON TOP OF mcp_servers, not
         # a second place to name a server -- a typo here would silently
         # grant a request nothing (engine.domain.policy still fails closed)

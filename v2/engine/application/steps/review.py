@@ -81,6 +81,7 @@ from engine.application import repair as fixup
 from engine.domain import ids
 from engine.infrastructure import procs
 from engine.infrastructure import sandbox
+from engine.infrastructure.reference_snapshot import ensure_snapshot_for_attempt
 from engine.config import McpServerConfig
 from engine.infrastructure.gitutil import git_argv
 from engine.domain.records import Event
@@ -439,7 +440,16 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     from engine.application.steps.worker_step import ENGINE_ROOT
 
     # The reviewer may import this engine package inside the sandbox too.
-    readonly: tuple[Path, ...] = (spec.workdir, home_dir, ENGINE_ROOT)
+    # reference_paths (ProjectConfig): same engine-owned, read-only
+    # SNAPSHOT the worker sandbox re-exposes (engine.application.steps.
+    # worker_sandbox.sandboxed_argv, engine.infrastructure.
+    # reference_snapshot) -- never the configured source path itself --
+    # so a reviewer can open and read it too, to actually check a
+    # worker's output against the source material rather than take the
+    # prompt's own paraphrase on faith.
+    snapshot_entries = ensure_snapshot_for_attempt(ctx.config, ctx.project, ctx.attempt_id)
+    readonly: tuple[Path, ...] = ((spec.workdir, home_dir, ENGINE_ROOT)
+                                  + tuple(entry.path for entry in snapshot_entries))
     # Same reasoning as engine.application.steps.worker_step's own `_sandboxed_argv`: the
     # runner's own CLI, resolved from argv[0] by PATH, must stay visible
     # even though the real HOME (where it is usually installed) is hidden
@@ -473,10 +483,17 @@ def _run_spawn_reviewer(ctx: StepContext) -> dict[str, object]:
     env = runner.env(spec, worker)
     argv = _sandboxed_argv(ctx, spec, argv, env, runner)
     popen_env = sandbox.exec_env(ctx.config.sandbox, env)
+    # Same stdin-vs-argv split as engine.application.steps.worker_step's own
+    # _run_spawn_worker -- see WorkerRunner.prompt_via_stdin's docstring.
+    stdin_path = None
+    if getattr(runner, "prompt_via_stdin", False):
+        stdin_path = procs.stdin_file_for(_stdout_path(ctx))
+        procs.write_stdin_file(stdin_path, spec.task)
     proc = procs.spawn(
         ctx.ledger, ctx.project, ctx.attempt_id, spec.station, argv,
         cwd=spec.workdir, env=popen_env, stdout_path=_stdout_path(ctx),
-        stdin_devnull=True, request_id=ctx.request.request_id,
+        stdin_path=stdin_path, stdin_devnull=(stdin_path is None),
+        request_id=ctx.request.request_id,
         pass_fds=sandbox.pass_fds_for(argv),
     )
     return {"pid": proc.pid, "station": spec.station}

@@ -597,3 +597,62 @@ def test_resume_after_a_killed_engine_sh_bwrap_chain_leaves_no_orphan_and_no_dup
             new_proc.wait(timeout=5)
     finally:
         resumed_ledger.close()
+
+
+# ---------------------------------------------------------------------------
+# stdin_path (S25: a 169,674-byte task prompt in argv exceeded Linux's
+# MAX_ARG_STRLEN and made exec itself fail with E2BIG -- the prompt must
+# reach the real CLI over stdin instead; see procs.stdin_file_for and
+# WorkerRunner.prompt_via_stdin's own docstrings).
+# ---------------------------------------------------------------------------
+
+def test_stdin_path_and_stdin_devnull_together_is_rejected(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    stdin_file = tmp_path / "prompt.stdin"
+    stdin_file.write_text("hello\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        procs.spawn(
+            workspace.ledger, "alpha", "J-alpha-TEST#10", "build",
+            ["cat"], cwd=workspace.alpha,
+            stdin_path=stdin_file, stdin_devnull=True,
+        )
+
+
+def test_stdin_path_feeds_the_real_child_process_stdin(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """A real `cat` process, with no argv of its own, must read exactly
+    the bytes written to stdin_path off its own stdin -- this is the
+    whole point of stdin_path: the child's prompt never touches argv at
+    all, so a 200,000-byte prompt (far past argv limits) still gets
+    through."""
+    big_prompt = "x" * 200_000
+    stdin_file = tmp_path / "prompt.stdin"
+    stdin_file.write_text(big_prompt, encoding="utf-8")
+    stdout_file = tmp_path / "out.stdout"
+
+    proc = procs.spawn(
+        workspace.ledger, "alpha", "J-alpha-TEST#11", "build",
+        ["cat"], cwd=workspace.alpha,
+        stdin_path=stdin_file, stdout_path=stdout_file,
+    )
+    proc.wait(timeout=5)
+    assert stdout_file.read_text(encoding="utf-8") == big_prompt
+
+
+def test_write_stdin_file_is_0600_and_stdin_file_for_is_a_sibling_of_exit(
+    tmp_path: Path,
+) -> None:
+    stations_dir = tmp_path / "stations"
+    stdout_path = stations_dir / "r1.stdout"
+    stdin_path = procs.stdin_file_for(stdout_path)
+
+    assert stdin_path.parent.name == "stdin"
+    assert stdin_path.parent.parent == stations_dir.parent
+    assert stdin_path != procs.exit_file_for(stdout_path)
+
+    procs.write_stdin_file(stdin_path, "the task\n")
+    assert stdin_path.read_text(encoding="utf-8") == "the task\n"
+    mode = stdin_path.stat().st_mode & 0o777
+    assert mode == 0o600

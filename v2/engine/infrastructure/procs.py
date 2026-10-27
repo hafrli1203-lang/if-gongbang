@@ -142,6 +142,48 @@ def exit_file_for(stdout_path: Path) -> Path:
     return stdout_path.parent.parent / "exit" / (stdout_path.name + ".exit")
 
 
+def stdin_file_for(stdout_path: Path) -> Path:
+    """The file a caller that wants the real command's instructions fed
+    over stdin (rather than as an argv element) should write the prompt
+    text into, derived deterministically from `stdout_path` -- the same
+    shape as exit_file_for's own sibling-directory rule, and for the
+    identical reason: a `claude`/`codex` CLI's full prompt can be
+    hundreds of KB, far past Linux's MAX_ARG_STRLEN (131072 bytes) for
+    a single argv element, which makes exec itself fail with E2BIG --
+    see claude_cli.ClaudeRunner/codex_cli.CodexRunner's own module
+    docstrings for the live incident this closes. A SIBLING "stdin"
+    directory of stdout_path's own parent -- typically .../stations/
+    <request>.stdout -> .../stdin/<request>.stdout.stdin -- never a
+    path inside stdout_path's own (worker-writable) stations directory:
+    the file only needs to be openable by THIS process, on the host,
+    strictly before the real command is exec'd (spawn() opens it and
+    hands the child an already-dup'd fd 0, exactly like stdout_path
+    itself), so it needs no sandbox mount of its own at all -- fd 0 is
+    inherited across fork/exec regardless of bwrap's own mount
+    namespace. Keeping it out of the worker-writable tree anyway (same
+    "exit" treatment) means nothing the worker's own sandbox runs can
+    race writing over it before spawn() opens it."""
+    return stdout_path.parent.parent / "stdin" / (stdout_path.name + ".stdin")
+
+
+def write_stdin_file(path: Path, text: str) -> None:
+    """Writes `text` (a runner's full prompt) to a fresh 0600 file at
+    `path` -- same O_NOFOLLOW/fchmod-on-the-open-fd shape as
+    claude_cli._write_mcp_config_file, for the same reason: an
+    attacker-planted symlink at this path must be refused outright
+    rather than written through, and the file must never be briefly
+    world/group-readable between creation and chmod."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = text.encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
 def _matching(ledger: Ledger, project: str, kind: str, attempt_id: str,
               station: str, request_id: str | None) -> list[dict[str, object]]:
     return [event.payload for _seq, event in ledger.events(project, kind)
@@ -320,7 +362,8 @@ def _adopt_if_live(ledger: Ledger, project: str, attempt_id: str, station: str,
 def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
           argv: list[str], cwd: Path, *, env: dict[str, str] | None = None,
           stdout_path: Path | None = None, exit_file: Path | None = None,
-          stdin_devnull: bool = False, pass_fds: tuple[int, ...] = (),
+          stdin_devnull: bool = False, stdin_path: Path | None = None,
+          pass_fds: tuple[int, ...] = (),
           request_id: str | None = None) -> "subprocess.Popen[bytes] | SimpleNamespace":
     """Popen with start_new_session=True; append proc.started {pid, pgid,
     station, request_id}.
@@ -379,7 +422,17 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     stdout+stderr and closed again once Popen has started the child (the
     child already has its own duplicated fd by then); stdin_devnull
     redirects stdin from /dev/null instead of inheriting it (needed by
-    e.g. `codex exec`, which otherwise blocks on stdin).
+    e.g. `codex exec`, which otherwise blocks on stdin). stdin_path, if
+    given, is opened for reading (same open-then-close-after-Popen-
+    starts shape as stdout_path) and the child's stdin is that file
+    instead -- used by a runner whose CLI reads its prompt from stdin
+    rather than an argv element (see stdin_file_for's own docstring for
+    why: a multi-hundred-KB prompt as a single argv element can exceed
+    Linux's MAX_ARG_STRLEN and make exec itself fail with E2BIG).
+    stdin_path and stdin_devnull are mutually exclusive -- both naming a
+    stdin source for the same spawn is a caller bug, not a runtime
+    condition to silently resolve one way, so this raises ValueError
+    immediately rather than picking one.
 
     exit_file defaults to exit_file_for(stdout_path) when not given
     explicitly (None if stdout_path is also None -- no wrapping at
@@ -444,6 +497,8 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     out of scope here; mode="bwrap" (where this IS fully closed) is
     the mode every worker/reviewer/bench sandbox actually runs under
     in production (engine.config.EngineConfig.sandbox)."""
+    if stdin_path is not None and stdin_devnull:
+        raise ValueError("stdin_path and stdin_devnull are mutually exclusive")
     adopted = _adopt_if_live(ledger, project, attempt_id, station, request_id,
                              stdout_path)
     if adopted is not None:
@@ -484,6 +539,7 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     if exit_file is None and stdout_path is not None:
         exit_file = exit_file_for(stdout_path)
     stdout_handle = None
+    stdin_handle = None
     real_argv = argv
     if exit_file is not None:
         exit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -510,11 +566,19 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
         if stdout_path is not None:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             stdout_handle = open(stdout_path, "wb")
+        if stdin_path is not None:
+            stdin_handle = open(stdin_path, "rb")
+        if stdin_handle is not None:
+            stdin_arg = stdin_handle
+        elif stdin_devnull:
+            stdin_arg = subprocess.DEVNULL
+        else:
+            stdin_arg = None
         proc = subprocess.Popen(
             real_argv, cwd=str(cwd), env=env,
             stdout=stdout_handle if stdout_handle is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if stdout_handle is not None else subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL if stdin_devnull else None,
+            stdin=stdin_arg,
             start_new_session=True,
             preexec_fn=lambda: _die_with_engine(this_pid),
             pass_fds=pass_fds,
@@ -522,6 +586,8 @@ def spawn(ledger: Ledger, project: str, attempt_id: str, station: str,
     finally:
         if stdout_handle is not None:
             stdout_handle.close()
+        if stdin_handle is not None:
+            stdin_handle.close()
         # The child has its own copy via fork by the time Popen's
         # constructor returns (or never will, if it raised) -- this
         # process's own copy is never needed again either way.

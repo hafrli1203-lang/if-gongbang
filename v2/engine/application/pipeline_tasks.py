@@ -30,6 +30,10 @@ from engine.application.pipeline_stages import (
     stop_build_task_for_unmet_context, stops_for_owner, task_position,
 )
 from engine.domain.plan import Plan, Task, classify_skill_tools, tools_for_station
+from engine.domain.policy import NOTE_REQUEST_KIND
+from engine.application.repair_target import (
+    handoff_note_text, is_owns_scope_request, owning_later_task, record_request_handoff,
+)
 from engine.application.job_state import (
     STAGE_POST_TASKS, STAGE_REQUIREMENTS_REVIEW, STAGE_SECURITY_FIX, STAGE_TASK_OWNER,
     record_position, stages_spec, without_release,
@@ -172,6 +176,23 @@ def install_followup_task_text(task_text: str, build_copy: Path) -> str:
     return f"{task_text}{note}"
 
 
+def edit_approved_followup_task_text(task_text: str, granted_paths: tuple[str, ...]) -> str:
+    """`task_text` plus a note that the owner has widened this task's own
+    `owns` to cover paths it reported outside its own scope
+    (OWNS_SCOPE_REQUEST_RULE, 결함 26/28: a pending `kind="edit"` request
+    the owner approved with `gb2 fix <app> --also-own <path>` WITHOUT
+    opening any new attempt -- engine.application.repair.approve_pending_edit,
+    engine.application.pipeline_resume_tasks.rerun_task_owner_stop). Never the
+    install-kind message (install_followup_task_text's own "의존성이 설치됐다"
+    is simply wrong here -- nothing was installed)."""
+    listed = ", ".join(granted_paths) or "(없음)"
+    note = (
+        "\n\n[작업 범위 확장] 운영자가 다음 경로의 쓰기 범위를 승인했다: "
+        f"{listed}. 처음부터 다시 하지 말고, 멈춘 곳부터 이어서 끝내고 이제 이 "
+        "경로도 직접 고친다."
+    )
+    return f"{task_text}{note}"
+
 
 def task_attempt_config(config: EngineConfig, project: str, job_name: str,
                          plan: Plan) -> EngineConfig:
@@ -208,6 +229,44 @@ def task_stages(config: EngineConfig, build_config: EngineConfig, ledger: Ledger
 
 
 
+def handoff_request_filter(ledger: Ledger, project: str, job_name: str, plan: Plan,
+                            task_id: str, attempt_id: str, later_task_ids: tuple[str, ...],
+                            handoff_notes: dict[str, list[dict[str, object]]] | None,
+                            ) -> orbit.RequestFilter:
+    """결함 31 (sample-app T4,: an owns-scope report
+    (repair_target.is_owns_scope_request) whose own "path" is already
+    listed in a LATER, not-yet-run task's own `owns` (`later_task_ids`,
+    plan.tasks order) never needs to stop this job for the owner at
+    all -- the plan already intends that later task to touch the path.
+    Routed instead: record_request_handoff (the ledger's own permanent
+    record) and, when `handoff_notes` is given, append the request to
+    that task id's own list so run_tasks can fold handoff_note_text
+    into its builder instructions once its own turn comes. Every OTHER
+    request (not an owns-scope report, or one no later task's `owns`
+    covers) passes through unchanged -- still stops the job exactly as
+    before."""
+    def _filter(requests: list[dict[str, object]]) -> list[dict[str, object]]:
+        still_pending: list[dict[str, object]] = []
+        for request in requests:
+            if isinstance(request, dict) and request.get("kind") == NOTE_REQUEST_KIND:
+                continue  # informational, never stops the job (결함 33)
+            if not isinstance(request, dict) or not is_owns_scope_request(request):
+                still_pending.append(request)
+                continue
+            path = str(request.get("path"))
+            target = owning_later_task(plan, later_task_ids, path)
+            if target is None:
+                still_pending.append(request)
+                continue
+            record_request_handoff(ledger, project, job_name, attempt_id, task_id, target,
+                                   request)
+            if handoff_notes is not None:
+                handoff_notes.setdefault(target, []).append(request)
+        return still_pending
+
+    return _filter
+
+
 def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                       job_name: str, task: Task, task_text: str, plan: Plan,
                       on_progress: ProgressCallback | None,
@@ -215,6 +274,7 @@ def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
                       base_task_text: str | None = None, *,
                       fixing: bool = False, remaining_task_ids: tuple[str, ...] = (),
                       max_fix_rounds: int = 2, fix_round: int | None = None,
+                      handoff_notes: dict[str, list[dict[str, object]]] | None = None,
                       ) -> orbit.JobOutcome:
     """Open a FRESH attempt for this one task (see module docstring for
     why) and run its full run_station(build) -> merge -> review ->
@@ -228,7 +288,13 @@ def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
     later resume knows what this task IS (an acceptance-fix round or a
     plain plan.tasks entry) and what is still queued behind it. If the
     attempt stops for the owner, that stop is recorded here too, as the
-    task position moved to STAGE_TASK_OWNER."""
+    task position moved to STAGE_TASK_OWNER.
+
+    `handoff_notes`, when given, is mutated by this call's own
+    request_filter (결함 31 -- see handoff_request_filter) rather than
+    returned: `remaining_task_ids[1:]` (the later, not-yet-run tasks)
+    is what decides whether an owns-scope report is handed off instead
+    of stopping the job."""
     task_pos = task_position(job_name, None, task.id, task_text,
                               base_task_text or task_text, fixing=fixing,
                               remaining_task_ids=remaining_task_ids,
@@ -242,9 +308,13 @@ def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
     task_pos = replace(task_pos, attempt_id=attempt_id,
                        extra={**task_pos.extra, "stages": stages_spec(stages)})
     record_position(ledger, project, task_pos)
+    request_filter = handoff_request_filter(
+        ledger, project, job_name, plan, task.id, attempt_id, remaining_task_ids[1:],
+        handoff_notes,
+    )
     outcome = orbit.continue_job(build_config, ledger, fakes_for(fakes, attempt_id), project,
                                  attempt_id, stages, processor_factory=processor_factory,
-                                 on_progress=on_progress)
+                                 on_progress=on_progress, request_filter=request_filter)
     if stops_for_owner(outcome):
         stop_extra = {"fix_round": fix_round} if fix_round is not None else {}
         record_task_stop(ledger, project, task_pos, outcome, **stop_extra)
@@ -274,8 +344,19 @@ def run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
     than silently falling back to None: the caller still needs a real
     attempt_id to pass acceptance (a None attempt_id used to crash
     engine.application.acceptance.run_acceptance on exactly this resume path)."""
+    # 결함 31 (sample-app T4,: task_id -> the owns-scope reports
+    # an EARLIER task's own attempt handed off to it (_handoff_request_
+    # filter, via run_task_attempt's own `handoff_notes`), because this
+    # task's `owns` already covered the reported path. Folded into this
+    # task's own base_task_text, as a HANDOFF_NOTE_PREFIX line per
+    # report, the one time this loop reaches it -- never carried any
+    # further once popped.
+    handoff_notes: dict[str, list[dict[str, object]]] = {}
     for index, task in enumerate(tasks):
         base_task_text = builder_task_text(task, plan.goal, job_name, plan.ui)
+        handed_off = handoff_notes.pop(task.id, None)
+        if handed_off:
+            base_task_text = f"{base_task_text}\n\n{handoff_note_text(handed_off)}"
         remaining_now = tuple(t.id for t in tasks[index:])
         build_gate = build_task_gate(config, ledger, project, plan, base_task_text)
         if build_gate.unmet is not None:
@@ -288,7 +369,7 @@ def run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
         outcome = run_task_attempt(config, ledger, fakes, project, job_name, task,
                                     task_text, plan, on_progress, processor_factory,
                                     base_task_text, remaining_task_ids=remaining_now,
-                                    max_fix_rounds=max_fix_rounds)
+                                    max_fix_rounds=max_fix_rounds, handoff_notes=handoff_notes)
         last_attempt_id = outcome.attempt_id
         full = station_outcome_to_full(outcome, "build")
         if full is not None:
@@ -427,7 +508,8 @@ def finish_from_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
 
 
 __all__ = [
+    "handoff_request_filter",
     "task_attempt_config", "task_stages", "run_task_attempt", "run_acceptance_and_handoff",
     "finish_after_handoff", "finish_from_tasks", "review_payload", "install_followup_task_text",
-    "build_task_gate",
+    "edit_approved_followup_task_text", "build_task_gate",
 ]

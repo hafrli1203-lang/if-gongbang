@@ -139,6 +139,62 @@ def test_facts_table_source_column_counts_as_source(tmp_path) -> None:
     assert check_facts(tmp_path, "j") == ["line 4: 통과 without 출처"]
 
 
+def test_facts_table_header_with_extra_words_still_names_columns(tmp_path) -> None:
+    """A header like "출처(파일:줄 또는 문서)" is still the source column --
+    a real facts.md was rejected line by line because only an exact "출처"
+    header was recognized."""
+    from engine.gates import check_facts
+    d = tmp_path / ".gongbang" / "j"
+    d.mkdir(parents=True)
+    (d / "facts.md").write_text(
+        "| 주장 | 판정 | 출처(파일:줄 또는 문서) |\n|---|---|---|\n"
+        "| a | 통과 | `src/x.ts:3` |\n| b | 통과 |  |\n",
+        encoding="utf-8")
+    assert check_facts(tmp_path, "j") == ["line 4: 통과 without 출처"]
+
+
+def test_facts_word_mentioned_in_a_non_verdict_table_is_not_a_claim(tmp_path) -> None:
+    """A real facts.md was rejected because a 확인 필요 table row (no 판정
+    column) said "다시 통과로 올림" -- that row is not a pass claim."""
+    from engine.gates import check_facts
+    d = tmp_path / ".gongbang" / "j"
+    d.mkdir(parents=True)
+    (d / "facts.md").write_text(
+        "| 주장 | 무엇을 확인하면 되나 |\n|---|---|\n"
+        "| 라이브러리 | 공식 문서를 확인한 뒤 facts.md에 다시 통과로 올림 |\n"
+        "- 바깥 줄: 통과\n",
+        encoding="utf-8")
+    assert check_facts(tmp_path, "j") == ["line 4: 통과 without 출처"]
+
+
+def test_facts_prose_paragraph_mentioning_pass_is_not_a_claim(tmp_path) -> None:
+    """A real facts.md was rejected for a prose paragraph saying items would
+    change to "통과" -- only table rows and list items are claims."""
+    from engine.gates import check_facts
+    d = tmp_path / ".gongbang" / "j"
+    d.mkdir(parents=True)
+    (d / "facts.md").write_text(
+        "설명: 여러 항목이 \"통과\" 또는 확인 필요로 바뀐다.\n"
+        "- 목록 주장: 통과\n",
+        encoding="utf-8")
+    assert check_facts(tmp_path, "j") == ["line 2: 통과 without 출처"]
+
+
+def test_code_values_pass_row_mentioning_needs_check_is_not_a_needs_check_claim(tmp_path) -> None:
+    """A real facts.md was rejected because a 통과 row's text said
+    "별도 확인 필요" -- only a 판정 cell or a list item claims it."""
+    from engine.gates import check_facts
+    d = tmp_path / ".gongbang" / "j"
+    d.mkdir(parents=True)
+    (d / "facts.md").write_text(
+        "## 코드에 넣는 값\n| 주장 | 판정 | 출처 |\n|---|---|---|\n"
+        "| 위치 인자로 확인함(표준 입력은 별도 확인 필요) | 통과 | `t1.log` |\n"
+        "| 모델 목록 | 확인 필요 | - |\n",
+        encoding="utf-8")
+    assert check_facts(tmp_path, "j") == [
+        "코드에 넣는 값: 확인 필요 remaining ('| 모델 목록 | 확인 필요 | - |')"]
+
+
 # ---- check_probe_targets / check_probe ---------------------------------
 
 def test_check_probe_targets_raises_when_section_missing_entirely(tmp_path: Path) -> None:
@@ -172,6 +228,45 @@ def test_check_probe_targets_parses_name_and_url(tmp_path: Path) -> None:
     ]
 
 
+def test_check_probe_targets_strips_trailing_explanation_after_url(
+    tmp_path: Path,
+) -> None:
+    """결함 19, 마케팅 채팅 job): a real bullet's doc value
+    carried an explanation on the SAME line, after the url --
+    "https://docs.claude.com/en/docs/claude-code/cli-reference —
+    probe t1 PROBE OK(단, …)". Only the first whitespace-delimited
+    token (the bare url) is kept; the rest is dropped, never folded
+    into the url run_probe_scripts'/check_probe's own "PROBE OK <url>"
+    match is checked against."""
+    text = (
+        "## 외부 대상\n"
+        "- Claude Code CLI(코드 실행): "
+        "https://docs.claude.com/en/docs/claude-code/cli-reference "
+        "— probe t1 PROBE OK(단, 실측 환경 한정)\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [
+        ("Claude Code CLI(코드 실행)",
+         "https://docs.claude.com/en/docs/claude-code/cli-reference"),
+    ]
+
+
+def test_check_probe_targets_keeps_whole_value_for_non_url_target(
+    tmp_path: Path,
+) -> None:
+    """An internal/사내 target with no http(s) scheme is never split on
+    whitespace -- its whole value after ":" stays the url, even if it
+    contains spaces."""
+    text = (
+        "## 외부 대상\n"
+        "- 사내 발주 시스템: 사내 전산팀 문서 v3 (공개 URL 없음)\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [
+        ("사내 발주 시스템", "사내 전산팀 문서 v3 (공개 URL 없음)"),
+    ]
+
+
 def test_check_probe_targets_raises_on_malformed_line(tmp_path: Path) -> None:
     text = (
         "## 외부 대상\n"
@@ -192,6 +287,19 @@ def test_check_probe_targets_raises_on_non_bullet_line(tmp_path: Path) -> None:
     _write_facts(tmp_path, "job", text)
     with pytest.raises(ProbeTargetsError):
         check_probe_targets(tmp_path, "job")
+
+
+def test_check_probe_targets_skips_explicit_note_lines(tmp_path: Path) -> None:
+    """A real facts.md stopped on a "(probe = …)" note in this section.
+    Whole-line parentheses and "> " quotes are notes; other text still raises."""
+    text = (
+        "## 외부 대상\n"
+        "(probe = 실측 기록 위치 설명)\n"
+        "> 참고: 엔진은 대상이 아님\n"
+        "- stripe: https://docs.stripe.com/api\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [("stripe", "https://docs.stripe.com/api")]
 
 
 def test_check_probe_targets_empty_mark_means_no_targets(tmp_path: Path) -> None:

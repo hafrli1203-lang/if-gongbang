@@ -38,7 +38,7 @@ from engine.infrastructure.skills import load_skill
 if TYPE_CHECKING:
     from engine.config import EngineConfig
 
-ITEM_KINDS = ("library", "lesson", "decision", "skill")
+ITEM_KINDS = ("library", "lesson", "decision", "skill", "reference")
 TRUST_KINDS = ("approved", "experience", "reference")
 
 # Section size caps (characters) for the "주입된 자료" block a station
@@ -314,6 +314,39 @@ def _decision_item(config: "EngineConfig", project: str) -> ContextItem | None:
                         source=path, trust="approved")
 
 
+def _reference_item(config: "EngineConfig", project: str,
+                     attempt_id: str | None) -> ContextItem | None:
+    """ProjectConfig.reference_paths rendered as one prompt line per
+    path, pointing at where this attempt's own SNAPSHOT (engine.
+    infrastructure.reference_snapshot) will/does live -- never the
+    configured source path itself, which is never mounted or read by a
+    worker/reviewer. Pure path math (engine.domain.ids.references_root
+    + reference_snapshot.snapshot_dir_name), no I/O: this never
+    triggers the actual copy (engine.application.steps.worker_sandbox/
+    review do that, right before a worker/reviewer needs it) and never
+    fails just because the source is not reachable from wherever a
+    prompt happens to be built. None when the project has no
+    reference_paths configured, or `attempt_id` is not yet known (a
+    station's required-context check that runs before any attempt is
+    open has nothing concrete to point at yet) -- never an empty
+    "## 주입된 자료" sub-block."""
+    projects = getattr(config, "projects", {})
+    proj = projects.get(project)
+    paths = proj.reference_paths if proj is not None else ()
+    if not paths or attempt_id is None:
+        return None
+    from engine.domain.ids import references_root
+    from engine.infrastructure.reference_snapshot import snapshot_dir_name
+
+    root = references_root(config.home, attempt_id)
+    lines = [f"- {original.name} -> {root / snapshot_dir_name(index, original)}"
+             for index, original in enumerate(paths)]
+    text = ("참고 자료 폴더(읽기 전용) — 판단·근거는 여기 원문을 직접 열어 확인한다:\n"
+            + "\n".join(lines))
+    return ContextItem(kind="reference", title="참고 자료 폴더", text=text,
+                       source="reference_paths", trust="approved")
+
+
 DIRECTION_STATIONS = ("facts", "plan")
 
 
@@ -330,7 +363,8 @@ def _direction_item(config: "EngineConfig", station: str) -> ContextItem | None:
                        source=str(path), trust="approved")
 
 
-def gather(config: "EngineConfig", project: str, station: str, request: str) -> Context:
+def gather(config: "EngineConfig", project: str, station: str, request: str,
+           attempt_id: str | None = None) -> Context:
     """Collects every ContextItem this station is entitled to for this
     `request` (used as the library_search query): the project's own
     CURRENT_DECISIONS.md section (if configured) plus, if a
@@ -338,7 +372,9 @@ def gather(config: "EngineConfig", project: str, station: str, request: str) -> 
     results (lessons only if `lessons_app` names this project). `station`
     is accepted for a uniform call shape across every caller even though
     this function itself does not yet vary behavior by station -- skill
-    selection (which DOES vary by station) lives in build() below."""
+    selection (which DOES vary by station) lives in build() below.
+    `attempt_id` (default None) is ONLY used by the reference_paths item
+    (_reference_item) -- every other item here is attempt-independent."""
     items: list[ContextItem] = []
     failed = False
     ctx_cfg = getattr(config, "context", None)
@@ -350,6 +386,10 @@ def gather(config: "EngineConfig", project: str, station: str, request: str) -> 
     decision = _decision_item(config, project)
     if decision is not None:
         items.append(decision)
+
+    reference = _reference_item(config, project, attempt_id)
+    if reference is not None:
+        items.append(reference)
 
     if ctx_cfg is not None and ctx_cfg.library_mcp is not None:
         app = ctx_cfg.lessons_app.get(project)
@@ -417,7 +457,7 @@ def _skills_section(roots: tuple[str, ...], names: tuple[str, ...]) -> tuple[str
 
 
 def build(config: "EngineConfig", project: str, station: str, request: str,
-          planned_skills: tuple[str, ...] = ()) -> StationContext:
+          planned_skills: tuple[str, ...] = (), attempt_id: str | None = None) -> StationContext:
     """One call a station-prompt-building call site makes: gathers
     context items, loads this station's configured skills, and
     assembles the full appendix text (library/lesson/decision items,
@@ -427,9 +467,11 @@ def build(config: "EngineConfig", project: str, station: str, request: str,
     `.missing`/`.failed` as the `context.injected`/`context.failed`
     ledger events, and may check `.unmet_required()`/`.required_missing`/
     `.required_library_failed` (from ContextConfig.required_skills/
-    require_library) to stop needs_owner instead of proceeding."""
+    require_library) to stop needs_owner instead of proceeding.
+    `attempt_id` (default None) is passed straight through to gather()
+    -- only the reference_paths item uses it."""
     ctx_cfg = getattr(config, "context", None)
-    ctx = gather(config, project, station, request)
+    ctx = gather(config, project, station, request, attempt_id)
     roots = ctx_cfg.skill_roots if ctx_cfg is not None else ()
     base = tuple(ctx_cfg.station_skills.get(station, ())) if ctx_cfg is not None else ()
     # The planner's own pick for this station comes on top of the small

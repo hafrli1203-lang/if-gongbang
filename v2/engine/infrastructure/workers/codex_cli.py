@@ -23,6 +23,13 @@ class CodexRunner:
     # The real `codex` CLI writes its own session/credential state under
     # this -- the only HOME subpath this runner needs writable.
     home_writable_subpaths = (".codex",)
+    # Same reasoning as ClaudeRunner.prompt_via_stdin: the prompt (here,
+    # a review prompt that embeds a whole diff, chunked up to a 240k-char
+    # budget -- see review.py's own module docstring) can exceed Linux's
+    # MAX_ARG_STRLEN as a single argv element. `codex exec ... -` (a bare
+    # "-" in the prompt's own argv position) reads the prompt from stdin
+    # instead.
+    prompt_via_stdin = True
 
     def argv(self, spec: WorkerSpec, worker: WorkerConfig) -> list[str]:
         schema_path = _schema_path(spec.result_path)
@@ -38,7 +45,7 @@ class CodexRunner:
             "-c", f'model_reasoning_effort="{reasoning}"',
             "--output-schema", str(schema_path),
             "-o", str(spec.result_path),
-            spec.task,
+            "-",
         ]
 
     def env(self, spec: WorkerSpec, worker: WorkerConfig) -> dict[str, str]:

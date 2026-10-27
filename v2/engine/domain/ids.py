@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import time
+from pathlib import Path
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -54,6 +55,22 @@ def attempt_dirname(attempt_id: str) -> str:
     return attempt_id.replace("#", "-")
 
 
+def references_root(home: Path, attempt_id: str) -> Path:
+    """The engine-owned directory an attempt's reference-folder snapshot
+    (engine.infrastructure.reference_snapshot) lives under: `home/
+    references/<attempt_dirname(attempt_id)>`. Pure path math, no I/O --
+    shared by the actual snapshot-copying code (engine.infrastructure.
+    reference_snapshot), the sandbox mount policy (engine.application.
+    steps.worker_sandbox/review), the station prompt (engine.
+    infrastructure.context, which only ever needs to know WHERE a
+    snapshot will/does live, never to copy anything itself) and the
+    read policy (engine.domain.policy, which only needs the boundary
+    to allow a worker/reviewer Read/Glob/Grep inside it) -- one
+    definition of this path, so none of those four can drift from the
+    others."""
+    return home / "references" / attempt_dirname(attempt_id)
+
+
 def canonical_json(payload: object) -> str:
     """Deterministic JSON: sorted keys, no whitespace, ensure_ascii=False."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -87,6 +104,6 @@ def with_retry(payload: dict[str, object], retry_of: str, retry_n: int) -> dict[
 
 
 __all__ = [
-    "ulid_like", "new_job_id", "attempt_id", "attempt_dirname", "canonical_json",
-    "request_id", "content_hash", "with_retry",
+    "ulid_like", "new_job_id", "attempt_id", "attempt_dirname", "references_root",
+    "canonical_json", "request_id", "content_hash", "with_retry",
 ]

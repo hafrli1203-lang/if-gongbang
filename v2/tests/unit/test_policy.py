@@ -472,6 +472,52 @@ def test_worker_read_without_copy_root_denied(workspace: Workspace) -> None:
     assert decision.reason == "no_copy_root"
 
 
+def test_worker_read_within_reference_snapshot_allowed(workspace: Workspace) -> None:
+    """Fix: Read/Glob/Grep (all tool="read") inside THIS
+    attempt's own reference-folder snapshot (engine.domain.ids.
+    references_root, engine.infrastructure.reference_snapshot) must be
+    allowed, even though it is outside the worker's own copy_root --
+    the whole point of mounting the snapshot read-only is for a
+    worker/reviewer to actually be able to read it."""
+    from engine.ids import attempt_dirname
+
+    policy = Policy(workspace.config, workspace.ledger)
+    copy_root = _make_copy(workspace, workspace.alpha, "r_ref_snapshot")
+    attempt_id = "J-alpha-REFSNAP#1"
+    snapshot_dir = (workspace.config.home / "references" / attempt_dirname(attempt_id)
+                    / "0-material")
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "brief.md").write_text("BRIEF\n", encoding="utf-8")
+    actor = Actor(kind="worker", role="builder", attempt_id=attempt_id, generation=0,
+                  station="build", copy_root=copy_root)
+    decision = policy.check("alpha", actor, Action(
+        tool="read", path=snapshot_dir / "brief.md"))
+    assert decision.allowed is True
+    assert decision.reason == "read_within_reference_snapshot"
+
+
+def test_worker_write_within_reference_snapshot_still_denied(workspace: Workspace) -> None:
+    """The snapshot is read-only, period -- the Read-side allowance
+    above must never widen rule 5's write check, which never looks at
+    the reference snapshot at all (it only ever allows a write under
+    the worker's own copy_root at a configured station_owners prefix)."""
+    policy = Policy(workspace.config, workspace.ledger)
+    copy_root = _make_copy(workspace, workspace.alpha, "w_ref_snapshot")
+    _open_project(workspace.ledger, "alpha")
+    attempt_id = "J-alpha-REFSNAP2#1"
+    from engine.ids import attempt_dirname
+
+    snapshot_dir = (workspace.config.home / "references" / attempt_dirname(attempt_id)
+                    / "0-material")
+    snapshot_dir.mkdir(parents=True)
+    actor = Actor(kind="worker", role="builder", attempt_id=attempt_id, generation=1,
+                  station="build", copy_root=copy_root)
+    decision = policy.check("alpha", actor, Action(
+        tool="write", path=snapshot_dir / "new-file.txt"))
+    assert decision.allowed is False
+    assert decision.reason == "outside_allowed_path"
+
+
 def test_worker_read_without_path_denied(workspace: Workspace) -> None:
     policy = Policy(workspace.config, workspace.ledger)
     copy_root = _make_copy(workspace, workspace.alpha, "r_nopath")

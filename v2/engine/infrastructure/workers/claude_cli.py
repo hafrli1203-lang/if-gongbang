@@ -170,9 +170,20 @@ class ClaudeRunner:
     # these -- the only HOME subpaths this runner needs writable (ENGINE.md
     # 3단계 OS 샌드박스 HOME 절).
     home_writable_subpaths = (".claude", ".claude.json")
+    # The task prompt reaches this CLI over stdin, never as an argv
+    # element -- a real production prompt measured at 169,674 bytes
+    # (performance-ads job, exceeded Linux's MAX_ARG_STRLEN
+    # (131,072 bytes) and made exec itself fail with E2BIG, surfaced only
+    # as the opaque "internal:OSError" engine.application.processor's own
+    # catch-all records. `claude -p` with NO prompt argument reads the
+    # prompt from stdin (the caller -- engine.application.steps.worker_step/
+    # review -- writes spec.task to a file via engine.infrastructure.procs.
+    # write_stdin_file and passes it as procs.spawn's stdin_path, never
+    # stdin_devnull).
+    prompt_via_stdin = True
 
     def argv(self, spec: WorkerSpec, worker: WorkerConfig) -> list[str]:
-        argv = ["claude", "-p", spec.task]
+        argv = ["claude", "-p"]
         if worker.model:
             argv += ["--model", worker.model]
         if worker.max_turns is not None:

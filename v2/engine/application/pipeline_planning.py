@@ -230,6 +230,131 @@ def _run_probe(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
 run_probe = _run_probe
 
 
+# Generous enough that a realistic finding list always fits whole (a
+# reviewer rarely reports more than a handful of P0-P3 items) -- only a
+# pathological one is ever cut, and plan_review_findings_note marks the
+# cut rather than silently dropping entries.
+_FINDINGS_NOTE_CAP = 20_000
+
+
+def plan_review_findings_note(ledger: Ledger, project: str, attempt_id: str) -> str:
+    """"[지난 검토에서 고칠 것]" section built from `attempt_id`'s own
+    NEWEST "review" evidence row (Ledger.evidence, oldest-first --
+    engine.domain.evidence_graph._task_review_passed's own contract: the
+    last row is the newest) -- "" iff that attempt has no review
+    evidence at all (a plan that crashed or stopped before review ever
+    ran has nothing to carry forward).
+
+    This is the fix for the real defect found testing a performance-ads
+    job: a STAGE_PLAN_REVIEW resume (engine.application.pipeline_resume.
+    _resume_reopened_station) used to open a fresh planner attempt
+    whose own prompt never mentioned a single word of the review that
+    just rejected the stale attempt's plan.json -- `gb2 continue`
+    reopened the SAME station with a prompt that could, and did,
+    reproduce the SAME P1/P2 findings. Every finding's severity/file/
+    line/note is kept whole (never summarized), so the planner sees
+    exactly what it was rejected for; a note also tells the planner
+    where to record what it fixed (plan.json's own task "detail" --
+    plan.json has no separate "notes" field) so a later review can
+    tell the finding was actually addressed, not just silently
+    dropped. Lives here, next to run_plan_and_review (the only caller
+    that ever attaches it to a prompt), rather than in
+    engine.application.pipeline_resume (whose own _resume_reopened_station calls it) --
+    same reasoning bd38249 already applied to facts/probe/plan rule
+    sentences: the one place that reads the review's own payload shape
+    stays next to the one place that turns it into prompt text."""
+    if not attempt_id:
+        return ""
+    rows = ledger.evidence(attempt_id, "review")
+    if not rows:
+        return ""
+    findings = rows[-1].payload.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return ""
+    lines = [
+        f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
+        f"— {f.get('note', '')}"
+        for f in findings if isinstance(f, dict)
+    ]
+    if not lines:
+        return ""
+    header = (
+        "[지난 검토에서 고칠 것]\n"
+        "아래는 이 계획의 직전 시도가 검토에서 불합격한 지적이다. 하나도 빠짐없이 "
+        "반영해 다시 쓴다. 어디서 어떻게 고쳤는지는 plan.json의 해당 task "
+        '"detail"에 적는다(예: "P1 fix: <무엇을 어디서 어떻게 고쳤는지>"). 지적을 '
+        "반영하지 않은 계획은 같은 지적으로 다시 검토에서 떨어진다.\n"
+    )
+    text = header + "\n".join(lines)
+    if len(text) > _FINDINGS_NOTE_CAP:
+        text = (text[:_FINDINGS_NOTE_CAP]
+                + f"\n...(생략됨 -- 지적 {len(lines)}건 중 일부만 표시)")
+    return text
+
+
+# The "evidence.recorded" kind a plan-check failure (load_plan's own
+# PlanError, or validate_plan/validate_tools returning problems) is
+# stored under -- read back by plan_check_failure_note. Distinct from
+# "review" (a reviewer's own verdict on an already-parseable plan.json)
+# since these two failures happen at a different, EARLIER point (before
+# any reviewer ever runs) and carry a different shape of detail.
+PLAN_CHECK_EVIDENCE_KIND = "plan_check"
+
+
+def record_plan_check_failure(ledger: Ledger, project: str, attempt_id: str, *,
+                               check: str, detail: str) -> None:
+    """Records ONE "plan_check" evidence row for `attempt_id` -- the
+    fix for the real defect found testing a marketing-chat job (결함
+    30): a plan station stopped twice in a row with "plan:
+    plan_unreadable" (a planner-written goal string's own unescaped
+    `--tools ""` broke plan.json's JSON syntax, json.JSONDecodeError
+    "Expecting ',' delimiter: line 2 column 654"), and `gb2 continue
+    --from plan` reran the SAME planner with no idea why -- nothing
+    was ever recorded, so the SAME mistake just repeated. `check` is
+    PlanError.reason ("plan_unreadable" or a schema token) for a
+    load_plan failure, or "plan_invalid" for a validate_plan/
+    validate_tools failure; `detail` is json_decode_error_detail's own
+    text (JSON errors) or the "; "-joined problem list (validate
+    errors) -- "" is never recorded (plan_check_failure_note treats an
+    empty detail the same as no row at all, so there is nothing worth
+    reading back)."""
+    if not detail:
+        return
+    from engine.infrastructure import evidence as evidence_mod
+
+    evidence_mod.record(ledger, project, attempt_id, PLAN_CHECK_EVIDENCE_KIND, "",
+                         payload={"check": check, "detail": detail})
+
+
+def plan_check_failure_note(ledger: Ledger, project: str, attempt_id: str) -> str:
+    """"[지난 계획 파일 문제 -- 고칠 것]" section built from `attempt_id`'s
+    own NEWEST "plan_check" evidence row -- "" iff that attempt never
+    recorded one (record_plan_check_failure never ran, or ran with an
+    empty detail). Same placement/approach as plan_review_findings_note
+    (3e95f0d) -- lives here, next to run_plan_and_review (the only
+    caller that attaches it to a prompt), rather than in
+    engine.application.pipeline_resume (whose own _resume_reopened_station/
+    force_reopen_station call it)."""
+    if not attempt_id:
+        return ""
+    rows = ledger.evidence(attempt_id, PLAN_CHECK_EVIDENCE_KIND)
+    if not rows:
+        return ""
+    payload = rows[-1].payload
+    detail = payload.get("detail")
+    if not isinstance(detail, str) or not detail:
+        return ""
+    check = payload.get("check", "?")
+    header = (
+        "[지난 계획 파일 문제 -- 고칠 것]\n"
+        f"이 계획의 직전 시도가 쓴 plan.json은 \"{check}\"로 실패했다. 아래 문제를 "
+        "고쳐서 다시 쓴다 -- 같은 문제가 그대로면 또 실패한다.\n"
+    )
+    text = header + str(detail)
+    if len(text) > _FINDINGS_NOTE_CAP:
+        text = text[:_FINDINGS_NOTE_CAP] + "\n...(생략됨)"
+    return text
+
 
 def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                          job_name: str, attempt_id: str, request: str, probe_text: str,
@@ -237,6 +362,7 @@ def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
                          processor_factory: orbit.ProcessorFactory | None,
                          max_fix_rounds: int, needs_resume_note: bool = False,
                          facts: trusted.Trusted | None = None,
+                         prior_findings_note: str = "",
                          ) -> tuple[FullOutcome | None, Plan | None]:
     """Runs the plan station, then reviews that same change, from
     scratch -- used for a job's first plan attempt, a STAGE_PLAN_REVIEW
@@ -246,7 +372,15 @@ def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
 
     `facts` is facts.md as captured when the facts gate passed in this
     same run; a resume that starts here checks and captures it again.
-    The planner prompt gets those exact bytes, verified unchanged."""
+    The planner prompt gets those exact bytes, verified unchanged.
+
+    `prior_findings_note` ("" for a job's first plan attempt -- only a
+    STAGE_PLAN_REVIEW resume ever passes a non-empty one, see
+    engine.application.pipeline_resume.plan_review_findings_note) is prepended to
+    the FRONT of the planner's own prompt, ahead of everything else:
+    the stale attempt's own review findings, whole, so the SAME
+    rejected plan.json is never handed back to a planner with no idea
+    what it was rejected for."""
     record_event(ledger, project, job_name, STAGE_PLAN, attempt_id, next_action="run_station",
             request=request, probe_text=probe_text, max_fix_rounds=max_fix_rounds)
     repo = config.projects[project].repo
@@ -263,7 +397,10 @@ def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
                 request=request, probe_text=probe_text, max_fix_rounds=max_fix_rounds)
         return FullOutcome("needs_owner", reason, attempt_id, None), None
     base_plan_prompt = planner_prompt(request, job_name, facts_md, skill_catalog_text(config),
-                                      probe_text)
+                                      probe_text, build_prefixes(config),
+                                      config.projects[project].manifest)
+    if prior_findings_note:
+        base_plan_prompt = f"{prior_findings_note}\n\n{base_plan_prompt}"
     # A STAGE_PLAN_REVIEW resume reruns this on the SAME (never-closed)
     # attempt -- same idempotent-request_id reasoning as _run_probe's own
     # retry note: an unchanged prompt would collide with the first
@@ -304,11 +441,20 @@ def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
     try:
         plan = load_plan(repo, job_name)
     except PlanError as exc:
-        return FullOutcome("failed", f"plan:{exc.reason}", attempt_id, None), None
+        reason = f"plan:{exc.reason}"
+        record_plan_check_failure(ledger, project, attempt_id, check=exc.reason, detail=exc.detail)
+        record_event(ledger, project, job_name, STAGE_PLAN_REVIEW, attempt_id, stop_reason=reason,
+                request=request, probe_text=probe_text, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("failed", reason, attempt_id, None), None
     problems = validate_plan(plan, repo, build_prefixes(config))
     problems += validate_tools(plan, config)
     if problems:
-        return FullOutcome("failed", "plan:" + "; ".join(problems), attempt_id, None), None
+        reason = "plan:" + "; ".join(problems)
+        record_plan_check_failure(ledger, project, attempt_id, check="plan_invalid",
+                                   detail="; ".join(problems))
+        record_event(ledger, project, job_name, STAGE_PLAN_REVIEW, attempt_id, stop_reason=reason,
+                request=request, probe_text=probe_text, max_fix_rounds=max_fix_rounds)
+        return FullOutcome("failed", reason, attempt_id, None), None
 
     # Review the planner's own merged-but-uncommitted change (plan.json +
     # tests/scenes/) BEFORE it is committed as the orchestrator's own plan
@@ -408,7 +554,8 @@ def probe_plan_design_close(config: EngineConfig, ledger: Ledger, fakes: Fakes, 
                              processor_factory: orbit.ProcessorFactory | None, *,
                              start: str = "probe", probe_text: str = "",
                              needs_resume_note: bool = False,
-                             facts: trusted.Trusted | None = None) -> FullOutcome:
+                             facts: trusted.Trusted | None = None,
+                             prior_findings_note: str = "") -> FullOutcome:
     """probe -> plan+review -> (design, if plan.ui) -> close -> build
     loop. `start` is "probe" (a fresh job, or a STAGE_PROBE_RETRY
     resume), "plan" (a STAGE_PLAN_REVIEW resume -- probe already
@@ -420,7 +567,10 @@ def probe_plan_design_close(config: EngineConfig, ledger: Ledger, fakes: Fakes, 
     resume_note`, only ever True for a STAGE_EARLY_STATION owner-
     request resume, is given ONLY to whichever station `start` names --
     the one THIS resume is actually for -- never to a later station in
-    the same call, which runs fresh regardless."""
+    the same call, which runs fresh regardless. `prior_findings_note`
+    ("" unless `start == "plan"` from a STAGE_PLAN_REVIEW resume) is
+    passed straight to run_plan_and_review -- see that function's own
+    docstring."""
     if start == "probe":
         full, probe_text = _run_probe(config, ledger, fakes, project, job_name, attempt_id,
                                       request, on_progress, processor_factory, max_fix_rounds,
@@ -438,7 +588,8 @@ def probe_plan_design_close(config: EngineConfig, ledger: Ledger, fakes: Fakes, 
         full, plan = run_plan_and_review(
             config, ledger, fakes, project, job_name, attempt_id, request, probe_text,
             on_progress, processor_factory, max_fix_rounds,
-            needs_resume_note=(needs_resume_note if start == "plan" else False), facts=facts)
+            needs_resume_note=(needs_resume_note if start == "plan" else False), facts=facts,
+            prior_findings_note=(prior_findings_note if start == "plan" else ""))
         if full is not None:
             return full
         assert plan is not None
@@ -569,4 +720,6 @@ def facts_then_rest(run: "Run", attempt_id: str, request: str, max_fix_rounds: i
 __all__ = [
     "run_full_job", "probe_plan_design_close", "close_early_attempt_then_tasks",
     "facts_then_rest", "maybe_rerun_plan_review", "append_owner_request_resume_note",
+    "plan_review_findings_note", "plan_check_failure_note", "record_plan_check_failure",
+    "PLAN_CHECK_EVIDENCE_KIND",
 ]

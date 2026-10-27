@@ -1,14 +1,18 @@
 """Crash/stop recovery for the full orbit: `continue_full_job` (tools/
 gb2's `continue`/`approve-design`/`approve-install`) reads the newest
 `job.position` and dispatches through RESUME_TABLE below to whichever
-of these handlers matches that stage -- one per place engine.full_
-orbit_early/_tasks/_release can stop a job (an early station's
-run_station/content gate, a design approval, a build task, the
-acceptance/handoff/security/release tail).
+of these handlers matches that stage -- one per place engine.full_orbit_
+early/_tasks/_release can stop a job (an early station's run_station/
+content gate, a design approval, a build task, the acceptance/handoff/
+security/release tail).
 
-Depends on engine.application.pipeline_base/_runner/_release/_early/_tasks;
-nothing in those four calls back into this module -- this is the only
-one of the five that depends on all the others."""
+Depends on engine.application.pipeline_base/_runner/_release/_early/_tasks/
+_resume_tasks; nothing in those five calls back into this module -- this
+is the only one of the six that depends on all the others. The build-
+task resume chain itself (resume_task/resume_task_owner and everything
+only they call) lives in engine.application.pipeline_resume_tasks, split
+out purely to keep this file under the repo's own line budget -- see
+that module's own docstring."""
 from __future__ import annotations
 
 import json
@@ -20,55 +24,40 @@ from engine.domain import faults
 from engine.application import task_pipeline as orbit
 from engine.config import EngineConfig
 from engine.application.pipeline_base import (
-    BUILDER_ROLE, DESIGNER_ROLE, EARLY_ROLES, FACTS_ROLE, PLANNER_ROLE, PROBER_ROLE,
-    FullOrbitError, FullOutcome, ProgressCallback, Run, checked_facts,
+    DESIGNER_ROLE, EARLY_ROLES, FACTS_ROLE, PLANNER_ROLE, PROBER_ROLE,
+    FullOrbitError, FullOutcome, ProgressCallback, Run, checked_facts, max_fix_rounds,
+    resumed_plan, task_attempt_committed, task_for, unblock_internal_crash,
 )
 from engine.application.pipeline_planning import (
     close_early_attempt_then_tasks, facts_then_rest, maybe_rerun_plan_review,
-    probe_plan_design_close,
+    plan_check_failure_note, plan_review_findings_note, probe_plan_design_close,
 )
 from engine.application.pipeline_release import finalize_release, prepare_release
+from engine.application.pipeline_resume_tasks import (
+    advance_past_task, continue_task_stages, rerun_task_on_new_attempt, rerun_task_owner_stop,
+    resume_task, resume_task_owner,
+)
 from engine.application.pipeline_stages import (
     attempt_has_requests, close_attempt, commit_paths, open_with_intent,
-    record_task_stop, station_outcome_to_full, stops_for_owner,
+    station_outcome_to_full,
 )
-from engine.application.pipeline_tasks import (
-    build_task_gate, finish_after_handoff, finish_from_tasks, install_followup_task_text,
-    run_acceptance_and_handoff, run_task_attempt, task_attempt_config, task_stages,
+from engine.application.pipeline_tasks import finish_after_handoff, run_acceptance_and_handoff
+from engine.domain.stage_checks import (
+    ProbeTargetsError, check_design_approved, check_probe_targets, facts_path,
 )
-from engine.domain.stage_checks import check_design_approved, facts_path
 from engine.domain.records import Event
-from engine.domain.plan import Plan, PlanError, Task, load_plan
+from engine.domain.plan import PlanError, load_plan
 from engine.application.job_state import (
     STAGE_DESIGN, STAGE_DESIGN_APPROVAL, STAGE_EARLY_CLOSE, STAGE_EARLY_STATION, STAGE_FACTS,
     STAGE_PLAN, STAGE_PLAN_REVIEW, STAGE_POST_TASKS, STAGE_PROBE, STAGE_PROBE_RETRY,
     STAGE_RELEASE_APPROVAL, STAGE_REQUIREMENTS_REVIEW, STAGE_SECURITY_FIX, STAGE_SMALL_PLAN,
-    STAGE_TASK, STAGE_TASK_OWNER, JobPosition, outstanding_requests, record_position,
-    resume_job, stages_from_spec, stages_spec, task_stop_position,
+    STAGE_TASK, STAGE_TASK_OWNER, JobPosition, outstanding_requests, resume_job, resume_job_from,
 )
 from engine.application.processor import Fakes
 from engine.application.steps.open_job import copy_root, dirty_paths, open_job
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
-
-
-def task_attempt_committed(ledger: Ledger, project: str, attempt_id: str) -> bool:
-    """True iff `attempt_id`'s own "commit" request reached "done" --
-    the one durable signal that a build task actually finished. Needed
-    because attempt.status alone cannot tell a GENUINELY finished task
-    apart from one fixup.close_failed_attempt closed for a repair (the
-    SAME "closed" status either way): a task whose review/bench failed
-    never reaches the commit stage at all before fixup closes it to
-    archive the work and open a replacement attempt."""
-    for _seq, event in ledger.events(project, "request.submitted"):
-        if event.attempt_id != attempt_id or event.payload.get("kind") != "commit":
-            continue
-        request_id = event.payload.get("request_id")
-        if isinstance(request_id, str) and ledger.request(request_id).status == "done":
-            return True
-    return False
-
 
 
 def abandon_orphaned_requests(ledger: Ledger, project: str, attempt_id: str) -> None:
@@ -95,9 +84,15 @@ def abandon_orphaned_requests(ledger: Ledger, project: str, attempt_id: str) -> 
     "running" request is left untouched -- the caller, _reopen_for_
     retry, has nothing useful to do with that either way: trying again
     later is always safe, since this function runs again on the next
-    attempt-retry."""
+    attempt-retry.
+
+    Also resolves an "unknown" request from an engine-internal crash
+    (unblock_internal_crash -> "running" first) so the "running" branch
+    below fails it out -- else Processor._block_on_unknown would refuse
+    every later request this caller submits (e.g. close_attempt's)."""
     from engine.application.processor import cancel_request
 
+    unblock_internal_crash(ledger, project, attempt_id)
     holder = f"full-orbit-orphan-{attempt_id}"
     have_lock = ledger.acquire_lock(project, holder)
     try:
@@ -123,7 +118,6 @@ def abandon_orphaned_requests(ledger: Ledger, project: str, attempt_id: str) -> 
             ledger.release_lock(project, holder)
 
 
-
 # Marker files close's own archive_tmp writes alongside the archived
 # paths themselves (never part of the real diff) -- same constant
 # engine.application.repair._ARCHIVE_MARKER_FILES defines, duplicated here rather
@@ -131,7 +125,6 @@ def abandon_orphaned_requests(ledger: Ledger, project: str, attempt_id: str) -> 
 # same reasoning fixup.py's own module docstring gives for duplicating
 # engine.application.steps.open_job's equivalent helper instead of reusing it.
 ARCHIVE_MARKER_FILES = {".deleted", ".modes"}
-
 
 
 def archive_dir_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> Path | None:
@@ -242,27 +235,21 @@ def reopen_for_retry(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
     own merge already landed and was committed once on `stale_attempt_id`
     -- engine.application.steps.merge's own base_head check (_verify_destinations_
     unchanged) refuses a SECOND merge of the same path on the SAME
-    attempt, because the repo's HEAD (carrying that first, already-
-    committed probe/plan trail) no longer matches that attempt's fixed
-    base_head: "someone else's committed change landed there since this
-    copy's base" -- true here even though the "someone else" is this
-    very job's own earlier station. A fresh attempt's own base_head is
-    the CURRENT repo HEAD (already including that earlier commit), so
-    the retry's own new merge sees no conflict. Returns (None, the new
-    attempt_id) to keep going, or (the failed FullOutcome to return
-    right now, "").
+    attempt, because the repo's HEAD no longer matches that attempt's
+    fixed base_head ("someone else's committed change landed there
+    since this copy's base" -- true even though the "someone else" is
+    this very job's own earlier station). A fresh attempt's own
+    base_head is the CURRENT repo HEAD, so the retry's own new merge
+    sees no conflict. Returns (None, the new attempt_id) to keep
+    going, or (the failed FullOutcome to return right now, "").
 
     `retry_stage`, when given ("facts"/"probe"/"plan"/"design"), is
     this retry's OWN station -- close's own archive_tmp step already
     copied out every path THAT station's merge had landed uncommitted
-    in the real repo (including, e.g., a probe log an owner hand-edited
-    while the job sat STAGE_PROBE_RETRY needs_owner) before reset_to_
-    head wiped the real repo back to HEAD; overlay_archive_into_copy
-    restores that same content into the fresh attempt's own role copy
-    (RETRY_STAGE_ROLE), so the owner's edit is still there for the
-    retry to see. Without this, close's own archive preserved it only
-    in cold storage -- the owner's edit never actually reached the new
-    attempt at all."""
+    (e.g. a probe log an owner hand-edited while needs_owner) before
+    reset_to_head wiped the repo back to HEAD; overlay_archive_into_copy
+    restores it into the fresh role copy (RETRY_STAGE_ROLE) -- else the
+    owner's edit never reaches the new attempt."""
     # A genuine crash (as opposed to the two pre-existing callers' own
     # terminal "failed"/"done" stop) can leave ONE request for
     # `stale_attempt_id` still "running" -- engine.application.processor.Processor.
@@ -370,30 +357,26 @@ def continue_full_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
                       processor_factory=processor_factory)
 
 
+def continue_full_job_from(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
+                           job_name: str, from_station: str, *,
+                           on_progress: ProgressCallback | None = None,
+                           processor_factory: orbit.ProcessorFactory | None = None) -> FullOutcome:
+    """engine.application.job_state.resume_job_from under the name
+    tools/gb2 calls (`gb2 continue <app> --from <station>`) -- see
+    force_reopen_station's own docstring for what this is for."""
+    return resume_job_from(config, ledger, fakes, project, job_name, from_station,
+                           on_progress=on_progress, processor_factory=processor_factory)
+
+
 
 # ---------------------------------------------------------------------
 # resume handlers -- one per position stage, dispatched by
 # engine.application.job_state.resume_job through RESUME_TABLE
+# (max_fix_rounds/task_for/resumed_plan/unblock_internal_crash:
+# engine.application.pipeline_base; the build-task chain itself --
+# resume_task/resume_task_owner and everything only they call --
+# engine.application.pipeline_resume_tasks; both imported above)
 # ---------------------------------------------------------------------
-
-def max_fix_rounds(pos: JobPosition) -> int:
-    return pos.max_fix_rounds
-
-
-
-def task_for(plan: Plan, task_id: str, fixing: bool) -> Task:
-    """The Task a position names: an acceptance-fix round's synthesized
-    task (owning every plan task's paths), or the plan's own task."""
-    if fixing:
-        all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
-        return Task(id=task_id, title="수락 실패 수정", detail="", owns=all_owns, depends_on=())
-    by_id = {t.id: t for t in plan.tasks}
-    task = by_id.get(task_id)
-    if task is None:
-        raise FullOrbitError(f"unknown task id for resume: {task_id!r}")
-    return task
-
-
 
 BEFORE_PLAN_STAGES = frozenset({
     STAGE_FACTS, STAGE_PROBE, STAGE_PLAN, STAGE_PROBE_RETRY, STAGE_PLAN_REVIEW, STAGE_SMALL_PLAN,
@@ -417,35 +400,6 @@ def resumed_plan_stop(run: Run, pos: JobPosition) -> FullOutcome | None:
 
 
 
-def resumed_plan(run: Run, pos: JobPosition) -> tuple[FullOutcome | None, Plan | None]:
-    """The committed plan, or the failed outcome when it cannot be
-    loaded. The plan was already checked against its review before the
-    resume dispatched (resumed_plan_stop)."""
-    try:
-        plan = load_plan(run.repo, run.job)
-    except PlanError as exc:
-        return FullOutcome("failed", f"plan:{exc.reason}", pos.attempt_id, None), None
-    return None, plan
-
-
-
-def advance_past_task(run: Run, pos: JobPosition, plan: Plan,
-                       attempt_id: str | None) -> FullOutcome:
-    """The task `pos` names has finished on `attempt_id`: continue with the
-    acceptance-fix loop (an acceptance-fix round) or the tasks still
-    queued behind it."""
-    if pos.fixing:
-        return run_acceptance_and_handoff(run.config, run.ledger, run.fakes, run.project,
-                                           run.job, plan, max_fix_rounds(pos), run.on_progress,
-                                           run.processor_factory, attempt_id)
-    by_id = {t.id: t for t in plan.tasks}
-    remaining = [by_id[i] for i in pos.remaining_task_ids[1:] if i in by_id]
-    return finish_from_tasks(run.config, run.ledger, run.fakes, run.project, run.job, plan,
-                              remaining, max_fix_rounds(pos), run.on_progress,
-                              run.processor_factory, attempt_id)
-
-
-
 STATION_STAGE = {
     "facts": STAGE_FACTS, "probe": STAGE_PROBE, "plan": STAGE_PLAN, "design": STAGE_DESIGN,
 }
@@ -458,6 +412,36 @@ REOPEN_STATION = {
 }
 
 
+def _facts_still_invalid(run: Run, pos: JobPosition) -> bool:
+    """True iff facts.md, as it stands in the repo RIGHT NOW, still
+    raises ProbeTargetsError -- i.e. nobody (owner or a previous facts
+    worker) has fixed the malformed "## 외부 대상" line since this
+    STAGE_PROBE_RETRY stop was recorded. False (facts.md is fine now,
+    or missing -- the facts gate, not this one, handles that) means
+    the ordinary "probe" reopen already handles an owner's repair."""
+    try:
+        check_probe_targets(run.repo, run.job)
+    except ProbeTargetsError:
+        return True
+    return False
+
+
+def _prior_plan_notes(ledger: "Ledger", project: str, attempt_id: str) -> str:
+    """Both kinds of "carry the last failure forward" note a reopened
+    "plan" station's prompt gets prepended with: plan_review_findings_
+    note (a reviewer rejected an otherwise-parseable plan.json) and
+    plan_check_failure_note (결함 30 -- load_plan/validate_plan itself
+    rejected it, before any reviewer ever ran). Only one is ever
+    non-empty for a given attempt -- a plan.json that failed to parse
+    or validate never reaches the review step at all -- but both are
+    concatenated rather than picked between, so neither caller needs to
+    know which one applies."""
+    review_note = plan_review_findings_note(ledger, project, attempt_id)
+    check_note = plan_check_failure_note(ledger, project, attempt_id)
+    if review_note and check_note:
+        return f"{review_note}\n\n{check_note}"
+    return review_note or check_note
+
 
 def _resume_reopened_station(run: Run, pos: JobPosition) -> FullOutcome:
     """A facts/probe/plan/design station that crashed, failed, or stopped
@@ -466,9 +450,35 @@ def _resume_reopened_station(run: Run, pos: JobPosition) -> FullOutcome:
     overlaid into the new copy, see reopen_for_retry) because merge's
     own base_head check refuses a second merge of a path the job already
     committed on that attempt. Every early-station role gets a copy, so
-    a small job (planner copy only) resumes here as a full job."""
+    a small job (planner copy only) resumes here as a full job. A
+    "plan" reopen also carries the stale attempt's review findings
+    into the new planner's prompt (see plan_review_findings_note).
+
+    A STAGE_PROBE_RETRY position whose stop_reason starts with
+    "probe_targets_invalid:" (engine.domain.stage_checks.
+    ProbeTargetsError -- facts.md's own "## 외부 대상" section has a
+    malformed line) reopens "facts" instead of REOPEN_STATION's plain
+    "probe" -- but ONLY if facts.md, as it stands in the repo RIGHT
+    NOW, is STILL malformed (check_probe_targets still raises). An
+    owner who already hand-repaired facts.md in the repo while the job
+    sat needs_owner (reopen_for_retry's own retry_stage=="probe"
+    branch below promotes exactly that edit into the job trail) must
+    keep reopening "probe" as before -- redirecting that case to
+    "facts" too would discard the owner's already-good repair and ask
+    a facts worker to redo work that is already done. Only when
+    nobody has fixed it yet does reopening "probe" again just
+    reproduce the SAME ProbeTargetsError forever, with no progress --
+    that is the case this redirects to a facts worker turn instead.
+    Every other STAGE_PROBE_RETRY stop (a real probe script failure,
+    stage_checks.check_probe's own "PROBE OK" miss) is untouched."""
     station = REOPEN_STATION[pos.stage]
+    if (pos.stage == STAGE_PROBE_RETRY and isinstance(pos.stop_reason, str)
+            and pos.stop_reason.startswith("probe_targets_invalid:")
+            and _facts_still_invalid(run, pos)):
+        station = "facts"
     request = str(pos.get("request", ""))
+    prior_findings_note = (_prior_plan_notes(run.ledger, run.project, pos.attempt_id or "")
+                           if station == "plan" else "")
     intent = JobPosition(job=run.job, stage=STATION_STAGE[station], attempt_id=None,
                          extra={k: v for k, v in pos.extra.items()
                                 if k in ("request", "probe_text", "max_fix_rounds",
@@ -484,23 +494,114 @@ def _resume_reopened_station(run: Run, pos: JobPosition) -> FullOutcome:
     return probe_plan_design_close(run.config, run.ledger, run.fakes, run.project, run.job,
                                     attempt_id, request, max_fix_rounds(pos), run.on_progress,
                                     run.processor_factory, start=station,
-                                    probe_text=str(pos.get("probe_text", "")))
+                                    probe_text=str(pos.get("probe_text", "")),
+                                    prior_findings_note=prior_findings_note)
 
 
 resume_reopened_station = _resume_reopened_station
 
+
+class ForceReopenError(FullOrbitError):
+    """Raised by force_reopen_station -- `gb2 continue <app> --from
+    <station>` refused outright, nothing changed. Distinct from
+    FullOrbitError's other plain uses so a CLI caller can catch this
+    one specifically and print its message rather than a traceback."""
+
+
+_EARLY_STATION_ORDER = ("facts", "probe", "plan", "design")
+
+
+def _current_early_station(pos: JobPosition) -> str | None:
+    """The station name `pos`'s current stop corresponds to, iff `pos`
+    is stopped at an early station (facts/probe/plan/design) -- via
+    REOPEN_STATION (STAGE_FACTS/PROBE/PLAN/DESIGN direct, plus
+    STAGE_PROBE_RETRY/STAGE_PLAN_REVIEW), or via STAGE_EARLY_STATION's
+    own "station" field (a run_station owner-request stop). None for
+    every other stage -- everything from STAGE_DESIGN_APPROVAL onward
+    is the build stage (docs/v2.md 「궤도 9칸」), where force_reopen_
+    station refuses outright."""
+    if pos.stage in REOPEN_STATION:
+        return REOPEN_STATION[pos.stage]
+    if pos.stage == STAGE_EARLY_STATION:
+        station = str(pos.get("station", ""))
+        return station if station in _EARLY_STATION_ORDER else None
+    return None
+
+
+def force_reopen_station(run: Run, pos: JobPosition, from_station: str) -> FullOutcome:
+    """`gb2 continue <app> --from <station>`: the owner naming an early
+    station to reopen from, EARLIER than (or equal to) the one `pos` is
+    currently stopped at -- the escape hatch for a real stuck job
+    (결함 24,, 마케팅 채팅 job): an owner/foreman decision
+    made AFTER facts.md was written dropped one probe target
+    (systemctl service status) from scope, but the probe station
+    cannot edit facts.md (station_record_prefixes reserves facts.md to
+    the "facts" station alone, 결함 12) and the ordinary `gb2 continue`
+    only ever reruns "probe" on a probe_failed/STAGE_PROBE_RETRY stop
+    (_resume_reopened_station) -- so there was no way to ever remove
+    that target from facts.md's own "## 외부 대상" section, and
+    reopening "probe" again just reproduces the exact same scope
+    forever. This reopens "facts" instead so the owner's edited
+    facts.md (with the target removed) becomes the job's real input,
+    then runs the rest of the early stations (probe/plan/[design])
+    the same way _resume_reopened_station already does.
+
+    Raises ForceReopenError (nothing changed -- no new position is
+    recorded) when:
+      - `pos` is not currently stopped at an early station at all (the
+        build stage, from STAGE_DESIGN_APPROVAL onward -- a crashed or
+        stopped build task has its own recovery through RESUME_TABLE,
+        never this escape hatch);
+      - `from_station` is not one of _EARLY_STATION_ORDER;
+      - `from_station` is LATER than `pos`'s own current station in
+        _EARLY_STATION_ORDER (an owner can only go BACK to an earlier
+        station they already passed, never skip ahead -- that is what
+        the ordinary resume already does)."""
+    current = _current_early_station(pos)
+    if current is None:
+        raise ForceReopenError(
+            f"build stage에서는 --from을 쓸 수 없다: stage={pos.stage!r}")
+    if from_station not in _EARLY_STATION_ORDER:
+        raise ForceReopenError(f"알 수 없는 station: {from_station!r}")
+    if _EARLY_STATION_ORDER.index(from_station) > _EARLY_STATION_ORDER.index(current):
+        raise ForceReopenError(
+            f"{from_station!r}은 현재 위치({current!r})보다 뒤 칸이라 되돌릴 수 없다")
+    request = str(pos.get("request", ""))
+    prior_findings_note = (_prior_plan_notes(run.ledger, run.project, pos.attempt_id or "")
+                           if from_station == "plan" else "")
+    intent = JobPosition(job=run.job, stage=STATION_STAGE[from_station], attempt_id=None,
+                         extra={k: v for k, v in pos.extra.items()
+                                if k in ("request", "probe_text", "max_fix_rounds",
+                                         "restore_from")})
+    failed, attempt_id = reopen_for_retry(run.config, run.ledger, run.fakes, run.project,
+                                           run.job, pos.attempt_id or "", run.on_progress,
+                                           run.processor_factory, retry_stage=from_station,
+                                           intent=intent)
+    if failed is not None:
+        return failed
+    if from_station == "facts":
+        return facts_then_rest(run, attempt_id, request, max_fix_rounds(pos))
+    return probe_plan_design_close(run.config, run.ledger, run.fakes, run.project, run.job,
+                                    attempt_id, request, max_fix_rounds(pos), run.on_progress,
+                                    run.processor_factory, start=from_station,
+                                    probe_text=str(pos.get("probe_text", "")),
+                                    prior_findings_note=prior_findings_note)
 
 
 def resume_early_station(run: Run, pos: JobPosition) -> FullOutcome:
     """A facts/probe/plan/design run_station stop reruns that station on
     the SAME attempt once every owner request it made is fulfilled, with
     a continuation note when there were requests (the earlier run_station
-    request is already "done", so an unchanged prompt would never run)."""
+    request is already "done", so an unchanged prompt would never run).
+    An internal-crash stop (stop_reason "internal:...") unblocks that
+    request first (unblock_internal_crash)."""
+    attempt_id = pos.attempt_id or ""
+    if isinstance(pos.stop_reason, str) and pos.stop_reason.startswith("internal:"):
+        unblock_internal_crash(run.ledger, run.project, attempt_id)
     if outstanding_requests(run.ledger, run.project, pos, repo=run.repo):
         return FullOutcome("needs_owner", "owner_request", pos.attempt_id, None)
     station = str(pos.get("station", ""))
     request = str(pos.get("request", ""))
-    attempt_id = pos.attempt_id or ""
     needs_note = bool(pos.pending_requests)
     if station == "facts":
         return facts_then_rest(run, attempt_id, request, max_fix_rounds(pos),
@@ -625,113 +726,10 @@ def resume_release_approval(run: Run, pos: JobPosition) -> FullOutcome:
 
 
 
-def resume_task(run: Run, pos: JobPosition) -> FullOutcome:
-    """A task position with no stop recorded: the task crashed, or its
-    attempt ended at an ordinary "failed". A closed attempt either
-    committed (the task finished -- advance) or was closed without
-    committing (abandoned, or closed for a repair that never opened its
-    replacement -- rerun the task from scratch on a new attempt). An
-    active attempt reruns its build on the same attempt; the idempotent
-    request ids skip whatever already finished."""
-    stop, plan = resumed_plan(run, pos)
-    if plan is None:
-        return stop  # type: ignore[return-value]
-    attempt_id = pos.attempt_id or ""
-    if attempt_id and run.ledger.attempt(attempt_id).status in ("closed", "abandoned"):
-        if task_attempt_committed(run.ledger, run.project, attempt_id):
-            return advance_past_task(run, pos, plan, attempt_id)
-        return rerun_task_on_new_attempt(run, pos, plan)
-    return rerun_task_owner_stop(run, pos, plan, crash=True)
-
-
-
-def rerun_task_on_new_attempt(run: Run, pos: JobPosition, plan: Plan) -> FullOutcome:
-    task = task_for(plan, pos.task_id or "", pos.fixing)
-    task_text = str(pos.get("task_text", ""))
-    base_task_text = str(pos.get("base_task_text", task_text))
-    outcome = run_task_attempt(run.config, run.ledger, run.fakes, run.project, run.job, task,
-                                task_text, plan, run.on_progress, run.processor_factory,
-                                base_task_text, fixing=pos.fixing,
-                                remaining_task_ids=pos.remaining_task_ids,
-                                max_fix_rounds=max_fix_rounds(pos))
-    full = station_outcome_to_full(outcome, "build")
-    if full is not None:
-        return full
-    return advance_past_task(run, pos, plan, outcome.attempt_id)
-
-
-
-def resume_task_owner(run: Run, pos: JobPosition) -> FullOutcome:
-    stop, plan = resumed_plan(run, pos)
-    if plan is None:
-        return stop  # type: ignore[return-value]
-    return rerun_task_owner_stop(run, pos, plan, crash=False)
-
-
-
-def rerun_task_owner_stop(run: Run, pos: JobPosition, plan: Plan, *,
-                           crash: bool) -> FullOutcome:
-    """Continues a build task on its SAME attempt/copy:
-    - a required-context gap rebuilds and rechecks the context first;
-    - a crash submits the task's own stage list again (task_stages):
-      every request that already finished reconciles by its id;
-    - worker_stuck reruns the build from scratch;
-    - a fulfilled owner request reruns run_station with a note that the
-      install is done and the already-changed files to read first.
-    An owner request that is still outstanding stays needs_owner."""
-    if outstanding_requests(run.ledger, run.project, pos, repo=run.repo):
-        return FullOutcome("needs_owner", "owner_request", pos.attempt_id, None)
-    attempt_id = pos.attempt_id or ""
-    base_task_text = str(pos.get("base_task_text", pos.get("task_text", "")))
-    task_text = str(pos.get("task_text", base_task_text))
-    task = task_for(plan, pos.task_id or "", pos.fixing)
-    run_config = task_attempt_config(run.config, run.project, run.job, plan)
-    spec = pos.get("stages")
-    if not isinstance(spec, list):
-        # A position recorded before stage specs were: rebuild the same list.
-        spec = stages_spec(task_stages(run.config, run_config, run.ledger, run.project, run.job,
-                                        plan, task, task_text, base_task_text, attempt_id))
-    if crash:
-        stages = stages_from_spec(spec, run_config, attempt_id)
-        return continue_task_stages(run, pos, plan, run_config, stages, task_text)
-    if pos.get("context_gap"):
-        gap_gate = build_task_gate(run.config, run.ledger, run.project, plan, base_task_text,
-                                   attempt_id)
-        if gap_gate.unmet is not None:
-            record_position(run.ledger, run.project, task_stop_position(
-                pos, attempt_id, gap_gate.unmet, (), context_gap=True))
-            return FullOutcome("needs_owner", gap_gate.unmet, attempt_id, None)
-        task_text = gap_gate.prompt(base_task_text)
-        run_station_text = task_text
-    elif pos.stop_reason == "worker_stuck":
-        run_station_text = task_text
-    else:
-        build_copy = copy_root(run_config, attempt_id, BUILDER_ROLE)
-        run_station_text = install_followup_task_text(task_text, build_copy)
-    merge_retry_n = sum(1 for _seq, event in run.ledger.events(run.project, "merge.recorded")
-                        if event.attempt_id == attempt_id)
-    stages = stages_from_spec(spec, run_config, attempt_id, task_text=run_station_text,
-                              merge_retry_n=merge_retry_n)
-    return continue_task_stages(run, pos, plan, run_config, stages, task_text)
-
-
-
-def continue_task_stages(run: Run, pos: JobPosition, plan: Plan, run_config: EngineConfig,
-                          stages: list[orbit.Stage], task_text: str) -> FullOutcome:
-    """Runs a resumed task's stages on its own attempt, records a new
-    owner stop if it makes one, and otherwise moves past the task."""
-    attempt_id = pos.attempt_id or ""
-    outcome = orbit.continue_job(run_config, run.ledger, run.fakes_for(attempt_id), run.project,
-                                 attempt_id, stages, processor_factory=run.processor_factory,
-                                 on_progress=run.on_progress)
-    if stops_for_owner(outcome):
-        task_pos = replace(pos, extra={**{k: v for k, v in pos.extra.items()
-                                          if k != "context_gap"}, "task_text": task_text})
-        record_task_stop(run.ledger, run.project, task_pos, outcome)
-    full = station_outcome_to_full(outcome, "build")
-    if full is not None:
-        return full
-    return advance_past_task(run, pos, plan, attempt_id)
+# resume_task/rerun_task_on_new_attempt/resume_task_owner/
+# rerun_task_owner_stop/continue_task_stages now live in
+# engine.application.pipeline_resume_tasks (imported above) -- see that
+# module's own docstring for why.
 
 
 RESUME_TABLE: dict[str, Callable[[Run, JobPosition], FullOutcome]] = {
@@ -757,7 +755,8 @@ RESUME_TABLE: dict[str, Callable[[Run, JobPosition], FullOutcome]] = {
 __all__ = [
     "continue_full_job", "resumed_plan_stop", "RESUME_TABLE", "overlay_archive_into_copy",
     "abandon_orphaned_requests", "archive_dir_for_attempt", "archive_has_content",
+    "unblock_internal_crash", "plan_review_findings_note",
     "STAGE_DESIGN_APPROVAL", "STAGE_TASK_OWNER", "STAGE_PROBE_RETRY", "STAGE_PLAN_REVIEW",
     "STAGE_REQUIREMENTS_REVIEW", "STAGE_SECURITY_FIX", "STAGE_RELEASE_APPROVAL",
-    "STAGE_EARLY_STATION",
+    "STAGE_EARLY_STATION", "force_reopen_station", "ForceReopenError", "continue_full_job_from",
 ]

@@ -511,6 +511,7 @@ def test_run_once_unexpected_exception_fails_request_and_continues(tmp_path: Pat
     req1 = ledger.request(rid1)
     assert req1.status == "failed"
     assert req1.result["reason"].startswith("internal:")
+    assert req1.result["detail"] == "'missing_field'"
     req2 = ledger.request(rid2)
     assert req2.status == "done"
 
@@ -539,6 +540,7 @@ def test_exception_after_dispatch_step_becomes_unknown_not_failed(tmp_path: Path
     req = ledger.request(rid)
     assert req.status == "unknown"
     assert req.result["reason"] == "internal:PermissionError"
+    assert req.result["detail"] == "artifact dir not writable"
     assert ledger.steps(rid)["call_publisher"].status == "done"
 
 
@@ -564,7 +566,34 @@ def test_exception_before_dispatch_step_still_fails(tmp_path: Path) -> None:
     req = ledger.request(rid)
     assert req.status == "failed"
     assert req.result["reason"] == "internal:PermissionError"
+    assert req.result["detail"] == "artifact dir not writable"
     assert "call_publisher" not in ledger.steps(rid)
+
+
+def test_internal_failure_detail_is_truncated_to_300_chars(tmp_path: Path) -> None:
+    """S25: an internal:<Type> reason alone (previously the only thing
+    recorded) gave no clue what actually broke -- the real incident this
+    closes (a spawn's exec failing with E2BIG over a 169,674-byte task
+    prompt) only ever showed up as 'internal:OSError'. The exception
+    message's first 300 chars are now kept as 'detail' alongside it."""
+    ledger = _ledger(tmp_path)
+    attempt_id = _open_attempt(ledger)
+    rid = submit(ledger, "alpha", attempt_id, "publish", {}, "owner")
+
+    long_message = "z" * 500
+
+    def boom(ctx: object) -> dict[str, object]:
+        raise OSError(long_message)
+
+    proc = _processor(ledger)
+    proc.register("publish", lambda ctx: [StepDef("only", boom, lambda c: False)])
+    n = proc.run_once("alpha")
+    assert n == 0
+    req = ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result["reason"] == "internal:OSError"
+    assert req.result["detail"] == long_message[:300]
+    assert len(req.result["detail"]) == 300
 
 
 def test_resume_in_recovering_state_allowed_for_mid_flight_request(workspace: Workspace) -> None:

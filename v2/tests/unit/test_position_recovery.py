@@ -342,6 +342,46 @@ def test_e_owner_repaired_facts_reach_the_probe_retry_gate(
     assert (ws.alpha / f".gongbang/{job_name}/facts.md").read_text(encoding="utf-8") == _FACTS_MD
 
 
+# ---- (d) 결함 12: nobody repaired facts.md -- continue reruns facts ------
+
+def test_d_probe_targets_invalid_without_owner_repair_reopens_facts_station(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike (e) above, nobody touches facts.md by hand before `gb2
+    continue` runs -- check_probe_targets' error is still live. Resume
+    must give a FRESH facts worker turn a chance to fix it, not just
+    reopen "probe" again onto the exact same malformed file forever
+    (결함 12,: "probe_targets_invalid로 멈춘 경우 재개 길도
+    막힘"). The stub's "facts" queue has a SECOND entry (the first,
+    malformed one was already consumed by the initial run) -- its
+    presence being consumed at all is the proof a facts worker reran."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "facts-repair-auto"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    malformed = "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n- stripe 문서 없음\n"
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": malformed},
+                  {f".gongbang/{job_name}/facts.md": _FACTS_MD}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+    first = full_orbit.run_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
+                                    "파일 하나 만들어줘", processor_factory=_factory(stub))
+    assert first.status == "needs_owner", first
+    assert first.reason is not None and first.reason.startswith("probe_targets_invalid")
+
+    resumed = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
+                                           processor_factory=_factory(stub))
+
+    assert resumed.status == "done", resumed
+    assert stub.calls.count(("facts", "facts")) == 2
+    assert (ws.alpha / f".gongbang/{job_name}/facts.md").read_text(encoding="utf-8") == _FACTS_MD
+
+
 # ---- (f) owner fulfillment is bound to the proposal ----------------------
 
 _INSTALL = {"kind": "install", "manifest": "package.json",

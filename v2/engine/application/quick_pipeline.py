@@ -264,7 +264,8 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     durations: dict[str, float] = {}
 
     started = time.monotonic()
-    prompt = small_prompt(request, job_name, skill_catalog_text(config))
+    prompt = small_prompt(request, job_name, skill_catalog_text(config),
+                          full_orbit.build_prefixes(config), config.projects[project].manifest)
     # No planned_skills -- same convention engine.application.pipeline._run_plan_
     # and_review uses for the planner station: the planner has not run
     # yet, so there is no plan to read usable skills back from.
@@ -283,9 +284,22 @@ def _run_from_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     task_text = plan_gate.prompt(prompt)
     task_text = full_orbit.append_owner_request_resume_note(
         config, attempt_id, PLANNING_ROLE, task_text, needs_resume_note)
+    # This ONE worker turn writes BOTH facts.md (station "facts"'s own
+    # record) AND plan.json (+ tests/scenes/, station "plan"'s own
+    # record) -- never two separate merge calls. An explicit "owns"
+    # naming both is what tells merge.py's own
+    # other_station_record_violation (engine.domain.stage_checks) this
+    # is a deliberate, engine-declared combined record, not a "plan"
+    # copy quietly overwriting "facts"'s record the way a real prober
+    # once did by accident (결함 12, -- without it, merge
+    # would reject facts.md here as wrote_other_station_record even
+    # though writing it is this fast path's whole point.
+    combined_owns = [f".gongbang/{job_name}/facts.md", f".gongbang/{job_name}/plan.json",
+                      "tests/scenes/"]
     station_outcome = full_orbit.run_and_merge(
         config, ledger, fakes, project, attempt_id, PLANNING_STATION, PLANNING_ROLE,
-        task_text, on_progress, processor_factory)
+        task_text, on_progress, processor_factory,
+        extra_payload={"owns": combined_owns})
 
     # One wall-clock bucket for the whole planning phase (the combined
     # worker call plus every gate/validation/review step below, up to

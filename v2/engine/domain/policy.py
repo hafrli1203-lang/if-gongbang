@@ -14,11 +14,14 @@ Rules (first match wins) — see plan §4:
     (e.g. Read with no file_path falling back to some other cwd) must
     never be allowed through by default; the sensitive-area denial above
     applies first (it also protects those areas from inside the worker's
-    own copy); copy_root=None is denied ("no_copy_root"); otherwise the
-    read is allowed only if realpath(path) is under realpath(copy_root)
-    ("read_within_copy"), else denied ("read_outside_copy") -- a worker
-    cannot read anything outside its own sandboxed copy, including the
-    operator's ~/.claude, other projects, or the real project repo.
+    own copy); otherwise allowed if realpath(path) is under realpath(
+    copy_root) ("read_within_copy") OR under THIS ATTEMPT's own
+    reference-folder snapshot directory (engine.domain.ids.
+    references_root; "read_within_reference_snapshot" -- see engine.
+    infrastructure.reference_snapshot), else denied ("no_copy_root" if
+    copy_root itself is None, else "read_outside_copy") -- a worker
+    cannot read anything else outside its own sandboxed copy, including
+    the operator's ~/.claude, other projects, or the real project repo.
  2. worker write/terminal/mcp/browser/publish/install/commit: denied unless
     project state is OPEN.
  3. worker with generation < project generation: denied (stale worker).
@@ -272,6 +275,50 @@ def owns_within_prefixes(owns: tuple[str, ...], prefixes: tuple[str, ...]) -> bo
     return all(any(_prefix_covers(p, entry) for p in prefixes) for entry in owns)
 
 
+# Spliced verbatim into engine.application.stage_prompts.builder_task_text,
+# right next to the owns-scope sentence it already builds from
+# task.owns, so the words a builder is told and the boundary this rule
+# (owns, read by engine.application.steps.worker_gate_log.task_owns for
+# the live gate, re-checked by owns_within_prefixes above and by
+# engine.application.steps.merge._owner_prefixes at merge time) actually
+# enforces can never drift apart -- same bd38249 pattern every other
+# *_RULE constant in this codebase follows. 결함 26,
+# sample-app): a build task removed a field it owned, but the only
+# consumer of that field was outside ANY task's `owns` -- the builder
+# never said so, so the fix a later review demanded could never
+# actually land (merge drops a write outside `owns` silently, never a
+# failure), and the SAME finding kept coming back on every `gb2 fix`
+# until an owner noticed by hand and ran `gb2 fix --also-own` (engine.
+# application.repair.add_also_own). Telling the builder to report
+# instead of silently skipping the file (or writing it anyway, which
+# merge would just drop) is what gives the owner the chance to do that
+# sooner -- via the existing WorkerResult.requests channel every
+# runner already reports through (engine.infrastructure.workers.base).
+#
+# 결함 31, sample-app T4): the sentence below used to leave the
+# `requests` entry's own shape unsaid, so a builder invented its own
+# kind ("out_of_scope_followup") for the exact same report -- the
+# engine knows no such kind, and approve_pending_edit (engine.
+# application.repair_approval) only ever matched `kind="edit"`, so none
+# of the three stayed approvable at all. Spelling out the literal JSON
+# shape here is bd38249's own pattern: the words a builder is told and
+# the shape engine.application.repair_target.EDIT_REQUEST_KIND,
+# job_state._request_fulfilled and repair_approval.approve_pending_edit
+# actually read can never drift apart. is_owns_scope_request
+# (repair_target.py) still tolerates an unknown "kind" carrying the same
+# "path" -- a builder should simply never need to invent one now that
+# the exact shape is given.
+OWNS_SCOPE_REQUEST_RULE = (
+    'owns 밖의 파일을 고쳐야 하면 직접 고치지 않는다 -- requests에 '
+    '{"kind": "edit", "path": "<repo-relative path>", "reason": "<why>"} '
+    "형태로 그 경로와 이유를 적어 보고한다. 결정이 필요 없는 정보(다음 작업이 알아야 할 것)는 "
+    '{"kind": "note", "detail": "<내용>"}으로 남긴다 -- note는 작업을 멈추지 않는다.'
+)
+
+# Informational request kind: recorded, never blocks the job (결함 33).
+NOTE_REQUEST_KIND = "note"
+
+
 def _within_allowed_prefix(copy_root: Path, prefixes: tuple[str, ...], path: Path) -> bool:
     # copy_root itself is resolved (it is the trusted boundary), but the
     # prefix suffix is deliberately NOT resolved before joining: resolving
@@ -450,20 +497,34 @@ class Policy:
         if actor.kind != "worker":
             return Decision(True, "read_allowed")
 
-        # Worker read is bounded to its own copy (see module docstring
-        # rule 1): a worker is a real process that inherits the
-        # operator's HOME, so a path-less read or a read of anything
-        # outside its sandboxed copy must never be allowed by default.
+        # Worker read is bounded to its own copy, OR this
+        # attempt's own reference-folder snapshot (see module docstring
+        # rule 1 and engine.infrastructure.reference_snapshot): a worker
+        # is a real process that inherits the operator's HOME, so a
+        # path-less read or a read of anything outside BOTH of those
+        # must never be allowed by default. Sensitive-area denial is
+        # checked first, before either allowance, and applies equally
+        # inside a reference snapshot -- there is nothing sensitive
+        # under it (only engine-copied, filtered, read-only material),
+        # but the ordering itself must never change.
         if action.path is None:
             return Decision(False, "read_requires_path")
         if self._protected_for_actor(project, actor, action.path):
             return Decision(False, "worker_read_denied_sensitive_area")
+        real = Path(os.path.realpath(action.path))
+        if actor.copy_root is not None:
+            copy_root_real = Path(os.path.realpath(actor.copy_root))
+            if real == copy_root_real or _is_under(real, copy_root_real):
+                return Decision(True, "read_within_copy")
+        if actor.attempt_id is not None:
+            from engine.domain.ids import references_root
+
+            snapshot_root = Path(os.path.realpath(
+                references_root(self.config.home, actor.attempt_id)))
+            if real == snapshot_root or _is_under(real, snapshot_root):
+                return Decision(True, "read_within_reference_snapshot")
         if actor.copy_root is None:
             return Decision(False, "no_copy_root")
-        real = Path(os.path.realpath(action.path))
-        copy_root_real = Path(os.path.realpath(actor.copy_root))
-        if real == copy_root_real or _is_under(real, copy_root_real):
-            return Decision(True, "read_within_copy")
         return Decision(False, "read_outside_copy")
 
     def _decide_worker_write(self, project: str, actor: Actor, action: Action) -> Decision:

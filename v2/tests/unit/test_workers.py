@@ -49,6 +49,21 @@ def _spec(tmp_path: Path, task: str = "do the thing") -> WorkerSpec:
 
 # ---- ClaudeRunner ----------------------------------------------------
 
+def test_claude_argv_never_embeds_the_task_text(tmp_path: Path) -> None:
+    """A real task prompt (170KB performance-ads job, exceeded
+    Linux's MAX_ARG_STRLEN (131,072 bytes) as a single argv element and
+    made exec itself fail with E2BIG. `claude -p` with no prompt
+    argument reads the prompt from stdin instead -- spec.task must
+    never appear anywhere in argv, regardless of its length."""
+    long_task = "x" * 200_000
+    spec = _spec(tmp_path, task=long_task)
+    argv = ClaudeRunner().argv(spec, WorkerConfig(runner="claude"))
+
+    assert long_task not in argv
+    assert argv[0:2] == ["claude", "-p"]
+    assert ClaudeRunner.prompt_via_stdin is True
+
+
 def test_claude_argv_has_no_user_settings(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     worker = WorkerConfig(runner="claude", model="claude-sonnet-5",
@@ -273,7 +288,12 @@ def test_codex_argv_read_only_and_schema(tmp_path: Path) -> None:
     assert "--skip-git-repo-check" in argv
     assert argv[argv.index("-C") + 1] == str(spec.workdir)
     assert argv[argv.index("-c") + 1] == 'model_reasoning_effort="low"'
-    assert argv[-1] == "review this diff"
+    # The prompt reaches codex over stdin, not as an argv element (a
+    # real review prompt can exceed Linux's MAX_ARG_STRLEN -- see
+    # CodexRunner.prompt_via_stdin's own docstring) -- a bare "-" in
+    # the prompt's own argv position tells codex to read it from stdin.
+    assert argv[-1] == "-"
+    assert CodexRunner.prompt_via_stdin is True
     schema_path = Path(argv[argv.index("--output-schema") + 1])
     assert schema_path.exists()
     schema = json.loads(schema_path.read_text(encoding="utf-8"))

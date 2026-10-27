@@ -128,6 +128,91 @@ def test_decision_item_missing_file_is_skipped(tmp_path: Path) -> None:
     assert ctx.items == ()
 
 
+# ---------------------------------------------------------------------------
+# reference_paths (ProjectConfig.reference_paths): every station's prompt
+# gets a "참고 자료 폴더" item listing, for each configured path, the
+# ORIGINAL folder's own name alongside the SNAPSHOT path that will/does
+# actually get mounted (engine.infrastructure.reference_snapshot) --
+# never the configured source path itself. See
+# engine.infrastructure.context._reference_item.
+# ---------------------------------------------------------------------------
+
+class _StubProject:
+    def __init__(self, reference_paths: tuple[Path, ...]) -> None:
+        self.reference_paths = reference_paths
+
+
+class _StubConfigWithProjects:
+    """A minimal stand-in carrying `.context` (None here -- these tests
+    only exercise reference_paths, not library/decision/skill),
+    `.projects` and `.home` (_reference_item needs `.home` to compute
+    the pure, no-I/O snapshot path via engine.domain.ids.
+    references_root)."""
+
+    def __init__(self, projects: dict[str, _StubProject], home: Path) -> None:
+        self.context = None
+        self.projects = projects
+        self.home = home
+
+
+def test_reference_item_included_when_paths_configured(tmp_path: Path) -> None:
+    material = tmp_path / "material"
+    config = _StubConfigWithProjects({"alpha": _StubProject((material,))}, tmp_path / "home")
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id="J-alpha-ABC#1")
+    assert len(ctx.items) == 1
+    item = ctx.items[0]
+    assert item.kind == "reference"
+    assert item.trust == "approved"
+    assert "참고 자료 폴더" in item.text
+    assert "material" in item.text  # the original folder's own name
+    assert str(tmp_path / "home" / "references" / "J-alpha-ABC-1" / "0-material") in item.text
+    assert str(material) not in item.text  # never the source path itself
+
+
+def test_reference_item_lists_every_configured_path(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    config = _StubConfigWithProjects({"alpha": _StubProject((first, second))}, tmp_path / "home")
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id="J-alpha-ABC#1")
+    [item] = ctx.items
+    assert "first" in item.text and "0-first" in item.text
+    assert "second" in item.text and "1-second" in item.text
+
+
+def test_reference_item_absent_when_no_paths_configured() -> None:
+    config = _StubConfigWithProjects({"alpha": _StubProject(())}, Path("/home"))
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id="J-alpha-ABC#1")
+    assert ctx.items == ()
+
+
+def test_reference_item_absent_when_project_not_in_config() -> None:
+    config = _StubConfigWithProjects({}, Path("/home"))
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id="J-alpha-ABC#1")
+    assert ctx.items == ()
+
+
+def test_reference_item_absent_when_attempt_id_is_none(tmp_path: Path) -> None:
+    """A station's required-context check can run before any attempt is
+    open (attempt_id=None) -- there is no concrete snapshot path to
+    point at yet, so the item must simply be omitted, not raise or
+    point at the (never mounted) source path."""
+    config = _StubConfigWithProjects({"alpha": _StubProject((tmp_path / "material",))},
+                                     tmp_path / "home")
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id=None)
+    assert ctx.items == ()
+
+
+def test_reference_item_never_truncated_by_total_cap(tmp_path: Path) -> None:
+    """trust="approved" items are never cut (see render_items) -- a long
+    reference folder listing must come through whole, same guarantee
+    CURRENT_DECISIONS.md already gets."""
+    many = tuple(tmp_path / f"folder-{i}" for i in range(50))
+    config = _StubConfigWithProjects({"alpha": _StubProject(many)}, tmp_path / "home")
+    ctx = gather(config, "alpha", "facts", "질문", attempt_id="J-alpha-ABC#1")
+    text = render_items(ctx.items)
+    assert "49-folder-49" in text
+
+
 def test_render_items_empty() -> None:
     assert render_items(()) == ""
 

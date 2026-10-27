@@ -23,6 +23,7 @@ import sys
 import types
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -911,6 +912,103 @@ def test_plan_review_failure_stops_before_committing_the_plan_trail(
     assert f"{job_name} - plan" not in log
 
 
+def _review_stub_with_one_internal_crash() -> Callable[[StepContext], list[StepDef]]:
+    """A "review" step list whose FIRST call journals "spawn_reviewer"
+    done then raises OSError from "record_review" -- the exact shape
+    _station_stub_with_one_internal_crash gives run_station, but for
+    the review kind's own real dispatch step (engine.application.steps.review's
+    "spawn_reviewer", _DISPATCH_STEP_BY_KIND["review"]), reproducing
+    what the PLAN station's own inline review (engine.application.pipeline_planning.
+    run_plan_and_review's `orbit.Stage("review", ...)` call) leaves
+    behind when it crashes instead of merely rejecting the plan. Every
+    later call behaves like _review_always_passes_steps."""
+    calls = {"n": 0}
+
+    def steps(ctx: StepContext) -> list[StepDef]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return _review_always_passes_steps(ctx)
+
+        def _spawn(ctx: StepContext) -> dict[str, object]:
+            return {}
+
+        def _boom(ctx: StepContext) -> dict[str, object]:
+            raise OSError("disk full")
+
+        return [
+            StepDef("spawn_reviewer", _spawn, lambda ctx: False),
+            StepDef("record_review", _boom, lambda ctx: False),
+        ]
+
+    return steps
+
+
+def test_internal_crash_during_the_plan_stations_own_review_is_retried_by_continue_not_stuck(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plan station's own inline review (run_plan_and_review's
+    `orbit.Stage("review", ...)` call, BEFORE the plan trail is ever
+    committed) can crash internal-exception the same way an early
+    station's run_station can: the request ends 'unknown', not
+    'failed', and this stop is recorded as STAGE_PLAN_REVIEW with
+    stop_reason hardcoded "plan_review_failed" (engine.application.pipeline_planning.
+    run_plan_and_review loses the real "internal:OSError" reason on
+    this exact branch). `gb2 continue` dispatches STAGE_PLAN_REVIEW
+    through _resume_reopened_station -> reopen_for_retry, which closes
+    the stale attempt (report -> close) before opening a fresh one --
+    but close's own queue drain is ALSO refused by
+    Processor._block_on_unknown while that stuck 'unknown' review
+    request sits there project-wide, so a continue used to make zero
+    progress forever, same shape as the early-station/build-task
+    crashes above, one level deeper still (inside reopen_for_retry
+    rather than inside resume_early_station/resume_task directly)."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "plan-review-internal-crash"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        # Two entries: the plan station's own run_station finishes fine
+        # (only its INLINE review crashes), so the reopened retry calls
+        # "plan" a second time from scratch, needing its own queue entry.
+        "plan": [_plan_queue_entry(job_name, plan_json), _plan_queue_entry(job_name, plan_json)],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    review_steps = _review_stub_with_one_internal_crash()
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", stub.steps)
+        proc.register("review", review_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner", first
+    assert first.reason == "plan_review_failed", first
+    progress = _position_view(ws.ledger, job_name)
+    assert progress is not None
+    assert progress.get("stage") == position.STAGE_PLAN_REVIEW
+
+    # Before the fix, this re-hit the stuck 'unknown' review request
+    # inside reopen_for_retry's own close_attempt call and made zero
+    # progress. After the fix, the stale attempt closes, a fresh one
+    # opens, the plan station reruns, its review passes this time, and
+    # the job finishes.
+    second = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert second.status == "done", second
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
 # ---- 9. worker_stuck resume: rerun the build task, then merge, review --
 
 def test_worker_stuck_resume_reruns_build_task_before_review(
@@ -1674,6 +1772,105 @@ def test_continue_after_plan_review_failed_reruns_plan_and_review(
     assert (ws.alpha / "src/greeter/extra1.py").exists()
 
 
+def test_plan_review_findings_carried_into_resumed_plan_prompt(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 10 (sample-app live job,: a STAGE_PLAN_REVIEW
+    resume (`gb2 continue`) reopened the plan station with a planner
+    prompt that said nothing about the review that just rejected it --
+    the SAME finding had nothing stopping it from recurring. The
+    resumed planner's own prompt must now carry that finding's
+    severity/file/line/note forward verbatim, at the very front; the
+    FIRST plan attempt (nothing to carry yet) must not have it."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "plan-findings-job"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    stub = _RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [
+            _plan_queue_entry(job_name, plan_json),
+            _plan_queue_entry(job_name, plan_json),
+        ],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    })
+    plan_task_texts: list[str] = []
+
+    def steps_capturing_plan_task(ctx: StepContext) -> list[StepDef]:
+        if str(ctx.request.payload.get("station")) == "plan":
+            plan_task_texts.append(str(ctx.request.payload.get("task", "")))
+        return stub.steps(ctx)
+
+    review_calls = {"n": 0}
+    finding = {"severity": "P1", "file": "src/greeter/extra1.py", "line": 7,
+               "note": "import 순서가 잘못됐다"}
+
+    def _review_fails_once_with_finding_then_passes(ctx: StepContext) -> list[StepDef]:
+        def _run(ctx: StepContext) -> dict[str, object]:
+            review_calls["n"] += 1
+            from engine import evidence
+
+            project_config = ctx.config.projects[ctx.project]
+            fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+            if review_calls["n"] == 1:
+                # Same ordering the real review step uses (record, THEN
+                # raise) -- evidence.record.
+                evidence.record(
+                    ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                    payload={"passed": False, "request_id": ctx.request.request_id,
+                             "findings": [finding]},
+                )
+                raise StepFailed("review_not_passed")
+            evidence.record(
+                ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+                payload={"passed": True, "request_id": ctx.request.request_id, "findings": []},
+            )
+            return {}
+
+        def _reconcile(ctx: StepContext) -> bool:
+            if review_calls["n"] == 1:
+                return False
+            for row in ctx.ledger.evidence(ctx.attempt_id, "review"):
+                if row.payload.get("request_id") == ctx.request.request_id:
+                    return True
+            return False
+
+        return [StepDef("record_review", _run, _reconcile)]
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_capturing_plan_task)
+        proc.register("review", _review_fails_once_with_finding_then_passes)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "needs_owner"
+    assert first.reason == "plan_review_failed"
+    assert len(plan_task_texts) == 1
+    assert "[지난 검토에서 고칠 것]" not in plan_task_texts[0]
+
+    done = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+
+    assert done.status == "done", done
+    assert len(plan_task_texts) == 2
+    second_task = plan_task_texts[1]
+    assert second_task.index("[지난 검토에서 고칠 것]") == 0
+    assert "P1" in second_task
+    assert "src/greeter/extra1.py:7" in second_task
+    assert "import 순서가 잘못됐다" in second_task
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
 # ---- 12. _run_tasks([]) must never discard an already-known attempt_id --
 
 def test_run_tasks_with_empty_list_preserves_passed_in_attempt_id() -> None:
@@ -2243,6 +2440,167 @@ def test_design_owner_request_resumes_to_design_approval(
     # never "done" directly, since nobody approved the design itself.
     assert next_stop.status == "needs_owner", next_stop
     assert next_stop.reason == "design_approval"
+
+
+def _station_stub_with_one_internal_crash(queues: dict[str, list[dict[str, str]]],
+                                          target_station: str):
+    """A _RunStationStub whose FIRST call for `target_station` journals a
+    "spawn_worker" step done (the dispatch step engine.processor.
+    _DISPATCH_STEP_BY_KIND names for kind "run_station"), then raises a
+    plain OSError from a SECOND step -- reproducing exactly what
+    Processor._run_one's catch-all turns into: the request ends
+    'unknown' (not 'failed'), reason "internal:OSError", because
+    _dispatch_may_have_run sees "spawn_worker" already 'done'. Every
+    later call (any station, including a retried `target_station`)
+    behaves exactly like the plain stub, so a correct retry actually
+    finishes the station for real."""
+    stub = _RunStationStub(queues)
+    base_steps = stub.steps
+    calls = {"n": 0}
+
+    def steps(ctx: StepContext) -> list[StepDef]:
+        station = str(ctx.request.payload.get("station"))
+        if station != target_station:
+            return base_steps(ctx)
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return base_steps(ctx)
+
+        def _spawn(ctx: StepContext) -> dict[str, object]:
+            return {}
+
+        def _boom(ctx: StepContext) -> dict[str, object]:
+            raise OSError("disk full")
+
+        return [
+            StepDef("spawn_worker", _spawn, lambda ctx: False),
+            StepDef("record_station", _boom, lambda ctx: False),
+        ]
+
+    return stub, steps
+
+
+def test_internal_crash_at_an_early_station_is_retried_by_continue_not_stuck(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plan-station run that crashes with an engine-internal exception
+    (not an owner-actionable outcome) must still be retriable: `gb2
+    continue`'s own continue_full_job reruns the SAME station rather
+    than forever returning the stored 'failed' outcome a stuck
+    'unknown' request used to leave behind (Processor._block_on_unknown
+    refuses every later run_once call for the whole project while any
+    request sits 'unknown' -- see
+    engine.application.pipeline_resume.unblock_internal_crash)."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "early-plan-internal-crash"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_internal_crash(queues, "plan")
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    # The crash surfaces as a terminal stop, never raises out of
+    # run_full_job -- station_outcome_to_full's own "failed" branch for
+    # a non-owner-actionable outcome.
+    assert first.status == "failed", first
+    assert "internal:OSError" in first.reason, first
+    progress = _stop_view(ws.ledger, job_name, first.attempt_id)
+    assert progress is not None
+    assert progress.get("stage") == full_orbit.STAGE_EARLY_STATION
+    assert progress.get("station") == "plan"
+
+    # Before the fix, this second call just re-hit the same stuck
+    # 'unknown' request and returned a no-progress "failed" again
+    # (minutes ~0, no new worker call). After the fix, the plan
+    # station's SECOND call actually runs (the plain stub) and the job
+    # finishes.
+    second = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert second.status == "done", second
+    assert ("plan", "planner") in stub.calls
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
+
+
+def test_internal_crash_at_a_build_task_is_retried_by_continue_not_stuck(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same internal-crash shape as
+    test_internal_crash_at_an_early_station_is_retried_by_continue_not_stuck,
+    but for a BUILD task's own run_station (station "build") instead of
+    an early facts/probe/plan/design station. A build task that crashes
+    this way never reaches record_task_stop (engine.application.pipeline_tasks.
+    run_task_attempt's stops_for_owner is False for a plain "failed"
+    outcome with no pending_requests), so the newest position stays at
+    STAGE_TASK -- resume_task's own "no stop recorded" branch
+    (engine.application.pipeline_resume.resume_task) -- on an attempt the ledger
+    still shows "active". Before this fix, resume_task went straight to
+    rerun_task_owner_stop(crash=True), which resubmits the build's own
+    stage list onto the SAME still-'unknown' request
+    Processor._block_on_unknown refuses to touch -- the exact sample-app
+    shape, just one layer deeper (a build task instead of an early
+    station)."""
+    ws = _full_orbit_workspace(workspace)
+    job_name = "build-task-internal-crash"
+    plan_json = _plan_json(tasks=[
+        {"id": "t1", "title": "첫 파일", "detail": "", "owns": ["src/greeter/extra1.py"],
+         "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
+        "plan": [_plan_queue_entry(job_name, plan_json)],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+    }
+    stub, steps_fn = _station_stub_with_one_internal_crash(queues, "build")
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", _review_always_passes_steps)
+        return proc
+
+    _install_fake_acceptance_and_handoff(monkeypatch, [_FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
+        processor_factory=factory,
+    )
+    assert first.status == "failed", first
+    assert "internal:OSError" in first.reason, first
+    progress = _position_view(ws.ledger, job_name)
+    assert progress is not None
+    assert progress.get("stage") == position.STAGE_TASK
+    assert progress.get("attempt_id") == first.attempt_id
+
+    # Before the fix, this re-hit the same stuck 'unknown' request and
+    # returned a no-progress "failed" again. After the fix, the build
+    # task's SECOND run_station call actually runs (the plain stub) and
+    # the job finishes.
+    second = full_orbit.continue_full_job(
+        ws.config, ws.ledger, _fakes(), "alpha", job_name, processor_factory=factory,
+    )
+    assert second.status == "done", second
+    assert ("build", "builder") in stub.calls
+    assert (ws.alpha / "src/greeter/extra1.py").exists()
 
 
 # ---- 16. requirement completion reads the evidence graph: a PASSING

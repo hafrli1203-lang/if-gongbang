@@ -15,7 +15,13 @@ the position, finishes an interrupted fix transition first if there is
 one, and otherwise dispatches on `stage` through one table.
 
 `pending_owner_requests` is the only place that decides which owner
-requests a job is still waiting on.
+requests a job is still waiting on -- including a `kind="edit"` request
+(repair_target.EDIT_REQUEST_KIND, OWNS_SCOPE_REQUEST_RULE, 결함 26/28):
+unlike install/scripts_change/test_config_change, such a request is
+never submitted to any processor at all, so it is fulfilled only by an
+owner's `--also-own` grant (repair_target.OWNS_EXTENDED_KIND) covering
+its path, recorded strictly after it was proposed -- see
+_edit_request_fulfilled.
 
 `FLOW_BOUNDARIES` lists every named crash boundary the flow layer
 (engine.application.pipeline, engine.application.repair, engine.application.quick_pipeline, engine.application.steps.close)
@@ -28,8 +34,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from engine.domain import faults
+from engine.domain.policy import owns_within_prefixes
 from engine.domain.records import Event, LedgerError
 from engine.application.owner_approval import PENDING_KIND_WHITELIST
+from engine.domain.policy import NOTE_REQUEST_KIND
+from engine.application.repair_target import (
+    HANDOFF_KIND, OWNS_EXTENDED_KIND, is_owns_scope_request, owning_later_task, record_request_handoff,
+)
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
@@ -393,6 +404,64 @@ def stages_from_spec(spec: list[dict], config: "EngineConfig", attempt_id: str, 
     return stages
 
 
+def _widen_owns_list(owns: list, extra_owns: tuple[str, ...]) -> list[str]:
+    """Deliberately duplicates engine.application.repair's own private
+    `_widen_owns` (same bd38249-style small-helper duplication this
+    codebase already uses for a handful of module-private lookups --
+    see e.g. repair_target._job_name_for_attempt's own docstring):
+    importing it here would mean this module depending on
+    engine.application.repair, which itself imports THIS module
+    (engine.application.job_state) -- a real import cycle, not a
+    style choice."""
+    widened = list(owns)
+    for path in extra_owns:
+        if path not in widened:
+            widened.append(path)
+    return widened
+
+
+def widen_stage_owns(stages: "list[orbit.Stage]",
+                     extra_owns: tuple[str, ...]) -> "list[orbit.Stage]":
+    """`stages`, unchanged, iff `extra_owns` is empty; otherwise a new
+    list with every run_station payload's own "owns" and every merge
+    copy's own "owns" widened by `extra_owns` on top of whatever it
+    already lists -- the SAME technique engine.application.repair._fix_spec
+    uses for a brand-new fix attempt, reused here so a job resuming a
+    STILL-OPEN task attempt (engine.application.pipeline_resume_tasks.
+    rerun_task_owner_stop, 결함 28: an owner's `--also-own` grant for a
+    pending "edit" request, approved without opening any new attempt at
+    all) sees the exact same owner-granted widening the live gate
+    (engine.application.steps.worker_gate_log.task_owns) and merge's own
+    re-check (engine.application.steps.merge._owner_prefixes) both
+    trust. Never touches any OTHER stage kind, and never plan.json
+    itself (frozen evidence, same reasoning _fix_spec's own docstring
+    gives)."""
+    from engine.application import task_pipeline as orbit
+
+    if not extra_owns:
+        return stages
+    out: list[orbit.Stage] = []
+    for stage in stages:
+        payload = stage.payload
+        if stage.kind == "run_station" and isinstance(payload.get("owns"), list):
+            payload = {**payload, "owns": _widen_owns_list(payload["owns"], extra_owns)}
+        elif stage.kind == "review" and isinstance(payload.get("task"), str):
+            # The reviewer must judge against the same widened owns, or it
+            # flags the owner-approved paths as out of scope (결함 32).
+            note = ("\n\nPaths the owner added to this task's owns (approved, "
+                    "in scope): " + ", ".join(extra_owns))
+            if note not in payload["task"]:
+                payload = {**payload, "task": payload["task"] + note}
+        elif stage.kind == "merge":
+            payload = {**payload, "copies": [
+                ({**copy, "owns": _widen_owns_list(copy["owns"], extra_owns)}
+                 if isinstance(copy.get("owns"), list) else copy)
+                for copy in payload.get("copies", [])
+            ]}
+        out.append(orbit.Stage(stage.kind, payload))
+    return out
+
+
 def fix_opened_position(pos: JobPosition | None, job: str, old_attempt_id: str,
                         new_attempt_id: str, task_text: str,
                         stages: list[dict] | None = None) -> JobPosition:
@@ -476,13 +545,62 @@ def _manifest_holds(repo: Path, manifest: str, change: object) -> bool:
     return all(line in present for line in wanted)
 
 
+def _edit_request_fulfilled(ledger: Ledger, project: str, request: dict, *,
+                            job_name: str | None, task_id: str | None,
+                            after_seq: int) -> bool:
+    """True iff `request` (repair_target.is_owns_scope_request -- a
+    `kind="edit"` request, or (결함 31) any unknown kind shaped
+    {"path": str, ...} -- OWNS_SCOPE_REQUEST_RULE, 결함 26) names a path
+    an owner's `gb2 fix <app> --also-own <path>` grant
+    (repair_target.OWNS_EXTENDED_KIND, for THIS job's `task_id`) already
+    covers, with that grant itself recorded strictly after `request` was
+    proposed (`after_seq`). Such a request is never submitted to any
+    processor (PENDING_KIND_WHITELIST never lists "edit", nor any kind
+    it does not itself recognize -- see repair_target.
+    is_owns_scope_request's own docstring), so there is no
+    "install.recorded"-shaped engine run to look for the way
+    _request_fulfilled's whitelisted branch does; the owner's grant
+    event is the only evidence of approval that can ever exist."""
+    if job_name is None or task_id is None:
+        return False
+    path = request.get("path")
+    if not isinstance(path, str) or not path:
+        return False
+    # Handed to a later task of the plan (결함 31): fulfilled for THIS stop.
+    for seq, event in ledger.events(project, HANDOFF_KIND):
+        if (seq > after_seq and event.payload.get("job_name") == job_name
+                and event.payload.get("from_task_id") == task_id
+                and event.payload.get("path") == path):
+            return True
+    for seq, event in ledger.events(project, OWNS_EXTENDED_KIND):
+        if seq <= after_seq:
+            continue
+        if (event.payload.get("job_name") != job_name
+                or event.payload.get("task_id") != task_id):
+            continue
+        raw = event.payload.get("paths")
+        if not isinstance(raw, list):
+            continue
+        if any(owns_within_prefixes((path,), (str(p),)) for p in raw):
+            return True
+    return False
+
+
 def _request_fulfilled(ledger: Ledger, project: str, request: dict, *, after_seq: int,
-                       repo: Path | None, proposal: str) -> bool:
+                       repo: Path | None, proposal: str,
+                       job_name: str | None = None, task_id: str | None = None) -> bool:
     """True iff `request` is a kind an owner can approve, an engine run of
     THAT kind applied exactly its manifest+change after the proposal was
     made (`after_seq`), and -- when `repo` is given -- the manifest still
-    holds the change now."""
+    holds the change now. `job_name`/`task_id` (the position's own, see
+    outstanding_requests) are only read for the EDIT_REQUEST_KIND branch
+    (_edit_request_fulfilled), which has no manifest/change at all."""
     kind = request.get("kind")
+    if kind == NOTE_REQUEST_KIND:
+        return True  # informational note, never awaits the owner (결함 33)
+    if is_owns_scope_request(request):
+        return _edit_request_fulfilled(ledger, project, request, job_name=job_name,
+                                       task_id=task_id, after_seq=after_seq)
     if kind not in PENDING_KIND_WHITELIST:
         return False
     manifest = _normalized_manifest(request.get("manifest"))
@@ -519,7 +637,8 @@ def outstanding_requests(ledger: Ledger, project: str, pos: JobPosition | None, 
         r for r in pos.pending_requests
         if not _request_fulfilled(ledger, project, r, repo=repo,
                                   after_seq=proposal_seq(ledger, project, pos.attempt_id, r),
-                                  proposal=proposal_id(ledger, project, pos, r))
+                                  proposal=proposal_id(ledger, project, pos, r),
+                                  job_name=pos.job, task_id=pos.task_id)
     )
 
 
@@ -572,6 +691,39 @@ def resume_job(config: "EngineConfig", ledger: Ledger,
     return handler(run, pos)
 
 
+def resume_job_from(config: "EngineConfig", ledger: Ledger,
+                    fakes: "Fakes | Callable[[str], Fakes]", project: str, job: str,
+                    from_station: str, *,
+                    on_progress: "orbit.ProgressCallback | None" = None,
+                    processor_factory: "orbit.ProcessorFactory | None" = None) -> "FullOutcome":
+    """`gb2 continue <app> --from <station>`: the escape hatch for a job
+    stuck needs_owner/failed at an early station (facts/probe/plan/
+    design) because the owner's fix belongs at an EARLIER station than
+    the one it is stopped at (결함 24, -- see
+    full_orbit.force_reopen_station's own docstring for the real
+    incident). Same opening work as resume_job (finish an in-flight
+    close, reconcile an opening intent) but dispatches through
+    full_orbit.force_reopen_station instead of RESUME_TABLE, and never
+    through resumed_plan_stop -- force_reopen_station's own station-
+    order check already refuses anything resumed_plan_stop would
+    otherwise gate on (the build stage)."""
+    from engine import full_orbit
+
+    pos = load_position(ledger, project, job)
+    if pos is None and not ledger.attempts_for_job_name(project, job):
+        raise full_orbit.FullOrbitError(f"no attempt for job {job!r}")
+    if pos is None or pos.stage == STAGE_SINGLE:
+        raise full_orbit.FullOrbitError(f"no pending stop recorded for job {job!r}")
+    run = full_orbit.Run(config, ledger, fakes, project, job, on_progress, processor_factory)
+    unfinished_close = full_orbit.finish_inflight_close(run)
+    if unfinished_close is not None:
+        return unfinished_close
+    roles = opening_roles(pos)
+    if roles is not None:
+        pos = full_orbit.reconcile_opening(run, pos, roles)
+    return full_orbit.force_reopen_station(run, pos, from_station)
+
+
 def _finish_fix_then_resume(run: "full_orbit.Run") -> "FullOutcome":
     """An interrupted fix transition is finished by engine.application.repair.fix
     itself (it resumes its own journal), then the job continues."""
@@ -616,7 +768,26 @@ def resume_after_fix(config: "EngineConfig", ledger: Ledger,
 
 __all__ = [
     "JobPosition", "FixState", "record_position", "load_position", "pending_owner_requests",
-    "resume_job", "resume_after_fix", "FLOW_BOUNDARIES", "STAGES", "fix_opened_position",
-    "fix_opened_attempt", "task_stop_position", "without_release", "is_full_job",
-    "stages_spec", "stages_from_spec", "opening_roles", "proposal_id",
+    "resume_job", "resume_job_from", "resume_after_fix", "FLOW_BOUNDARIES", "STAGES",
+    "fix_opened_position", "fix_opened_attempt", "task_stop_position", "without_release",
+    "is_full_job", "stages_spec", "stages_from_spec", "opening_roles", "proposal_id",
+    "widen_stage_owns", "outstanding_requests",
 ]
+
+
+def hand_off_later_task_requests(ledger: Ledger, project: str, job_name: str,
+                                 pos: "JobPosition", plan: object) -> None:
+    """Hands every still-outstanding owns-scope request whose path a LATER
+    task of `plan` owns to that task (결함 31b): such a request is that
+    task's job, never a reason to keep this one stopped. Called both by the
+    owner's approval (`gb2 fix --also-own`) and by a plain resume."""
+    if pos.task_id is None:
+        return
+    later = tuple(t for t in (pos.remaining_task_ids or ()) if t != pos.task_id)
+    for request in outstanding_requests(ledger, project, pos, repo=None):
+        if not is_owns_scope_request(request):
+            continue
+        owner = owning_later_task(plan, later, str(request["path"]))
+        if owner is not None:
+            record_request_handoff(ledger, project, job_name, pos.attempt_id or "",
+                                   pos.task_id, owner, request)

@@ -96,16 +96,22 @@ from engine.infrastructure import evidence
 from engine.domain import ids
 from engine.infrastructure import sandbox
 from engine.application.processor import StepContext, StepDef, StepFailed
+from engine.application.steps import file_deps
 from engine.application.steps.suite_select import (  # noqa: F401 -- re-exported for tests
     build_related_argv as _build_related_argv,
 )
 from engine.application.steps.suite_select import resolve_test_argv as _resolve_test_argv
+from engine.application.steps.suite_select import full_scope_argv
 from engine.application.steps.suite_snapshot import tracked_directories, tracked_file_paths
 from engine.application.steps.suite_zero_tests import VITEST_NO_TESTS_RE as _VITEST_NO_TESTS_RE
 from engine.application.steps.suite_zero_tests import looks_like_zero_tests_ran
 from engine.application.steps.suite_zero_tests import ran_zero_tests as _ran_zero_tests
 
-_TAIL_CHARS = 2000
+# 4000 chars matches engine.infrastructure.publishers' own _TAIL_CHARS
+# precedent (결함 18,: the previous 2000 here left no room
+# for record_bench's own evidence payload to carry a useful amount of
+# output on a failed run -- see _run_record_bench).
+_TAIL_CHARS = 4000
 
 
 def _project_config(ctx: StepContext):
@@ -162,7 +168,10 @@ def _bench_home_dir(ctx: StepContext) -> Path:
 
 def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
                         env: dict[str, str], *, net: bool = False,
-                        extra_readonly: tuple[Path, ...] = ()) -> tuple[list[str], dict[str, str]]:
+                        extra_readonly: tuple[Path, ...] = (),
+                        extra_symlinks: tuple[tuple[Path, Path], ...] = (),
+                        extra_writable: tuple[Path, ...] = (),
+                        ) -> tuple[list[str], dict[str, str]]:
     """Bench sandbox policy: writable = the repo itself (test runners
     write __pycache__/coverage/etc there). readonly = repo/.git,
     mounted AFTER the repo's own writable bind (deeper path wins) so
@@ -208,10 +217,34 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     _bench_home_dir(), via readonly_remap, so `$HOME/<rel>` resolves
     inside the sandbox despite the real HOME being hidden (a project's
     test suite needing a toolchain cache under the real home, e.g.
-    installed browser binaries, without getting the rest of it)."""
+    installed browser binaries, without getting the rest of it).
+
+    extra_symlinks: forwarded straight into sandbox.wrap()'s own
+    `symlinks` tuple, on top of whatever this function itself adds
+    (none, today) -- a caller needing a worker-style CLI mounted
+    inside this same bench sandbox (engine.application.acceptance_bench.
+    run_in_bench_sandbox, for a project's probe_runtime_clis) passes
+    the `.symlinks` half of engine.application.steps.worker_sandbox.
+    cli_runtime_mounts()'s return value here, with the `.readonly` half
+    going into `extra_readonly` instead. Defaults to `()`, so every
+    pre-existing caller's mount list is unchanged.
+
+    extra_writable: additional WRITABLE mounts, added on top of
+    `writable` below regardless of bench_home_writable -- a deeper
+    mount always wins (sandbox.wrap), so a path under _bench_home_dir()
+    passed here stays writable even though bench_home itself defaults
+    to read-only. The only existing caller (run_in_bench_sandbox, for a
+    project's probe_runtime_clis) passes the `.writable` third of
+    engine.application.steps.worker_sandbox.cli_runtime_mounts()'s own
+    return value (결함 20,: without this, a probe script's
+    own `codex exec` could never write ".codex/..." under its
+    disposable $HOME and failed closed with a bare sandbox "Read-only
+    file system" error). Defaults to `()`, so every pre-existing
+    caller's mount list is unchanged.
+    """
     bench_home = _bench_home_dir(ctx)
     child_env = {**env, "HOME": str(bench_home)}
-    writable = (repo,)
+    writable = (repo,) + extra_writable
     readonly: tuple[Path, ...] = (repo / ".git",) + extra_readonly
     readonly_remap: tuple[tuple[Path, Path], ...] = ()
     if ctx.config.bench_home_writable:
@@ -256,11 +289,24 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.touch(exist_ok=True)
             readonly_remap += ((entry, dest),)
+    # 결함 17: every project.file_dep_targets pair (a
+    # package.json `file:../...` dependency resolved, once, against the
+    # project's REAL source checkout by `gb2 init` -- see
+    # engine.application.steps.file_deps' own module docstring) re-mapped onto
+    # THIS call's own `repo` -- the real repo for run_tests/trust_checks,
+    # or a disposable acceptance/probe snapshot for every OTHER caller of
+    # this same function (engine.application.acceptance's scene/full-suite
+    # snapshots, engine.application.acceptance_probe) -- so the identical
+    # relative escape every one of those copies/snapshots preserves
+    # byte-for-byte resolves, inside this sandbox, to the one real target
+    # directory regardless of which root it was walked from.
+    readonly_remap += file_deps.remap_pairs_for_root(
+        repo, _project_config(ctx).file_dep_targets)
     try:
         wrapped = sandbox.wrap(
             argv, cwd=repo, writable=writable, hidden=hidden, readonly=readonly,
-            readonly_remap=readonly_remap, net=net, mode=ctx.config.sandbox,
-            child_env=child_env,
+            readonly_remap=readonly_remap, symlinks=extra_symlinks, net=net,
+            mode=ctx.config.sandbox, child_env=child_env,
         )
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc
@@ -358,7 +404,10 @@ def _run_run_tests(ctx: StepContext) -> dict[str, object]:
         # distinct scope value from an ordinary "full" choice, so a
         # reader of bench evidence can tell the two apart.
         scope = "full(fallback)"
-        test_cmd = tuple(_project_config(ctx).test_cmd)
+        # Same runner-specific scene exclusion _resolve_test_argv's own
+        # "full" branch already applies (결함 16) -- this fallback must
+        # not bypass it by re-reading the project's raw test_cmd.
+        test_cmd = tuple(full_scope_argv(tuple(_project_config(ctx).test_cmd)))
         returncode, combined = _run_test_cmd(ctx, repo, list(test_cmd), env,
                                              extra_readonly=extra_readonly)
     # An exit-0 run that executed
@@ -371,9 +420,14 @@ def _run_run_tests(ctx: StepContext) -> dict[str, object]:
     # into the overall passed/reason, same as it already does for a
     # plain non-zero returncode.
     no_tests_executed = returncode == 0 and looks_like_zero_tests_ran(combined)
-    return {"returncode": returncode, "tail": combined[-_TAIL_CHARS:],
+    scrubbed = _scrub_secrets(combined)
+    return {"returncode": returncode, "tail": scrubbed[-_TAIL_CHARS:],
             "scope": scope, "argv": list(test_cmd),
-            "no_tests_executed": no_tests_executed}
+            "no_tests_executed": no_tests_executed,
+            # 결함 18: named here (from the FULL combined output, before
+            # it is sliced down to tail) so a failure far enough back to
+            # fall outside the tail window is still named in evidence.
+            "failed_test_files": _failed_test_files(combined)}
 
 
 _ERROR_LINE = re.compile(r"^E\s+(?:([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b|(assert)\b)", re.M)
@@ -394,6 +448,47 @@ _ERROR_LINE = re.compile(r"^E\s+(?:([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\
 # supposed to prove actually fired.
 _VITEST_FAILED_COUNT_RE = re.compile(r"\b\d+\s+failed\b", re.I)
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+# 결함 18: which test file(s) actually failed, extracted
+# from a run's own output, so bench evidence names them instead of
+# forcing a reader to re-run the suite to find out. Confirmed against
+# vitest's real output shape ("npx vitest run" in this repo,:
+# " FAIL  tests/scenes/r8-....test.ts > ..."); "FAILED" (common pytest
+# short-summary wording, e.g. "FAILED tests/x.py::test_y") is matched
+# the same way but NOT independently confirmed against an installed
+# pytest project -- no project configured for bench currently uses it.
+_FAILED_TEST_FILE_RE = re.compile(r"^\s*FAILED?\s+(\S+)", re.M)
+
+# Same credential-URL pattern engine.interface.cli._redact_for_display
+# already scrubs before printing a request for a human to read --
+# duplicated here (not imported) because suite_run.py is
+# application-layer code and that function lives in the interface
+# layer (engine.application must not import engine.interface -- see
+# docs/standards/engine-layout.md); the regex itself is the one thing
+# reused, not the whole display-redaction function.
+_CREDENTIAL_URL_RE = re.compile(r"(://)[^/\s@]+:[^/\s@]+@")
+
+
+def _scrub_secrets(text: str) -> str:
+    """scheme://user:pass@host -> scheme://***@host wherever it
+    appears in `text` -- a bench case's own "env" override (_case_env)
+    can embed a credential in a URL a failing test prints back
+    verbatim (e.g. a DB connection string); this runs on every tail
+    this module records as evidence, failure or not."""
+    return _CREDENTIAL_URL_RE.sub(r"\1***@", text)
+
+
+def _failed_test_files(text: str) -> list[str]:
+    """Distinct failed-test file/selector tokens named in `text`, in
+    first-seen order (see _FAILED_TEST_FILE_RE's own docstring for the
+    exact shapes matched). ANSI-stripped first, same as _case_signature
+    above, so a coloured "FAIL" does not break the leading `^\\s*`
+    anchor."""
+    stripped = _ANSI_ESCAPE.sub("", text)
+    seen: dict[str, None] = {}
+    for match in _FAILED_TEST_FILE_RE.finditer(stripped):
+        seen[match.group(1)] = None
+    return list(seen)
 # _VITEST_NO_TESTS_RE itself is owned by engine.application.steps.suite_zero_tests
 # (imported at the top of this file) and reused here only.
 
@@ -562,6 +657,14 @@ def _run_record_bench(ctx: StepContext) -> dict[str, object]:
             "tests_returncode": tests_returncode,
             "scope": run_tests_result.get("scope", "full"),
             "argv": run_tests_result.get("argv", []),
+            # 결함 18: carried over from run_tests' own
+            # journal payload (already scrubbed/truncated there --
+            # _scrub_secrets/_TAIL_CHARS) so a failed bench's evidence
+            # names what actually failed without re-running the suite.
+            # .get (not []) default: a step journaled before this field
+            # existed never wrote these keys at all.
+            "tail": run_tests_result.get("tail", ""),
+            "failed_test_files": run_tests_result.get("failed_test_files", []),
         },
     )
     if not passed:
@@ -608,4 +711,5 @@ def steps(ctx: StepContext) -> list[StepDef]:
 # bench_run._bench_sandbox_argv access, both already use them.
 bench_env = _bench_env
 bench_sandbox_argv = _bench_sandbox_argv
+bench_home_dir = _bench_home_dir
 TAIL_CHARS = _TAIL_CHARS

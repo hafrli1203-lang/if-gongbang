@@ -1055,6 +1055,138 @@ def test_review_sandbox_mounts_snapshot_readonly_hides_repo_and_ledger(
 
 
 @_needs_bwrap
+def test_station_sandbox_argv_mounts_reference_snapshot_readonly_not_source(
+    workspace: Workspace, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """ProjectConfig.reference_paths must mount the ENGINE-OWNED
+    SNAPSHOT (engine.infrastructure.reference_snapshot) read-only, by
+    its own path under config.home/"references" -- the configured
+    source path itself must NEVER appear in the argv at all (see
+    engine.application.steps.worker_sandbox.sandboxed_argv)."""
+    reference = tmp_path_factory.mktemp("external_reference")
+    (reference / "brief.md").write_text("BRIEF\n", encoding="utf-8")
+    project_config = replace(workspace.config.projects["alpha"],
+                             reference_paths=(reference,))
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project_config},
+                     sandbox="bwrap")
+    attempt_id = "J-alpha-REFPATH01#1"
+    own_copy = config.home / "copies" / attempt_id / "builder"
+    own_copy.mkdir(parents=True)
+    stations_dir = config.home / "jobs" / attempt_id / "stations"
+    stations_dir.mkdir(parents=True)
+    spec = WorkerSpec(
+        project="alpha", attempt_id=attempt_id, generation=1, station="build",
+        role="builder", copy_root=own_copy, workdir=own_copy, task="",
+        result_path=stations_dir / "r.json", config_path=None,
+    )
+    ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
+    argv = station._sandboxed_argv(ctx, spec, ["true"], {}, _NoHomeWritableRunner())
+
+    assert str(reference) not in argv  # the source itself is never mounted
+
+    snapshot_root = config.home / "references" / ids.attempt_dirname(attempt_id)
+    snapshot_dir = snapshot_root / f"0-{reference.name}"
+    assert (snapshot_dir / "brief.md").read_text(encoding="utf-8") == "BRIEF\n"
+    snapshot_str = str(snapshot_dir)
+    assert snapshot_str in argv
+    ro_idx = argv.index(snapshot_str)
+    assert argv[ro_idx - 1] == "--ro-bind"
+
+
+@_needs_bwrap
+def test_review_sandbox_argv_mounts_reference_snapshot_readonly_not_source(
+    workspace: Workspace, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Same setting, reviewer side (engine.application.steps.review.
+    _sandboxed_argv) -- a reviewer must be able to open the snapshot
+    too, to check a worker's output against the actual source
+    material, and must likewise never see the configured source path."""
+    reference = tmp_path_factory.mktemp("external_reference")
+    (reference / "brief.md").write_text("BRIEF\n", encoding="utf-8")
+    project_config = replace(workspace.config.projects["alpha"],
+                             reference_paths=(reference,))
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project_config},
+                     sandbox="bwrap")
+    attempt_id = "J-alpha-REFPATH02#1"
+    ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
+    snapshot_workdir = workspace.root / "review-snapshot"
+    snapshot_workdir.mkdir()
+    spec = WorkerSpec(
+        project="alpha", attempt_id=ctx.attempt_id, generation=1, station="review",
+        role="reviewer", copy_root=snapshot_workdir, workdir=snapshot_workdir, task="",
+        result_path=workspace.root / "r.json", config_path=None,
+    )
+    argv = review._sandboxed_argv(ctx, spec, ["true"], {}, _NoHomeWritableRunner())
+
+    assert str(reference) not in argv
+
+    snapshot_root = config.home / "references" / ids.attempt_dirname(attempt_id)
+    snapshot_dir = snapshot_root / f"0-{reference.name}"
+    snapshot_str = str(snapshot_dir)
+    assert snapshot_str in argv
+    ro_idx = argv.index(snapshot_str)
+    assert argv[ro_idx - 1] == "--ro-bind"
+
+
+@_needs_bwrap
+def test_station_sandbox_reference_snapshot_is_readable_but_unwritable_and_source_unreachable(
+    workspace: Workspace, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Real exec: a worker can read a file inside the reference
+    snapshot by its real path, cannot write there, and cannot reach the
+    configured SOURCE path at all (the source itself is never mounted
+    -- only the engine-owned copy is)."""
+    reference = tmp_path_factory.mktemp("external_reference")
+    (reference / "brief.md").write_text("REFERENCE-BRIEF-CONTENT\n", encoding="utf-8")
+
+    project_config = replace(workspace.config.projects["alpha"],
+                             reference_paths=(reference,))
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project_config},
+                     sandbox="bwrap")
+    attempt_id = "J-alpha-REFPATH03#1"
+    own_copy = config.home / "copies" / attempt_id / "builder"
+    own_copy.mkdir(parents=True)
+    stations_dir = config.home / "jobs" / attempt_id / "stations"
+    stations_dir.mkdir(parents=True)
+    spec = WorkerSpec(
+        project="alpha", attempt_id=attempt_id, generation=1, station="build",
+        role="builder", copy_root=own_copy, workdir=own_copy, task="",
+        result_path=stations_dir / "r.json", config_path=None,
+    )
+    ctx = SimpleNamespace(config=config, project="alpha", attempt_id=attempt_id)
+    snapshot_dir = (config.home / "references" / ids.attempt_dirname(attempt_id)
+                    / f"0-{reference.name}")
+
+    def wrapped(argv_inner: list[str]) -> list[str]:
+        return station._sandboxed_argv(
+            ctx, spec, argv_inner, {}, _NoHomeWritableRunner())
+
+    read_result = _run_sandboxed(
+        wrapped(["sh", "-c", f"cat {snapshot_dir}/brief.md"]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert read_result.returncode == 0
+    assert "REFERENCE-BRIEF-CONTENT" in read_result.stdout
+
+    write_result = _run_sandboxed(
+        wrapped(["sh", "-c", f"echo hi > {snapshot_dir}/new-file.txt"]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert write_result.returncode != 0
+    assert not (snapshot_dir / "new-file.txt").exists()
+
+    source_result = _run_sandboxed(
+        wrapped(["sh", "-c", f"cat {reference}/brief.md 2>&1"]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert source_result.returncode != 0
+
+
+
+@_needs_bwrap
 def test_station_sandbox_never_mounts_copy_link_that_escapes_to_secrets(
     workspace: Workspace,
 ) -> None:

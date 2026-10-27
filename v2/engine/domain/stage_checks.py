@@ -44,7 +44,22 @@ check_probe_targets  facts.md's optional "## 외부 대상" section ->
               target bullets also raises ProbeTargetsError
               ("probe_targets_mixed_empty_marker") -- "no targets" and
               "here are the targets" are contradictory, never resolved
-              by quietly picking one.
+              by quietly picking one. When a bullet's doc value is an
+              http(s) URL, only its FIRST whitespace-delimited token is
+              kept as the url -- any trailing explanation on the same
+              line (결함 19,: a real bullet read
+              "https://…/cli-reference — probe t1 PROBE OK(단, …)") is
+              dropped, never kept as part of the url a probe script's
+              own "PROBE OK <url>" line is matched against. A target
+              with no http(s) scheme (an internal/사내 target with no
+              public doc) gets the same treatment from
+              _cut_doc_value_explanation (결함 23,: a
+              trailing explanation appended after a " — "/" -- "/" - "
+              separator that sits OUTSIDE any "(...)" the value itself
+              opens is dropped the same way; a separator inside that
+              value's own parentheses is kept, since the real probe
+              script's own "PROBE OK <문서>" line prints that whole
+              parenthetical.
 check_probe   [] iff every target in a check_probe_targets() list has
               its own .gongbang/<job>/probe/t<N>.log (1-based position
               in the SAME list, see check_probe_targets) containing
@@ -177,8 +192,13 @@ def _table_pass_rows(lines: list[str]) -> dict[int, bool]:
             continue
         cells = _cells(stripped)
         if verdict_col is None:
-            if "판정" in cells and _SOURCE_MARK in cells:
-                verdict_col, source_col = cells.index("판정"), cells.index(_SOURCE_MARK)
+            # A header cell names its column when it CONTAINS the word
+            # ("출처(파일:줄)" is still the source column), not only when
+            # it is exactly that word.
+            verdict_at = [k for k, c in enumerate(cells) if "판정" in c]
+            source_at = [k for k, c in enumerate(cells) if _SOURCE_MARK in c]
+            if verdict_at and source_at:
+                verdict_col, source_col = verdict_at[0], source_at[0]
             continue
         if all(set(c) <= set("-: ") for c in cells):
             continue  # the |---|---| separator row
@@ -203,16 +223,51 @@ def _check_facts_text(text: str) -> list[str]:
             if not table_rows[lineno]:
                 problems.append(f"line {lineno}: {_PASS_MARK} without {_SOURCE_MARK}")
             continue
+        # Table rows are judged only through a table that has a 판정 column
+        # (above). A row of any other table merely MENTIONING the word
+        # (e.g. "다시 통과로 올림" in a 확인 필요 table) is not a claim.
+        if line.strip().startswith("|"):
+            continue
+        # Outside tables only a LIST ITEM ("- 주장: 통과 (출처: …)") is a
+        # claim; a prose paragraph that merely mentions the word is not
+        # (a real facts.md was rejected for "… '통과' 또는 … 로 바뀐다").
+        if not line.lstrip().startswith(("- ", "* ")):
+            continue
         if _PASS_MARK in line and _SOURCE_MARK not in line:
             problems.append(f"line {lineno}: {_PASS_MARK} without {_SOURCE_MARK}")
 
     code_values_lines = _code_values_section(lines)
-    for line in code_values_lines:
-        if _NEEDS_CHECK_MARK in line:
-            problems.append(
-                f"{_CODE_VALUES_HEADER}: {_NEEDS_CHECK_MARK} remaining ({line.strip()!r})"
-            )
+    for line in _needs_check_claims(code_values_lines):
+        problems.append(
+            f"{_CODE_VALUES_HEADER}: {_NEEDS_CHECK_MARK} remaining ({line.strip()!r})"
+        )
     return problems
+
+
+def _needs_check_claims(lines: list[str]) -> list[str]:
+    """Lines that CLAIM 확인 필요: a verdict-table row whose 판정 cell says
+    it, or a list item carrying it. Prose, and a pass row whose own text
+    merely mentions "별도 확인 필요", are not claims (a real facts.md was
+    rejected for exactly that)."""
+    found: list[str] = []
+    verdict_col: int | None = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            cells = _cells(stripped)
+            if verdict_col is None:
+                at = [k for k, c in enumerate(cells) if "판정" in c]
+                verdict_col = at[0] if at else -1
+                continue
+            if all(set(c) <= set("-: ") for c in cells):
+                continue
+            if verdict_col >= 0 and verdict_col < len(cells) and _NEEDS_CHECK_MARK in cells[verdict_col]:
+                found.append(line)
+            continue
+        verdict_col = None
+        if stripped.startswith(("- ", "* ")) and _NEEDS_CHECK_MARK in stripped:
+            found.append(line)
+    return found
 
 
 def check_facts(repo: Path, job: str) -> list[str]:
@@ -254,6 +309,10 @@ def check_design_approved(ledger: Ledger, project: str, job: str) -> bool:
         if event.payload.get("job") == job:
             return True
     return False
+
+
+def _is_probe_section_note(stripped: str) -> bool:
+    return stripped.startswith("> ") or (stripped.startswith("(") and stripped.endswith(")"))
 
 
 def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
@@ -298,6 +357,12 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         if bare in (f"({_PROBE_EMPTY_MARK})", _PROBE_EMPTY_MARK):
             saw_empty_mark = True
             continue
+        if _is_probe_section_note(stripped):
+            # An explicit note -- a whole line in parentheses or a "> "
+            # quote -- is not a target (a real facts.md stopped on
+            # "(probe = …)"). Any other non-bullet line still raises:
+            # a target written in the wrong shape must never vanish.
+            continue
         if not stripped.startswith("-"):
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
         body = stripped[1:].strip()
@@ -305,6 +370,34 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         name, url = name.strip(), url.strip()
         if not sep or not name or not url:
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
+        # 결함 19, 마케팅 채팅 job): a real bullet's doc value
+        # was "https://.../cli-reference — probe t1 PROBE OK(단, ...)" --
+        # an http(s) URL with a human explanation appended on the SAME
+        # line, after the url -- so the url this function returned was
+        # that whole trailing string, never the probe script's own
+        # `PROBE OK <url>` line (which only ever prints the bare
+        # address). _probe_observed (engine.application.acceptance_probe)
+        # then compared the script's real "PROBE OK https://.../
+        # cli-reference" against this longer string and failed every
+        # target whose planner wrote a doc value this way, even though
+        # the probe itself had actually succeeded. An http(s) url is
+        # split on its first run of whitespace -- the url is the FIRST
+        # token; anything after it on the same line is an explanation,
+        # not part of the address, and is dropped here (never kept as
+        # part of url, never raised as malformed -- PROBE_TARGETS_
+        # SECTION_FORMAT_RULE already asks for that explanation on its
+        # OWN note line instead). A target with no http(s) scheme (an
+        # internal/사내 target with no real URL) is never split this
+        # way -- its whole value after ":" stays the url, unchanged.
+        if url.startswith("http://") or url.startswith("https://"):
+            url = url.split(None, 1)[0]
+        else:
+            # 결함 23: a non-url doc value (a "사내" target
+            # with no public doc) can carry the SAME kind of trailing
+            # explanation an http(s) url above already strips -- see
+            # _cut_doc_value_explanation's own docstring for the real
+            # ledger evidence this repairs.
+            url = _cut_doc_value_explanation(url)
         targets.append((name, url))
     if saw_empty_mark and targets:
         # "(없음)" and one or more real target bullets both appeared in
@@ -319,6 +412,64 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
         # nothing here must never be read the same as writing "(없음)".
         raise ProbeTargetsError("probe_targets_section_empty")
     return targets
+
+
+_DOC_VALUE_EXPLANATION_SEPARATORS = (" — ", " -- ", " - ")
+
+
+def _cut_doc_value_explanation(value: str) -> str:
+    """`value` (a non-http(s) "## 외부 대상" doc value, already stripped
+    of its "- name:" prefix) with any trailing human explanation cut
+    off at the first _DOC_VALUE_EXPLANATION_SEPARATORS match found at
+    PAREN DEPTH 0 -- never inside a "(...)" the value itself opens.
+
+    결함 23, 마케팅 채팅 job, ledger seq 603/733, read via
+    probe.executed): a real bullet's doc value for an internal target
+    with no public doc (an OS library API) was "(공식 문서 URL 없음 —
+    사내 API; kit/os 패키지나 sample-app-OS 저장소 안에 있을 것으로
+    추정되나 이 샌드박스에서 열람 불가) — probe t5는 다른 경로
+    (sample-app-library MCP)를 테스트했던 것이라 이 결정과는 별도로 다시
+    probe 필요" -- a parenthetical explanation of WHY there is no url,
+    followed by a second, unrelated note about a different probe
+    attempt, appended on the SAME line after " — ". The probe script
+    itself (seq 603's own stdout_tail) only ever printed "PROBE OK "
+    plus the FIRST parenthetical -- "(공식 문서 URL 없음 — 사내 API; …
+    열람 불가)" -- never the trailing "— probe t5는 …" clause, so
+    check_probe_targets must keep only that first parenthetical as the
+    url this gate compares against, exactly the way an http(s) url
+    already keeps only its first whitespace token (결함 19 above).
+
+    A plain first-occurrence cut would be WRONG here: the first " — "
+    in the real value above sits INSIDE the opening "(...)" (between
+    "없음" and "사내"), at paren depth 1 -- cutting there would lose the
+    rest of that same parenthetical ("사내 API; … 열람 불가)") that the
+    script's own stdout DOES include. Only the " — " that comes AFTER
+    the matching ")" (depth back to 0) is a genuine second explanation
+    to drop. A value with no parens at all has no depth-1 region, so
+    its first separator (if any) is already at depth 0 and is cut
+    exactly as the plain reading of the rule says.
+
+    Going forward PROBE_TARGETS_SECTION_FORMAT_RULE instead asks a
+    target with no public doc to write only "(사내)" in the doc slot,
+    with any explanation on its own note line -- this function is the
+    defensive floor under an already-written facts.md (this historical
+    one, or a future one that still gets the convention wrong), never
+    a reason to skip following that convention."""
+    depth = 0
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0:
+            for sep in _DOC_VALUE_EXPLANATION_SEPARATORS:
+                if value.startswith(sep, i):
+                    return value[:i]
+        i += 1
+    return value
 
 
 def probe_target_id(index: int) -> str:
@@ -352,7 +503,206 @@ def check_probe(repo: Path, job: str, targets: list[tuple[str, str]]) -> list[st
     return problems
 
 
+# ---------------------------------------------------------------------------
+# Station -> own record path table (결함 12,: the actual
+# incident -- a prober worker appended an explanatory line to facts.md
+# ("## 외부 대상" section) during the probe station, which the NEXT
+# facts.md read choked on as a malformed target line
+# (probe_targets_invalid:malformed_probe_target_line), wedging the job
+# with no way forward. The root cause: EngineConfig.station_owners
+# grants facts/probe/plan/design every one the WHOLE ".gongbang/" tree
+# (see tools/templates/*.json), so merge.py's own config-driven prefix
+# check never saw anything wrong with the prober's copy touching
+# facts.md -- any early station can write any OTHER early station's
+# own record.
+#
+# This table is the authoritative, config-INDEPENDENT floor underneath
+# that shared ".gongbang/" grant (same role _PLANNER_ONLY_PREFIX plays
+# for tests/scenes/ in engine.application.steps.merge): station_owners'
+# own ".gongbang/" prefix may stay as broad as it already is, but
+# engine.application.steps.merge._deny_if_other_station_record checks
+# every write a copy makes against THIS table first and refuses
+# (StepFailed("wrote_other_station_record:<path>"), never silently
+# dropped) any write that lands on a path some OTHER station's own
+# entry here claims. A station absent from this table (e.g. "build",
+# "review", "bench", "report") is not narrowed by it at all -- merge's
+# existing config/owns-driven prefixes keep deciding those, and a merge
+# call that carries its own explicit per-request "owns" (e.g. a build
+# task's own narrowed paths, or quick_pipeline's combined facts+plan
+# turn -- see engine.application.steps.merge._owner_prefixes) is
+# like-wise exempt: an explicit owns is already an engine-authored,
+# reviewed declaration of exactly what THIS call may touch, never
+# something a worker can forge on its own (gate_facts.json's own "owns"
+# is set by the engine process before the worker ever runs, see
+# engine.application.steps.worker_gate_log.task_owns), so it is trusted
+# to state a deliberate cross-station grant (e.g. a UI build task
+# also dropping a screenshot under .gongbang/<job>/screens/, which this
+# table otherwise reserves for "design").
+_STATION_RECORD_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "facts": ("facts.md",),
+    "probe": ("probe/",),
+    "plan": ("plan.json",),
+    "design": ("design/", "screens/"),
+}
+
+
+def station_record_prefixes(station: str, job: str) -> tuple[str, ...]:
+    """The repo-relative paths `station` owns as ITS OWN record for
+    `job`, per _STATION_RECORD_TEMPLATES -- () for a station with no
+    entry in that table (every write it makes is judged only by
+    merge's existing config/owns-driven prefixes, never by this
+    table)."""
+    templates = _STATION_RECORD_TEMPLATES.get(station)
+    if not templates:
+        return ()
+    return tuple(f".gongbang/{job}/{t}" for t in templates)
+
+
+def _covers(prefix: str, rel: str) -> bool:
+    if prefix.endswith("/"):
+        return rel == prefix.rstrip("/") or rel.startswith(prefix)
+    return rel == prefix
+
+
+def other_station_record_violation(station: str, job: str, rel: str) -> str | None:
+    """None iff `rel` is not claimed, by _STATION_RECORD_TEMPLATES, as
+    some OTHER station's own record -- i.e. `station` writing `rel` is
+    fine as far as this table is concerned (either `rel` is `station`'s
+    own record, or no station's record at all). Otherwise the
+    offending prefix (e.g. ".gongbang/job1/facts.md"), for the caller's
+    StepFailed reason to name."""
+    for other, templates in _STATION_RECORD_TEMPLATES.items():
+        if other == station:
+            continue
+        for prefix in (f".gongbang/{job}/{t}" for t in templates):
+            if _covers(prefix, rel):
+                return prefix
+    return None
+
+
+def station_record_rule_sentence(station: str, job: str) -> str:
+    """"이 칸은 <경로>만 쓴다 -- 다른 칸 기록(예: facts.md)은 고치지
+    않는다" for `station`, naming station_record_prefixes' own paths
+    verbatim -- engine.application.stage_prompts splices this into
+    that station's own prompt so the rule a worker is told and the
+    rule merge.py actually enforces (other_station_record_violation)
+    can never drift apart, same pattern as the other *_RULE sentences
+    below. "" for a station with no table entry (nothing to tell it)."""
+    prefixes = station_record_prefixes(station, job)
+    if not prefixes:
+        return ""
+    paths = ", ".join(prefixes)
+    return f"이 칸은 {paths}만 쓴다 — 다른 칸 기록(예: facts.md)은 고치지 않는다."
+
+
+# ---------------------------------------------------------------------------
+# Rule sentences -- the literal Korean text a worker's own instructions
+# (engine.application.stage_prompts) must carry VERBATIM for each check
+# above, written once HERE next to the check it describes, so a prompt and
+# the judgment code that grades it can never drift apart again (the actual
+# incident this guards against: the prober prompt once said only "로그에
+# PROBE OK" while run_probe_scripts/_probe_observed in
+# engine.application.acceptance_probe required "PROBE OK <문서 URL>" on the
+# script's own stdout -- a worker that followed the prompt to the letter
+# still failed the probe). stage_prompts.py imports these constants/
+# functions and splices them into its own prompt text rather than retyping
+# the sentence; tests/unit/test_stage_rule_sentences.py asserts every
+# sentence returned by *_rule_sentences() below is a literal substring of
+# the station prompt that is supposed to tell the worker about it.
+
+FACTS_PASS_NEEDS_SOURCE_RULE = (
+    "「통과」 주장은 판정·출처 칸이 있는 표의 행이나 \"- 주장: 통과 (출처: …)\" "
+    "목록 줄로만 쓰고, 반드시 출처(파일:줄, 문서 URL, 실행 로그)를 같은 행에 "
+    "적는다 — 출처 없는 「통과」는 없다. 설명 문단은 주장으로 보지 않는다."
+)
+
+# Deliberately stops short of saying what happens when 확인 필요 remains
+# (that consequence differs: "다음 단계로 넘어가지 못한다" for the full
+# facts station, "끝나지 못한다" for quick_pipeline's --small combined
+# turn) -- stage_prompts.py appends its own station-specific consequence
+# clause right after this, so the mechanism sentence itself (what to do,
+# what check_facts actually enforces) stays identical in both prompts.
+FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE = (
+    "코드에 그대로 넣을 숫자·기준·API 형식이 있으면 「코드에 넣는 값」이라는 "
+    "제목의 절에 모은다 — 그 절에 확인 필요가 남아 있으면 이 일은"
+)
+
+PROBE_TARGETS_SECTION_FORMAT_RULE = (
+    "\"## 외부 대상\" 절을 쓴다 — 이 일이 의존하는 외부 "
+    "API·CLI·파일 형식을 모두 한 줄씩 \"- <이름>: <공식 문서 URL>\" "
+    "형태로 적는다. URL은 공백 없는 주소 하나만 적는다 — 같은 줄에 설명을 "
+    "덧붙이지 않는다(실측 스크립트는 `PROBE OK <주소>`만 찍으므로, 주소 뒤에 "
+    "말을 더 붙이면 그 설명까지 주소로 읽혀 실측 통과와 불일치가 난다). "
+    "이 절의 설명은 줄 전체를 괄호로 감싸거나(\"( … )\") "
+    "\"> \"로 시작하는 줄로만 쓴다 — 그 밖의 글은 이 절에 쓰지 않는다"
+)
+
+PROBE_TARGETS_EMPTY_MARKER_RULE = (
+    "의존하는 외부 대상이 없으면 그 절 아래에 \"(없음)\"이라고만 적는다."
+)
+
+# 결함 23: 공식 문서가 없는 사내 대상의 긴 설명이 문서 칸에
+# 그대로 들어가 실측 통과와 불일치가 난 실제 사고(마케팅 채팅 job) 뒤에
+# 추가 -- main의 bd38249 스타일로 체크 바로 옆에 둔다.
+PROBE_TARGETS_INTERNAL_DOC_RULE = (
+    "공식 문서 URL이 없는 사내 대상은 문서 칸에 \"(사내)\"라고만 적는다 — "
+    "왜 없는지·무엇으로 대신했는지 같은 설명은 문서 칸에 붙이지 않고 "
+    "별도 줄(괄호로 감싼 줄이나 \"> \"로 시작하는 줄)에 적는다."
+)
+
+# check_probe (and run_probe_scripts/_probe_observed in
+# engine.application.acceptance_probe, which checks the same two
+# conditions against the script's own real stdout rather than a
+# worker-written log) -- the pass condition stated to the probe worker.
+PROBE_EXIT_AND_OK_LINE_RULE = (
+    "통과 조건은 두 가지다: 종료 코드 0(실패면 0이 아닌 값으로 끝낸다), "
+    "그리고 성공했을 때 표준 출력 마지막에 정확히 `PROBE OK <문서>` 한 줄을 "
+    "찍는다 -- <문서>는 위 목록의 그 대상 \"문서:\" 값을 글자 그대로 "
+    "쓴다(바꾸거나 줄이지 않는다)."
+)
+
+
+def probe_log_format_rule(job: str) -> str:
+    """check_probe's own log-format expectation (first line names the
+    target, then "PROBE OK"/"PROBE FAIL") -- takes `job` since the path
+    it names is job-specific, unlike the other rule sentences above."""
+    return (
+        f".gongbang/{job}/probe/<번호>.log 를 쓴다 -- 첫 줄은 그 대상의 이름과 "
+        "공식 문서 URL이고, 성공하면 \"PROBE OK\", 실패하면 \"PROBE "
+        "FAIL\"과 에러 내용을 적은 뒤 실제 요청·응답 형태도 남긴다."
+    )
+
+
+def facts_rule_sentences() -> tuple[str, ...]:
+    """Every rule sentence a facts-station prompt (facts_prompt,
+    small_prompt) must carry verbatim -- check_facts' own two gates plus
+    check_probe_targets' section format and empty-marker rule (facts.md
+    is the only place that section is written)."""
+    return (
+        FACTS_PASS_NEEDS_SOURCE_RULE,
+        FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE,
+        PROBE_TARGETS_SECTION_FORMAT_RULE,
+        PROBE_TARGETS_EMPTY_MARKER_RULE,
+        PROBE_TARGETS_INTERNAL_DOC_RULE,
+    )
+
+
+def prober_rule_sentences(job: str) -> tuple[str, ...]:
+    """Every rule sentence the prober-station prompt (prober_prompt)
+    must carry verbatim -- the exact pass condition run_probe_scripts/
+    _probe_observed checks against the script's own stdout, plus
+    check_probe's own log-format expectation."""
+    return (PROBE_EXIT_AND_OK_LINE_RULE, probe_log_format_rule(job))
+
+
 __all__ = [
     "check_facts", "check_facts_trusted", "facts_path", "check_design_approved",
     "check_probe_targets", "check_probe", "probe_target_id", "ProbeTargetsError",
+    "FACTS_PASS_NEEDS_SOURCE_RULE", "FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE",
+    "PROBE_TARGETS_SECTION_FORMAT_RULE", "PROBE_TARGETS_EMPTY_MARKER_RULE",
+    "PROBE_TARGETS_INTERNAL_DOC_RULE",
+    "PROBE_EXIT_AND_OK_LINE_RULE", "probe_log_format_rule",
+    "facts_rule_sentences", "prober_rule_sentences",
+    "station_record_prefixes", "other_station_record_violation",
+    "station_record_rule_sentence",
 ]

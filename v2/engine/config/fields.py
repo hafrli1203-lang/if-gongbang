@@ -415,6 +415,67 @@ def _project_hidden_paths(value: object, name: str) -> tuple[Path, ...]:
     return tuple(Path(p) for p in entries)
 
 
+def _project_file_dep_targets(value: object, name: str) -> tuple[tuple[str, str], ...]:
+    """FORM only, same as _project_reference_paths: no filesystem check
+    at config-parse time. Each entry a 2-item [relspec, target] list;
+    `target` must look absolute (a cheap string check, enforced again,
+    identically, by ProjectConfig.__post_init__). The real resolve/
+    validate pass (engine.application.steps.file_deps, against the
+    REAL source checkout) runs once at `gb2 init` time, before this
+    value is ever written to config.json -- see ProjectConfig.
+    file_dep_targets' own docstring."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"project {name!r}: file_dep_targets must be a list")
+    out: list[tuple[str, str]] = []
+    for entry in value:
+        if (not isinstance(entry, list) or len(entry) != 2
+                or not all(isinstance(x, str) for x in entry)):
+            raise ValueError(
+                f"project {name!r}: file_dep_targets entry must be [relspec, target]: {entry!r}"
+            )
+        relspec, target = entry
+        if not target.startswith("/"):
+            raise ValueError(
+                f"project {name!r}: file_dep_targets target must be absolute: {target!r}"
+            )
+        out.append((relspec, target))
+    return tuple(out)
+
+
+def _project_reference_paths(value: object, name: str) -> tuple[Path, ...]:
+    """FORM only -- absolute or "~/..." -- never touches the host
+    filesystem (no is_dir()/.env check here any more). Config loading
+    must never fail because some OTHER project's reference_paths entry
+    happens to be momentarily missing/unreadable on whatever host is
+    re-parsing this file for e.g. a worker's gate hook P1:
+    a hidden is_dir() check here made gate_hook re-deserializing the
+    WHOLE config die, with exit code 2, denying every tool call for
+    every OTHER project too, whenever any one project's reference
+    folder was not reachable). The real checks -- directory-ness, no
+    `.env*` anywhere in the tree, no overlap with secrets_dir/home/
+    the ledger dir/any project's repo/hidden_paths/the real HOME,
+    no hidden path component -- all live in engine.infrastructure.
+    reference_snapshot.snapshot_references, run once per attempt
+    (worker_sandbox/review, right before a worker/reviewer actually
+    needs the snapshot), not at config-parse time. A ProjectConfig
+    built directly in Python (bypassing this parser entirely) goes
+    through that same snapshot function and gets the same checks --
+    there is exactly one place these rules are enforced."""
+    entries = _str_list(value)
+    paths: list[Path] = []
+    for entry in entries:
+        if not (entry.startswith("~") or entry.startswith("/")):
+            raise ValueError(
+                f"project {name!r}: reference_paths entry must be absolute or ~/...: {entry!r}"
+            )
+        # expanduser reads THIS (engine) process's own HOME -- never a
+        # worker's or bench case's env, same rule as bench_readonly_paths.
+        paths.append(Path(os.path.expanduser(entry)))
+    return tuple(paths)
+
+
 _KNOWN_RELEASE_KEYS = frozenset({"master_repo", "target", "verify_cmd"})
 
 
@@ -494,6 +555,16 @@ PROJECT_FIELDS: tuple[ProjectFieldSpec, ...] = (
     ProjectFieldSpec("hidden_paths",
                       lambda v, base, name: _project_hidden_paths(v, name),
                       lambda base, name: (), lambda v: [str(p) for p in v]),
+    ProjectFieldSpec("reference_paths",
+                      lambda v, base, name: _project_reference_paths(v, name),
+                      lambda base, name: (), lambda v: [str(p) for p in v]),
+    ProjectFieldSpec("probe_runtime_clis",
+                      lambda v, base, name: tuple(_str_list(v)),
+                      lambda base, name: (), lambda v: list(v)),
+    ProjectFieldSpec("file_dep_targets",
+                      lambda v, base, name: _project_file_dep_targets(v, name),
+                      lambda base, name: (),
+                      lambda v: [list(pair) for pair in v]),
 )
 
 _KNOWN_PROJECT_KEYS = frozenset(spec.key for spec in PROJECT_FIELDS)

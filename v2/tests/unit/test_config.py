@@ -487,58 +487,86 @@ def test_hidden_paths_loaded_and_roundtrips_through_to_json_dict(tmp_path: Path)
     assert to_json_dict(config)["projects"]["alpha"]["hidden_paths"] == [str(original_src)]
 
 
-def test_context_required_skills_and_require_library_roundtrip(tmp_path: Path) -> None:
-    """engine.context.ContextConfig.required_skills/require_library (a
-    station's own mandatory skills, and projects where a library
-    lookup failure must also count as required-material missing) must
-    survive from_json -> to_json_dict -> from_json unchanged -- a
-    field known only to parsing (or only to serialization) would
-    otherwise either be unsettable from JSON at all (unknown-key
-    ValueError on load) or silently dropped on save; engine.config.
-    CONTEXT_FIELDS is the single table that makes that structurally
-    impossible (see test_config_roundtrip.py for the exhaustive,
-    table-driven version of this check)."""
+
+# ---------------------------------------------------------------------------
+# reference_paths (ProjectConfig): FORM-only at config parse time (absolute
+# or ~/...). All host-filesystem checks (directory-ness, .env* content,
+# overlap with protected roots) moved to engine.infrastructure.
+# reference_snapshot.snapshot_references, run once per attempt -- NOT
+# here, so config loading can never die on another project's unreachable
+# reference folder P1 fix). See tests/unit/test_reference_snapshot.py
+# for the actual security checks.
+# ---------------------------------------------------------------------------
+
+def test_reference_paths_loaded_and_roundtrips_through_to_json_dict(tmp_path: Path) -> None:
     from engine.config import to_json_dict, write_json
-
     make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    reference = tmp_path / "reference-material"
     config = EngineConfig.from_json(_write_config(tmp_path, {
-        "context": {
-            "station_skills": {"build": ["필수-스킬", "선택-스킬"]},
-            "required_skills": {"build": ["필수-스킬"]},
-            "require_library": ["alpha"],
-        },
+        "projects": {"alpha": {"repo": "repo", "reference_paths": [str(reference)]}},
     }))
-    assert config.context is not None
-    assert config.context.required_skills == {"build": ("필수-스킬",)}
-    assert config.context.require_library == ("alpha",)
-
-    as_json = to_json_dict(config)
-    assert as_json["context"]["required_skills"] == {"build": ["필수-스킬"]}
-    assert as_json["context"]["require_library"] == ["alpha"]
-
+    assert config.projects["alpha"].reference_paths == (reference,)
     loaded = write_json(config, tmp_path / "out.json")
-    assert loaded.context.required_skills == {"build": ("필수-스킬",)}
-    assert loaded.context.require_library == ("alpha",)
+    assert loaded.projects["alpha"].reference_paths == (reference,)
+    assert (to_json_dict(config)["projects"]["alpha"]["reference_paths"]
+            == [str(reference)])
 
 
-def test_context_required_skills_defaults_to_empty_when_absent(tmp_path: Path) -> None:
+def test_reference_paths_does_not_require_the_entry_to_exist(tmp_path: Path) -> None:
+    """The P1 fix itself: a reference_paths entry that does not exist on
+    disk at all must still load fine -- no is_dir()/existence check at
+    config-parse time any more (that check now lives in
+    engine.infrastructure.reference_snapshot, run once per attempt, not
+    on every config re-parse)."""
     make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    missing = tmp_path / "does-not-exist-at-all"
+    assert not missing.exists()
     config = EngineConfig.from_json(_write_config(tmp_path, {
-        "context": {"station_skills": {"build": ["스킬"]}},
+        "projects": {"alpha": {"repo": "repo", "reference_paths": [str(missing)]}},
     }))
-    assert config.context.required_skills == {}
-    assert config.context.require_library == ()
+    assert config.projects["alpha"].reference_paths == (missing,)
 
 
-def test_context_rejects_a_required_skills_value_that_is_not_a_list_of_strings(
-    tmp_path: Path,
-) -> None:
+def test_reference_paths_rejects_non_absolute_entry(tmp_path: Path) -> None:
     make_repo(tmp_path / "repo", {"a.txt": "a\n"})
     bad = _write_config(tmp_path, {
-        "context": {"required_skills": {"build": "스킬"}},
+        "projects": {"alpha": {"repo": "repo", "reference_paths": ["relative/material"]}},
     })
     try:
         EngineConfig.from_json(bad)
         raise AssertionError("expected ValueError")
     except ValueError as exc:
-        assert "expected a list of strings" in str(exc)
+        assert "absolute" in str(exc)
+
+
+def test_reference_paths_accepts_tilde_expansion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    config = EngineConfig.from_json(_write_config(tmp_path, {
+        "projects": {"alpha": {"repo": "repo", "reference_paths": ["~/Documents/material"]}},
+    }))
+    assert config.projects["alpha"].reference_paths == (fake_home / "Documents" / "material",)
+
+
+def test_reference_paths_other_projects_missing_entry_does_not_break_config_load(
+    tmp_path: Path,
+) -> None:
+    """P1 #5's exact repro, at the config layer: project beta names a
+    reference folder that does not exist (standing in for "momentarily
+    unreachable from whatever host is re-parsing this config, e.g. a
+    worker's gate hook") while alpha has none at all -- loading the
+    WHOLE config (as a gate hook does on every tool call) must not fail
+    just because of beta's entry."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    make_repo(tmp_path / "repo-beta", {"a.txt": "a\n"})
+    config = EngineConfig.from_json(_write_config(tmp_path, {
+        "projects": {
+            "alpha": {"repo": "repo"},
+            "beta": {"repo": "repo-beta",
+                     "reference_paths": [str(tmp_path / "unreachable-for-beta")]},
+        },
+    }))
+    assert config.projects["alpha"].reference_paths == ()
+    assert config.projects["beta"].reference_paths == (tmp_path / "unreachable-for-beta",)

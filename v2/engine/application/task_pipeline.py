@@ -37,6 +37,7 @@ from engine.infrastructure import evidence
 from engine.infrastructure import gitutil
 from engine.application import release as release_mod
 from engine.config import EngineConfig
+from engine.domain.policy import NOTE_REQUEST_KIND
 from engine.domain.records import Event, RequestRow
 from engine.infrastructure.db.ledger import Ledger
 from engine.application.processor import Fakes, Processor, submit
@@ -44,6 +45,10 @@ from engine.application.steps.open_job import copy_git_config_matches_recorded, 
 from engine.application.steps.open_job import open_job as _open_job
 
 ProcessorFactory = Callable[[EngineConfig, Ledger, Fakes], Processor]
+# Given the "requests" a run_station stage's own station.finished event
+# asked the owner for, returns the subset that should still stop the job
+# -- see continue_job's own docstring (결함 31, sample-app T4).
+RequestFilter = Callable[[list[dict[str, object]]], list[dict[str, object]]]
 
 
 @dataclass(frozen=True)
@@ -198,7 +203,8 @@ def run_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
 def continue_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                  attempt_id: str, stages: list[Stage],
                  processor_factory: ProcessorFactory | None = None,
-                 on_progress: ProgressCallback | None = None) -> JobOutcome:
+                 on_progress: ProgressCallback | None = None,
+                 request_filter: RequestFilter | None = None) -> JobOutcome:
     """Run the given stages on an attempt that is already open (e.g. after
     the owner submitted an install a station asked for). Does not call
     open_job -- the caller is resuming, not starting. Always drive the
@@ -211,9 +217,21 @@ def continue_job(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: st
     present together for _should_run_parallel to interleave them.
     `on_progress`, if given, is called with each stage's kind right
     after it finishes -- use it for incremental progress reporting
-    instead of driving the stage list incrementally."""
+    instead of driving the stage list incrementally.
+
+    `request_filter`, if given, is applied to a run_station stage's own
+    "requests" (once the very next stage -- merge -- has also completed,
+    same deferred timing as always) right before they would otherwise
+    stop the job for the owner: it returns the subset that STILL stops
+    the job, and may itself record whatever it needs about the rest
+    (결함 31, sample-app T4 -- engine.application.pipeline_tasks's own
+    filter hands a request off to a later task that already owns its
+    path instead of stopping, as a ledger record plus a note folded
+    into that task's own builder instructions). The remaining stages
+    (review/bench/commit/report/close) then run exactly as if the
+    station had asked for nothing at all."""
     return _run_stages(config, ledger, fakes, project, attempt_id, stages,
-                       processor_factory, on_progress)
+                       processor_factory, on_progress, request_filter)
 
 
 # A station worker that stalled, exited early, or reported a result the
@@ -377,7 +395,8 @@ def _run_review_then_bench(config: EngineConfig, ledger: Ledger, proc: Processor
 def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                attempt_id: str, stages: list[Stage],
                processor_factory: ProcessorFactory | None,
-               on_progress: ProgressCallback | None = None) -> JobOutcome:
+               on_progress: ProgressCallback | None = None,
+               request_filter: RequestFilter | None = None) -> JobOutcome:
     make_processor = processor_factory or default_processor_factory
     proc = make_processor(config, ledger, fakes)
     completed: list[str] = []
@@ -517,16 +536,19 @@ def _run_stages(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str
             idx += 1
             continue
         if pending_from_station:
-            _record_job_metrics_failure(
-                ledger, project, attempt_id, durations_ms,
-                git_calls_carried + (gitutil.call_count() - git_calls_at_start),
-                "needs_owner", "run_station",
-            )
-            return JobOutcome(
-                attempt_id=attempt_id, status="needs_owner", failed_request=None,
-                reason=None, pending_requests=tuple(pending_from_station),
-                completed=tuple(completed),
-            )
+            still_pending = blocking_station_requests(pending_from_station, request_filter)
+            if still_pending:
+                _record_job_metrics_failure(
+                    ledger, project, attempt_id, durations_ms,
+                    git_calls_carried + (gitutil.call_count() - git_calls_at_start),
+                    "needs_owner", "run_station",
+                )
+                return JobOutcome(
+                    attempt_id=attempt_id, status="needs_owner", failed_request=None,
+                    reason=None, pending_requests=tuple(still_pending),
+                    completed=tuple(completed),
+                )
+            pending_from_station = []
         idx += 1
     return JobOutcome(
         attempt_id=attempt_id, status="done", failed_request=None, reason=None,
@@ -628,6 +650,18 @@ def _record_job_metrics_failure(ledger: Ledger, project: str, attempt_id: str,
     ))
 
 
+def blocking_station_requests(requests: list[dict[str, object]],
+                              request_filter: "RequestFilter | None") -> list[dict[str, object]]:
+    """The station requests that really stop the job for the owner.
+    A `kind="note"` request is informational and is dropped HERE, for
+    every caller -- not only when a caller happens to pass a
+    request_filter (결함 33b, sample-app T5: the `gb2 fix` path
+    passes none, so a note stopped it)."""
+    blocking = [r for r in requests
+                if not (isinstance(r, dict) and r.get("kind") == NOTE_REQUEST_KIND)]
+    return request_filter(blocking) if request_filter is not None else blocking
+
+
 def _station_pending_requests(ledger: Ledger, project: str,
                               request_id: str) -> list[dict[str, object]]:
     """The "requests" a station.finished event (matching request_id) asked
@@ -642,6 +676,7 @@ def _station_pending_requests(ledger: Ledger, project: str,
 
 
 __all__ = [
-    "Stage", "JobOutcome", "ProgressCallback", "default_stages", "fix_stages",
+    "Stage", "JobOutcome", "ProgressCallback", "RequestFilter", "default_stages", "fix_stages",
     "stages_after_install", "release_followup_stages", "run_job", "continue_job",
+    "blocking_station_requests",
 ]

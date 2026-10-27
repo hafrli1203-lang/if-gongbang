@@ -42,6 +42,12 @@
                                           optional additional owner
                                           instructions appended to the
                                           composed continue-task
+    tools/gb2 fix <app> --also-own P     before continuing, widen the
+                                          task currently being fixed
+                                          with an extra write path `P`
+                                          (repeatable; see engine.fixup.
+                                          add_also_own) -- never edits
+                                          plan.json itself
     tools/gb2 doctor                     check every external dependency
                                           gb2 itself relies on (python3.12,
                                           git, bwrap, claude, codex, node,
@@ -258,6 +264,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fix = sub.add_parser("fix")
     p_fix.add_argument("app")
     p_fix.add_argument("extra", nargs="?", default=None)
+    p_fix.add_argument("--also-own", dest="also_own", action="append", default=[],
+                       help="widen the task currently being fixed with an extra "
+                            "write path (repeatable) -- see engine.fixup.add_also_own")
 
     p_status = sub.add_parser("status")
     p_status.add_argument("app")
@@ -315,6 +324,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_continue = sub.add_parser("continue")
     p_continue.add_argument("app")
+    p_continue.add_argument("--from", dest="from_station", default=None,
+                            choices=("facts", "probe", "plan"),
+                            help="reopen from this early station instead of "
+                                 "the ordinary resume point -- e.g. an owner/"
+                                 "foreman scope decision made after facts.md "
+                                 "was written needs facts.md itself redone. "
+                                 "Refused if the job is not currently stopped "
+                                 "at an early station, or if this names a "
+                                 "station LATER than the one it is stopped "
+                                 "at.")
 
     sub.add_parser("doctor")
 

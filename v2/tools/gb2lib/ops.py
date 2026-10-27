@@ -15,6 +15,9 @@ from pathlib import Path
 from engine.cli import cmd_backup as _engine_cmd_backup
 from engine.cli import cmd_status as _engine_cmd_status
 from engine.config import EngineConfig
+from engine.infrastructure.db.ledger import Ledger
+from engine.application.job_state import pending_owner_requests
+from engine.application.repair_target import is_owns_scope_request
 
 from . import shared
 
@@ -24,9 +27,57 @@ __all__ = [
 ]
 
 
+def _job_name_for_attempt(ledger: Ledger, project: str, attempt_id: str) -> str | None:
+    """job_name of the job.opened event that created `attempt_id`, or
+    None if there is none -- this module's own small duplicate of the
+    same lookup engine.interface.cli/engine.application.repair_target/
+    engine.application.release_certificate each already keep privately
+    (see repair_target._job_name_for_attempt's own docstring for why
+    this codebase duplicates it per module rather than importing
+    another module's private name across a boundary tools/arch_check.py
+    itself checks for)."""
+    for _seq, event in ledger.events(project, "job.opened"):
+        if event.payload.get("attempt_id") == attempt_id:
+            return str(event.payload.get("job_name"))
+    return None
+
+
+def _edit_owner_hints(config: EngineConfig, app: str) -> list[dict[str, str]]:
+    """Every outstanding owns-scope report (repair_target.
+    is_owns_scope_request -- a `kind="edit"` request, or, since 결함 31,
+    any unknown kind carrying the same "path") the app's current job is
+    stopped on, each with the exact `gb2 fix <app> --also-own <path>`
+    line that approves it -- read-only (opens and closes its own Ledger
+    connection, same as engine.cli.cmd_status itself does). [] when
+    there is no current attempt, no job.opened event can be found for
+    it, or nothing of this kind is pending."""
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        row = ledger.project(app)
+        if row.current_attempt_id is None:
+            return []
+        job_name = _job_name_for_attempt(ledger, app, row.current_attempt_id)
+        if job_name is None:
+            return []
+        pending = pending_owner_requests(ledger, app, job_name,
+                                         repo=config.projects[app].repo)
+    finally:
+        ledger.close()
+    return [
+        {"kind": str(r.get("kind")), "path": str(r["path"]),
+         "hint": f"gb2 fix {app} --also-own {r['path']}로 승인"}
+        for r in pending
+        if is_owns_scope_request(r)
+    ]
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = EngineConfig.from_json(shared.app_workspace(args.app) / "config.json")
-    return _engine_cmd_status(config, argparse.Namespace(project=args.app))
+    code = _engine_cmd_status(config, argparse.Namespace(project=args.app))
+    hints = _edit_owner_hints(config, args.app)
+    if hints:
+        print(json.dumps({"owner_action_needed": hints}, ensure_ascii=False))
+    return code
 
 
 def cmd_backup(args: argparse.Namespace) -> int:

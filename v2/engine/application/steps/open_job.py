@@ -432,6 +432,9 @@ def recover_job(config: EngineConfig, ledger: Ledger, project: str,
         ledger.release_lock(project, holder)
 
 
+ENGINE_RECORDS_DIR = ".gongbang"
+
+
 def dirty_paths(repo: Path, excludes: tuple[str, ...]) -> tuple[str, ...]:
     """Relative paths (literal filenames, never git-quoted) in the
     commit-tree range that differ from HEAD. Uses `-z` so non-ASCII/special
@@ -458,6 +461,25 @@ def dirty_paths(repo: Path, excludes: tuple[str, ...]) -> tuple[str, ...]:
         if status[0] in ("R", "C") and i < len(tokens) and tokens[i]:
             paths.add(tokens[i])
             i += 1
+    # The engine's own records under .gongbang/ (facts.md, probe/t<N>.log,
+    # plan, review files) must travel even when the app's .gitignore
+    # matches them (a common "*.log" rule dropped every probe log and
+    # stopped a real job at probe_failed). Ignored files elsewhere stay
+    # out, exactly as before.
+    ignored = subprocess.run(
+        git_argv(repo, "status", "--porcelain", "-z", "--ignored=matching",
+                 "--untracked-files=all", "--", ENGINE_RECORDS_DIR),
+        check=True, capture_output=True,
+    ).stdout.decode("utf-8", "surrogateescape").split("\0")
+    for entry in ignored:
+        if entry.startswith("!! "):
+            rel = entry[3:]
+            if rel.endswith("/"):
+                for f in (repo / rel).rglob("*"):
+                    if f.is_file() and not f.is_symlink():
+                        paths.add(str(f.relative_to(repo)))
+            else:
+                paths.add(rel)
     excluded_prefixes = tuple(e.rstrip("/") for e in excludes)
     def is_excluded(p: str) -> bool:
         return any(p == e or p.startswith(e + "/") for e in excluded_prefixes)
@@ -576,23 +598,36 @@ def _link_copy_link_entry(repo_real: Path, dest_real: Path, dest: Path,
     wherever that pre-existing symlink points, outside `dest`).
 
     With no `writable_subpaths`: `dest/entry` is a single symlink to
-    `repo/entry` (unchanged). With `writable_subpaths` (e.g.
-    node_modules needing .vite-temp/.vite writable at runtime despite
-    the rest being read-only): `dest/entry` becomes a REAL directory
-    instead -- a symlink has no "contents" of its own to selectively
-    override, and nesting a writable OS-sandbox mount under a
-    read-only re-exposure of `repo/entry` is impossible (bwrap cannot
-    create a missing mountpoint under an already read-only bind,
-    verified empirically -- so this split has to happen at
-    copy-creation time instead, never at sandbox-mount time). Each
-    of `repo/entry`'s own immediate children is individually
-    symlinked in (same source-containment check as the whole-entry
-    case; a child that fails it is simply skipped, not the whole
-    entry), and each configured writable_subpaths name becomes a
-    real, empty, writable directory living ONLY in the copy -- it is
-    never symlinked to the repo, so writes under it can never reach
-    the real repo's node_modules, and it needs no sandbox mount at
-    all (the copy itself is already writable)."""
+    `repo/entry` -- UNLESS `dest/entry` already exists as a real path
+    (e.g. a copy_links entry like "knowledge" whose own .gitignore
+    only ignores PART of it -- "knowledge/*" + "!knowledge/SOURCES.md"
+    -- so the copy's `git archive HEAD` extraction already materialized
+    a real "knowledge/" directory containing that one tracked file
+    before this function ever runs; a flat `symlink_to` there raises
+    FileExistsError). In that case this merges instead, via
+    `link_entry_children` (defect 22): only `repo/entry`'s children
+    that do not already exist in the copy get symlinked in, recursing
+    one level deeper only where BOTH sides are already a real
+    directory at the same child name; a tracked file the archive
+    already placed there is left exactly as committed. With
+    `writable_subpaths` (e.g. node_modules needing .vite-temp/.vite
+    writable at runtime despite the rest being read-only): `dest/entry`
+    becomes a REAL directory instead -- a symlink has no "contents" of
+    its own to selectively override, and nesting a writable OS-sandbox
+    mount under a read-only re-exposure of `repo/entry` is impossible
+    (bwrap cannot create a missing mountpoint under an already
+    read-only bind, verified empirically -- so this split has to happen
+    at copy-creation time instead, never at sandbox-mount time). Each
+    of `repo/entry`'s own immediate children is individually symlinked
+    in via the same `link_entry_children` merge (so a partly-tracked
+    entry combined with writable_subpaths also just works), and each
+    configured writable_subpaths name becomes a real, empty, writable
+    directory living ONLY in the copy -- it is never symlinked to the
+    repo, so writes under it can never reach the real repo's
+    node_modules, and it needs no sandbox mount at all (the copy itself
+    is already writable). Either way, nothing here ever raises: a
+    conflict this function cannot resolve is reported as a
+    "copy_link_*" skip reason instead."""
     target = repo / entry
     if not target.exists():
         return None  # nothing to link; not a failure (pre-existing behavior)
@@ -610,25 +645,81 @@ def _link_copy_link_entry(repo_real: Path, dest_real: Path, dest: Path,
     if parent_real != dest_real and not is_within(parent_real, dest_real):
         return "copy_link_parent_escapes_copy"
 
+    entry_dest = dest / entry
     if not writable_subpaths:
-        (dest / entry).symlink_to(target)
-        return None
+        if not entry_dest.exists():
+            entry_dest.symlink_to(target)
+            return None
+        if entry_dest.is_symlink():
+            return None  # already linked (e.g. a re-run); nothing further to do
+        if not target.is_dir() or not entry_dest.is_dir():
+            # A real, non-directory conflict on at least one side (a
+            # tracked FILE already sits at this exact path) -- the
+            # archive's own tracked content wins, nothing to link.
+            return None
+        return link_entry_children(target, entry_dest, dest_real, repo_real)
 
     if not target.is_dir():
         return "copy_link_writable_subpaths_requires_dir"
-    entry_dest = dest / entry
     entry_dest.mkdir(parents=True, exist_ok=True)
-    writable_names = set(writable_subpaths)
-    for child_name in os.listdir(target):
-        if child_name in writable_names:
-            continue  # the writable subpath wins; never symlinked to the repo
-        child = target / child_name
-        child_real = Path(os.path.realpath(child))
-        if child_real != repo_real and not is_within(child_real, repo_real):
-            continue  # fail closed for this one child, not the whole entry
-        (entry_dest / child_name).symlink_to(child)
+    reason = link_entry_children(target, entry_dest, dest_real, repo_real,
+                                   skip_names=frozenset(writable_subpaths))
+    if reason is not None:
+        return reason
     for subpath in writable_subpaths:
         (entry_dest / subpath).mkdir(parents=True, exist_ok=True)
+    return None
+
+
+def link_entry_children(target: Path, entry_dest: Path, dest_real: Path,
+                         repo_real: Path | None,
+                         skip_names: frozenset[str] = frozenset()) -> str | None:
+    """Symlink each of `target`'s own children into the already-existing
+    real directory `entry_dest`, skipping any name in `skip_names`
+    (copy_link_writable_subpaths) and any child `entry_dest` already
+    has (a tracked file/dir the copy's git-archive, or the snapshot's
+    export_tree, already materialized there -- that tracked content
+    wins, nothing to link over it) -- recursing one level deeper only
+    for a child that is a real directory on BOTH sides (so a tracked
+    file nested two levels down under an otherwise-untracked tree still
+    gets its untracked siblings linked in). Shared by
+    `_link_copy_link_entry` (worker copies, open_job._make_copy) and
+    `engine.application.steps.suite_snapshot._link_snapshot_dep_entry`
+    (disposable snapshots), so the one merge rule that avoids
+    FileExistsError on a partly-tracked copy_links entry (defect 22)
+    only has to be right in one place.
+
+    `repo_real` fail-closes a child the same way the whole-entry case
+    already does (a child whose realpath resolves outside the repo is
+    skipped, not the whole entry) -- callers that must NOT fail closed
+    on source (the snapshot caller; see that module's own docstring for
+    why) pass `repo_real=None` instead, to skip only that check while
+    keeping this same merge behavior. Never raises: a conflict this
+    cannot resolve for one child is simply left as whatever already
+    exists there, same fail-closed-but-non-raising shape as the
+    whole-entry case."""
+    for child_name in os.listdir(target):
+        if child_name in skip_names:
+            continue
+        child = target / child_name
+        if repo_real is not None:
+            child_real = Path(os.path.realpath(child))
+            if child_real != repo_real and not is_within(child_real, repo_real):
+                continue  # fail closed for this one child, not the whole entry
+        child_dest = entry_dest / child_name
+        if not child_dest.exists():
+            child_dest.symlink_to(child)
+            continue
+        if child_dest.is_symlink():
+            continue  # already linked; nothing further to do
+        if child.is_dir() and child_dest.is_dir():
+            reason = link_entry_children(child, child_dest, dest_real, repo_real)
+            if reason is not None:
+                return reason
+            continue
+        # A real, non-directory conflict (a tracked file already sits
+        # at this exact child path) -- the already-materialized tracked
+        # content wins, nothing to link.
     return None
 
 
@@ -679,6 +770,12 @@ def _make_copy(repo: Path, dest: Path, copy_links: tuple[str, ...] = (),
     env = {**os.environ, **_COPY_GIT_IDENTITY, "GIT_CONFIG_GLOBAL": "/dev/null"}
     subprocess.run(git_argv(dest, "add", "-A"), check=True,
                     capture_output=True, env=env)
+    # Engine records the repo tracks under .gongbang/ stay in the base even
+    # when the app's .gitignore matches them, so the copy starts equal to
+    # HEAD there (only .gongbang/ is forced; copy_links stay out).
+    if (dest / ENGINE_RECORDS_DIR).is_dir():
+        subprocess.run(git_argv(dest, "add", "-f", "--", ENGINE_RECORDS_DIR), check=True,
+                        capture_output=True, env=env)
     subprocess.run(git_argv(dest, "commit", "-q", "-m", "base"),
                     check=True, capture_output=True, env=env)
     return skipped, _copy_git_config_sha256(dest)

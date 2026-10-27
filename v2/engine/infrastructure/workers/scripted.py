@@ -18,6 +18,11 @@ class ScriptedRunner:
     # A scripted worker is not a real CLI with its own credential state --
     # it needs no writable HOME subpath at all.
     home_writable_subpaths: tuple[str, ...] = ()
+    # The fake worker script already gets spec.task inline via its own
+    # --inline argv (see argv() below) -- never over stdin like the real
+    # claude/codex CLIs, so this stays the default "no" rather than
+    # picking up the real runners' stdin-prompt behavior.
+    prompt_via_stdin = False
 
     def __init__(self, script_path: Path,
                  gate_argv: tuple[str, ...] | None = None,

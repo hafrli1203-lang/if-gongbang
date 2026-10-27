@@ -18,6 +18,7 @@ from engine.domain import ids
 from engine.config import EngineConfig
 from engine.infrastructure.gitutil import git_argv
 from engine.application.steps.open_job import is_within as _is_within
+from engine.application.steps.open_job import link_entry_children
 
 _SNAPSHOT_GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "engine", "GIT_AUTHOR_EMAIL": "engine@local",
@@ -90,7 +91,10 @@ def make_snapshot(repo: Path, dest: Path, fp: str) -> None:
     evidence.export_tree(repo, fp, dest)
     subprocess.run(git_argv(dest, "init", "-q"), check=True, capture_output=True)
     env = {**os.environ, **_SNAPSHOT_GIT_IDENTITY, "GIT_CONFIG_GLOBAL": "/dev/null"}
-    subprocess.run(git_argv(dest, "add", "-A"), check=True,
+    # -f: `dest` holds exactly the certified tree export_tree just wrote,
+    # nothing else, so the app's own .gitignore (e.g. "*.log" matching a
+    # tracked .gongbang/<job>/probe/t1.log) must not drop any of it.
+    subprocess.run(git_argv(dest, "add", "-A", "-f"), check=True,
                     capture_output=True, env=env)
     subprocess.run(git_argv(dest, "commit", "-q", "-m", "engine-snapshot"),
                     check=True, capture_output=True, env=env)
@@ -239,7 +243,17 @@ def _link_snapshot_dep_entry(dest_real: Path, dest: Path, repo: Path, entry: str
     containment check. Silently does nothing for a missing/unsafe case
     (same fail-closed-but-non-raising shape as that function), since a
     missing test dependency surfaces on its own as a test failure
-    rather than needing a second signal here."""
+    rather than needing a second signal here.
+
+    The actual merge-into-an-existing-real-directory behavior (defect
+    22 -- a copy_links entry like "knowledge" that is only PARTLY
+    gitignored, so `evidence.export_tree`'s own certified-fingerprint
+    extraction already materialized a real directory with that one
+    tracked file in it, before this function ever runs) is shared with
+    open_job._link_copy_link_entry via `link_entry_children`, passing
+    `repo_real=None` so that shared helper skips only the source-
+    containment check this function's own docstring says must not
+    apply here, while still merging children the same way."""
     target = repo / entry
     if not target.exists():
         return
@@ -253,18 +267,22 @@ def _link_snapshot_dep_entry(dest_real: Path, dest: Path, repo: Path, entry: str
     if parent_real != dest_real and not _is_within(parent_real, dest_real):
         return  # destination parent escapes the snapshot -- unsafe, skip
 
+    entry_dest = dest / entry
     if not writable_subpaths:
-        (dest / entry).symlink_to(target)
+        if not entry_dest.exists():
+            entry_dest.symlink_to(target)
+            return
+        if entry_dest.is_symlink():
+            return  # already linked (e.g. a re-run); nothing further to do
+        if not target.is_dir() or not entry_dest.is_dir():
+            return  # tracked content already there wins; nothing to link
+        link_entry_children(target, entry_dest, dest_real, repo_real=None)
         return
 
     if not target.is_dir():
         return  # writable_subpaths only make sense for a directory entry
-    entry_dest = dest / entry
     entry_dest.mkdir(parents=True, exist_ok=True)
-    writable_names = set(writable_subpaths)
-    for child_name in os.listdir(target):
-        if child_name in writable_names:
-            continue  # the writable subpath wins; never symlinked to the repo
-        (entry_dest / child_name).symlink_to(target / child_name)
+    link_entry_children(target, entry_dest, dest_real, repo_real=None,
+                         skip_names=frozenset(writable_subpaths))
     for subpath in writable_subpaths:
         (entry_dest / subpath).mkdir(parents=True, exist_ok=True)

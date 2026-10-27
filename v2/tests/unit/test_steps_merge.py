@@ -180,6 +180,80 @@ def test_merge_rejects_owns_widening_beyond_station_prefixes(workspace: Workspac
     assert req.result == {"reason": "owns_escapes_station_prefixes"}
 
 
+def _gongbang_config(config: EngineConfig) -> EngineConfig:
+    """A config variant matching the real app's own station_owners shape
+    (tools/templates/node-vitest.json): "facts"/"probe" each grant their
+    role the WHOLE ".gongbang/" tree -- the exact shape that let a
+    prober's copy touch facts.md in the first place (결함 12,
+   , before engine.domain.stage_checks.
+    station_record_prefixes started refusing it independently of
+    config."""
+    return dataclasses.replace(config, station_owners={
+        **config.station_owners,
+        "facts": {"facts": (".gongbang/",)},
+        "probe": {"prober": (".gongbang/",)},
+    })
+
+
+def test_prober_writing_into_facts_record_fails_wrote_other_station_record(
+    workspace: Workspace,
+) -> None:
+    """결함 12: a prober's own copy touching facts.md --
+    station "facts"'s own record, not "probe"'s -- fails loudly and
+    merges nothing, even though config still grants "probe" the whole
+    ".gongbang/" tree station_record_prefixes is the config-independent
+    floor underneath that (same role _PLANNER_ONLY_PREFIX plays for
+    tests/scenes/ above)."""
+    cfg = _gongbang_config(workspace.config)
+    attempt_id = open_job(cfg, workspace.ledger, "alpha", "job1", "full", ("prober",))
+    copy_a = copy_root(cfg, attempt_id, "prober")
+    (copy_a / ".gongbang" / "job1" / "probe").mkdir(parents=True)
+    (copy_a / ".gongbang" / "job1" / "probe" / "t1.log").write_text(
+        "PROBE OK\n", encoding="utf-8")
+    (copy_a / ".gongbang" / "job1" / "facts.md").write_text("corrupted\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "prober", "station": "probe", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace, config=cfg)
+    n = proc.run_once("alpha")
+    assert n == 0
+    req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {
+        "reason": "wrote_other_station_record:.gongbang/job1/facts.md",
+    }
+    assert not (workspace.alpha / ".gongbang" / "job1" / "facts.md").exists()
+    assert not (workspace.alpha / ".gongbang" / "job1" / "probe" / "t1.log").exists()
+    denied = [e for _seq, e in workspace.ledger.events("alpha", "merge.denied")
+              if e.payload.get("reason") == "wrote_other_station_record"]
+    assert denied and denied[0].payload["station"] == "probe"
+    assert denied[0].payload["path"] == ".gongbang/job1/facts.md"
+
+
+def test_prober_writing_only_its_own_probe_record_succeeds(workspace: Workspace) -> None:
+    """The positive case for the same table: a prober's copy that only
+    touches its OWN record (.gongbang/<job>/probe/) merges exactly as
+    before -- the new check never narrows a station's write access to
+    its own record, only blocks writes into ANOTHER station's."""
+    cfg = _gongbang_config(workspace.config)
+    attempt_id = open_job(cfg, workspace.ledger, "alpha", "job2", "full", ("prober",))
+    copy_a = copy_root(cfg, attempt_id, "prober")
+    (copy_a / ".gongbang" / "job2" / "probe").mkdir(parents=True)
+    (copy_a / ".gongbang" / "job2" / "probe" / "t1.log").write_text(
+        "PROBE OK\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "prober", "station": "probe", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace, config=cfg)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    assert (workspace.alpha / ".gongbang" / "job2" / "probe" / "t1.log").read_text(
+        encoding="utf-8") == "PROBE OK\n"
+
+
 def test_conflicting_edit_fails_and_writes_nothing(workspace: Workspace) -> None:
     cfg = _overlap_config(workspace.config)
     attempt_id = open_job(cfg, workspace.ledger, "alpha", "conflict", "full",
@@ -377,20 +451,22 @@ def test_validate_rel_rejects_dotdot_absolute_and_protected(workspace: Workspace
     policy = Policy(workspace.config, workspace.ledger)
     ctx = SimpleNamespace(project="alpha")
     repo = workspace.alpha
+    job = "irrelevant-job"  # none of these paths touch any station_record_prefixes entry
 
     with pytest.raises(StepFailed) as exc1:
-        merge._validate_rel(ctx, repo, policy, "../outside.txt", "builder")
+        merge._validate_rel(ctx, repo, policy, "../outside.txt", "builder", "build", job, None)
     assert exc1.value.reason == "path_rejected"
 
     with pytest.raises(StepFailed) as exc2:
-        merge._validate_rel(ctx, repo, policy, "/etc/passwd", "builder")
+        merge._validate_rel(ctx, repo, policy, "/etc/passwd", "builder", "build", job, None)
     assert exc2.value.reason == "path_rejected"
 
     with pytest.raises(StepFailed) as exc3:
-        merge._validate_rel(ctx, repo, policy, ".gitignore", "builder")
+        merge._validate_rel(ctx, repo, policy, ".gitignore", "builder", "build", job, None)
     assert exc3.value.reason == "path_rejected"
 
-    merge._validate_rel(ctx, repo, policy, "src/app.py", "builder")  # does not raise
+    # does not raise
+    merge._validate_rel(ctx, repo, policy, "src/app.py", "builder", "build", job, None)
 
 
 def test_symlink_in_copy_is_rejected(workspace: Workspace) -> None:

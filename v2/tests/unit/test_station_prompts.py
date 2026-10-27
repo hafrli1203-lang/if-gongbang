@@ -111,3 +111,14 @@ def test_no_industry_or_brand_words_in_any_prompt() -> None:
     ]
     for text in samples:
         _assert_no_banned_words(text)
+
+
+def test_prober_prompt_states_the_exact_rule_the_engine_judges() -> None:
+    """The prober prompt once asked only for exit 0 and "PROBE OK" in the
+    log, while acceptance_probe._probe_observed requires the script's own
+    output to carry "PROBE OK <doc>" -- every real probe then failed."""
+    from engine.application.acceptance_probe import _PROBE_OK_MARK
+    from engine.application.stage_prompts import prober_prompt
+    text = prober_prompt("req", "job", (("Some API", "https://docs.example/x"),))
+    assert f"`{_PROBE_OK_MARK} <문서>`" in text
+    assert "https://docs.example/x" in text

@@ -47,16 +47,35 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# The one shared literal every module that cares about this boundary
+# (this one, engine.application.steps.merge's _PLANNER_ONLY_PREFIX,
+# engine.application.steps.suite_select's own full-scope exclusion) must use --
+# the planner-owned scene-script directory inside a project's own repo.
+# Exported so a later caller imports the VALUE rather than re-typing the
+# literal a third time.
+SCENES_PREFIX = "tests/scenes/"
+
+
 class PlanError(ValueError):
     """plan.json is missing, not valid JSON, does not match the fixed
     schema below, or (from ordered_tasks) has an unknown depends_on or
     a dependency cycle. `reason` is a short machine-readable token;
     callers (engine.application.pipeline) turn it into a FullOutcome("failed",
     reason=...) rather than letting this surface as an unhandled
-    exception mid-orbit."""
+    exception mid-orbit.
 
-    def __init__(self, reason: str) -> None:
+    `detail` ("" unless `reason == "plan_unreadable"` from a real JSON
+    parse failure -- see json_decode_error_detail) is the human-
+    readable error position and surrounding text a caller (engine.
+    application.pipeline_planning.run_plan_and_review, 결함 30) records
+    to the ledger so a reopened plan station's prompt can tell the
+    planner exactly what was wrong with the LAST plan.json it wrote,
+    instead of silently handing the same broken file back with no clue
+    why it failed."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
         self.reason = reason
+        self.detail = detail
         super().__init__(reason)
 
 
@@ -252,8 +271,38 @@ def _parse_plan(raw: object) -> Plan:
                 tools=tools, requirements=requirements)
 
 
+# How much context json_decode_error_detail keeps on each side of the
+# error position -- the owner's own figure (결함 30): enough that the
+# planner can actually SEE the broken quote/comma, never the whole file.
+_JSON_ERROR_CONTEXT_CHARS = 80
+
+
+def json_decode_error_detail(raw_text: str, exc: BaseException) -> str:
+    """"line L column C: <80 chars before>⟪ERROR⟫<80 chars after>" for a
+    real json.JSONDecodeError, else "" (e.g. exc is a plain
+    UnicodeDecodeError, which has no line/col/pos to show). Lives next
+    to load_plan (the one place that actually catches this) -- same
+    bd38249 reasoning as every other rule/detail helper in this module:
+    the code that reads the failure shape stays next to the code that
+    turns it into text."""
+    lineno = getattr(exc, "lineno", None)
+    colno = getattr(exc, "colno", None)
+    pos = getattr(exc, "pos", None)
+    msg = getattr(exc, "msg", None) or str(exc)
+    if not isinstance(pos, int):
+        return msg
+    start = max(0, pos - _JSON_ERROR_CONTEXT_CHARS)
+    end = min(len(raw_text), pos + _JSON_ERROR_CONTEXT_CHARS)
+    before = raw_text[start:pos]
+    after = raw_text[pos:end]
+    where = f"line {lineno} column {colno}" if lineno is not None else f"문자 위치 {pos}"
+    return f"{msg} ({where}): ...{before}⟪여기⟫{after}..."
+
+
 def load_plan(repo: Path, job: str) -> Plan:
-    """Raises PlanError("plan_missing"/"plan_unreadable"/<schema token>)."""
+    """Raises PlanError("plan_missing"/"plan_unreadable"/<schema token>) --
+    a "plan_unreadable" from a real JSON parse failure carries
+    json_decode_error_detail's own text as PlanError.detail."""
     path = plan_path(repo, job)
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -263,8 +312,8 @@ def load_plan(repo: Path, job: str) -> Plan:
         raise PlanError("plan_unreadable") from None
     try:
         raw = json.loads(raw_text)
-    except (ValueError, UnicodeDecodeError):
-        raise PlanError("plan_unreadable") from None
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise PlanError("plan_unreadable", json_decode_error_detail(raw_text, exc)) from None
     return _parse_plan(raw)
 
 
@@ -346,6 +395,22 @@ _SUPPORTED_SCENE_RUNNERS: tuple[tuple[str, ...], ...] = (
     ("npx", "vitest", "run"),
 )
 
+# Value-less flags a `covers`-claiming scene's cmd may place between its
+# runner prefix and the scene script itself -- e.g. ["npx", "vitest",
+# "run", "--no-color", "--no-cache", "tests/scenes/x.test.ts"], the same
+# shape a project's own test_cmd (EngineConfig.test_cmd, e.g. "npx vitest
+# run --no-color --no-cache") already uses, so a planner copying that
+# project convention into a scene's cmd is not rejected outright. A flag
+# that takes a value -- "--config x" (separate token) or "--root=.."
+# (packed into one token with "=") -- is deliberately NOT on this list and
+# never will be matched by prefix/pattern: scene_script_arg only ever
+# skips a token that equals one of these EXACTLY, so a value-taking flag
+# simply fails to match, is never treated as "the scene path", and the
+# scene has no scene_script_arg at all (same as any other unsupported
+# token here) -- never silently treated as safe because it merely LOOKS
+# like one of these.
+_SAFE_SCENE_CMD_FLAGS: tuple[str, ...] = ("--no-color", "--no-cache", "--silent")
+
 
 def _is_safe_scene_path(token: str) -> bool:
     """True iff `token` is a tests/scenes/ file path with no escape --
@@ -371,16 +436,18 @@ def _is_safe_scene_path(token: str) -> bool:
 
 def scene_script_arg(cmd: tuple[str, ...]) -> str | None:
     """The tests/scenes/ path `cmd` actually runs -- the token right
-    after a matched _SUPPORTED_SCENE_RUNNERS prefix, iff that token is
-    a safe scene path (_is_safe_scene_path). None if `cmd` does not
-    start with any supported runner, cmd[0] is not a BARE runner name
-    (contains "/" or "\\" -- a path-qualified cmd[0] is never trusted
-    here at all, see module docstring), or the runner's first real
-    argument is something else (a flag, a different path, a path that
-    escapes tests/scenes/, or the scene path buried behind other
-    tokens) -- `cmd` mentioning "tests/scenes/..." ANYWHERE else does
-    not count (see module docstring: `["true", "tests/scenes/x.py"]`
-    must return None here, since `true` never runs that script).
+    after a matched _SUPPORTED_SCENE_RUNNERS prefix and any run of
+    _SAFE_SCENE_CMD_FLAGS immediately following it, iff that token is a
+    safe scene path (_is_safe_scene_path). None if `cmd` does not start
+    with any supported runner, cmd[0] is not a BARE runner name (contains
+    "/" or "\\" -- a path-qualified cmd[0] is never trusted here at all,
+    see module docstring), or the token right after the runner (and any
+    leading safe flags) is something else (an unsupported/value-taking
+    flag, a different path, a path that escapes tests/scenes/, or the
+    scene path buried behind other tokens) -- `cmd` mentioning
+    "tests/scenes/..." ANYWHERE else does not count (see module
+    docstring: `["true", "tests/scenes/x.py"]` must return None here,
+    since `true` never runs that script).
 
     Imported directly by engine.application.acceptance (`from engine.domain.plan import
     scene_script_arg`), so this exact name must keep resolving on
@@ -391,7 +458,12 @@ def scene_script_arg(cmd: tuple[str, ...]) -> str | None:
         n = len(prefix)
         if len(cmd) <= n or cmd[0] != prefix[0] or tuple(cmd[1:n]) != prefix[1:]:
             continue
-        arg = cmd[n]
+        idx = n
+        while idx < len(cmd) - 1 and cmd[idx] in _SAFE_SCENE_CMD_FLAGS:
+            idx += 1
+        if idx >= len(cmd):
+            continue
+        arg = cmd[idx]
         if _is_safe_scene_path(arg):
             return arg
     return None
@@ -526,7 +598,143 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
     return problems
 
 
+def plan_owns_rule_sentence(build_prefixes: "tuple[str, ...] | None",
+                             manifest: str | None) -> str | None:
+    """The literal Korean sentence a planner-station prompt
+    (engine.application.stage_prompts.planner_prompt/small_prompt) must carry
+    VERBATIM, right next to the owns-vs-build_prefixes check above this
+    function, so the planner is told the same boundary that check
+    enforces BEFORE it writes a plan that fails it -- 결함 27
+   , marketing-chat job): plan check round 2 failed with
+    "task T11: owns 'package.json' is outside build prefixes [...]"
+    because nothing in either prompt ever said what `owns` may contain
+    or where a manifest change belongs instead (same bd38249 "rules and
+    instructions in one place" family as every other *_RULE constant in
+    this module).
+
+    Returns None when `build_prefixes` is None -- there is no prefix
+    list to name, same skip this function's only caller (stage_prompts)
+    must match. `manifest` is the project's ProjectConfig.manifest (the
+    one path install/scripts_change may edit, e.g. "package.json");
+    when it is also None, the sentence names "package.json" only as a
+    generic example, never as this project's own real path."""
+    if build_prefixes is None:
+        return None
+    manifest_example = manifest or "package.json"
+    return (
+        "작업(task)의 owns는 다음 경로 아래에서만 고를 수 있다: "
+        f"{', '.join(build_prefixes)}. {manifest_example} 같은 매니페스트 파일은 "
+        "owns에 넣지 않는다 -- 의존성이나 스크립트를 바꿔야 하면 그 작업의 detail에 "
+        "\"설치/스크립트 변경 요청: <무엇, 왜>\"라고 적는다(운영자 승인 뒤 따로 적용된다)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rule sentences -- same purpose as engine.domain.stage_checks' own rule
+# sentences (see that module's docstring for the incident this pattern
+# guards against): the literal Korean text a planner-station prompt
+# (engine.application.stage_prompts.planner_prompt/small_prompt) must carry
+# VERBATIM for a rule this module actually enforces (_parse_plan's schema,
+# validate_plan's requirement-coverage gate, Scene's own exit-0 contract).
+# tests/unit/test_stage_rule_sentences.py checks this.
+
+# _parse_plan's own required top-level shape -- goal/ui/scenes/tasks/
+# acceptance, plus the optional requirements/tools lists -- exactly as the
+# full-orbit planner must write it (depends_on free-form per task).
+PLAN_SCHEMA_RULE = (
+    'plan.json 스키마: '
+    '{"goal": str, "ui": bool, '
+    '"requirements": [{"id","text","kind": "function"|"security"}], '
+    '"scenes": [{"id","actor_does","app_shows","where","cmd": [argv...], '
+    '"covers": [requirement id...]}], '
+    '"tasks": [{"id","title","detail","owns": [관련 경로...], '
+    '"depends_on": [task id...], "covers": [requirement id...]}], '
+    '"acceptance": [str]}.'
+)
+
+# Same schema, for the `--small` worker turn (quick_pipeline.small_prompt)
+# whose plan always has exactly one task -- depends_on is fixed to [] there
+# rather than free-form, so this is its own constant, never PLAN_SCHEMA_RULE
+# reused with a find/replace.
+PLAN_SCHEMA_RULE_SMALL = (
+    'plan.json 스키마: '
+    '{"goal": str, "ui": bool, '
+    '"requirements": [{"id","text","kind": "function"|"security"}], '
+    '"scenes": [{"id","actor_does","app_shows","where","cmd": [argv...], '
+    '"covers": [requirement id...]}], '
+    '"tasks": [{"id","title","detail","owns": [관련 경로...], '
+    '"depends_on": [], "covers": [requirement id...]}], '
+    '"acceptance": [str]}.'
+)
+
+# validate_plan's own requirement_coverers gate: a task-only `covers` is
+# tracking only, never sufficient -- only a PASSING scene's own `covers`
+# satisfies a requirement.
+PLAN_REQUIREMENT_SCENE_COVERAGE_RULE = (
+    "모든 requirement는 그것을 실제로 확인하는 장면 하나 이상의 covers에 "
+    "그 id로 나타나야 한다(작업의 covers는 추적용일 뿐 충족 근거가 아니다)."
+)
+
+# Scene's own dataclass docstring/contract ("runs in repo root; exit 0 =
+# pass") -- stated to the planner so a scene it writes actually behaves
+# that way.
+PLAN_SCENE_EXIT0_RULE = (
+    "장면(scene)마다 cmd가 실행할 스크립트를 tests/scenes/ 아래에 실제로 "
+    "만든다 — 통과 장면은 사람의 행동 → 결과를 그대로 자동으로 확인하는 "
+    "스크립트이고, exit 0이면 통과다."
+)
+
+# scene_script_arg's own _SAFE_SCENE_CMD_FLAGS allowlist -- stated to the
+# planner so a scene cmd copying a project's own test_cmd convention
+# (e.g. "npx vitest run --no-color --no-cache") is not silently rejected
+# by validate_plan's scene_cmd_not_a_scene_file check, and so a planner
+# never reaches for a value-taking flag ("--config x", "--root=..")
+# scene_script_arg will never accept there (see that allowlist's own
+# comment for why: an exact-match allowlist, never a prefix/pattern one,
+# so a flag that merely LOOKS safe is never treated as safe).
+PLAN_SCENE_CMD_FLAGS_RULE = (
+    '장면의 cmd가 "npx", "vitest", "run" 다음에 플래그를 더 쓸 때는 값이 '
+    '없는 "--no-color", "--no-cache", "--silent" 중에서만 고르고, 장면 '
+    '스크립트 경로는 그 뒤에 그대로 와야 한다 -- "--config x"나 '
+    '"--root=.."처럼 값을 받는 플래그는 쓰지 않는다.'
+)
+
+# load_plan's own json.loads gate (결함 30): a goal/detail string that
+# contains a literal double quote (e.g. a shell flag quoted as `--tools
+# ""`) breaks plan.json's own JSON syntax if written unescaped -- the
+# real, repeating failure (plan_unreadable) this rule sentence exists to
+# head off before it happens, rather than only explaining it after a
+# reopened station already repeated it (see plan_check_failure_note in
+# engine.application.pipeline_planning for the after-the-fact half).
+PLAN_JSON_VALID_RULE = (
+    "plan.json은 유효한 JSON이어야 한다 -- 문자열 안의 쌍따옴표는 \\\"로 "
+    "이스케이프한다. 쓴 뒤 직접 파싱해 보고 확인한다."
+)
+
+
+def plan_rule_sentences() -> tuple[str, ...]:
+    """Every rule sentence the full-orbit planner prompt (planner_prompt)
+    must carry verbatim."""
+    return (
+        PLAN_SCHEMA_RULE, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
+    )
+
+
+def plan_rule_sentences_small() -> tuple[str, ...]:
+    """Same, for the `--small` combined facts+plan prompt (small_prompt),
+    whose plan.json schema sentence is PLAN_SCHEMA_RULE_SMALL instead."""
+    return (
+        PLAN_SCHEMA_RULE_SMALL, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
+    )
+
+
 __all__ = [
+    "SCENES_PREFIX",
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
-    "validate_plan", "ordered_tasks", "requirement_coverers",
+    "validate_plan", "ordered_tasks", "requirement_coverers", "plan_owns_rule_sentence",
+    "PLAN_SCHEMA_RULE", "PLAN_SCHEMA_RULE_SMALL", "PLAN_REQUIREMENT_SCENE_COVERAGE_RULE",
+    "PLAN_SCENE_EXIT0_RULE", "PLAN_SCENE_CMD_FLAGS_RULE",
+    "plan_rule_sentences", "plan_rule_sentences_small",
 ]
