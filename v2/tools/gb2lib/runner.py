@@ -21,7 +21,7 @@ from engine.steps.open_job import open_job
 from . import ops, shared, workspace
 
 __all__ = [
-    "cmd_run", "cmd_fix", "cmd_change", "cmd_approve_design",
+    "cmd_run", "cmd_fix", "cmd_change", "cmd_approve_design", "cmd_approve_plan_edit",
     "cmd_continue", "cmd_approve_install",
 ]
 
@@ -139,6 +139,70 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 3
 
 
+def _report_fix_rounds_exhausted(ledger: Ledger, app: str, message: str) -> int:
+    """`gb2 fix <app>` refused (결함 41) because this job already spent
+    JobPosition.max_fix_rounds rounds on a failed review/bench since its
+    last commit, and `--past-cap` was not given -- fixup.fix itself
+    recorded NOTHING for this refusal. Prints a needs_owner shape (exit
+    2, like a real stop) naming the still-outstanding review findings
+    (fixup.find_fix_target's own read -- safe to call again here, it
+    writes nothing either) and the owner's two choices, rather than a
+    bare error: this is a decision point, not a hard failure."""
+    rounds_used = message[len(fixup.FIX_ROUNDS_EXHAUSTED_PREFIX):]
+    review_findings: list[object] = []
+    try:
+        target = fixup.find_fix_target(ledger, app)
+    except fixup.FixupError:
+        target = None
+    if target is not None:
+        review_findings = list(target.review_findings)
+    summary = {
+        "app": app, "status": "needs_owner", "reason": "fix_rounds_exhausted",
+        "rounds_used": rounds_used,
+        "review_findings": review_findings,
+        "next": [
+            f'범위를 줄여 다시: gb2 fix {app} "<줄인 지시>" --past-cap',
+            "지적을 알려진 문제로 받아들이기: 운영자 결정",
+        ],
+    }
+    print(json.dumps(summary, ensure_ascii=False))
+    return 2
+
+
+def _report_no_progress(ledger: Ledger, app: str, message: str) -> int:
+    """`gb2 fix <app>` refused (a past incident, 반장 지시 because the
+    review about to be retried just raised the EXACT SAME finding
+    (file+severity+note, fixup.review_findings_repeat) it already
+    raised last round -- fixup.fix recorded NOTHING for this refusal,
+    same as _report_fix_rounds_exhausted's own cap case. Prints a
+    needs_owner shape (exit 2) naming the repeated findings and the
+    job's cumulative cost so far (fixup.job_cost_usd), rather than a
+    bare error."""
+    rounds_used = message[len(fixup.NO_PROGRESS_PREFIX):]
+    review_findings: list[object] = []
+    job_name = ""
+    try:
+        target = fixup.find_fix_target(ledger, app)
+    except fixup.FixupError:
+        target = None
+    if target is not None:
+        review_findings = list(target.review_findings)
+        job_name = target.job_name
+    cost_usd = fixup.job_cost_usd(ledger, app, job_name) if job_name else None
+    summary = {
+        "app": app, "status": "needs_owner", "reason": "no_progress",
+        "rounds_used": rounds_used,
+        "repeated_findings": review_findings,
+        "cost_usd_so_far": cost_usd,
+        "next": [
+            f'다른 지시를 붙여 다시: gb2 fix {app} "<다른 지시>" --past-cap',
+            "지적을 알려진 문제로 받아들이기: 운영자 결정",
+        ],
+    }
+    print(json.dumps(summary, ensure_ascii=False))
+    return 2
+
+
 def cmd_fix(args: argparse.Namespace) -> int:
     """Continue the app's current job attempt after it failed at review
     or bench (engine.fixup.fix): closes that attempt (archiving, never
@@ -170,7 +234,16 @@ def cmd_fix(args: argparse.Namespace) -> int:
     then acceptance, the requirement-coverage check, the handoff report,
     the app-wide security check, and (only once, for the WHOLE job) its
     single release request. For a plain single-task job it returns None
-    and the fix outcome is the whole result."""
+    and the fix outcome is the whole result.
+
+    `--past-cap` (결함 41, plans/-gongbang-entry-unify.md §B):
+    without it, fixup.fix refuses (FixupError, nothing recorded) once
+    this job has already spent JobPosition.max_fix_rounds (default 2)
+    rounds on a failed review/bench since its last commit -- printed
+    here as a needs_owner shape (exit 2) naming the remaining review
+    findings and the owner's two choices (a narrower `gb2 fix <app>
+    "..." --past-cap`, or accepting the finding as a known issue --
+    the owner's own call, never this script's)."""
     config_path = shared.app_workspace(args.app) / "config.json"
     if not config_path.exists():
         print(json.dumps({"error": f"not initialized: run `gb2 init {args.app}` first"}),
@@ -180,6 +253,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     config = EngineConfig.from_json(config_path)
     extra = args.extra or ""
     also_own = tuple(getattr(args, "also_own", None) or ())
+    decline = tuple(getattr(args, "decline", None) or ())
 
     def fakes_for(attempt_id: str):
         return _build_fakes(config, args.app, attempt_id, None)
@@ -200,12 +274,13 @@ def cmd_fix(args: argparse.Namespace) -> int:
         # add_also_own+fix() flow below. Every OTHER FixupError here (an
         # unrequested path, or whatever validate_also_own itself refuses
         # for) is a REAL refusal and is reported as-is.
-        if also_own:
+        if also_own or decline:
             attempt_id = ledger.project(args.app).current_attempt_id
             try:
                 full_outcome = fixup.approve_pending_edit(
                     config, ledger, args.app, also_own, fakes_for,
-                    on_progress=shared.progress_printer,
+                    on_progress=shared.progress_printer, declined=decline,
+                    decline_note=extra if decline else "",
                 )
             except fixup.FixupError as exc:
                 if str(exc) != NOT_TASK_OWNER_EDIT_STOP:
@@ -236,9 +311,15 @@ def cmd_fix(args: argparse.Namespace) -> int:
         # returns None for a plain single-task job.
         try:
             result = fixup.fix(config, ledger, args.app, extra, fakes_for,
-                               on_progress=shared.progress_printer)
+                               on_progress=shared.progress_printer,
+                               past_cap=bool(getattr(args, "past_cap", False)))
         except fixup.FixupError as exc:
-            return shared.err_json(str(exc), 1)
+            message = str(exc)
+            if message.startswith(fixup.FIX_ROUNDS_EXHAUSTED_PREFIX):
+                return _report_fix_rounds_exhausted(ledger, args.app, message)
+            if message.startswith(fixup.NO_PROGRESS_PREFIX):
+                return _report_no_progress(ledger, args.app, message)
+            return shared.err_json(message, 1)
 
         full_outcome = position.resume_after_fix(
             config, ledger, fakes_for, args.app, result, on_progress=shared.progress_printer,
@@ -351,6 +432,63 @@ def cmd_change(args: argparse.Namespace) -> int:
     return shared.run_full_job_and_report(args, config, job_name, request)
 
 
+def cmd_approve_plan_edit(args: argparse.Namespace) -> int:
+    """`gb2 approve-plan-edit <app> --reason "<사유>"`: the owner's
+    re-approval for the CURRENT job's plan after the owner has edited
+    a tests/scenes/ file post-review (plan.json itself is never
+    touched -- see engine.domain.plan_review.record_owner_plan_amend's
+    own docstring for the full contract). No TTY gate (unlike
+    approve-design/approve-install's "승인 <job>" line): this command
+    is owner-only by construction already -- a builder runs inside the
+    engine's sandbox and has no path to invoke `gb2` at all, and
+    engine.application.repair_target never hands tests/scenes/ to a
+    worker in the first place, so there is no non-owner caller to gate
+    against here.
+
+    Refused (exit 1, nothing recorded) if there is no active job for
+    this app, or if record_owner_plan_amend itself refuses (blank
+    reason, unreadable/invalid plan, never reviewed, or nothing
+    changed since the last review). On success, prints {"job_name":
+    ..., "reason": ..., "changed": ...} and returns 0 -- this command
+    only re-approves the plan; it does NOT resume the job itself
+    (`gb2 fix`/`gb2 continue` does that separately, same as any other
+    owner action)."""
+    config_path = shared.app_workspace(args.app) / "config.json"
+    if not config_path.exists():
+        return shared.err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
+    workspace.verify_app_repo_identity(args.app)
+    config = EngineConfig.from_json(config_path)
+
+    from engine.domain.plan_review import record_owner_plan_amend
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        project_row = ledger.project(args.app)
+        attempt_id = project_row.current_attempt_id
+        if attempt_id is None:
+            return shared.err_json("no_active_job", 1)
+        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
+        if job_name is None:
+            return shared.err_json("no_active_job", 1)
+        repo = config.projects[args.app].repo
+
+        problems = record_owner_plan_amend(
+            ledger, args.app, attempt_id, repo, job_name, args.reason or "",
+        )
+        if problems:
+            return shared.err_json(f"refused: {'; '.join(problems)}", 1)
+
+        changed = None
+        for _seq, event in ledger.events(args.app, "plan.owner_amended"):
+            if event.attempt_id == attempt_id and event.payload.get("job") == job_name:
+                changed = event.payload.get("changed")
+        print(json.dumps({"job_name": job_name, "reason": args.reason, "changed": changed},
+                         ensure_ascii=False))
+        return 0
+    finally:
+        ledger.close()
+
+
 def cmd_approve_design(args: argparse.Namespace) -> int:
     """`gb2 approve-design <app>`: the owner's TTY-only approval gate
     for engine.gates.check_design_approved -- requires the owner to
@@ -437,6 +575,7 @@ def cmd_continue(args: argparse.Namespace) -> int:
     from engine import full_orbit
 
     from_station = getattr(args, "from_station", None)
+    past_cap = bool(getattr(args, "past_cap", False))
 
     ledger = Ledger.open(config.ledger_path)
     try:
@@ -456,7 +595,7 @@ def cmd_continue(args: argparse.Namespace) -> int:
             else:
                 outcome = full_orbit.continue_full_job(
                     config, ledger, fakes_for, args.app, job_name,
-                    on_progress=shared.progress_printer,
+                    on_progress=shared.progress_printer, past_cap=past_cap,
                 )
         except full_orbit.ForceReopenError as exc:
             return shared.err_json(f"force_reopen_refused: {exc}", 1)

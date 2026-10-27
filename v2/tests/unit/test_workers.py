@@ -234,6 +234,44 @@ def test_claude_parse_result_last_json_block(tmp_path: Path) -> None:
     assert result.cost_usd == 0.42
     assert result.turns == 7
     assert result.requests == ()
+    # No "usage" key here -- the real shape (see the next test) -- so
+    # tokens_out stays unrecorded rather than fabricated.
+    assert result.tokens_out is None
+
+
+def test_claude_parse_result_reads_usage_output_tokens(tmp_path: Path) -> None:
+    """The real `claude -p --output-format json` result carries a
+    top-level "usage" object whose "output_tokens" is an int (recorded
+    shape: docs/stage3-runs/v1/S3-1.json, usage.output_tokens=9051) --
+    parse_cli_shaped_result must thread that int through to
+    WorkerResult.tokens_out, the same way it already threads
+    total_cost_usd/num_turns through to cost_usd/turns."""
+    spec = _spec(tmp_path)
+    stdout = tmp_path / "out.stdout"
+    stdout.write_text(json.dumps({
+        "result": '{"status": "done", "summary": "ok", "requests": []}',
+        "total_cost_usd": 0.42, "num_turns": 7, "is_error": False,
+        "usage": {"input_tokens": 40, "output_tokens": 9051,
+                   "output_tokens_details": {"thinking_tokens": 2884}},
+    }), encoding="utf-8")
+
+    result = ClaudeRunner().parse_result(stdout, spec)
+    assert result.tokens_out == 9051
+
+
+def test_claude_parse_result_non_int_usage_output_tokens_ignored(tmp_path: Path) -> None:
+    """A malformed/missing "usage.output_tokens" must never surface as a
+    fabricated number -- None, same as a wholly absent "usage"."""
+    spec = _spec(tmp_path)
+    stdout = tmp_path / "out.stdout"
+    stdout.write_text(json.dumps({
+        "result": '{"status": "done", "summary": "ok", "requests": []}',
+        "total_cost_usd": 0.42, "num_turns": 7, "is_error": False,
+        "usage": {"output_tokens": "not-a-number"},
+    }), encoding="utf-8")
+
+    result = ClaudeRunner().parse_result(stdout, spec)
+    assert result.tokens_out is None
 
 
 def test_claude_parse_result_last_json_block_brace_in_string(tmp_path: Path) -> None:

@@ -239,6 +239,80 @@ def test_find_fix_target_and_compose_task_carry_review_findings(
     assert "Extra: please re-check auth too" in task
 
 
+# ---------------------------------------------------------------------
+# refusal: an early-station (facts/probe/plan/design) attempt is never
+# "fixable" the way a build task is -- `gb2 fix` must never mistake a
+# failed plan-review (e.g. gb2 change --small's own combined plan
+# station, run_station payload {"station": "plan", "role": "planner"})
+# for a failed BUILD-task review (결함 50). Without this refusal,
+# find_fix_target happily reads the plan attempt's own run_station.role
+# ("planner") back as builder_role, and fixup.fix()'s own
+# station_prefixes lookup (hardcoded "build") then looks up
+# station_owners["build"]["planner"], which does not exist --
+# station_role_not_authorized while the fix's own run_station executes,
+# and merge's unknown_owner right after -- leaving the attempt stuck
+# "active" with no way forward except an owner noticing and running
+# `gb2 continue` instead.
+# ---------------------------------------------------------------------
+
+def _plan_station_processor_factory(review_findings: list[object]):
+    """Like `_processor_factory` above, but writes within the "plan"
+    station's own owned prefix (station_owners["plan"]["planner"] ==
+    ("plan.md", "tools.md"), tests/conftest.py's STATION_OWNERS) instead
+    of the "build" station's src/docs/ -- so merge accepts the write
+    for THIS station/role pair rather than failing for an unrelated
+    reason (owns_escapes_station_prefixes) before review ever runs."""
+
+    def _run_station_plan(ctx: StepContext) -> dict[str, object]:
+        role = str(ctx.request.payload.get("role"))
+        copy_path = copy_root(ctx.config, ctx.attempt_id, role)
+        (copy_path / "plan.md").write_text("combined plan\n", encoding="utf-8")
+        ctx.ledger.append(Event(
+            project=ctx.project, kind="station.finished", actor_kind="processor",
+            actor_id="processor", attempt_id=ctx.attempt_id,
+            payload={
+                "request_id": ctx.request.request_id,
+                "station": ctx.request.payload.get("station"), "role": role,
+                "ok": True, "summary": "stub", "cost_usd": 0.0, "turns": 1,
+                "changed_paths": [], "requests": [],
+            },
+        ))
+        return {}
+
+    def factory(config, ledger, fakes) -> Processor:
+        proc = Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", lambda ctx: [
+            StepDef("record_station", _run_station_plan, _reconcile_station)])
+        proc.register("review", _review_steps(False, review_findings))
+        return proc
+
+    return factory
+
+
+def test_find_fix_target_refuses_a_failed_plan_station_attempt(
+    workspace: Workspace,
+) -> None:
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "small-plan-stuck",
+                          "full", ("planner", "reviewer"))
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station",
+                     {"station": "plan", "role": "planner", "task": "combined plan"}),
+         orbit.Stage("merge", {"copies": [
+             {"role": "planner", "station": "plan",
+              "path": str(copy_root(workspace.config, attempt_id, "planner"))},
+         ]}),
+         orbit.Stage("review", {"role": "reviewer"})],
+        processor_factory=_plan_station_processor_factory([{"summary": "plan rejected"}]),
+    )
+    assert outcome.status == "failed"
+    assert outcome.completed == ("run_station", "merge")
+
+    with pytest.raises(fixup.FixupError, match="not a build task"):
+        fixup.find_fix_target(workspace.ledger, "alpha")
+
+
 def test_find_fix_target_uses_the_selected_failing_bench_not_the_oldest_one(
     workspace: Workspace,
 ) -> None:

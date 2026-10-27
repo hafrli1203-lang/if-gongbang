@@ -21,16 +21,16 @@ from engine.application.pipeline_base import (
     BUILDER_ROLE, FullOutcome, Run, max_fix_rounds, resumed_plan, task_attempt_committed,
     task_for, unblock_internal_crash,
 )
-from engine.application.pipeline_stages import (
-    record_task_stop, station_outcome_to_full, stops_for_owner,
-)
+from engine.application.pipeline_stages import station_outcome_to_full
 from engine.application.pipeline_tasks import (
-    handoff_request_filter,
-    build_task_gate, edit_approved_followup_task_text, finish_from_tasks,
+    build_task_gate, declined_followup_note, edit_approved_followup_task_text, finish_from_tasks,
     install_followup_task_text, run_acceptance_and_handoff, run_task_attempt,
     task_attempt_config, task_stages,
 )
-from engine.application.repair_target import extended_owns_for_task, is_owns_scope_request
+from engine.application.task_stage_runner import HandoffContext, run_task_stages
+from engine.application.repair_target import (
+    declined_for_attempt, extended_owns_for_task, is_owns_scope_request,
+)
 from engine.domain.plan import Plan
 from engine.application.job_state import (
     JobPosition, hand_off_later_task_requests, outstanding_requests, record_position, stages_from_spec, stages_spec,
@@ -79,8 +79,16 @@ def resume_task(run: Run, pos: JobPosition) -> FullOutcome:
 
 def rerun_task_on_new_attempt(run: Run, pos: JobPosition, plan: Plan) -> FullOutcome:
     task = task_for(plan, pos.task_id or "", pos.fixing)
-    task_text = str(pos.get("task_text", ""))
-    base_task_text = str(pos.get("base_task_text", task_text))
+    base_task_text = str(pos.get("base_task_text", pos.get("task_text", "")))
+    # 결함 48: this opens a genuinely NEW attempt (the old one closed
+    # without committing) -- same reasoning as rerun_task_owner_stop's
+    # own non-crash continuations, a fresh context block belongs here
+    # too, built from the clean `base_task_text` the position stored
+    # (never the stale `task_text` the OLD attempt's own build baked
+    # in). `attempt_id=None` here matches run_tasks' own first-run call
+    # (this task's new attempt is not open yet at this point either).
+    gate = build_task_gate(run.config, run.ledger, run.project, plan, base_task_text)
+    task_text = gate.prompt(base_task_text)
     outcome = run_task_attempt(run.config, run.ledger, run.fakes, run.project, run.job, task,
                                 task_text, plan, run.on_progress, run.processor_factory,
                                 base_task_text, fixing=pos.fixing,
@@ -142,21 +150,47 @@ def rerun_task_owner_stop(run: Run, pos: JobPosition, plan: Plan, *,
     if crash:
         stages = widen_stage_owns(stages_from_spec(spec, run_config, attempt_id), extra_owns)
         return continue_task_stages(run, pos, plan, run_config, stages, task_text)
+    # 결함 48 (appX live #49/#50): every OTHER continuation below used
+    # to replay `task_text` exactly as the position stored it -- the
+    # "## 주입된 자료" appendix baked in back when this task's FIRST
+    # attempt (or fix round) built its prompt, never looked at again.
+    # A crash (above) genuinely IS a plain retry of that same submitted
+    # request, so it is left alone; every other continuation here is a
+    # new one (an install/edit approval, a context gap recheck, a
+    # worker_stuck restart), so it gets a FRESH context block -- the
+    # SAME build_task_gate() a first run uses, called again with THIS
+    # attempt_id so context.injected is recorded against it (never left
+    # pointing only at the long-closed original attempt). `base_task_text`
+    # (never carrying an old appendix -- pipeline_stages.task_position
+    # stores it separately, clean) is what gets a new one appended, not
+    # the stale `task_text` -- so the old block is replaced, never
+    # duplicated alongside a second one.
+    gate = build_task_gate(run.config, run.ledger, run.project, plan, base_task_text, attempt_id)
+    task_text = gate.prompt(base_task_text)
     if pos.get("context_gap"):
-        gap_gate = build_task_gate(run.config, run.ledger, run.project, plan, base_task_text,
-                                   attempt_id)
-        if gap_gate.unmet is not None:
+        if gate.unmet is not None:
             record_position(run.ledger, run.project, task_stop_position(
-                pos, attempt_id, gap_gate.unmet, (), context_gap=True))
-            return FullOutcome("needs_owner", gap_gate.unmet, attempt_id, None)
-        task_text = gap_gate.prompt(base_task_text)
+                pos, attempt_id, gate.unmet, (), context_gap=True))
+            return FullOutcome("needs_owner", gate.unmet, attempt_id, None)
         run_station_text = task_text
     elif pos.stop_reason == "worker_stuck":
         run_station_text = task_text
-    elif pos.pending_requests and all(
+    elif pos.pending_requests and any(
         isinstance(r, dict) and is_owns_scope_request(r) for r in pos.pending_requests
     ):
-        run_station_text = edit_approved_followup_task_text(task_text, extra_owns)
+        declined = (declined_for_attempt(run.ledger, run.project, run.job, pos.task_id, attempt_id)
+                    if pos.task_id else ())
+        granted_text = edit_approved_followup_task_text(task_text, extra_owns) if extra_owns else task_text
+        run_station_text = granted_text + declined_followup_note(declined)
+        # a review finding: a mixed stop (e.g. install + edit together)
+        # must still carry the install-done note too -- never just the
+        # edit-approved one, which used to be the ONLY branch reached
+        # once even one request in the stop was owns-scope.
+        if any(
+            isinstance(r, dict) and not is_owns_scope_request(r) for r in pos.pending_requests
+        ):
+            build_copy = copy_root(run_config, attempt_id, BUILDER_ROLE)
+            run_station_text = install_followup_task_text(run_station_text, build_copy)
     else:
         build_copy = copy_root(run_config, attempt_id, BUILDER_ROLE)
         run_station_text = install_followup_task_text(task_text, build_copy)
@@ -178,15 +212,13 @@ def continue_task_stages(run: Run, pos: JobPosition, plan: Plan, run_config: Eng
     # The same later-task hand-off the first run uses (결함 31) -- a resumed
     # task once re-stopped on a path T5 owns (sample-app T4, 결함 31b).
     later = tuple(t for t in (pos.remaining_task_ids or ()) if t != pos.task_id)
-    request_filter = handoff_request_filter(
-        run.ledger, run.project, run.job, plan, pos.task_id or "", attempt_id, later, None)
-    outcome = orbit.continue_job(run_config, run.ledger, run.fakes_for(attempt_id), run.project,
-                                 attempt_id, stages, processor_factory=run.processor_factory,
-                                 on_progress=run.on_progress, request_filter=request_filter)
-    if stops_for_owner(outcome):
-        task_pos = replace(pos, extra={**{k: v for k, v in pos.extra.items()
-                                          if k != "context_gap"}, "task_text": task_text})
-        record_task_stop(run.ledger, run.project, task_pos, outcome)
+    handoff = HandoffContext(plan, pos.task_id or "", later, None)
+    task_pos = replace(pos, extra={**{k: v for k, v in pos.extra.items()
+                                      if k != "context_gap"}, "task_text": task_text})
+    outcome = run_task_stages(run_config, run.ledger, run.fakes_for(attempt_id), run.project,
+                              run.job, attempt_id, stages, on_progress=run.on_progress,
+                              processor_factory=run.processor_factory, handoff=handoff,
+                              task_pos=task_pos)
     full = station_outcome_to_full(outcome, "build")
     if full is not None:
         return full

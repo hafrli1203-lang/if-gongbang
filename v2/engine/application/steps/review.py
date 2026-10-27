@@ -107,6 +107,18 @@ def _excludes(ctx: StepContext) -> tuple[str, ...]:
     return _project_config(ctx).excludes
 
 
+def _file_dep_targets(ctx: StepContext) -> tuple[tuple[str, str], ...]:
+    """ProjectConfig.file_dep_targets -- fed to evidence.with_file_deps
+    so the EVIDENCE fingerprint record_review records (compared by
+    three_match at commit time) also covers a `file:../...` shared
+    package's own content, never the tree fingerprint used right above
+    it for tree_changed_during_review (a review finding,: that
+    check, and _export_review_snapshot's git diff/ls-tree calls, must
+    stay on the plain git tree hash -- only the evidence.record() call
+    gets the combined one)."""
+    return _project_config(ctx).file_dep_targets
+
+
 def _stations_dir(ctx: StepContext) -> Path:
     return ctx.config.home / "jobs" / ids.attempt_dirname(ctx.attempt_id) / "stations"
 
@@ -283,6 +295,41 @@ def _allowed_mcp_servers(ctx: StepContext) -> dict[str, McpServerConfig]:
     return {name: ctx.config.mcp_servers[name] for name in names}
 
 
+def _required_unapplied_skills_note(ctx: StepContext) -> str:
+    """"" (nothing to add), or a short note naming the station-required
+    skills (ContextConfig.required_skills) this attempt's own builder
+    station injected but never reported applying -- the ledger's
+    "skills.unapplied" event engine.application.steps.worker_step._record_skills_unapplied
+    appends at that station's own record_station step (G20: a plan that
+    marks a skill "반드시" must have a required-skill gap REACH the
+    review, not just sit unseen on the ledger). Filtered to THIS
+    attempt_id's own events only (unlike worker_step's own
+    _latest_injected_skills, which cannot filter by attempt_id for the
+    injected-skills lookup itself -- this event is always appended with
+    the real, already-open attempt_id record_station runs under, never
+    None, so filtering by it here is exact, not a sequencing guess).
+    Only "required_unapplied" ever surfaces here -- a plain, non-
+    required unapplied skill stays a ledger-only annotation, same as
+    ContextConfig.required_skills' own existing missing-skill contract
+    (see engine.infrastructure.context's module docstring)."""
+    required: list[str] = []
+    for _seq, event in ctx.ledger.events(ctx.project, "skills.unapplied"):
+        if event.attempt_id != ctx.attempt_id:
+            continue
+        names = event.payload.get("required_unapplied", [])
+        if isinstance(names, list):
+            for name in names:
+                if name not in required:
+                    required.append(str(name))
+    if not required:
+        return ""
+    return (
+        "[필수 스킬 미적용] 이 계획이 반드시 적용하도록 지정한 스킬이 적용 보고 "
+        f"없이 지나갔다: {', '.join(required)}. 이를 지적(findings)에 포함해 "
+        "판단한다."
+    )
+
+
 def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     role = str(ctx.request.payload["role"])
     # The ORIGINAL request text the builder was given -- "" for a
@@ -349,6 +396,9 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object, str]:
     review_context = ctx.request.payload.get("context")
     if isinstance(review_context, str) and review_context.strip():
         full_task = f"{full_task}\n\n{review_context.strip()}"
+    required_unapplied_note = _required_unapplied_skills_note(ctx)
+    if required_unapplied_note:
+        full_task = f"{full_task}\n\n{required_unapplied_note}"
     spec = dataclasses.replace(base_spec, task=full_task)
     return spec, worker, runner, coverage_sent
 
@@ -626,13 +676,23 @@ def _run_record_review(ctx: StepContext) -> dict[str, object]:
     # Trusting the reviewer's own report alone (as a prior version of
     # this function did) let exactly that slip through.
     passed = not blocking and coverage_sent == "full" and reviewer_coverage == "full"
+    # a review finding: the EVIDENCE fingerprint (what three_match
+    # at commit time compares) also covers this project's own
+    # file_dep_targets content -- `fp` itself (the plain git tree hash
+    # just verified, above, against a LIVE recompute) stays untouched,
+    # since it is also what _export_review_snapshot already used to
+    # extract this exact tree via git plumbing. A project with no
+    # file_dep_targets gets evidence_fp == fp exactly (evidence.
+    # with_file_deps' own no-op case), so this is a pure addition.
+    evidence_fp = evidence.with_file_deps(fp, _file_dep_targets(ctx))
     evidence.record(
-        ctx.ledger, ctx.project, ctx.attempt_id, "review", fp,
+        ctx.ledger, ctx.project, ctx.attempt_id, "review", evidence_fp,
         payload={
             "passed": passed, "reviewer_passed": reviewer_passed,
             "findings": findings, "coverage": coverage_sent,
             "reviewer_coverage": reviewer_coverage,
             "request_id": ctx.request.request_id,
+            "tree_fp": fp,
         },
     )
     if not passed:

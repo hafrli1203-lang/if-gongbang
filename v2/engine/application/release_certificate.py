@@ -141,9 +141,16 @@ def _certificate_reason(changed: tuple[str, ...]) -> str:
     return f"{_JOB_CERTIFICATE_MISSING_REASON}:{shown}{more}"
 
 
+_JOB_CERTIFICATE_FILE_DEP_STALE_REASON = (
+    "release_requires_job_certificate:file_dep_target_changed"
+)
+
+
 def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
                            repo: Path, fingerprint: str,
-                           config: "EngineConfig | None" = None) -> tuple[bool, str]:
+                           config: "EngineConfig | None" = None,
+                           file_dep_targets: tuple[tuple[str, str], ...] = (),
+                           ) -> tuple[bool, str]:
     """(ok, reason) for whether the JOB `attempt_id` belongs to carries
     the certificate a release of the commit fingerprinted as
     `fingerprint` is required to have: the newest passing
@@ -294,6 +301,34 @@ def job_certificate_status(ledger: Ledger, project: str, attempt_id: str,
         from engine import app_security  # lazy import, see full_orbit's own convention
         if graph.certificate_policy_hash != app_security.security_policy_hash(config):
             return False, _JOB_CERTIFICATE_STALE_POLICY_REASON
+
+    # a review finding: a matching tree is ALSO not enough when
+    # this project has file_dep_targets -- a shared package's own
+    # content can change between when acceptance/app_security ran and
+    # right now without the app's own repo tree moving at all (the
+    # exact gap ④ named: "완료 인증은 여전히 앱 트리만 해싱"). Compare the
+    # CURRENT file-dep-aware evidence fingerprint (evidence.
+    # with_file_deps(fingerprint, file_dep_targets)) against each
+    # recorded one (graph.evidence_fingerprint, graph.
+    # certificate_evidence_fingerprint) -- never against the tree-
+    # diffed `fingerprint`/`certificate_fingerprint` above, which must
+    # stay real git tree hashes. `file_dep_targets=()` (every caller
+    # not yet updated to pass it) skips this entirely, same as
+    # `config=None` skips the policy check above -- fully backward
+    # compatible. A recorded "" (an old-shape event, from before this
+    # field existed) is tolerated exactly like evidence.with_file_deps's
+    # own no-op contract: it only ever differs from a real combined
+    # value when file_dep_targets is non-empty, so a project with none
+    # configured never trips this on an old event either.
+    if file_dep_targets:
+        from engine.infrastructure.evidence import with_file_deps
+
+        current_evidence_fp = with_file_deps(fingerprint, file_dep_targets)
+        for recorded_evidence_fp in (
+            graph.evidence_fingerprint, graph.certificate_evidence_fingerprint,
+        ):
+            if recorded_evidence_fp and recorded_evidence_fp != current_evidence_fp:
+                return False, _JOB_CERTIFICATE_FILE_DEP_STALE_REASON
 
     if changed:
         # Dedupe while keeping first-seen order (acceptance's own diff

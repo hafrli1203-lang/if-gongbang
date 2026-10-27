@@ -33,7 +33,7 @@ def _valid_plan_dict(**overrides: object) -> dict[str, object]:
                     "where": "home", "cmd": ["python3", "tests/scenes/base.py"],
                     "covers": ["R1"]}],
         "tasks": [{"id": "t1", "title": "고치기", "detail": "...",
-                   "owns": ["src/"], "depends_on": []}],
+                   "owns": ["src/", "tests/"], "depends_on": []}],
         "acceptance": ["요구사항대로 동작한다"],
         "requirements": [{"id": "R1", "text": "요구사항대로 동작한다", "kind": "function"}],
     }
@@ -104,7 +104,7 @@ def test_load_plan_valid_roundtrip(tmp_path: Path) -> None:
     assert plan.goal == "작은 수정"
     assert plan.ui is False
     assert plan.scenes[0].id == "s1"
-    assert plan.tasks[0].owns == ("src/",)
+    assert plan.tasks[0].owns == ("src/", "tests/")
 
 
 # ---- validate_plan -------------------------------------------------
@@ -112,7 +112,7 @@ def test_load_plan_valid_roundtrip(tmp_path: Path) -> None:
 def test_validate_plan_owns_within_build_prefixes_ok(tmp_path: Path) -> None:
     _write_plan(tmp_path, "job", _valid_plan_dict())
     plan = load_plan(tmp_path, "job")
-    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "lib/"))
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "lib/", "tests/"))
     assert problems == []
 
 
@@ -149,7 +149,7 @@ def test_validate_plan_existing_scene_script_is_fine(tmp_path: Path) -> None:
     ])
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    problems = validate_plan(plan, tmp_path, build_prefixes=("src/",))
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/"))
     assert problems == []
 
 
@@ -240,7 +240,7 @@ def test_requirement_covered_by_scene_is_valid(tmp_path: Path) -> None:
     plan = load_plan(tmp_path, "job")
     assert plan.requirements[0].id == "R1"
     assert plan.scenes[0].covers == ("R1",)
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_requirement_not_covered_by_any_scene_or_task_is_a_problem(tmp_path: Path) -> None:
@@ -288,12 +288,12 @@ def test_requirement_covered_by_task_and_scene_is_valid(tmp_path: Path) -> None:
         requirements=[{"id": "R1", "text": "입력 검증", "kind": "security"}],
         scenes=[{"id": "s1", "actor_does": "입력", "app_shows": "검증 결과", "where": "home",
                  "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["R1"]}],
-        tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/"],
+        tasks=[{"id": "t1", "title": "고치기", "detail": "...", "owns": ["src/", "tests/"],
                 "depends_on": [], "covers": ["R1"]}],
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_scene_covers_unknown_requirement_is_a_problem(tmp_path: Path) -> None:
@@ -338,7 +338,7 @@ def test_validate_plan_scene_claiming_coverage_with_a_scene_file_is_fine(
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_requirement_duplicate_ids_raise(tmp_path: Path) -> None:
@@ -654,7 +654,7 @@ def test_scene_covering_a_requirement_via_node_is_fine(tmp_path: Path) -> None:
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_scene_covering_a_requirement_via_npx_vitest_run_is_fine(tmp_path: Path) -> None:
@@ -665,7 +665,7 @@ def test_scene_covering_a_requirement_via_npx_vitest_run_is_fine(tmp_path: Path)
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_scene_covering_a_requirement_via_a_path_qualified_runner_is_a_problem(
@@ -716,7 +716,7 @@ def test_scene_covering_a_requirement_via_bare_python3_is_fine(tmp_path: Path) -
     )
     _write_plan(tmp_path, "job", data)
     plan = load_plan(tmp_path, "job")
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_scene_covering_a_requirement_via_scene_path_escaping_tests_scenes_is_a_problem(

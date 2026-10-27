@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Callable
 
 from engine.infrastructure import context as context_mod
 from engine.domain import faults
-from engine.application import task_pipeline as orbit
 from engine.config import EngineConfig
 from engine.application.pipeline_base import (
     BUILDER_ROLE, FullOutcome, ProgressCallback, Run, fakes_for,
@@ -33,10 +32,19 @@ from engine.application.job_state import (
     JobPosition, record_position, task_stop_position,
 )
 from engine.application.processor import Fakes
-from engine.application.steps.open_job import copy_root, open_job
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
+    # Only for type annotations below (resolved lazily thanks to
+    # `from __future__ import annotations` above) -- a module-level
+    # `import engine.application.task_pipeline as orbit` here would
+    # reopen the same cycle steps/__init__ -> review -> repair ->
+    # task_stage_runner/repair_approval already walks back into THIS
+    # module before it has finished executing (결함: standalone-import
+    # smoke test, tests/unit/test_standalone_imports.py). The three
+    # functions below that actually call `orbit.*` at runtime import it
+    # locally instead, once this module is fully loaded.
+    from engine.application import task_pipeline as orbit
 
 
 def record_event(ledger: Ledger, project: str, job_name: str, stage: str, attempt_id: str | None,
@@ -93,6 +101,15 @@ def stops_for_owner(outcome: orbit.JobOutcome) -> bool:
     return outcome.status == "needs_owner" or bool(outcome.pending_requests)
 
 
+# Deliberately placed here, after record_task_stop/stops_for_owner are
+# already defined above, rather than with the other imports at the top
+# of the file: engine.application.steps.open_job's own import chain
+# (steps/__init__ -> review -> repair -> task_stage_runner) imports
+# `record_task_stop`/`stops_for_owner` back from THIS module -- moving
+# this import below those two definitions means that re-entry always
+# finds them already bound, even though this module itself has not
+# finished executing yet (tests/unit/test_standalone_imports.py).
+from engine.application.steps.open_job import copy_root, open_job  # noqa: E402
 
 ORCHESTRATOR_GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "processor", "GIT_AUTHOR_EMAIL": "processor@local",
@@ -437,6 +454,7 @@ def finish_inflight_close(run: "Run") -> FullOutcome | None:
                and run.ledger.request(rid).status in ("queued", "running")]
     if not pending:
         return FullOutcome("failed", "close:closing_without_request", attempt_id, None)
+    from engine.application import task_pipeline as orbit
     factory = run.processor_factory or orbit.default_processor_factory
     processor = factory(run.config, run.ledger, run.fakes_for(attempt_id))
     status = processor.run_request(run.project, pending[-1])
@@ -482,6 +500,7 @@ def run_and_merge(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: s
     and never actually reapply anything (engine.application.processor.submit's
     idempotency) -- `merge_retry_n` (how many merges this attempt has
     already recorded) makes each retry's merge payload genuinely new."""
+    from engine.application import task_pipeline as orbit
     payload: dict[str, object] = {"station": station, "role": role, "task": task_text}
     if extra_payload:
         payload.update(extra_payload)
@@ -524,6 +543,7 @@ def close_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: s
     own (the facts/planner/designer attempt -- every file it touched
     was already committed directly via commit_job_trail, so close's
     own archive/reset has nothing left to archive or reset)."""
+    from engine.application import task_pipeline as orbit
     return orbit.continue_job(config, ledger, fakes_for(fakes, attempt_id), project, attempt_id,
                               orbit.release_followup_stages(job_name),
                               processor_factory=processor_factory, on_progress=on_progress)

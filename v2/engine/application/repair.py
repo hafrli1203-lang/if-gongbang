@@ -114,15 +114,29 @@ from engine.application import release as release_mod
 from engine.config import EngineConfig
 from engine.application.repair_target import (
     ARCHIVE_MARKER_FILES, FixTarget, FixupError, compose_fix_task, extended_owns_for_task,
-    find_fix_target, record_owns_extension, requests_for_attempt, validate_also_own,
+    find_fix_target, fix_rounds_used, inject_context_into_fix_task, job_cost_usd,
+    previous_review_findings, record_owns_extension, requests_for_attempt,
+    review_findings_repeat, validate_also_own,
 )
 from engine.domain.records import Event
 from engine.application.processor import Fakes, Processor, submit
 from engine.application.job_state import (
     STAGE_TASK, JobPosition, fix_opened_attempt, fix_opened_position, is_full_job,
-    load_position, record_position, stages_from_spec, task_stop_position, without_release,
+    load_position, record_position, stages_from_spec, without_release,
 )
 from engine.application.steps.open_job import copy_root, open_job
+from engine.application.task_stage_runner import HandoffContext, run_task_stages
+# Split out purely to keep this module under the repo's own line budget
+# (see repair_journal's own docstring) -- aliased back to their
+# historical bare names since every call site below still uses them.
+from engine.application.repair_journal import (
+    already_opened_new_attempt as _already_opened_new_attempt,
+    append_fix_event as _append_fix_event,
+    current_opening_marker_seq as _current_opening_marker_seq,
+    find_unfinished_fix_cycle as _find_unfinished_fix_cycle,
+    latest_fix_event_after as _latest_fix_event_after,
+    latest_fix_event_seq_after as _latest_fix_event_seq_after,
+)
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
@@ -149,6 +163,26 @@ class FixResult:
 
 
 FakesFor = Callable[[str], Fakes]
+
+# fix()'s own entry-check refusal reason (결함 41, plans/-
+# gongbang-entry-unify.md §B): "<this prefix><rounds already spent>".
+# Never a new number of its own -- the cap itself is JobPosition.
+# max_fix_rounds (운영자 기준 "최대 2바퀴", unchanged, job_state.py's own
+# existing default). tools/gb2lib.runner.cmd_fix matches on this exact
+# prefix to report a needs_owner shape instead of a bare refusal.
+FIX_ROUNDS_EXHAUSTED_PREFIX = "fix_rounds_exhausted:"
+
+# fix()'s own SECOND entry-check refusal reason (a past incident, 반장 지시
+#: "<this prefix><rounds already spent>" -- a review that
+# comes back naming the EXACT SAME finding (file+severity+note,
+# repair_target.review_findings_repeat) it already raised last round,
+# meaning the round just spent changed nothing the reviewer cared
+# about. Checked even when rounds_used has not yet reached max_rounds
+# (FIX_ROUNDS_EXHAUSTED_PREFIX's own gate) -- no amount of headroom left
+# in the cap makes restating an unresolved finding worth another round.
+# tools/gb2lib.runner.cmd_fix matches on this exact prefix the same way
+# it already matches FIX_ROUNDS_EXHAUSTED_PREFIX.
+NO_PROGRESS_PREFIX = "no_progress:"
 
 # ---------------------------------------------------------------------
 # close the failed attempt, recover its archive
@@ -239,143 +273,6 @@ def _overlay_archive_into_builder_copy(config: EngineConfig, attempt_id: str,
 
 
 # ---------------------------------------------------------------------
-# journal: resuming an interrupted fix() transition
-# ---------------------------------------------------------------------
-
-def _append_fix_event(ledger: Ledger, project: str, kind: str, old_attempt_id: str,
-                      payload: dict[str, object]) -> int:
-    """Append one of this module's own journal events (see module
-    docstring) and return its seq -- used by fix.started's own seq to
-    bound which later events belong to the same cycle."""
-    faults.flow_boundary(f"fixup.{kind}")
-    return ledger.append(Event(
-        project=project, kind=kind, actor_kind="owner", actor_id="owner",
-        attempt_id=old_attempt_id, payload=payload,
-    ))
-
-
-def _latest_fix_event_after(ledger: Ledger, project: str, kind: str,
-                            after_seq: int) -> Event | None:
-    """The most recent event of this journal `kind` appended strictly
-    after `after_seq` (the current cycle's own "fix.started" seq) -- any
-    such event belongs to the CURRENT, still-unfinished cycle: a new
-    "fix.started" can only ever be appended once the previous cycle's
-    own "fix.finished" has been (see _find_unfinished_fix_cycle), so
-    nothing from an earlier, already-finished cycle can have a seq past
-    this one's "fix.started"."""
-    matches = [event for seq, event in ledger.events(project, kind) if seq > after_seq]
-    return matches[-1] if matches else None
-
-
-def _latest_fix_event_seq_after(ledger: Ledger, project: str, kind: str,
-                                after_seq: int) -> int | None:
-    """Same lookup as _latest_fix_event_after, but returns the matching
-    event's own seq rather than its payload -- used only for
-    "fix.opening_new" (see its use in fix()), whose seq itself becomes
-    the fix id that _already_opened_new_attempt matches against, not
-    anything carried in its payload."""
-    matches = [seq for seq, event in ledger.events(project, kind) if seq > after_seq]
-    return matches[-1] if matches else None
-
-
-def _current_opening_marker_seq(ledger: Ledger, project: str, started_seq: int) -> int | None:
-    """This cycle's own still-valid "fix.opening_new" marker seq, or None
-    if there is none yet, or the most recent one was already
-    invalidated by a "fix.opening_failed" written after it (see fix()'s
-    own call order). That only happens once THIS cycle's own open_job()
-    call has itself raised -- conclusive proof it never produced a
-    job.opened of its own -- at which point the marker is worthless for
-    _already_opened_new_attempt's identity check: a fresh marker (and a
-    fresh open_job() attempt) must replace it, or an unrelated
-    job.opened for the same job_name landing anywhere after the stale
-    marker -- however much later, once this project is genuinely CLOSED
-    again -- would still wrongly pass the old marker's bound."""
-    marker_seq = _latest_fix_event_seq_after(ledger, project, "fix.opening_new", started_seq)
-    if marker_seq is None:
-        return None
-    failed_seq = _latest_fix_event_seq_after(ledger, project, "fix.opening_failed", started_seq)
-    if failed_seq is not None and failed_seq > marker_seq:
-        return None
-    return marker_seq
-
-
-def _already_opened_new_attempt(ledger: Ledger, project: str, job_name: str,
-                                old_attempt_id: str, fix_id_seq: int) -> str | None:
-    """If open_job() already succeeded for THIS fix cycle -- the project
-    is OPEN on a fresh attempt of this same job -- but a crash hit before
-    "fix.opened_new" could be journaled for it, return that attempt_id so
-    fix() can record the missing event and move on instead of calling
-    open_job() again. A second open_job() call there would simply raise
-    (the project is OPEN, not CLOSED, by then -- open_job only accepts
-    CLOSED) rather than silently forking a duplicate attempt, but that
-    still leaves the fix cycle permanently stuck; detecting the already-
-    open attempt here is what actually lets it resume. Returns None when
-    there is nothing to detect (open_job genuinely has not run yet, or
-    failed before completing) -- fix() then calls open_job() as usual.
-
-    Matching on job_name ALONE is not enough: this same job_name can be
-    reopened by something that is not this fix cycle at all (an owner's
-    independent `gb2 change` on the same job_name landing in the gap
-    between the crash and this retry, or a stale attempt left over from
-    an EARLIER, already-finished fix cycle on the same job) --
-    attempts_for_job_name would still list it, and adopting it here
-    would silently overlay this fix's archived files onto a job it
-    never opened. `fix_id_seq` is the actual identity check, and it must
-    be THIS cycle's own "fix.opening_new" marker seq (the fix id fix()
-    journals immediately before ever calling open_job() for this cycle),
-    never "fix.started"'s seq: a crash can hit BEFORE fix() ever reaches
-    its own open_job() call at all, leaving an arbitrarily long real-time
-    gap after "fix.started" (and after "fix.closed_old") during which an
-    unrelated `gb2 change` on the same job_name can legitimately run and
-    complete -- its own job.opened event then also lands after
-    "fix.started", so bounding on that seq alone would wrongly adopt it.
-    Bounding on "fix.opening_new" instead means a candidate only matches
-    once this cycle has actually attempted its own open_job() call, which
-    only ever happens right after that marker is journaled (see fix()'s
-    own call order) -- nothing legitimate can land a job.opened for this
-    job_name between the marker and this cycle's own open_job() call,
-    since open_job() is lock-serialized and would simply raise, not
-    silently lose the CLOSED->OPEN slot, if something else took it
-    first."""
-    row = ledger.project(project)
-    if row.state != "OPEN" or row.current_attempt_id is None:
-        return None
-    candidate = row.current_attempt_id
-    if candidate == old_attempt_id:
-        return None
-    opened_seq: int | None = None
-    opened_job_name: str | None = None
-    for seq, event in ledger.events(project, "job.opened"):
-        if event.payload.get("attempt_id") == candidate:
-            opened_seq = seq
-            opened_job_name = str(event.payload.get("job_name"))
-    if opened_seq is None or opened_seq <= fix_id_seq:
-        return None
-    if opened_job_name != job_name:
-        return None
-    return candidate
-
-
-def _find_unfinished_fix_cycle(ledger: Ledger, project: str) -> tuple[int, dict[str, object]] | None:
-    """(fix.started's own seq, its payload) for the most recent fix()
-    transition that started but never reached "fix.finished" -- or None
-    if there isn't one (the common case: either no fix() has ever run
-    for this project, or the last one finished its own transition
-    cleanly, whatever happened to the job afterward). fix() calls this
-    FIRST, before find_fix_target -- which an interrupted transition's
-    CLOSED-but-not-yet-reopened project state can never satisfy ("not
-    OPEN") even though there is very much something to resume."""
-    started_events = ledger.events(project, "fix.started")
-    if not started_events:
-        return None
-    started_seq, started_event = started_events[-1]
-    finished_events = ledger.events(project, "fix.finished")
-    if finished_events and finished_events[-1][0] > started_seq:
-        return None
-    return started_seq, started_event.payload
-
-
-# ---------------------------------------------------------------------
 # top-level entry point
 # ---------------------------------------------------------------------
 
@@ -450,32 +347,33 @@ def _fix_spec(pos: "JobPosition | None", old_attempt_id: str, config: EngineConf
     return out
 
 
-def _fix_request_filter(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
-                        pos: object, attempt_id: str, full_job: bool,
-                        ) -> "orbit.RequestFilter | None":
+def _fix_handoff(config: EngineConfig, project: str, job_name: str,
+                 pos: object) -> "HandoffContext | None":
     """The same later-task hand-off the first run and resume use (결함 31),
     for the `gb2 fix` path too -- 결함 40 (sample-app T7,: a
     request for a path a later task owns stopped the fix for the owner.
-    None for a plain single-task job or a plan that cannot be loaded (the
-    notes-never-block rule still applies -- task_pipeline drops them)."""
+    None for a plain single-task job (no per-task `owns` to hand off
+    against -- see is_full_job) or a plan that cannot be loaded; either
+    way run_task_stages then runs with no handoff filter at all (the
+    notes-never-block rule still applies -- task_pipeline drops those
+    unconditionally)."""
     task_id = getattr(pos, "task_id", None)
-    if not full_job or not task_id:
+    if not is_full_job(pos) or not task_id:
         return None
-    from engine.application.pipeline_tasks import handoff_request_filter
     from engine.domain.plan import PlanError, load_plan
     try:
         plan = load_plan(config.projects[project].repo, job_name)
     except PlanError:
         return None
     later = tuple(t for t in (getattr(pos, "remaining_task_ids", None) or ()) if t != task_id)
-    return handoff_request_filter(ledger, project, job_name, plan, task_id, attempt_id,
-                                  later, None)
+    return HandoffContext(plan, task_id, later, None)
 
 
 def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
        fakes_for: FakesFor,
        on_progress: orbit.ProgressCallback | None = None,
-       processor_factory: orbit.ProcessorFactory | None = None) -> FixResult:
+       processor_factory: orbit.ProcessorFactory | None = None,
+       past_cap: bool = False) -> FixResult:
     """Continue the project's current (failed-at-review-or-bench)
     attempt instead of starting a fresh job -- or, if a PRIOR call to
     this function was itself interrupted partway through its own
@@ -495,7 +393,20 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
     FixupError (no ledger write beyond whatever close_failed_attempt
     itself already committed, and the "fix.started" this function
     itself appended first) if there is nothing eligible to fix, or if
-    closing the failed attempt does not end 'done'."""
+    closing the failed attempt does not end 'done'.
+
+    Entry check (결함 41, plans/-gongbang-entry-unify.md §B):
+    only on a FRESH cycle (never while resuming an already-journaled
+    one -- `cycle` below is already past this point, and re-checking it
+    on resume would refuse a transition that already started) --
+    before anything is appended, if fix_rounds_used (repair_target's
+    own pure count of this job's earlier attempts, since its last
+    commit, that closed on a failed review/bench request) is already at
+    or past the position's own `max_fix_rounds` (default 2, unchanged --
+    no new number), raise FixupError(f"{FIX_ROUNDS_EXHAUSTED_PREFIX}
+    {rounds_used}") with NOTHING recorded, UNLESS `past_cap` is True --
+    then one more round is allowed and a "fix.past_cap" ledger event
+    records it (tools/gb2lib.runner.cmd_fix's own `--past-cap` flag)."""
     cycle = _find_unfinished_fix_cycle(ledger, project)
     if cycle is not None:
         started_seq, payload = cycle
@@ -509,7 +420,39 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         target = find_fix_target(ledger, project)
         old_attempt_id = target.attempt_id
         job_name = target.job_name
+        cap_pos = load_position(ledger, project, job_name)
+        # JobPosition.max_fix_rounds' own default (2) when there is no
+        # recorded position yet (a plain `gb2 run` single-task job's
+        # first-ever fix has none) -- never a second number invented here.
+        max_rounds = cap_pos.max_fix_rounds if cap_pos is not None else 2
+        rounds_used = fix_rounds_used(ledger, project, job_name, old_attempt_id)
+        # a past incident (반장 지시,: checked BEFORE the cap itself,
+        # so it also catches a job that has not yet reached max_fix_rounds
+        # -- only for "review" (build-task review; engine.application.
+        # pipeline_resume's own early-station reopen runs the identical
+        # check for a plan review), never "bench" (a failing test's own
+        # tail legitimately repeats while a fix is still in progress,
+        # that is not "no progress").
+        if (target.failing_kind == "review" and target.review_findings
+                and not past_cap):
+            prior_findings = previous_review_findings(ledger, project, job_name,
+                                                       old_attempt_id)
+            if review_findings_repeat(target.review_findings, prior_findings):
+                raise FixupError(f"{NO_PROGRESS_PREFIX}{rounds_used}")
+        if rounds_used >= max_rounds:
+            if not past_cap:
+                raise FixupError(f"{FIX_ROUNDS_EXHAUSTED_PREFIX}{rounds_used}")
+            _append_fix_event(ledger, project, "fix.past_cap", old_attempt_id,
+                              {"job_name": job_name, "rounds_used": rounds_used,
+                               "max_fix_rounds": max_rounds})
         task = compose_fix_task(target, extra, _also_own_for_task(ledger, project, job_name))
+        # 결함 48: compose_fix_task is plain text -- a fix round's own
+        # builder instructions never got a "## 주입된 자료" block at
+        # all (never mind a stale one) -- see inject_context_into_fix_
+        # task's own docstring (repair_target.py).
+        task = inject_context_into_fix_task(
+            config, ledger, project, job_name, task,
+            is_full_job(load_position(ledger, project, job_name)))
         builder_role = target.builder_role
         reviewer_role = target.reviewer_role
         archive_source = str(target.carried_archive) if target.carried_archive is not None else None
@@ -645,21 +588,19 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         _append_fix_event(ledger, project, "fix.finished", old_attempt_id, {})
 
     new_fakes = fakes_for(new_attempt_id)
-    outcome = orbit.continue_job(
-        config, ledger, new_fakes, project, new_attempt_id, stages,
-        processor_factory=processor_factory, on_progress=on_progress,
-        request_filter=_fix_request_filter(config, ledger, project, job_name, pos,
-                                           new_attempt_id, full_job),
+    # The repaired task stopped for the owner (e.g. another install) is
+    # recorded on `pos` ONLY when it is still the project's current
+    # full-job task position on this exact replacement attempt -- a
+    # plain single-task job, or a position already moved elsewhere,
+    # has nothing of this shape to record a stop on.
+    stop_pos = (pos if full_job and pos is not None and pos.stage == STAGE_TASK
+               and pos.attempt_id == new_attempt_id else None)
+    outcome = run_task_stages(
+        config, ledger, new_fakes, project, job_name, new_attempt_id, stages,
+        on_progress=on_progress, processor_factory=processor_factory,
+        handoff=_fix_handoff(config, project, job_name, pos),
+        task_pos=stop_pos, flow_boundary_label="fixup.fix.task_stop",
     )
-    if (full_job and pos is not None and pos.stage == STAGE_TASK
-            and pos.attempt_id == new_attempt_id
-            and (outcome.status == "needs_owner" or outcome.pending_requests)):
-        # The repaired task stopped for the owner (e.g. another install):
-        # recorded here, where the outcome is known, so a later resume
-        # waits on that request instead of rebuilding.
-        faults.flow_boundary("fixup.fix.task_stop")
-        record_position(ledger, project, task_stop_position(
-            pos, new_attempt_id, outcome.reason, list(outcome.pending_requests)))
     return FixResult(
         old_attempt_id=old_attempt_id, new_attempt_id=new_attempt_id,
         job_name=job_name, task=task, outcome=outcome, full_job=full_job,
@@ -713,8 +654,14 @@ def add_also_own(config: EngineConfig, ledger: Ledger, project: str,
         raise FixupError("no_task_being_fixed") from None
     if not any(t.id == pos.task_id for t in plan.tasks):
         raise FixupError("no_task_being_fixed")
+    # a review finding: pass the CURRENT remaining_task_ids (this task
+    # plus every task still to run) as `active_task_ids`, exactly like
+    # repair_approval.approve_pending_edit already does -- a FINISHED
+    # task's plan.json `owns` must not block a grant any more than its
+    # EXTRA --also-own grants already don't (결함 34/38).
     normalized = validate_also_own(
         ledger, project, target.job_name, plan, pos.task_id, paths,
+        tuple(pos.remaining_task_ids or ()),
         station_prefixes=tuple(config.station_owners.get("build", {}).get(target.builder_role, ())))
     record_owns_extension(ledger, project, target.job_name, pos.task_id, target.attempt_id,
                           normalized)
@@ -733,7 +680,7 @@ from engine.application.repair_approval import approve_pending_edit  # noqa: E40
 __all__ = [
     "FixupError", "FixTarget", "FixResult", "find_fix_target",
     "compose_fix_task", "close_failed_attempt", "fix", "original_task", "add_also_own",
-    "approve_pending_edit",
+    "approve_pending_edit", "FIX_ROUNDS_EXHAUSTED_PREFIX",
 ]
 
 

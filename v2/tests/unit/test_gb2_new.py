@@ -120,18 +120,27 @@ def _install_fake_full_orbit(monkeypatch: pytest.MonkeyPatch, *, run_result=None
         open_job(config, ledger, project, job_name, "full", roles=())
         return run_result if run_result is not None else _FakeFullOutcome(status="done")
 
-    def continue_full_job(config, ledger, fakes, project, job_name, *, on_progress=None):
-        continue_calls.append((config, ledger, fakes, project, job_name, on_progress))
+    def continue_full_job(config, ledger, fakes, project, job_name, *,
+                          on_progress=None, past_cap=False):
+        continue_calls.append((config, ledger, fakes, project, job_name, on_progress,
+                               past_cap))
         return continue_result if continue_result is not None else _FakeFullOutcome(status="done")
 
     def pending_owner_requests(ledger, project, job_name, **_kwargs):
         pending_calls.append((project, job_name))
         return pending_requests
 
+    class ForceReopenError(Exception):
+        """Stub mirror of the real engine.application.pipeline_resume.ForceReopenError
+        (raised when `gb2 continue --from-station` would discard ledger history
+        without `--past-cap`); tools/gb2lib.runner.cmd_continue catches this by
+        attribute off `full_orbit`, so the stub module must expose it too."""
+
     stub.run_full_job = run_full_job  # type: ignore[attr-defined]
     stub.continue_full_job = continue_full_job  # type: ignore[attr-defined]
     stub.pending_owner_requests = pending_owner_requests  # type: ignore[attr-defined]
     stub.FullOutcome = _FakeFullOutcome  # type: ignore[attr-defined]
+    stub.ForceReopenError = ForceReopenError  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "engine.full_orbit", stub)
     # `from engine import full_orbit` reads the package attribute first,
     # so a real module imported earlier in the run must be shadowed too.
@@ -713,7 +722,7 @@ def test_cmd_approve_design_appends_event_and_calls_continue_full_job(
 
     assert code == 0
     assert len(continue_calls) == 1
-    (_cfg, _ledger, fakes_for, project, job_name, _on_progress) = continue_calls[0]
+    (_cfg, _ledger, fakes_for, project, job_name, _on_progress, _past_cap) = continue_calls[0]
     assert project == "demo"
     assert job_name == "gb2-new-1000"
     assert fakes_for(attempt_id).installer is not None
@@ -807,7 +816,7 @@ def test_cmd_approve_install_approves_runs_install_then_continues(
 
     assert code == 0
     assert len(continue_calls) == 1
-    (_cfg, _ledger, fakes_for, project, job_name, _on_progress) = continue_calls[0]
+    (_cfg, _ledger, fakes_for, project, job_name, _on_progress, _past_cap) = continue_calls[0]
     assert project == "demo"
     assert job_name == "gb2-new-1000"
     assert fakes_for(attempt_id).installer is not None
@@ -844,9 +853,10 @@ def test_cmd_continue_calls_continue_full_job(
 
     assert code == 0
     assert len(continue_calls) == 1
-    (_cfg, _ledger, _fakes_for, project, job_name, _on_progress) = continue_calls[0]
+    (_cfg, _ledger, _fakes_for, project, job_name, _on_progress, past_cap) = continue_calls[0]
     assert project == "demo"
     assert job_name == "gb2-new-1000"
+    assert past_cap is False
 
 
 def test_cmd_continue_refuses_when_no_active_job(

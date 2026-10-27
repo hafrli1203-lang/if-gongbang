@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 from engine import procs
-from engine.config import McpServerConfig, WorkerConfig
+from engine.config import ContextConfig, McpServerConfig, WorkerConfig
+from engine.domain.records import Event
 from engine.faults import CrashInjected, Faults
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -95,6 +96,12 @@ def test_run_station_done_records_changed_paths_from_git_status(
     assert "../escape" not in changed
     assert "/etc/passwd" not in changed
     assert all(not p.startswith("..") and not p.startswith("/") for p in changed)
+    # G16: the station.finished payload now always carries a tokens_out
+    # key (None here -- the scripted fake worker's stdout has no "usage"
+    # object, so there is genuinely nothing to record, same as a real
+    # codex result).
+    assert "tokens_out" in finished[0].payload
+    assert finished[0].payload["tokens_out"] is None
 
 
 def test_record_station_fails_closed_if_copy_git_config_changed(
@@ -501,3 +508,103 @@ def test_full_spec_task_unchanged_when_no_builder_test_hint_configured(
     # No stray blank-line-plus-hint appended beyond what build_prompt's
     # own test_cmd line already adds.
     assert spec.task.count("\n\n") <= 1
+
+
+def _seed_context_injected(ws: Workspace, attempt_id: str, station: str,
+                           skills: list[str]) -> None:
+    """A minimal context.injected event, same shape engine.infrastructure.context.
+    build's caller (engine.application.pipeline_stages.record_context) actually
+    appends -- build/review stations record this with attempt_id=None
+    (see worker_step._latest_injected_skills's own docstring), so tests
+    seed it that way too rather than tying it to attempt_id."""
+    ws.ledger.append(Event(
+        project="alpha", kind="context.injected", actor_kind="processor",
+        actor_id="processor", attempt_id=None,
+        payload={"station": station, "items": [], "skills": skills,
+                 "missing": [], "base": [], "planned": list(skills)},
+    ))
+
+
+def test_record_station_includes_skills_applied_from_final_json(
+    workspace: Workspace,
+) -> None:
+    """G20: a builder's final JSON "skills_applied" reaches
+    station.finished -- the one place a job's board/report can later
+    show which station skills were actually used, not just injected."""
+    ws = _station_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, [
+        {"final": {
+            "status": "done", "summary": "used a skill",
+            "skills_applied": [{"name": "아우라-파밍", "where": "화면 배색"}],
+            "requests": [],
+        }},
+    ])
+    attempt_id, rid = _submit_station(ws)
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+
+    finished = [e for _s, e in ws.ledger.events("alpha", "station.finished")
+                if e.payload.get("request_id") == rid]
+    assert len(finished) == 1
+    assert finished[0].payload["skills_applied"] == [
+        {"name": "아우라-파밍", "where": "화면 배색"},
+    ]
+
+
+def test_record_station_flags_injected_skill_never_reported_applied(
+    workspace: Workspace,
+) -> None:
+    """An injected skill (context.injected's own "skills" list for this
+    station) the worker's final JSON never named in "skills_applied" is
+    recorded as a "skills.unapplied" event -- not required by default
+    (ContextConfig.required_skills unset), so required_unapplied stays
+    empty."""
+    ws = _station_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, [
+        {"final": {"status": "done", "summary": "done", "skills_applied": [],
+                   "requests": []}},
+    ])
+    attempt_id, rid = _submit_station(ws)
+    _seed_context_injected(ws, attempt_id, "build", ["아우라-파밍"])
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+
+    unapplied = [e for _s, e in ws.ledger.events("alpha", "skills.unapplied")
+                if e.payload.get("request_id") == rid]
+    assert len(unapplied) == 1
+    assert unapplied[0].payload["unapplied"] == ["아우라-파밍"]
+    assert unapplied[0].payload["required_unapplied"] == []
+
+
+def test_record_station_required_unapplied_when_configured(
+    workspace: Workspace,
+) -> None:
+    """A skill ContextConfig.required_skills["build"] actually names,
+    injected but never reported applied, lands in "required_unapplied"
+    -- the field engine.application.steps.review._full_spec reads to fold a note
+    into the reviewer's own input (G20)."""
+    ws = _station_workspace(workspace)
+    config = replace(ws.config, context=ContextConfig(
+        required_skills={"build": ("아우라-파밍",)},
+    ))
+    ws = Workspace(ws.root, config, ws.ledger, ws.alpha, ws.beta)
+    script = ws.root / "script.json"
+    _write_script(script, [
+        {"final": {"status": "done", "summary": "done", "skills_applied": [],
+                   "requests": []}},
+    ])
+    attempt_id, rid = _submit_station(ws)
+    _seed_context_injected(ws, attempt_id, "build", ["아우라-파밍", "기획"])
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+
+    unapplied = [e for _s, e in ws.ledger.events("alpha", "skills.unapplied")
+                if e.payload.get("request_id") == rid]
+    assert len(unapplied) == 1
+    assert sorted(unapplied[0].payload["unapplied"]) == ["기획", "아우라-파밍"]
+    assert unapplied[0].payload["required_unapplied"] == ["아우라-파밍"]

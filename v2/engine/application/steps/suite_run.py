@@ -43,6 +43,21 @@ run_tests            Speed default (project.bench_scope, "related" unless
                      no_tests_executed is itself a step failure here:
                      record_bench (not this step) folds both into the
                      overall passed/reason.
+run_arch_check       project.arch_check_cmd (empty -> {"configured": False},
+                     nothing checked, byte-identical to before this
+                     step existed) -> runs it in the bench sandbox
+                     against the repo, parses its JSON stdout
+                     (COMMON_ARCHITECTURE_STANDARD.md's arch_check
+                     shape: {"violations": [...]}), splits violations
+                     into this attempt's own ("new_violations", by
+                     "file" against dirty_paths) and pre-existing
+                     ("existing_violation_count") -- only the former
+                     can fail the bench. Output that fails to parse as
+                     that shape (tool crashed/missing/wrong) ->
+                     StepFailed("arch_check_failed") regardless of
+                     exit code (arch_check.py's own exit 1 on a clean
+                     run that FOUND violations is normal data, not a
+                     failure). reconcile False.
 trust_checks         project.bench_cases (a JSON file in the repo) ->
                      bench.Case list; each case's run() executes
                      `test_cmd + [selector]` with os.environ overridden
@@ -60,14 +75,18 @@ record_bench         recompute the fingerprint; if it differs from
                      recorded for a tree a worker kept editing under our
                      feet. Otherwise passed = (run_tests returncode==0)
                      and trust.passed (plan §5: the real suite AND the
-                     trust-checked cases must both be clean); reason is
-                     trust.reason when the cases failed, else
-                     "tests_failed" when only the real suite is red,
-                     else "ok". Record evidence (kind "bench", payload
-                     {"passed", "reason", "request_id", "per_case",
-                     "tests_returncode", "scope", "argv"} -- scope/argv
-                     carried over from run_tests' own journal payload)
-                     FIRST, then, if the bench did
+                     trust-checked cases must both be clean) and no
+                     NEW arch_check violation (run_arch_check's own
+                     "new_violations"; a pre-existing one never blocks
+                     this attempt); reason is trust.reason when the
+                     cases failed, "tests_failed" when the real suite
+                     is red, "arch_violations" when only the structure
+                     check found a new violation, else "ok". Record
+                     evidence (kind "bench", payload {"passed",
+                     "reason", "request_id", "per_case",
+                     "tests_returncode", "scope", "argv", "arch"} --
+                     scope/argv carried over from run_tests' own
+                     journal payload) FIRST, then, if the bench did
                      not pass, raise StepFailed(reason) -- evidence is
                      recorded before raising so the failure (and its
                      signatures) stays visible to three_match/record
@@ -97,6 +116,7 @@ from engine.domain import ids
 from engine.infrastructure import sandbox
 from engine.application.processor import StepContext, StepDef, StepFailed
 from engine.application.steps import file_deps
+from engine.application.steps import suite_arch_check
 from engine.application.steps.suite_select import (  # noqa: F401 -- re-exported for tests
     build_related_argv as _build_related_argv,
 )
@@ -124,6 +144,16 @@ def _repo(ctx: StepContext) -> Path:
 
 def _excludes(ctx: StepContext) -> tuple[str, ...]:
     return _project_config(ctx).excludes
+
+
+def _file_dep_targets(ctx: StepContext) -> tuple[tuple[str, str], ...]:
+    """Same role as engine.application.steps.review._file_dep_targets:
+    fed to evidence.with_file_deps so record_bench's EVIDENCE
+    fingerprint (what three_match compares at commit time) also covers
+    a `file:../...` shared package's content -- never the plain tree
+    fp used for tree_changed_during_bench or bench.run_bench's own
+    bookkeeping (a review finding,."""
+    return _project_config(ctx).file_dep_targets
 
 
 def _timeout_sec(ctx: StepContext) -> float:
@@ -300,8 +330,15 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     # relative escape every one of those copies/snapshots preserves
     # byte-for-byte resolves, inside this sandbox, to the one real target
     # directory regardless of which root it was walked from.
-    readonly_remap += file_deps.remap_pairs_for_root(
-        repo, _project_config(ctx).file_dep_targets)
+    # 결함 42: `repo` alone is not enough when it is a
+    # disposable snapshot, never the real repo -- a copy_links entry's
+    # own escaping symlink always resolves against the REAL repo's own
+    # parent (see file_deps.sandbox_file_dep_pairs' own docstring), so
+    # the real project repo is passed here too, and the one shared
+    # function also pre-creates a dest bwrap could not otherwise mkdir
+    # under this call's own `hidden` apps-root entry.
+    readonly_remap += file_deps.sandbox_file_dep_pairs(
+        repo, _repo(ctx), _project_config(ctx).file_dep_targets)
     try:
         wrapped = sandbox.wrap(
             argv, cwd=repo, writable=writable, hidden=hidden, readonly=readonly,
@@ -493,6 +530,24 @@ def _failed_test_files(text: str) -> list[str]:
 # (imported at the top of this file) and reused here only.
 
 
+# --------------------------------------------------------------------
+# Check: project structure (COMMON_ARCHITECTURE_STANDARD.md's
+# arch_check), gated to NEW violations only -- mechanics live in
+# engine.application.steps.suite_arch_check (kept out of this file to
+# stay under the 800-line cap); this is a thin wrapper binding this
+# module's own sandbox/env helpers to it.
+# --------------------------------------------------------------------
+
+def _run_run_arch_check(ctx: StepContext) -> dict[str, object]:
+    project = _project_config(ctx)
+    return suite_arch_check.run(
+        ctx, project=project, repo=_repo(ctx),
+        extra_readonly=_bench_immutable_source(ctx), env=_bench_env(ctx),
+        timeout_sec=_timeout_sec(ctx), sandbox_mode=ctx.config.sandbox,
+        sandbox_argv_fn=_bench_sandbox_argv,
+    )
+
+
 def _case_signature(output: dict[str, object]) -> str | None:
     """Classify a failed case. pytest-shaped output: from its `E   ...`
     lines only (not from arbitrary text such as `from x import
@@ -639,20 +694,33 @@ def _run_record_bench(ctx: StepContext) -> dict[str, object]:
     tests_ok = tests_returncode == 0 and not no_tests_executed
     trust = _journal_payload(ctx, "trust_checks")
     trust_passed = bool(trust["passed"])
-    passed = tests_ok and trust_passed
+    arch = _journal_payload(ctx, "run_arch_check")
+    arch_new_violations = arch.get("new_violations", []) if arch.get("configured") else []
+    arch_ok = not arch_new_violations
+    passed = tests_ok and trust_passed and arch_ok
     if not trust_passed:
         reason = str(trust["reason"])
     elif no_tests_executed:
         reason = "no_tests_executed"
     elif not tests_ok:
         reason = "tests_failed"
+    elif not arch_ok:
+        reason = "arch_violations"
     else:
         reason = "ok"
+    # a review finding: same split as review._run_record_review --
+    # `fp` (just verified against a live recompute, above) stays the
+    # plain git tree hash bench.run_bench already used it as; only the
+    # EVIDENCE fingerprint recorded here (what three_match compares at
+    # commit time) also covers file_dep_targets' own content. A project
+    # with none gets evidence_fp == fp exactly.
+    evidence_fp = evidence.with_file_deps(fp, _file_dep_targets(ctx))
     evidence.record(
-        ctx.ledger, ctx.project, ctx.attempt_id, "bench", fp,
+        ctx.ledger, ctx.project, ctx.attempt_id, "bench", evidence_fp,
         payload={
             "passed": passed, "reason": reason,
             "request_id": ctx.request.request_id,
+            "tree_fp": fp,
             "per_case": trust.get("per_case", {}),
             "tests_returncode": tests_returncode,
             "scope": run_tests_result.get("scope", "full"),
@@ -665,6 +733,15 @@ def _run_record_bench(ctx: StepContext) -> dict[str, object]:
             # existed never wrote these keys at all.
             "tail": run_tests_result.get("tail", ""),
             "failed_test_files": run_tests_result.get("failed_test_files", []),
+            # Structure-check result (run_arch_check) -- "new_violations"
+            # is this attempt's own doing only; "existing_violation_count"
+            # names, without blocking this attempt over them, how many
+            # OTHER (pre-existing) violations the same tool found.
+            "arch": {
+                "configured": bool(arch.get("configured")),
+                "new_violations": arch_new_violations,
+                "existing_violation_count": arch.get("existing_violation_count", 0),
+            },
         },
     )
     if not passed:
@@ -698,6 +775,7 @@ def steps(ctx: StepContext) -> list[StepDef]:
     return [
         StepDef("compute_fingerprint", _run_compute_fingerprint, _reconcile_false),
         StepDef("run_tests", _run_run_tests, _reconcile_false),
+        StepDef("run_arch_check", _run_run_arch_check, _reconcile_false),
         StepDef("trust_checks", _run_trust_checks, _reconcile_false),
         StepDef("record_bench", _run_record_bench, _reconcile_record_bench),
     ]

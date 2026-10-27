@@ -153,6 +153,17 @@ class SecurityResult:
     # "no finding"; a later caller must never treat "" as "the tree
     # this result applies to is unambiguous."
     fingerprint: str = ""
+    # a review finding: `fingerprint` above stays the PLAIN git
+    # tree hash -- engine.application.release_certificate.job_certificate_status
+    # diffs it against real git trees, never a value folded with
+    # file_dep_targets' own content (same reasoning engine.application.
+    # acceptance.AcceptanceResult.evidence_fingerprint documents). This
+    # is the separate, file-dep-aware value (evidence.with_file_deps)
+    # that same caller additionally compares, so a shared package's
+    # content changing since this security check ran -- even though
+    # the app's own repo tree never moved -- still makes the
+    # certificate stale. "" whenever `fingerprint` itself is "".
+    evidence_fingerprint: str = ""
     # _hash_security_policy() of the SAME security_config snapshot
     # check() read once and used for this very verdict -- see this
     # module's own docstring and security_policy_hash's.
@@ -414,8 +425,11 @@ def check(config: EngineConfig, project: str, attempt_id: str,
             passed = False
 
     fingerprint = ""
+    evidence_fingerprint = ""
     try:
         fingerprint = evidence.fingerprint(repo, project_config.excludes)
+        evidence_fingerprint = evidence.with_file_deps(
+            fingerprint, project_config.file_dep_targets)
     except evidence.FingerprintError:
         findings.append("no_fingerprint")
         passed = False
@@ -435,7 +449,7 @@ def check(config: EngineConfig, project: str, attempt_id: str,
                 passed = False
 
     return SecurityResult(passed=passed, findings=tuple(findings), ran=tuple(ran),
-                          fingerprint=fingerprint,
+                          fingerprint=fingerprint, evidence_fingerprint=evidence_fingerprint,
                           policy_hash=_hash_security_policy(security_config))
 
 
@@ -455,6 +469,7 @@ def record(ledger: Ledger, project: str, attempt_id: str,
         payload={
             "passed": result.passed, "findings": list(result.findings),
             "ran": list(result.ran), "fingerprint": result.fingerprint,
+            "evidence_fingerprint": result.evidence_fingerprint,
             "policy_hash": result.policy_hash,
         },
     ))

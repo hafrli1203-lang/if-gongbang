@@ -281,6 +281,17 @@ class ProjectConfig:
     # is the one place a later sandbox build actually uses this value,
     # and it already drops a pair whose target no longer exists.
     file_dep_targets: tuple[tuple[str, str], ...] = ()
+    # argv for a structure-check command this project supplies on its
+    # own (COMMON_ARCHITECTURE_STANDARD.md's `arch_check`, e.g.
+    # ["python3", "tools/arch_check.py"]) -- the engine never ships or
+    # hardcodes a path to one itself (public code: no particular
+    # internal checkout belongs in here). Empty (default): bench
+    # (engine.application.steps.suite_run) skips the structure check
+    # entirely, unchanged from before this field existed. When set,
+    # bench appends this attempt's repo path and "--json" itself and
+    # runs it inside the same bench sandbox run_tests uses -- never a
+    # second, differently-isolated subprocess call.
+    arch_check_cmd: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.bench_scope not in _KNOWN_BENCH_SCOPES:
@@ -350,6 +361,13 @@ class EngineConfig:
     hooks: tuple[Path, ...] = ()
     hook_timeout_sec: float = 2.0
     approval_ttl_sec: int = 4 * 3600
+    # `gb2 watch --loop --resume`'s own anti-thrash limit (engine.application.
+    # watch): at most this many "watch.resumed" events within any trailing
+    # one-hour window for one app. A "stalled" app past the limit is left
+    # alone (a "watch.gave_up" event is appended instead, and the verdict
+    # stays "failed") rather than resumed forever against a cause watch
+    # itself cannot fix -- see watch.py's own module docstring.
+    watch_max_resumes_per_hour: int = 3
     stations: tuple[str, ...] = (
         "register", "facts", "probe", "plan", "design",
         "build", "review", "bench", "report",

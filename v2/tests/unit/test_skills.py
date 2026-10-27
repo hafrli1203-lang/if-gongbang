@@ -70,3 +70,27 @@ def test_symlinked_category_dir_escaping_root_is_rejected(tmp_path: Path) -> Non
     result = load_skill((str(root),), "숨은-스킬")
     assert result.body is None
     assert result.path is None
+
+
+def test_found_deep_inside_a_skill_pack(tmp_path: Path) -> None:
+    """Live shape: ~/.claude/skills-library keeps installed packs as
+    <category>/<pack>/skills/<name>/SKILL.md -- three levels below the
+    category. The planner picks these by name (76 misses in the live
+    ledger), so they must be found, not reported missing."""
+    _write_skill(tmp_path, "00-설치원본/obra-superpowers/skills",
+                 "verification-before-completion", "증거 먼저")
+    result = load_skill((str(tmp_path),), "verification-before-completion")
+    assert result.body == "증거 먼저"
+
+
+def test_deep_match_prefers_the_shallowest_copy(tmp_path: Path) -> None:
+    _write_skill(tmp_path, "08-카탈로그/templates/cli/components/skills/dev",
+                 "systematic-debugging", "카탈로그 사본")
+    _write_skill(tmp_path, "00-설치원본/obra/skills", "systematic-debugging", "설치 원본")
+    result = load_skill((str(tmp_path),), "systematic-debugging")
+    assert result.body == "설치 원본"
+
+
+def test_deep_search_skips_node_modules(tmp_path: Path) -> None:
+    _write_skill(tmp_path, "pack/node_modules/x", "숨은-스킬", "의존성 안")
+    assert load_skill((str(tmp_path),), "숨은-스킬").body is None

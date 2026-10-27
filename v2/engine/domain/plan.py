@@ -30,8 +30,8 @@ from engine.domain.plan_model import (
     plan_path, requirement_coverers, validate_plan, scene_script_arg as _scene_script_arg,
 )
 from engine.domain.plan_review import (
-    check_resumed_plan, is_plan_reviewed, plan_digest, record_plan_reviewed,
-    scene_file_digests, verify_reviewed_scenes,
+    check_resumed_plan, is_plan_reviewed, plan_digest, record_owner_plan_amend,
+    record_plan_reviewed, scene_file_digests, verify_reviewed_scenes,
 )
 from engine.domain.plan_tools import (
     classify_skill_tools, skill_catalog_text, tools_for_station, validate_tools,
@@ -41,6 +41,6 @@ __all__ = [
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "validate_tools", "tools_for_station", "classify_skill_tools",
     "ordered_tasks", "requirement_coverers", "plan_digest", "scene_file_digests",
-    "record_plan_reviewed", "check_resumed_plan", "verify_reviewed_scenes",
-    "is_plan_reviewed",
+    "record_plan_reviewed", "record_owner_plan_amend", "check_resumed_plan",
+    "verify_reviewed_scenes", "is_plan_reviewed",
 ]

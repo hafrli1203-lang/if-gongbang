@@ -27,10 +27,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from engine.application import task_pipeline as orbit
 from engine.config import EngineConfig
 from engine.application.repair_target import (
-    FixupError, is_owns_scope_request, record_owns_extension, validate_also_own,
+    FixupError, is_owns_scope_request, record_owns_extension, record_request_declined,
+    validate_also_own,
 )
 from engine.application.processor import Fakes
 from engine.application.job_state import (
@@ -40,6 +40,11 @@ from engine.application.job_state import (
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
     from engine.application.pipeline import FullOutcome
+    # Type-only (no runtime `orbit.*` call in this module) -- a
+    # module-level import here reopens the steps/__init__ -> review ->
+    # repair -> repair_approval cycle this module is itself one leg of
+    # (tests/unit/test_standalone_imports.py).
+    from engine.application import task_pipeline as orbit
 
 FakesFor = Callable[[str], Fakes]
 
@@ -80,6 +85,8 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
                          paths: tuple[str, ...], fakes_for: FakesFor, *,
                          on_progress: orbit.ProgressCallback | None = None,
                          processor_factory: orbit.ProcessorFactory | None = None,
+                         declined: tuple[str, ...] = (),
+                         decline_note: str = "",
                          ) -> "FullOutcome":
     """Owner-only. Raises FixupError(NOT_TASK_OWNER_EDIT_STOP) -- nothing
     recorded -- unless the project's current attempt is OPEN/active AND
@@ -105,8 +112,13 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
     since nothing here ever failed. The approved paths stop appearing in
     a later `pending_owner_requests` call (the P5 single computation,
     job_state.outstanding_requests's own "edit" branch) -- there is no
-    separate "fulfilled" ledger to fall out of sync with it."""
-    if not paths:
+    separate "fulfilled" ledger to fall out of sync with it.
+
+    `declined` (결함 43): pending edit paths the owner refuses instead
+    (FixupError("decline_not_requested:<path>") for one that was not
+    asked for). Each is recorded as task.request_declined -- never
+    granted -- so it stops blocking the resume."""
+    if not paths and not declined:
         raise FixupError("also_own_no_paths")
     found = _job_name_for_current_attempt(ledger, project)
     if found is None:
@@ -125,6 +137,9 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
     for path in paths:
         if path not in pending_edit_paths:
             raise FixupError(f"also_own_not_requested:{path}")
+    for path in declined:
+        if path not in pending_edit_paths:
+            raise FixupError(f"decline_not_requested:{path}")
 
     from engine.domain.plan import PlanError, load_plan
 
@@ -132,12 +147,24 @@ def approve_pending_edit(config: EngineConfig, ledger: "Ledger", project: str,
         plan = load_plan(config.projects[project].repo, job_name)
     except PlanError:
         raise FixupError("no_task_being_fixed") from None
-    if not any(t.id == pos.task_id for t in plan.tasks):
+    # An acceptance-fix round's own synthesized task (결함 46,
+    # engine.application.pipeline_base.task_for's own `fixing` branch)
+    # never appears in plan.tasks -- its id ("fix-1", ...) is made up
+    # fresh per round by engine.application.pipeline_tasks's own
+    # run_acceptance_and_handoff, never written into plan.json. Only a
+    # NON-fixing position's task id must still be one of plan.tasks's
+    # real ids.
+    if not pos.fixing and not any(t.id == pos.task_id for t in plan.tasks):
         raise FixupError("no_task_being_fixed")
-    normalized = validate_also_own(
-        ledger, project, job_name, plan, pos.task_id, paths, tuple(pos.remaining_task_ids or ()),
-        station_prefixes=tuple(config.station_owners.get("build", {}).get("builder", ())))
-    record_owns_extension(ledger, project, job_name, pos.task_id, attempt_id, normalized)
+    if paths:
+        normalized = validate_also_own(
+            ledger, project, job_name, plan, pos.task_id, paths,
+            tuple(pos.remaining_task_ids or ()),
+            station_prefixes=tuple(config.station_owners.get("build", {}).get("builder", ())))
+        record_owns_extension(ledger, project, job_name, pos.task_id, attempt_id, normalized)
+    for path in declined:
+        record_request_declined(ledger, project, job_name, pos.task_id, attempt_id, path,
+                                note=decline_note)
     hand_off_later_task_requests(ledger, project, job_name, pos, plan)
 
     return resume_job(config, ledger, fakes_for, project, job_name,

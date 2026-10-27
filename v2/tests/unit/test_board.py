@@ -576,6 +576,139 @@ def test_job_position_request_id_lives_under_extra(tmp_path):
     assert board.jobs[0].status == "실패"
 
 
+def test_job_board_counts_ai_requests_and_fix_rounds(tmp_path):
+    """G16 (gongbang_directives.md): the board must show, per job, how
+    many requests the engine actually sent to an AI worker, and how
+    many fix rounds the job went through -- not just the raw attempt
+    count. 'AI 요청' is every request.submitted event whose own
+    payload["kind"] is one of the two request kinds that spawn a
+    worker runner (engine.application.processor.KNOWN_KINDS +
+    engine.application.steps.KINDS: "run_station" -> worker_step.py,
+    "review" -> review.py); "close"/"commit"/"bench"/... do not spawn a
+    worker and must not be counted. 'fix 회차' is attempt_count - 1 (n=1
+    is the job's own first attempt, every attempt after that is a fix
+    round) -- see this job opening TWO attempts below."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-build", "kind": "run_station",
+                 "content_hash": "h1", "payload": {"station": "build"}},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-review", "kind": "review",
+                 "content_hash": "h2", "payload": {}},
+    ))
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-close", "kind": "close",
+                 "content_hash": "h3", "payload": {}},
+    ))
+    ledger.append(Event(
+        project=project, kind="job.opened", actor_kind="owner", actor_id="owner",
+        attempt_id="job-1.2",
+        payload={"job_id": "job-1", "job_name": "add-login", "attempt_id": "job-1.2",
+                 "n": 2, "kind": "full", "generation": 2, "dirty_paths": []},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert len(board.jobs) == 1
+    job = board.jobs[0]
+    assert job.attempt_count == 2
+    assert job.ai_request_count == 2
+    assert job.fix_round_count == 1
+
+
+def test_job_board_tokens_out_is_none_when_ledger_never_records_it(tmp_path):
+    """No station.finished event today ever carries an output-token
+    count (engine.infrastructure.workers.base.parse_cli_shaped_result only
+    pulls total_cost_usd/num_turns off the CLI's raw JSON, never
+    usage.output_tokens) -- the board must show "기록 없음", never a
+    guessed number, until that wiring exists."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="station.finished", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r1", "station": "build", "role": "builder",
+                 "ok": True, "summary": "ok", "cost_usd": 1.0, "turns": 2,
+                 "changed_paths": [], "requests": []},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].tokens_out is None
+
+
+def test_job_board_tokens_out_sums_when_station_finished_does_carry_it(tmp_path):
+    """Once a caller DOES record tokens_out on station.finished (see
+    this module's own TODO note on parse_cli_shaped_result), the board
+    must add it up across the job's stations rather than ignore it."""
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="station.finished", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r1", "station": "build", "role": "builder",
+                 "ok": True, "summary": "ok", "cost_usd": 1.0, "turns": 2,
+                 "changed_paths": [], "requests": [], "tokens_out": 1200},
+    ))
+    ledger.append(Event(
+        project=project, kind="station.finished", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r2", "station": "review", "role": "reviewer",
+                 "ok": True, "summary": "ok", "cost_usd": 0.5, "turns": 1,
+                 "changed_paths": [], "requests": [], "tokens_out": 300},
+    ))
+    ledger.close()
+
+    board = load_app_board("alpha", ledger_path, project)
+
+    assert board.jobs[0].tokens_out == 1500
+
+
+def test_board_html_shows_ai_requests_fix_rounds_and_tokens_columns(tmp_path):
+    project = "alpha"
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger = _make_ledger(ledger_path, project)
+    _open_job(ledger, project, "job-1", "add-login", "job-1.1")
+    ledger.append(Event(
+        project=project, kind="request.submitted", actor_kind="owner",
+        actor_id="owner", attempt_id="job-1.1",
+        payload={"request_id": "r-build", "kind": "run_station",
+                 "content_hash": "h1", "payload": {}},
+    ))
+    ledger.append(Event(
+        project=project, kind="station.finished", actor_kind="processor",
+        actor_id="processor", attempt_id="job-1.1",
+        payload={"request_id": "r-build", "station": "build", "role": "builder",
+                 "ok": True, "summary": "ok", "cost_usd": 1.0, "turns": 2,
+                 "changed_paths": [], "requests": []},
+    ))
+    ledger.close()
+
+    apps = [load_app_board("alpha", ledger_path, project)]
+    html_out = render_board_html(apps, generated_ts=0.0)
+
+    assert "요청" in html_out
+    assert "수정 회차" in html_out
+    assert "출력 토큰" in html_out
+    assert "기록 없음" in html_out  # this job's tokens_out is None
+
+
 def test_job_position_newest_seq_wins_over_an_older_full_orbit_progress(tmp_path):
     """A ledger that straddles the P1 cutover (old full_orbit.progress
     events from before, new job.position events from after) must still

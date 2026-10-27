@@ -257,12 +257,34 @@ def _normalize_rel(path: str) -> str:
     return stripped[2:] if stripped.startswith("./") else stripped
 
 
-def _prefix_covers(prefix: str, entry: str) -> bool:
+def prefix_covers(prefix: str, entry: str) -> bool:
+    """True iff `entry` (a repo-relative path, posix-separated) is
+    covered by `prefix`, under the ONE convention this whole engine
+    uses for a station_owners/owns entry: a prefix ending in "/" is a
+    DIRECTORY -- it covers itself and everything under it -- while a
+    prefix with no trailing slash names an EXACT file and covers
+    nothing else, not even a path that merely starts with it (e.g.
+    "src/new" never covers "src/new/extra.py"). This is the single
+    function both the live write gate (_within_allowed_prefix, via
+    owns_within_prefixes below) and engine.application.steps.merge's
+    own owns/prefix re-check call -- merge used to carry its own ad
+    hoc, trailing-slash-blind "is it under this path" check, which let
+    a copy's write land under an exact-file owns entry's "directory"
+    even though the SAME write would have been refused outright by the
+    live gate while the worker was running (a review finding,:
+    owns=["src/new", ...], copy creates src/new/extra.py -- the gate
+    denies it, merge used to fold it in anyway). There must never be a
+    second definition of "does this owns/prefix entry cover this path"
+    in this codebase; every caller goes through this one."""
     e = _normalize_rel(entry)
     if prefix.endswith("/"):
         base = _normalize_rel(prefix)
         return e == base or e.startswith(base + "/")
     return e == _normalize_rel(prefix)
+
+
+# Backward-compat alias: kept private-named for existing in-module callers.
+_prefix_covers = prefix_covers
 
 
 def owns_within_prefixes(owns: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
@@ -272,7 +294,7 @@ def owns_within_prefixes(owns: tuple[str, ...], prefixes: tuple[str, ...]) -> bo
     what engine.domain.plan.validate_plan already enforced at plan-approval
     time, done again here against a tampered or malformed gate facts
     file, never trusted a second time without re-verifying."""
-    return all(any(_prefix_covers(p, entry) for p in prefixes) for entry in owns)
+    return all(any(prefix_covers(p, entry) for p in prefixes) for entry in owns)
 
 
 # Spliced verbatim into engine.application.stage_prompts.builder_task_text,

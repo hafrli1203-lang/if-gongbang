@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -1447,7 +1448,10 @@ def _setup_unknown_publish_job(
     job = _setup_release_job(gb2, tmp_path, monkeypatch)
     workspace = job["config"].ledger_path.parent
     sleeper = tmp_path / "sleeper.py"
-    sleeper.write_text("import time\ntime.sleep(0.05)\n", encoding="utf-8")
+    # Long enough to always outlive the 0.01s timeout even on a loaded
+    # host (0.05s raced and sometimes finished first -> "done"); the
+    # child is killed and reaped below once "unknown" is confirmed.
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     hang_config = replace(
         job["config"], publisher_argv=(sys.executable, str(sleeper)),
         publisher_timeout_sec=0.01,
@@ -1467,6 +1471,10 @@ def _setup_unknown_publish_job(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["status"] == "unknown"
     pid = receipt["pid"]
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -1499,7 +1507,7 @@ def test_resolve_refuses_while_process_group_still_alive(
     # Claim the receipt's process group is THIS test process's own pid --
     # guaranteed alive.
     receipt = json.loads(job["receipt_path"].read_text(encoding="utf-8"))
-    receipt["pgid"] = os.getpid()
+    receipt["pgid"] = os.getpgid(0)  # this process's real group (xdist workers do not lead one)
     job["receipt_path"].write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
 
@@ -1824,7 +1832,7 @@ _EARLY_DESIGN_PLAN_JSON = json.dumps({
          "where": "cli", "cmd": ["bash", _EARLY_DESIGN_SCENE_SCRIPT_PATH], "covers": ["R1"]},
     ],
     "tasks": [{"id": "t1", "title": "첫 파일", "detail": "",
-              "owns": ["src/extra1.py"], "depends_on": []}],
+              "owns": ["src/extra1.py", "tests/t1_test_owns.py"], "depends_on": []}],
     "acceptance": ["요구사항대로 동작한다"],
     "requirements": [{"id": "R1", "text": "요구사항대로 동작한다", "kind": "function"}],
 })
@@ -1839,7 +1847,10 @@ _EARLY_DESIGN_STATION_OWNERS = {
     # OWNERS["plan"]["planner"] does.
     "plan": {"planner": (".gongbang/", "tests/scenes/")},
     "design": {"designer": (".gongbang/",)},
-    "build": {"builder": ("src/",)},
+    # "tests/" too -- 결함 42 (plans/-gongbang-entry-unify.md
+    # §C): a build task owning src/ must also own a tests/ path of its
+    # own for its test file.
+    "build": {"builder": ("src/", "tests/")},
     "review": {"reviewer": ("review.md",)},
 }
 

@@ -113,7 +113,9 @@ from pathlib import Path
 
 from engine.application import release as release_mod
 from engine.domain.approvals import check as approvals_check
-from engine.infrastructure.evidence import FingerprintError, fingerprint, record, sha256_file
+from engine.infrastructure.evidence import (
+    FingerprintError, fingerprint, record, sha256_file, with_file_deps,
+)
 from engine.infrastructure.fake_publisher import PublisherCrashed
 from engine.infrastructure.gitutil import git_argv
 from engine.domain.records import Event
@@ -234,19 +236,44 @@ def _run_check_artifact(ctx: StepContext) -> dict[str, object]:
 
 
 def _release_fingerprint(ctx: StepContext) -> str | None:
-    """The project repo's CURRENT fingerprint (engine.infrastructure.evidence.
-    fingerprint, same computation engine.application.steps.publish's own
-    record_source step uses), or None if it cannot be computed.
-    Shared by every release-path check that needs to bind to "the
-    exact commit being released" -- by the time advance_master/
-    call_publisher call this, check_artifact has already confirmed
-    `git rev-parse HEAD` equals the approved sha AND the tree is
-    clean, so this fingerprint IS that commit's, not merely "whatever
-    the repo happens to contain right now"."""
+    """The project repo's CURRENT plain tree fingerprint (engine.
+    infrastructure.evidence.fingerprint, same computation engine.
+    application.steps.publish's own record_source step uses), or None
+    if it cannot be computed. Shared by every release-path check that
+    needs to bind to "the exact commit being released" -- by the time
+    advance_master/call_publisher call this, check_artifact has
+    already confirmed `git rev-parse HEAD` equals the approved sha AND
+    the tree is clean, so this fingerprint IS that commit's, not
+    merely "whatever the repo happens to contain right now". Always
+    the PLAIN git tree hash, never folded with file_dep_targets (see
+    _release_evidence_fingerprint for that): engine.application.
+    release_certificate.job_certificate_status diffs this value
+    against real git tree objects (`git diff`), which only ever works
+    on an actual git tree hash."""
     try:
         return fingerprint(_repo(ctx), _excludes(ctx))
     except FingerprintError:
         return None
+
+
+def _release_evidence_fingerprint(ctx: StepContext) -> str | None:
+    """Like _release_fingerprint, but folded with this project's
+    file_dep_targets (evidence.with_file_deps) -- the SAME combined
+    value engine.application.steps.suite_run.record_bench now records
+    bench evidence against (a review finding,. Bench evidence
+    lookups (latest_full_bench_passed) must compare against THIS
+    value, never the plain tree fingerprint _release_fingerprint
+    returns: before this fix, a project with file_dep_targets whose
+    full bench genuinely passed (recorded bound to the combined value)
+    was refused release anyway, because this gate re-fetched the
+    bench evidence keyed by the plain tree hash alone -- reproduction:
+    a full bench succeeds (suite_run.record_bench writes evidence_fp),
+    then this check (still plain fp) finds no matching row and reports
+    full_bench_missing even though the bench genuinely passed."""
+    fp = _release_fingerprint(ctx)
+    if fp is None:
+        return None
+    return with_file_deps(fp, _project_config(ctx).file_dep_targets)
 
 
 def _full_bench_passed_for_release(ctx: StepContext) -> bool:
@@ -254,12 +281,13 @@ def _full_bench_passed_for_release(ctx: StepContext) -> bool:
     ensure_full_bench gate (which normally refuses to grant an
     approval at all until this already holds): true iff the latest
     non-stale bench evidence for this attempt, bound to the project
-    repo's CURRENT fingerprint, passed with scope "full"/
-    "full(fallback)" (release._latest_full_bench_passed -- same check,
-    same fingerprint computation engine.application.steps.publish's own
-    record_source step uses). False (never raises) if the fingerprint
-    itself cannot be computed."""
-    fp = _release_fingerprint(ctx)
+    repo's CURRENT evidence fingerprint (_release_evidence_fingerprint,
+    file-dep-aware), passed with scope "full"/"full(fallback)"
+    (release._latest_full_bench_passed -- same check, same fingerprint
+    computation engine.application.release.ensure_full_bench uses).
+    False (never raises) if the fingerprint itself cannot be
+    computed."""
+    fp = _release_evidence_fingerprint(ctx)
     if fp is None:
         return False
     return release_mod._latest_full_bench_passed(ctx.ledger, ctx.attempt_id, fp)
@@ -267,16 +295,20 @@ def _full_bench_passed_for_release(ctx: StepContext) -> bool:
 
 def _job_certificate_ok_for_release(ctx: StepContext) -> tuple[bool, str]:
     """(ok, reason) for engine.application.release.job_certificate_status, bound to
-    the SAME current-fingerprint computation _release_fingerprint uses
-    -- never a stale or caller-supplied fingerprint. A fingerprint that
-    cannot be computed at all is treated as "no certificate"
+    the SAME current PLAIN-tree fingerprint computation
+    _release_fingerprint uses -- never a stale or caller-supplied
+    fingerprint, and never the file-dep-folded evidence fingerprint
+    (job_certificate_status diffs real git trees, see
+    _release_fingerprint's own docstring). A fingerprint that cannot be
+    computed at all is treated as "no certificate"
     (release_requires_job_certificate), same failure shape as every
     other reason this gate can refuse with."""
     fp = _release_fingerprint(ctx)
     if fp is None:
         return False, "release_requires_job_certificate"
-    return release_mod.job_certificate_status(ctx.ledger, ctx.project, ctx.attempt_id,
-                                              _repo(ctx), fp, config=ctx.config)
+    return release_mod.job_certificate_status(
+        ctx.ledger, ctx.project, ctx.attempt_id, _repo(ctx), fp, config=ctx.config,
+        file_dep_targets=_project_config(ctx).file_dep_targets)
 
 
 def _run_advance_master(ctx: StepContext) -> dict[str, object]:

@@ -109,7 +109,7 @@ def _probe_target_ids_at_review(repo: Path, job: str) -> list[str]:
 
 
 def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
-                         repo: Path, job: str) -> None:
+                         repo: Path, job: str, *, actor_kind: str = "processor") -> None:
     """Appends one plan.reviewed ledger event ({"job": job, "digest":
     plan_digest(...), "scene_digests": scene_file_digests(...),
     "requirement_ids": [...], "task_ids": [...], "probe_target_ids":
@@ -144,13 +144,99 @@ def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
     except PlanError:
         requirement_ids, task_ids = [], []
     ledger.append(Event(
-        project=project, kind="plan.reviewed", actor_kind="processor",
-        actor_id="processor", attempt_id=attempt_id,
+        project=project, kind="plan.reviewed", actor_kind=actor_kind,
+        actor_id=actor_kind, attempt_id=attempt_id,
         payload={"job": job, "digest": plan_digest(path),
                  "scene_digests": scene_file_digests(path),
                  "requirement_ids": requirement_ids, "task_ids": task_ids,
                  "probe_target_ids": _probe_target_ids_at_review(repo, job)},
     ))
+
+
+def record_owner_plan_amend(ledger: Ledger, project: str, attempt_id: str,
+                            repo: Path, job: str, reason: str) -> list[str]:
+    """Owner-only re-approval for a job whose plan was already
+    reviewed once, used after the OWNER edits a tests/scenes/ file
+    (never plan.json itself -- plan.json stays frozen evidence, the
+    same contract engine.application.repair's add_also_own already
+    keeps for a task's `owns`) post-review, which would otherwise
+    leave every resume point stuck on check_resumed_plan's own
+    "plan_changed_since_review" forever (ENGINE.md's digest check has
+    no other way to move forward short of a fresh plan review).
+
+    `tools/gb2 approve-plan-edit <app> --reason "..."` is the only
+    caller (owner-only by construction: a builder runs inside the
+    sandbox and has no path to invoke `gb2` at all, and
+    engine.application.repair_target never hands tests/scenes/ to a
+    worker in the first place).
+
+    Returns [] on success, after appending exactly two ledger events:
+      1. "plan.owner_amended" (actor_kind="owner") -- {"job": job,
+         "reason": reason, "changed": {<scene file path>: {"old":
+         <sha256 or "">, "new": <sha256 or "">}, ...}} for every
+         tests/scenes/ file whose digest moved since the last
+         plan.reviewed event (scene_file_digests before vs. now --
+         the audit trail: what the owner actually changed, and why).
+      2. A fresh "plan.reviewed" event (record_plan_reviewed, with
+         actor_kind="owner" so it is ledger-distinguishable from the
+         ordinary planner-station review) at the CURRENT plan_digest/
+         scene_file_digests/requirement_ids/task_ids/probe_target_ids
+         -- so check_resumed_plan reads this job as reviewed again
+         immediately, on the very next resume.
+
+    Refuses (returns a non-empty problem list, appends NOTHING to the
+    ledger at all) when:
+      - `reason` is blank/whitespace-only: ["reason_required"] --
+        every owner override must carry a real, recorded reason.
+      - plan.json fails to load/parse: [f"plan:{PlanError.reason}"]
+      - validate_plan(plan, repo, build_prefixes=None) finds anything:
+        that exact problem list -- an owner edit to a scene script can
+        break plan structural rules just as easily as any other edit,
+        and this function is never a way around that check.
+      - no "plan.reviewed" event exists yet for this (project, job):
+        ["plan_never_reviewed"] -- there is nothing to RE-approve.
+      - the CURRENT plan_digest already matches the latest
+        plan.reviewed event's digest: ["no_change_since_review"] --
+        nothing was actually edited since that review, so there is
+        nothing for the owner to re-approve either."""
+    if not reason.strip():
+        return ["reason_required"]
+
+    try:
+        plan = load_plan(repo, job)
+    except PlanError as exc:
+        return [f"plan:{exc.reason}"]
+
+    problems = validate_plan(plan, repo, None)
+    if problems:
+        return problems
+
+    reviewed = _latest_plan_reviewed(ledger, project, job)
+    if reviewed is None:
+        return ["plan_never_reviewed"]
+
+    path = plan_path(repo, job)
+    if reviewed.get("digest") == plan_digest(path):
+        return ["no_change_since_review"]
+
+    old_scene_digests = reviewed.get("scene_digests")
+    if not isinstance(old_scene_digests, dict):
+        old_scene_digests = {}
+    new_scene_digests = scene_file_digests(path)
+    changed = {
+        scene_path: {"old": old_scene_digests.get(scene_path, ""),
+                     "new": new_scene_digests.get(scene_path, "")}
+        for scene_path in sorted(set(old_scene_digests) | set(new_scene_digests))
+        if old_scene_digests.get(scene_path, "") != new_scene_digests.get(scene_path, "")
+    }
+
+    ledger.append(Event(
+        project=project, kind="plan.owner_amended", actor_kind="owner",
+        actor_id="owner", attempt_id=attempt_id,
+        payload={"job": job, "reason": reason, "changed": changed},
+    ))
+    record_plan_reviewed(ledger, project, attempt_id, repo, job, actor_kind="owner")
+    return []
 
 
 def _latest_plan_reviewed(ledger: Ledger, project: str,
@@ -297,6 +383,6 @@ def check_resumed_plan(ledger: Ledger, project: str, job_name: str, repo: Path) 
 
 
 __all__ = [
-    "scene_file_digests", "plan_digest", "record_plan_reviewed", "is_plan_reviewed",
-    "verify_reviewed_scenes", "check_resumed_plan",
+    "scene_file_digests", "plan_digest", "record_plan_reviewed", "record_owner_plan_amend",
+    "is_plan_reviewed", "verify_reviewed_scenes", "check_resumed_plan",
 ]

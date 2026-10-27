@@ -2,7 +2,7 @@
 # IF 공방 v2 설치: 엔진 가상환경, gb2 실행 명령, AI 직원 파일, /일 명령.
 #
 #   bash tools/install.sh --apps-root <앱 저장소 폴더> [--workspace <작업 폴더>]
-#                         [--library-mcp "<회사 도서관 MCP 실행 명령>"]
+#                         [--library-mcp "<회사 곳간 MCP 실행 명령>"]
 #                         [--direction-file <방향 원문표 경로>]
 #
 # 이미 있는 직원 파일·스킬은 덮어쓰지 않는다. 다시 실행해도 안전하다.

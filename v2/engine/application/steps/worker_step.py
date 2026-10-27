@@ -41,7 +41,8 @@ record_station  runner.parse_result(stdout, spec) for the worker's own
                 it touched, or claims a path outside its own copy,
                 cannot make that lie land in the ledger). Appends
                 station.finished {request_id, station, role, ok,
-                summary, cost_usd, turns, changed_paths, requests} and
+                summary, cost_usd, turns, tokens_out, changed_paths,
+                requests} and
                 writes the same facts to
                 home/jobs/{attempt}/stations/{request_id}.json, THEN (if
                 the worker reported failure) raises
@@ -323,12 +324,82 @@ def _changed_paths(ctx: StepContext, spec: WorkerSpec) -> tuple[str, ...]:
     return dirty_paths(spec.copy_root, ())
 
 
+def _latest_injected_skills(ctx: StepContext, station: str) -> tuple[str, ...]:
+    """The "skills" list of the most recently recorded context.injected
+    event for this project+station (engine.infrastructure.context.build's own
+    ledger record, appended by engine.application.pipeline_stages.record_context) --
+    the station skill names whose body actually reached this worker's
+    own prompt. Scans in seq order and keeps the LAST match: a build/
+    review task station's context is recorded with attempt_id=None
+    (built before/alongside its own attempt opens -- see
+    record_context's own docstring), so this can never filter by
+    ctx.attempt_id; it relies instead on run_task_stages/task_stages'
+    own guarantee that one task's whole stage pipeline runs to
+    completion before the next task's begins (the same sequential
+    assumption engine.application.handoff.reconcile_tools already makes about
+    these same events), so the most recent one recorded for this
+    station is always the one THIS call's own run just used."""
+    skills: tuple[str, ...] = ()
+    for _seq, event in ctx.ledger.events(ctx.project, "context.injected"):
+        if event.payload.get("station") == station:
+            names = event.payload.get("skills", [])
+            if isinstance(names, list):
+                skills = tuple(str(n) for n in names)
+    return skills
+
+
+def _skills_unapplied(ctx: StepContext, station: str,
+                       skills_applied: tuple[dict[str, object], ...],
+                       ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(unapplied, required_unapplied) for this station's own run:
+    `unapplied` is every injected skill name (_latest_injected_skills)
+    this worker's own final JSON "skills_applied" never named;
+    `required_unapplied` narrows that to the names
+    ContextConfig.required_skills[station] actually marks mandatory --
+    the ones a review of this change needs to be told about (see
+    engine.application.steps.review._full_spec's own "skills.unapplied" lookup).
+    A skill the worker reports applying is trusted here (same as
+    engine.infrastructure.context itself, which never re-verifies a loaded
+    skill was actually followed) -- this only catches one the worker's
+    own report never mentioned at all."""
+    injected = _latest_injected_skills(ctx, station)
+    applied_names = {str(s.get("name", "")) for s in skills_applied}
+    unapplied = tuple(n for n in injected if n not in applied_names)
+    ctx_cfg = getattr(ctx.config, "context", None)
+    required = set(ctx_cfg.required_skills.get(station, ())) if ctx_cfg is not None else set()
+    required_unapplied = tuple(n for n in unapplied if n in required)
+    return unapplied, required_unapplied
+
+
+def _record_skills_unapplied(ctx: StepContext, station: str,
+                              skills_applied: tuple[dict[str, object], ...]) -> None:
+    """Appends a "skills.unapplied" event -- never raises, never gates
+    anything itself: engine.application.steps.review._full_spec is what later reads
+    it and, only for a name in "required_unapplied", folds a note into
+    the reviewer's own input (see that module's own docstring on why
+    this is the right place for a "반드시" skill gap to actually stop a
+    job: the review failing it like any other finding, not a second,
+    separate gate here)."""
+    unapplied, required_unapplied = _skills_unapplied(ctx, station, skills_applied)
+    if not unapplied:
+        return
+    ctx.ledger.append(Event(
+        project=ctx.project, kind="skills.unapplied", actor_kind="processor",
+        actor_id="processor", attempt_id=ctx.attempt_id,
+        payload={
+            "request_id": ctx.request.request_id, "station": station,
+            "unapplied": list(unapplied), "required_unapplied": list(required_unapplied),
+        },
+    ))
+
+
 def _run_record_station(ctx: StepContext) -> dict[str, object]:
     spec, _worker, runner = _full_spec(ctx)
     if not gate_log_already_imported(ctx):
         import_gate_log(ctx, spec)
     result = runner.parse_result(stdout_path(ctx), spec)
     changed = _changed_paths(ctx, spec)
+    _record_skills_unapplied(ctx, spec.station, result.skills_applied)
     ctx.ledger.append(Event(
         project=ctx.project, kind="station.finished", actor_kind="processor",
         actor_id="processor", attempt_id=ctx.attempt_id,
@@ -336,7 +407,9 @@ def _run_record_station(ctx: StepContext) -> dict[str, object]:
             "request_id": ctx.request.request_id, "station": spec.station,
             "role": spec.role, "ok": result.ok, "summary": result.summary,
             "cost_usd": result.cost_usd, "turns": result.turns,
+            "tokens_out": result.tokens_out,
             "changed_paths": list(changed), "requests": list(result.requests),
+            "skills_applied": list(result.skills_applied),
         },
     ))
     record = record_path(ctx)
@@ -344,7 +417,7 @@ def _run_record_station(ctx: StepContext) -> dict[str, object]:
     record.write_text(json.dumps({
         "request_id": ctx.request.request_id, "ok": result.ok,
         "summary": result.summary, "changed_paths": list(changed),
-        "requests": list(result.requests),
+        "requests": list(result.requests), "skills_applied": list(result.skills_applied),
     }), encoding="utf-8")
     if not result.ok:
         raise StepFailed("worker_reported_failure")

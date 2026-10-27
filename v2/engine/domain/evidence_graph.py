@@ -280,11 +280,26 @@ class EvidenceGraph:
     # see TaskEvidence's own docstring).
     tasks: tuple[TaskEvidence, ...]
     requirements: tuple[RequirementEvidence, ...]
+    # a review finding: the newest acceptance.recorded/passing
+    # app_security.recorded event's own "evidence_fingerprint" payload
+    # field (engine.application.acceptance.AcceptanceResult.evidence_fingerprint /
+    # engine.application.app_security.SecurityResult.evidence_fingerprint) --
+    # the file-dep-aware value, separate from `fingerprint`/
+    # `certificate_fingerprint` above, which stay plain git tree
+    # hashes for job_certificate_status's own tree-diff logic. "" for
+    # an event recorded before this field existed (a plain "" never
+    # matches a real combined value except in the no-file-deps case,
+    # where evidence.with_file_deps's own no-op contract makes it
+    # equal the plain fingerprint instead -- see job_certificate_
+    # status's own use of these two fields for exactly how that old-
+    # shape gap is tolerated).
+    evidence_fingerprint: str = ""
+    certificate_evidence_fingerprint: str = ""
 
 
 def _latest_acceptance(
     ledger: Ledger, project: str, attempt_ids: frozenset[str],
-) -> tuple[str, dict[str, bool], bool]:
+) -> tuple[str, str, dict[str, bool], bool]:
     """(fingerprint, {scene_id: passed}, overall_passed) of the newest
     'acceptance.recorded' event among `attempt_ids` -- ("", {}, False)
     if no such event exists at all. Deliberately the newest one
@@ -302,22 +317,24 @@ def _latest_acceptance(
         if event.attempt_id in attempt_ids
     ]
     if not rows:
-        return "", {}, False
+        return "", "", {}, False
     _seq, latest = max(rows, key=lambda row: row[0])
     fp = latest.payload.get("fingerprint")
+    evidence_fp = latest.payload.get("evidence_fingerprint")
     scenes_raw = latest.payload.get("scenes", [])
     scenes: dict[str, bool] = {}
     if isinstance(scenes_raw, list):
         for entry in scenes_raw:
             if isinstance(entry, dict) and isinstance(entry.get("id"), str):
                 scenes[entry["id"]] = entry.get("passed") is True
-    return (str(fp) if fp else "", scenes, latest.payload.get("passed") is True)
+    return (str(fp) if fp else "", str(evidence_fp) if evidence_fp else "",
+            scenes, latest.payload.get("passed") is True)
 
 
 def _latest_passing_app_security(
     ledger: Ledger, project: str, attempt_ids: frozenset[str],
-) -> tuple[str, str]:
-    """(fingerprint, policy_hash) of the NEWEST 'app_security.recorded'
+) -> tuple[str, str, str]:
+    """(fingerprint, evidence_fingerprint, policy_hash) of the NEWEST 'app_security.recorded'
     event among `attempt_ids` -- but ONLY if that newest one's own
     payload["passed"] is True; ("", "") otherwise, including when no
     such event exists at all, or the newest one carries no non-""
@@ -340,13 +357,15 @@ def _latest_passing_app_security(
         if event.attempt_id in attempt_ids
     ]
     if not rows:
-        return "", ""
+        return "", "", ""
     _seq, latest = max(rows, key=lambda row: row[0])
     if latest.payload.get("passed") is not True:
-        return "", ""
+        return "", "", ""
     fp = latest.payload.get("fingerprint")
+    evidence_fp = latest.payload.get("evidence_fingerprint")
     policy_hash = latest.payload.get("policy_hash")
-    return (str(fp) if fp else "", str(policy_hash) if policy_hash else "")
+    return (str(fp) if fp else "", str(evidence_fp) if evidence_fp else "",
+            str(policy_hash) if policy_hash else "")
 
 
 def _latest_plan_reviewed(ledger: Ledger, project: str, job: str) -> dict[str, object] | None:
@@ -542,9 +561,10 @@ def build(ledger: Ledger, project: str, job: str, plan: "Plan") -> EvidenceGraph
         str(pid) for pid in reviewed.get("probe_target_ids", ())
     ) if reviewed is not None else frozenset()
 
-    fingerprint, scene_passed, acceptance_passed = _latest_acceptance(
+    fingerprint, evidence_fingerprint, scene_passed, acceptance_passed = _latest_acceptance(
         ledger, project, attempt_ids)
-    cert_fp, cert_policy_hash = _latest_passing_app_security(ledger, project, attempt_ids)
+    cert_fp, cert_evidence_fp, cert_policy_hash = _latest_passing_app_security(
+        ledger, project, attempt_ids)
     task_attempt = _task_attempt_ids(ledger, project, job)
     task_commits = _task_commits(ledger, project, job, attempt_ids)
     probe_results = _probe_target_results(ledger, project, attempt_ids)
@@ -608,6 +628,8 @@ def build(ledger: Ledger, project: str, job: str, plan: "Plan") -> EvidenceGraph
         job=job, plan_reviewed=plan_reviewed, fingerprint=fingerprint,
         acceptance_passed=acceptance_passed, certificate_fingerprint=cert_fp,
         certificate_policy_hash=cert_policy_hash, probe_targets=probe_targets,
+        evidence_fingerprint=evidence_fingerprint,
+        certificate_evidence_fingerprint=cert_evidence_fp,
         tasks=tuple(tasks),
         requirements=tuple(requirements),
     )

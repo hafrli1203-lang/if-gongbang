@@ -180,6 +180,39 @@ def test_merge_rejects_owns_widening_beyond_station_prefixes(workspace: Workspac
     assert req.result == {"reason": "owns_escapes_station_prefixes"}
 
 
+def test_merge_owns_exact_file_prefix_never_covers_a_subdirectory(
+        workspace: Workspace) -> None:
+    """a review finding: an `owns` entry with no trailing slash
+    (e.g. "src/new") names an EXACT file, same convention the live
+    write gate enforces (engine.domain.policy._within_allowed_prefix /
+    _prefix_covers: no trailing slash -> exact match only, never a
+    directory prefix). Reproduction: owns=["src/new", "tests/unit/"],
+    and the copy creates src/new/extra.py (treating "src/new" as a
+    directory instead). The write gate would have refused that write
+    outright; merge must never be laxer and fold it in anyway --
+    extra.py is simply never a merge candidate, same as any other
+    out-of-owns path. ("docs/" stands in for the Codex report's own
+    "tests/unit/" -- the point under test is the no-trailing-slash
+    entry, "docs/" is just a second, real, config-covered prefix
+    alongside it so this exercises the same "owns has more than one
+    entry" shape the report described.)"""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "exactfile",
+                           "full", ("builder",))
+    copy_a = copy_root(workspace.config, attempt_id, "builder")
+    (copy_a / "src" / "new").mkdir(parents=True, exist_ok=True)
+    (copy_a / "src" / "new" / "extra.py").write_text("X = 1\n", encoding="utf-8")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "builder", "station": "build", "path": str(copy_a),
+                    "owns": ["src/new", "docs/"]}],
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    assert not (workspace.alpha / "src" / "new" / "extra.py").exists()
+
+
 def _gongbang_config(config: EngineConfig) -> EngineConfig:
     """A config variant matching the real app's own station_owners shape
     (tools/templates/node-vitest.json): "facts"/"probe" each grant their
@@ -488,6 +521,53 @@ def test_symlink_in_copy_is_rejected(workspace: Workspace) -> None:
     assert req.status == "failed"
     assert req.result == {"reason": "symlink_in_copy"}
     assert (workspace.alpha / "src" / "app.py").read_text(encoding="utf-8") == "print('alpha')\n"
+
+
+def test_dependency_folder_symlink_is_skipped_not_rejected(workspace: Workspace) -> None:
+    """A dependency folder (node_modules, by name -- the same list
+    engine.infrastructure.skills._SKIP_DIRS already prunes for a skill-file
+    walk) that ends up under an owned prefix -- e.g. because a register/
+    probe-station script ran `npm install` there, in a project whose own
+    .gitignore/excludes never mention node_modules (결함 51: a Python
+    sample app's probe station ran `npm install` to prove a wrongly-named
+    "외부 대상" callable) -- must never fail the whole merge just because
+    npm itself creates node_modules/.bin/* symlinks pointing at a real
+    script elsewhere inside the SAME dependency folder. The dependency
+    folder is excluded from copy collection entirely (never raised on,
+    never merged into the destination repo either); a symlink OUTSIDE a
+    dependency folder (test_symlink_in_copy_is_rejected, above) still
+    raises exactly as before."""
+    # Reproduce a project that told neither git nor the engine about
+    # node_modules: drop the fixture repo's own gitignore entry and the
+    # project's "excludes" config for it.
+    (workspace.alpha / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    git(workspace.alpha, "add", "-A")
+    git(workspace.alpha, "commit", "-q", "-m", "drop node_modules ignore")
+    config = dataclasses.replace(workspace.config, projects={
+        **workspace.config.projects,
+        "alpha": dataclasses.replace(workspace.config.projects["alpha"], excludes=()),
+    })
+
+    attempt_id = open_job(config, workspace.ledger, "alpha", "deps",
+                           "register", ("tester",))
+    copy_a = copy_root(config, attempt_id, "tester")
+    node_modules = copy_a / "tests" / "bench" / "node_modules"
+    real_script = node_modules / "some-pkg" / "cli.js"
+    real_script.parent.mkdir(parents=True)
+    real_script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    bin_dir = node_modules / ".bin"
+    bin_dir.mkdir(parents=True)
+    os.symlink(real_script, bin_dir / "some-pkg")
+
+    rid = submit(workspace.ledger, "alpha", attempt_id, "merge", {
+        "copies": [{"role": "tester", "station": "register", "path": str(copy_a)}],
+    }, "owner")
+    proc = _processor(workspace, config=config)
+    n = proc.run_once("alpha")
+    assert n == 1
+    req = workspace.ledger.request(rid)
+    assert req.status == "done"
+    assert not (workspace.alpha / "tests" / "bench" / "node_modules").exists()
 
 
 # ---- B-10: a copy's delta is against its own base_head, not live HEAD ---

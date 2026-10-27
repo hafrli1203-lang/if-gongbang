@@ -26,17 +26,15 @@ from engine.application.pipeline_base import (
 from engine.application.pipeline_release import maybe_release_or_done
 from engine.application.pipeline_stages import (
     ContextGate, build_station_context, commit_job_trail, open_with_intent, planned_skills,
-    record_event, record_task_stop, station_context_gate, station_outcome_to_full,
-    stop_build_task_for_unmet_context, stops_for_owner, task_position,
+    record_event, station_context_gate, station_outcome_to_full,
+    stop_build_task_for_unmet_context, task_position,
 )
+from engine.application.task_stage_runner import HandoffContext, run_task_stages
 from engine.domain.plan import Plan, Task, classify_skill_tools, tools_for_station
-from engine.domain.policy import NOTE_REQUEST_KIND
-from engine.application.repair_target import (
-    handoff_note_text, is_owns_scope_request, owning_later_task, record_request_handoff,
-)
+from engine.application.repair_target import handed_off_requests_for_task, handoff_note_text
 from engine.application.job_state import (
     STAGE_POST_TASKS, STAGE_REQUIREMENTS_REVIEW, STAGE_SECURITY_FIX, STAGE_TASK_OWNER,
-    record_position, stages_spec, without_release,
+    acceptance_fix_rounds_used, record_position, stages_spec, without_release,
 )
 from engine.application.processor import Fakes
 from engine.application.stage_prompts import builder_task_text, fix_task_text
@@ -176,6 +174,21 @@ def install_followup_task_text(task_text: str, build_copy: Path) -> str:
     return f"{task_text}{note}"
 
 
+def declined_followup_note(declined: tuple[tuple[str, str], ...]) -> str:
+    """결함 45: the owner's refusal of pending edit requests, with the
+    owner's own words, so the resumed worker does not ask again."""
+    if not declined:
+        return ""
+    lines = []
+    for path, note in declined:
+        line = f"- {path}: 고치지 않는다."
+        if note:
+            line += f" 운영자 지시: {note}"
+        lines.append(line)
+    return ("\n\n[운영자 거절] 다음 수정 요청은 거절됐다. 같은 경로를 다시 요청하지 말고, "
+            "운영자 지시를 지키면서 지금 범위 안에서 다른 방법으로 끝낸다:\n" + "\n".join(lines))
+
+
 def edit_approved_followup_task_text(task_text: str, granted_paths: tuple[str, ...]) -> str:
     """`task_text` plus a note that the owner has widened this task's own
     `owns` to cover paths it reported outside its own scope
@@ -229,44 +242,6 @@ def task_stages(config: EngineConfig, build_config: EngineConfig, ledger: Ledger
 
 
 
-def handoff_request_filter(ledger: Ledger, project: str, job_name: str, plan: Plan,
-                            task_id: str, attempt_id: str, later_task_ids: tuple[str, ...],
-                            handoff_notes: dict[str, list[dict[str, object]]] | None,
-                            ) -> orbit.RequestFilter:
-    """결함 31 (sample-app T4,: an owns-scope report
-    (repair_target.is_owns_scope_request) whose own "path" is already
-    listed in a LATER, not-yet-run task's own `owns` (`later_task_ids`,
-    plan.tasks order) never needs to stop this job for the owner at
-    all -- the plan already intends that later task to touch the path.
-    Routed instead: record_request_handoff (the ledger's own permanent
-    record) and, when `handoff_notes` is given, append the request to
-    that task id's own list so run_tasks can fold handoff_note_text
-    into its builder instructions once its own turn comes. Every OTHER
-    request (not an owns-scope report, or one no later task's `owns`
-    covers) passes through unchanged -- still stops the job exactly as
-    before."""
-    def _filter(requests: list[dict[str, object]]) -> list[dict[str, object]]:
-        still_pending: list[dict[str, object]] = []
-        for request in requests:
-            if isinstance(request, dict) and request.get("kind") == NOTE_REQUEST_KIND:
-                continue  # informational, never stops the job (결함 33)
-            if not isinstance(request, dict) or not is_owns_scope_request(request):
-                still_pending.append(request)
-                continue
-            path = str(request.get("path"))
-            target = owning_later_task(plan, later_task_ids, path)
-            if target is None:
-                still_pending.append(request)
-                continue
-            record_request_handoff(ledger, project, job_name, attempt_id, task_id, target,
-                                   request)
-            if handoff_notes is not None:
-                handoff_notes.setdefault(target, []).append(request)
-        return still_pending
-
-    return _filter
-
-
 def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
                       job_name: str, task: Task, task_text: str, plan: Plan,
                       on_progress: ProgressCallback | None,
@@ -290,11 +265,11 @@ def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
     attempt stops for the owner, that stop is recorded here too, as the
     task position moved to STAGE_TASK_OWNER.
 
-    `handoff_notes`, when given, is mutated by this call's own
-    request_filter (결함 31 -- see handoff_request_filter) rather than
-    returned: `remaining_task_ids[1:]` (the later, not-yet-run tasks)
-    is what decides whether an owns-scope report is handed off instead
-    of stopping the job."""
+    `handoff_notes`, when given, is mutated by run_task_stages' own
+    request_filter (결함 31 -- see engine.application.task_stage_runner.
+    handoff_request_filter) rather than returned: `remaining_task_ids[1:]`
+    (the later, not-yet-run tasks) is what decides whether an owns-scope
+    report is handed off instead of stopping the job."""
     task_pos = task_position(job_name, None, task.id, task_text,
                               base_task_text or task_text, fixing=fixing,
                               remaining_task_ids=remaining_task_ids,
@@ -308,17 +283,12 @@ def run_task_attempt(config: EngineConfig, ledger: Ledger, fakes: Fakes, project
     task_pos = replace(task_pos, attempt_id=attempt_id,
                        extra={**task_pos.extra, "stages": stages_spec(stages)})
     record_position(ledger, project, task_pos)
-    request_filter = handoff_request_filter(
-        ledger, project, job_name, plan, task.id, attempt_id, remaining_task_ids[1:],
-        handoff_notes,
-    )
-    outcome = orbit.continue_job(build_config, ledger, fakes_for(fakes, attempt_id), project,
-                                 attempt_id, stages, processor_factory=processor_factory,
-                                 on_progress=on_progress, request_filter=request_filter)
-    if stops_for_owner(outcome):
-        stop_extra = {"fix_round": fix_round} if fix_round is not None else {}
-        record_task_stop(ledger, project, task_pos, outcome, **stop_extra)
-    return outcome
+    handoff = HandoffContext(plan, task.id, remaining_task_ids[1:], handoff_notes)
+    stop_extra = {"fix_round": fix_round} if fix_round is not None else {}
+    return run_task_stages(build_config, ledger, fakes_for(fakes, attempt_id), project,
+                           job_name, attempt_id, stages, on_progress=on_progress,
+                           processor_factory=processor_factory, handoff=handoff,
+                           task_pos=task_pos, stop_extra=stop_extra)
 
 
 
@@ -349,12 +319,26 @@ def run_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
     # filter, via run_task_attempt's own `handoff_notes`), because this
     # task's `owns` already covered the reported path. Folded into this
     # task's own base_task_text, as a HANDOFF_NOTE_PREFIX line per
-    # report, the one time this loop reaches it -- never carried any
-    # further once popped.
+    # report, the one time this loop reaches it.
+    #
+    # a review finding: read back EVERY handoff ever recorded for
+    # this task_id from the ledger itself (repair_target.
+    # handed_off_requests_for_task) -- never only the in-memory
+    # `handoff_notes` dict below, which is scoped to THIS one
+    # run_tasks() call and loses a handoff recorded while an earlier
+    # task was being RESUMED (a separate call: engine.application.
+    # pipeline_resume_tasks.continue_task_stages -> advance_past_task ->
+    # finish_from_tasks -> a brand-new run_tasks() with its own empty
+    # dict). `handoff_notes` is still passed to run_task_attempt below
+    # so handoff_request_filter keeps recording into it too (harmless,
+    # and lets a same-call handoff show up even before its own ledger
+    # event would otherwise be re-read), but it is no longer this
+    # loop's own source of truth for the prompt text.
     handoff_notes: dict[str, list[dict[str, object]]] = {}
     for index, task in enumerate(tasks):
         base_task_text = builder_task_text(task, plan.goal, job_name, plan.ui)
-        handed_off = handoff_notes.pop(task.id, None)
+        handoff_notes.pop(task.id, None)
+        handed_off = handed_off_requests_for_task(ledger, project, job_name, task.id)
         if handed_off:
             base_task_text = f"{base_task_text}\n\n{handoff_note_text(handed_off)}"
         remaining_now = tuple(t.id for t in tasks[index:])
@@ -389,7 +373,14 @@ def run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fake
     record_event(ledger, project, job_name, STAGE_POST_TASKS, last_attempt_id,
             next_action="acceptance", max_fix_rounds=max_fix_rounds)
     acc = acceptance_mod.run_acceptance(config, ledger, project, last_attempt_id, plan)
-    rounds = 0
+    # a review finding, a past incident): NOT a bare 0 -- this job may already
+    # have spent rounds on an EARLIER call to this same function, if the
+    # round just finished (advance_past_task, after a fix round's own
+    # task attempt stopped needs_owner mid-round and `gb2 continue`
+    # reopened it) is what got us back here. A bare 0 reset the cap on
+    # every such resume, so a job could spend max_fix_rounds more every
+    # time it was resumed, forever.
+    rounds = acceptance_fix_rounds_used(ledger, project, job_name)
     while not acc.passed and rounds < max_fix_rounds:
         failing = tuple(s.id for s in acc.scenes if not s.passed)
         all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
@@ -481,8 +472,23 @@ def finish_after_handoff(config: EngineConfig, ledger: Ledger, project: str, job
         # actually certified.
         from engine.infrastructure import evidence  # worker C's module; lazy import
 
-        excludes = config.projects[project].excludes
-        certified_fingerprint = evidence.fingerprint(config.projects[project].repo, excludes)
+        project_config = config.projects[project]
+        plain_fp = evidence.fingerprint(project_config.repo, project_config.excludes)
+        # a review finding (4), 짝의 나머지 반 (s69-certfp,: this value
+        # is compared on resume (engine.application.pipeline_resume.
+        # resume_security_fix) against a freshly recomputed one, purely
+        # as an opaque "did the source change since" token -- never
+        # built into a git commit/diffed as a real tree (unlike
+        # engine.application.acceptance/app_security's own "fingerprint"
+        # fields), so folding file_dep_targets' own content in here is a
+        # straight swap, not an additive field: a project with none
+        # configured gets back exactly `plain_fp` unchanged
+        # (evidence.with_file_deps's own no-op contract), and a project
+        # WITH some now also catches a shared package's content
+        # changing between this security-fix stop and the resume, which
+        # `plain_fp` alone could never see (the app's own repo tree
+        # never moves when only the dependency's content does).
+        certified_fingerprint = evidence.with_file_deps(plain_fp, project_config.file_dep_targets)
         record_event(ledger, project, job_name, STAGE_SECURITY_FIX, attempt_id,
                 stop_reason=reason, report_path=str(report_path),
                 max_fix_rounds=max_fix_rounds, certified_fingerprint=certified_fingerprint)
@@ -508,8 +514,7 @@ def finish_from_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
 
 
 __all__ = [
-    "handoff_request_filter",
     "task_attempt_config", "task_stages", "run_task_attempt", "run_acceptance_and_handoff",
     "finish_after_handoff", "finish_from_tasks", "review_payload", "install_followup_task_text",
-    "edit_approved_followup_task_text", "build_task_gate",
+    "edit_approved_followup_task_text", "declined_followup_note", "build_task_gate",
 ]

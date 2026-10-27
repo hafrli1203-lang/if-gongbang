@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from engine.config import McpServerConfig, WorkerConfig
+from engine.domain.records import Event
 from engine.evidence import fingerprint
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
@@ -44,6 +45,16 @@ def _review_workspace(workspace: Workspace) -> Workspace:
     )
     return Workspace(workspace.root, config, workspace.ledger,
                      workspace.alpha, workspace.beta)
+
+
+def _with_file_dep_targets(ws: Workspace, targets: tuple[tuple[str, str], ...]) -> Workspace:
+    """A Workspace whose "alpha" project carries `file_dep_targets` --
+    the (relspec, target) pairs a `file:../...` package.json dependency
+    resolves to (engine.application.steps.file_deps), used here to
+    exercise a review finding's evidence-fingerprint wiring in record_review."""
+    project = replace(ws.config.projects["alpha"], file_dep_targets=targets)
+    config = replace(ws.config, projects={**ws.config.projects, "alpha": project})
+    return Workspace(ws.root, config, ws.ledger, ws.alpha, ws.beta)
 
 
 def _write_script(path: Path, items: list[dict[str, object]]) -> None:
@@ -123,6 +134,44 @@ def test_review_records_evidence_bound_to_fingerprint(workspace: Workspace) -> N
     assert evidence[0].fingerprint == fp
     assert evidence[0].payload["passed"] is True
     assert evidence[0].payload["request_id"] == rid
+
+
+def test_review_evidence_fingerprint_covers_file_dep_target_content(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """a review finding reproduction: a project depends on a
+    package OUTSIDE its own repo via `file:../_shared/kit`. None of
+    that content is part of alpha's own git tree, so record_review's
+    recorded evidence fingerprint must still move when the kit's
+    content changes -- otherwise a review stays "valid" for commit's
+    three_match check forever, no matter what the real dependency code
+    becomes."""
+    kit = tmp_path / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+
+    ws = _review_workspace(_with_file_dep_targets(workspace, targets))
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True))
+    attempt_id, rid = _submit_review(ws)
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert ws.ledger.request(rid).status == "done"
+
+    recorded_fp = ws.ledger.evidence(attempt_id, "review")[0].fingerprint
+    plain_tree_fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes)
+    assert recorded_fp != plain_tree_fp  # kit awareness actually changed it
+
+    # The kit's content edited AFTER review ran: the fingerprint this
+    # engine would now recompute for the SAME tree+targets must differ
+    # from what record_review already recorded (RED before the fix: the
+    # recorded fingerprint was plain_tree_fp either way, so it would
+    # have kept "matching" here even though the real kit moved).
+    (kit / "index.js").write_text("module.exports = 2;\n", encoding="utf-8")
+    now_fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes, targets)
+    assert now_fp != recorded_fp
 
 
 def test_review_verdict_with_p1_finding_records_passed_false_and_fails(
@@ -730,3 +779,63 @@ def test_diff_text_skips_excluded_paths(workspace: Workspace) -> None:
     text = _diff_text_now(ws, attempt_id, rid)
     assert "ok.py" in text and "print('ok')" in text
     assert "VENDORED" not in text
+
+
+def test_full_spec_folds_required_unapplied_skill_into_reviewer_prompt(
+    workspace: Workspace,
+) -> None:
+    """G20: a "skills.unapplied" event (engine.application.steps.worker_step.
+    _record_skills_unapplied) whose own "required_unapplied" names a
+    skill for THIS attempt_id reaches the reviewer's own prompt text,
+    so a plan's "반드시" skill requirement that the builder's final
+    JSON never reported applying becomes something the reviewer is
+    told to judge, not a gap only sitting silently on the ledger."""
+    ws = _review_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True))
+    attempt_id, rid = _submit_review(ws, task="do the task")
+    ws.ledger.append(Event(
+        project="alpha", kind="skills.unapplied", actor_kind="processor",
+        actor_id="processor", attempt_id=attempt_id,
+        payload={"request_id": "some-other-request", "station": "build",
+                 "unapplied": ["아우라-파밍", "기획"],
+                 "required_unapplied": ["아우라-파밍"]},
+    ))
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+    req = ws.ledger.request(rid)
+    assert req.status == "done"
+
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(script, read_only=True)})
+    ctx = StepContext(config=ws.config, ledger=ws.ledger, fakes=fakes,
+                      request=req, project="alpha", attempt_id=attempt_id)
+    spec, _worker, _runner, _coverage = review._full_spec(ctx)
+
+    assert "아우라-파밍" in spec.task
+    assert "기획" not in spec.task  # only the REQUIRED one is folded in
+
+
+def test_full_spec_omits_note_when_no_required_skill_went_unapplied(
+    workspace: Workspace,
+) -> None:
+    """No "skills.unapplied" event for this attempt_id at all (the
+    common case) -- the reviewer's prompt is unchanged, same as before
+    this feature existed."""
+    ws = _review_workspace(workspace)
+    script = ws.root / "script.json"
+    _write_script(script, _verdict_script(passed=True))
+    attempt_id, rid = _submit_review(ws, task="do the task")
+    proc = _processor(ws, script)
+    n = proc.run_once("alpha")
+    assert n == 1
+    req = ws.ledger.request(rid)
+
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(script, read_only=True)})
+    ctx = StepContext(config=ws.config, ledger=ws.ledger, fakes=fakes,
+                      request=req, project="alpha", attempt_id=attempt_id)
+    spec, _worker, _runner, _coverage = review._full_spec(ctx)
+
+    assert "필수 스킬 미적용" not in spec.task

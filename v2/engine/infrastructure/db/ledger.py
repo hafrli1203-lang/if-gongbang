@@ -206,6 +206,45 @@ class Ledger:
         ).fetchone()
         return row[0] if row is not None else None
 
+    def lock_pid(self, project: str) -> int | None:
+        """pid recorded against the lock row keyed by `project` (same key
+        space as lock_holder/acquire_lock/release_lock), or None if
+        unlocked, or if the row's own pid column is NULL (a lock written
+        before schema v2 added it -- open() already refuses any ledger
+        whose user_version predates that, so this is purely defensive).
+        `engine.application.watch` reads this to tell a genuinely live
+        driver (the holder's own pid still exists on this host) apart
+        from a stale lock row a crashed driver left behind."""
+        row = self._conn.execute(
+            "SELECT pid FROM locks WHERE project=?", (project,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
+    def event_timestamps(self, project: str, kind: str) -> list[float]:
+        """ts of every event of this kind for `project`, oldest first --
+        Event itself carries no ts (engine.domain.records.Event), so a
+        caller that needs one (e.g. engine.application.watch's own
+        resume-rate window) reads it back from the row directly here
+        rather than this module threading ts through Event everywhere
+        else it is already passed around without one."""
+        rows = self._conn.execute(
+            "SELECT ts FROM events WHERE project=? AND kind=? ORDER BY ts",
+            (project, kind),
+        ).fetchall()
+        return [float(row[0]) for row in rows]
+
+    def last_event_ts(self, project: str) -> float | None:
+        """ts of the newest event recorded for `project` (any kind), or
+        None if this project has no events at all."""
+        row = self._conn.execute(
+            "SELECT MAX(ts) FROM events WHERE project=?", (project,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
     def project(self, project: str) -> ProjectRow:
         """Raises LedgerError if the project is not registered."""
         row = self._conn.execute(

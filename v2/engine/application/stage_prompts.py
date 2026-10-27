@@ -12,12 +12,14 @@ from pathlib import Path
 from engine.domain.plan import Task
 from engine.domain.plan_model import (
     PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
-    PLAN_SCENE_EXIT0_RULE, PLAN_SCHEMA_RULE, PLAN_SCHEMA_RULE_SMALL, plan_owns_rule_sentence,
+    PLAN_SCENE_EXIT0_RULE, PLAN_SCHEMA_RULE, PLAN_SCHEMA_RULE_SMALL, PLAN_TASK_TEST_OWNS_RULE,
+    plan_owns_rule_sentence,
 )
 from engine.domain.policy import OWNS_SCOPE_REQUEST_RULE
 from engine.domain.stage_checks import (
     FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE, FACTS_PASS_NEEDS_SOURCE_RULE,
     PROBE_EXIT_AND_OK_LINE_RULE, PROBE_TARGETS_EMPTY_MARKER_RULE,
+    PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE,
     PROBE_TARGETS_INTERNAL_DOC_RULE, PROBE_TARGETS_SECTION_FORMAT_RULE,
     probe_log_format_rule, station_record_rule_sentence,
 )
@@ -57,7 +59,8 @@ def facts_prompt(request: str, job: str) -> str:
         "다음 단계로 넘어가지 못한다. 모르는 값은 지어내지 말고 확인 필요로 남긴다.\n\n"
         f"마지막으로 {PROBE_TARGETS_SECTION_FORMAT_RULE}"
         "(probe 단계는 이 절만 보고 무엇을 실제로 호출해 볼지 정한다). "
-        f"{PROBE_TARGETS_EMPTY_MARKER_RULE} {PROBE_TARGETS_INTERNAL_DOC_RULE}\n\n"
+        f"{PROBE_TARGETS_EMPTY_MARKER_RULE} {PROBE_TARGETS_INTERNAL_DOC_RULE} "
+        f"{PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE}\n\n"
         f"{station_record_rule_sentence('facts', job)}"
     )
 
@@ -114,7 +117,8 @@ def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = ""
         f"{probe_part}\n\n"
         f".gongbang/{job}/plan.json 과, 필요하면 tests/scenes/ 아래 장면 "
         f"스크립트를 쓴다. {PLAN_SCHEMA_RULE} {PLAN_JSON_VALID_RULE} "
-        f"{PLAN_SCENE_EXIT0_RULE} {PLAN_SCENE_CMD_FLAGS_RULE} 작업(task)마다 owns에 그 작업이 "
+        f"{PLAN_SCENE_EXIT0_RULE} {PLAN_SCENE_CMD_FLAGS_RULE} {PLAN_TASK_TEST_OWNS_RULE} "
+        "작업(task)마다 owns에 그 작업이 "
         "쓸 파일·폴더만 적는다(다른 작업의 소유 경로와 겹치지 않게 나눈다)."
         f"{owns_rule_part} "
         "depends_on으로 작업 순서를 정한다. 화면이 있는 요청이면 ui를 "
@@ -165,7 +169,8 @@ def small_prompt(request: str, job: str, tool_catalog: str = "",
         "끝나지 못한다. 모르는 값은 지어내지 말고 확인 필요로 남긴다. "
         f"마지막으로 {PROBE_TARGETS_SECTION_FORMAT_RULE}. 의존하는 외부 대상이 "
         f"있으면 이 요청은 작게 끝낼 수 없다. {PROBE_TARGETS_EMPTY_MARKER_RULE} "
-        f"{PROBE_TARGETS_INTERNAL_DOC_RULE}\n\n"
+        f"{PROBE_TARGETS_INTERNAL_DOC_RULE} "
+        f"{PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE}\n\n"
         f"2) 이어서 .gongbang/{job}/plan.json 과, 필요하면 tests/scenes/ 아래 "
         "장면 스크립트를 쓴다. 이 계획은 작업(tasks)을 정확히 1개만 담는다 "
         f"— 작게 끝낼 수 있는 변경이므로 여러 작업으로 나누지 않는다. "
@@ -174,7 +179,7 @@ def small_prompt(request: str, job: str, tool_catalog: str = "",
         "(기능은 kind \"function\", 권한·데이터 분리 같은 보안 요구는 kind "
         f"\"security\"). {PLAN_REQUIREMENT_SCENE_COVERAGE_RULE} 장면이 없는 requirement가 "
         f"있으면 이 계획은 통과하지 못한다. {PLAN_SCENE_EXIT0_RULE} "
-        f"{PLAN_SCENE_CMD_FLAGS_RULE} "
+        f"{PLAN_SCENE_CMD_FLAGS_RULE} {PLAN_TASK_TEST_OWNS_RULE} "
         f"tasks[0].owns에는 이 작업이 쓸 파일·폴더만 적는다.{owns_rule_part}\n\n"
         f"{_ARCHITECTURE_LAYER_NOTE}"
         + tools_part

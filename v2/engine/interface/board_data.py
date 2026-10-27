@@ -63,7 +63,10 @@ class JobBoard:
     status: str  # derived display label -- see _derive_job_status
     stage: str  # derived display label -- see _derive_job_stage
     attempt_count: int
+    ai_request_count: int  # see AI_DISPATCH_REQUEST_KINDS' own docstring
+    fix_round_count: int  # attempt_count - 1 (n=1 is the first attempt, not a fix)
     cost_usd: float | None  # None: no station carried a cost_usd value
+    tokens_out: int | None  # None: no station carried a tokens_out value (see docstring)
     duration_sec: float | None  # None: fewer than two timestamped events
     first_ts: float | None
     last_ts: float | None
@@ -196,6 +199,26 @@ _AWAITING_PREFIX = "awaiting_"
 # a new one, never a mix that needs its own special case.
 POSITION_EVENT_KINDS = ("full_orbit.progress", "job.position")
 
+# G16 (ops-repo/audit/gongbang_directives.md -- "직접 보낸요청, 수정횟수,
+# 출력토큰을 알고 싶다"): the ledger's own "requests" concept
+# (request.submitted, engine.application.processor.submit) covers BOTH owner-facing
+# process actions (close/commit/publish/merge/report/bench -- never a
+# worker) and the two request kinds that actually spawn an AI worker
+# process -- engine.application.processor.KNOWN_KINDS lists every kind, and
+# engine.application.steps.KINDS (its own kind -> step-module map) shows which
+# ones carry a `spawn_worker`/runner.spawn step: "run_station" ->
+# engine.application.steps.worker_step (the builder), "review" ->
+# engine.application.steps.review (the reviewer, codex or claude). "bench" runs
+# the project's OWN test suite (engine.application.steps.suite_run), not an AI
+# call, so it is deliberately excluded here even though it is also a
+# request.submitted kind. There is no actor_kind/"AI column" on
+# request.submitted itself (every request.submitted event is
+# actor_kind="owner" -- see engine.application.processor.submit) to filter on
+# directly; this tuple is the one place that distinction is made, so a
+# reader auditing "why this number and not request.submitted's own
+# total count" only has to look here.
+AI_DISPATCH_REQUEST_KINDS = ("run_station", "review")
+
 
 def _position_request_id(event: "EventRow") -> object:
     if event.kind == "job.position":
@@ -220,6 +243,16 @@ def _derive_job(app: str, job_id: str, job_name: str,
     costs = [c for c in costs if isinstance(c, (int, float))]
     cost_usd = sum(costs) if costs else None
 
+    tokens = [e.payload.get("tokens_out") for e in job_events if e.kind == "station.finished"]
+    tokens = [t for t in tokens if isinstance(t, int)]
+    tokens_out = sum(tokens) if tokens else None
+
+    ai_request_count = sum(
+        1 for e in job_events
+        if e.kind == "request.submitted" and e.payload.get("kind") in AI_DISPATCH_REQUEST_KINDS
+    )
+    fix_round_count = max(len(attempts) - 1, 0)
+
     latest_attempt = attempts[-1] if attempts else None
     status = _derive_job_status(job_events, latest_attempt, request_status,
                                 ledger_path=ledger_path, project=project,
@@ -228,8 +261,9 @@ def _derive_job(app: str, job_id: str, job_name: str,
 
     return JobBoard(
         app=app, job_id=job_id, job_name=job_name, status=status, stage=stage,
-        attempt_count=len(attempts), cost_usd=cost_usd, duration_sec=duration_sec,
-        first_ts=first_ts, last_ts=last_ts,
+        attempt_count=len(attempts), ai_request_count=ai_request_count,
+        fix_round_count=fix_round_count, cost_usd=cost_usd, tokens_out=tokens_out,
+        duration_sec=duration_sec, first_ts=first_ts, last_ts=last_ts,
     )
 
 
@@ -545,6 +579,6 @@ def _load_text(path: Path) -> str | None:
 
 
 __all__ = [
-    "EventRow", "AttemptRow", "JobBoard", "AppBoard", "POSITION_EVENT_KINDS", "load_app_board",
-    "group_lessons", "build_board",
+    "EventRow", "AttemptRow", "JobBoard", "AppBoard", "POSITION_EVENT_KINDS",
+    "AI_DISPATCH_REQUEST_KINDS", "load_app_board", "group_lessons", "build_board",
 ]

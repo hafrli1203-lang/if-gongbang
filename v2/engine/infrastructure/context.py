@@ -108,6 +108,26 @@ class StationContext:
         return bool(self.required_missing) or self.required_library_failed
 
 
+# The library's own label for AI run output (its `origin` field carries the
+# display label, not the internal key) -- both are filtered (결함 44).
+RUN_OUTPUT_ORIGINS = frozenset({"run_output", "실행 결과"})
+
+
+def _result_objects(text: str) -> list[dict[str, object]]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [{"text": text}]
+    if isinstance(parsed, list):
+        return [p for p in parsed if isinstance(p, dict)]
+    if isinstance(parsed, dict):
+        results = parsed.get("results")
+        if isinstance(results, list):
+            return [p for p in results if isinstance(p, dict)]
+        return [parsed]
+    return []
+
+
 class McpClientError(Exception):
     """Any stdio MCP client failure (spawn, protocol, timeout). Always
     caught inside gather() -- never escapes it."""
@@ -234,11 +254,12 @@ class _StdioMcpClient:
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def call_tool(self, name: str, arguments: dict[str, object]) -> list[dict[str, object]]:
-        """Calls `tools/call`, expecting MCP's own result shape
-        {"content": [{"type": "text", "text": <json array string>}]}
-        where the text, parsed as JSON, is a list of plain result
-        objects. Any content entry that isn't exactly that shape is
-        skipped rather than raising."""
+        """Calls `tools/call` and returns its result objects. Accepts every
+        shape the real company library MCP answers with (verified against
+        the live server,: a JSON list of objects, ONE JSON object
+        carrying them under "results" (library_search), or plain text
+        (lessons_for) -- which comes back as one {"text": ...} object. A
+        content entry that is none of these is skipped, never raised."""
         result = self._request("tools/call", {"name": name, "arguments": arguments})
         content = result.get("content")
         if not isinstance(content, list):
@@ -248,14 +269,9 @@ class _StdioMcpClient:
             if not isinstance(entry, dict) or entry.get("type") != "text":
                 continue
             text = entry.get("text")
-            if not isinstance(text, str):
+            if not isinstance(text, str) or not text.strip():
                 continue
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, list):
-                items.extend(p for p in parsed if isinstance(p, dict))
+            items.extend(_result_objects(text))
         return items
 
     def close(self) -> None:
@@ -276,12 +292,15 @@ class _StdioMcpClient:
 def _library_items(client: _StdioMcpClient, request: str) -> list[ContextItem]:
     items: list[ContextItem] = []
     for entry in client.call_tool("library_search", {"query": request, "k": 5}):
-        if entry.get("origin") == "run_output":
+        if entry.get("origin") in RUN_OUTPUT_ORIGINS:
             continue
+        label = str(entry.get("authorityLabel") or "")
+        title = str(entry.get("title") or entry.get("file") or "")
         items.append(ContextItem(
-            kind="library", title=str(entry.get("title", "")),
+            kind="library", title=f"[{label}] {title}" if label else title,
             text=str(entry.get("text", "")),
-            source=str(entry.get("source", "library")), trust="reference",
+            source=str(entry.get("citation") or entry.get("path") or entry.get("source") or "library"),
+            trust="reference",
         ))
     return items
 
@@ -289,10 +308,10 @@ def _library_items(client: _StdioMcpClient, request: str) -> list[ContextItem]:
 def _lesson_items(client: _StdioMcpClient, app: str) -> list[ContextItem]:
     items: list[ContextItem] = []
     for entry in client.call_tool("lessons_for", {"app": app}):
-        if entry.get("origin") == "run_output":
+        if entry.get("origin") in RUN_OUTPUT_ORIGINS:
             continue
         items.append(ContextItem(
-            kind="lesson", title=str(entry.get("title", "")),
+            kind="lesson", title=str(entry.get("title") or "작업 일지"),
             text=str(entry.get("text", "")),
             source=str(entry.get("source", "lessons")), trust="experience",
         ))
@@ -363,6 +382,38 @@ def _direction_item(config: "EngineConfig", station: str) -> ContextItem | None:
                        source=str(path), trust="approved")
 
 
+# How many times gather() tries the whole library/lesson round trip
+# (fresh spawn each try) before giving up and recording Context.failed
+# -- a single long-running station call (full job and small mode
+# alike) spawning a cold node process under a busy host can occasionally
+# miss ctx_cfg.library_mcp.timeout_sec once without the server itself
+# being broken (결함 49: observed live -- the SAME job's "plan" station
+# lookup timed out while its own later "review" station lookup, a few
+# seconds later on a less loaded host, succeeded). One retry turns that
+# kind of one-off miss back into a normal success instead of silently
+# dropping every item for that station; a SECOND failure in a row still
+# records Context.failed exactly as before -- this never masks a truly
+# broken/misconfigured server.
+LIBRARY_LOOKUP_ATTEMPTS = 2
+
+
+def _library_lookup_once(library_mcp: "LibraryMcpConfig", app: str | None,
+                         request: str) -> list[ContextItem]:
+    """One full library_search(+lessons_for) round trip: a fresh
+    _StdioMcpClient spawned, used, and closed -- never reused across
+    attempts, so a prior attempt's half-dead process can never be
+    mistaken for a working one. Raises McpClientError straight through
+    on any failure; the caller (gather()) decides whether to retry."""
+    client = _StdioMcpClient(library_mcp.command, library_mcp.timeout_sec)
+    try:
+        items = list(_library_items(client, request))
+        if app:
+            items.extend(_lesson_items(client, app))
+        return items
+    finally:
+        client.close()
+
+
 def gather(config: "EngineConfig", project: str, station: str, request: str,
            attempt_id: str | None = None) -> Context:
     """Collects every ContextItem this station is entitled to for this
@@ -374,7 +425,13 @@ def gather(config: "EngineConfig", project: str, station: str, request: str,
     this function itself does not yet vary behavior by station -- skill
     selection (which DOES vary by station) lives in build() below.
     `attempt_id` (default None) is ONLY used by the reference_paths item
-    (_reference_item) -- every other item here is attempt-independent."""
+    (_reference_item) -- every other item here is attempt-independent.
+
+    The library/lesson round trip is tried up to LIBRARY_LOOKUP_ATTEMPTS
+    times (see that constant's own docstring, 결함 49) before
+    `Context.failed` is set -- every other item above is local
+    file/string work that never flakes the same way a spawned MCP
+    server over a shared, possibly-busy host can."""
     items: list[ContextItem] = []
     failed = False
     ctx_cfg = getattr(config, "context", None)
@@ -393,17 +450,14 @@ def gather(config: "EngineConfig", project: str, station: str, request: str,
 
     if ctx_cfg is not None and ctx_cfg.library_mcp is not None:
         app = ctx_cfg.lessons_app.get(project)
-        client: _StdioMcpClient | None = None
-        try:
-            client = _StdioMcpClient(ctx_cfg.library_mcp.command, ctx_cfg.library_mcp.timeout_sec)
-            items.extend(_library_items(client, request))
-            if app:
-                items.extend(_lesson_items(client, app))
-        except McpClientError:
-            failed = True
-        finally:
-            if client is not None:
-                client.close()
+        failed = True
+        for _attempt in range(LIBRARY_LOOKUP_ATTEMPTS):
+            try:
+                items.extend(_library_lookup_once(ctx_cfg.library_mcp, app, request))
+                failed = False
+                break
+            except McpClientError:
+                continue
 
     return Context(items=tuple(items), failed=failed)
 
@@ -505,4 +559,5 @@ __all__ = [
     "ContextItem", "Context", "StationContext", "McpClientError",
     "LibraryMcpConfig", "ContextConfig",
     "gather", "render_items", "build", "PER_ITEM_CAP", "TOTAL_SECTION_CAP",
+    "LIBRARY_LOOKUP_ATTEMPTS",
 ]

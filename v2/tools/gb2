@@ -21,6 +21,23 @@
                                           ledger event, then resume with
                                           engine.full_orbit
                                           .continue_full_job
+    tools/gb2 approve-plan-edit <app>    owner-only, no TTY gate: re-
+      --reason "<사유>"                   approve the current job's
+                                          plan after the OWNER edited
+                                          a tests/scenes/ file post-
+                                          review (plan.json itself is
+                                          never touched), recording
+                                          why; appends plan.owner_
+                                          amended + a fresh plan.
+                                          reviewed event (engine.
+                                          domain.plan_review.
+                                          record_owner_plan_amend).
+                                          Refused if nothing changed
+                                          since the last review, or
+                                          the reason is blank. Does
+                                          NOT resume the job itself --
+                                          follow with `gb2 fix`/
+                                          `gb2 continue`.
     tools/gb2 approve-install <app>      TTY-only: show the pending
                                           install request(s) a builder
                                           station asked for, type "승인
@@ -48,6 +65,18 @@
                                           (repeatable; see engine.fixup.
                                           add_also_own) -- never edits
                                           plan.json itself
+    tools/gb2 fix <app> --decline P      refuse a pending edit request's
+                                          path (recorded, never granted)
+    tools/gb2 fix <app> ... --past-cap   allow one more fix round past
+                                          JobPosition.max_fix_rounds
+                                          (default 2) for this job since
+                                          its last commit; without it,
+                                          `fix` refuses once that many
+                                          rounds are already spent
+                                          (engine.fixup.fix,
+                                          fix_rounds_exhausted) and
+                                          prints the remaining review
+                                          findings + next-step choices
     tools/gb2 doctor                     check every external dependency
                                           gb2 itself relies on (python3.12,
                                           git, bwrap, claude, codex, node,
@@ -76,6 +105,29 @@
                                           command, ask the owner
                                           "deployed"/"not deployed" on
                                           a TTY, then report -> close
+    tools/gb2 watch [<app>...] --once    one verdict per app (engine.
+                                          application.watch.judge_app):
+                                          running/stalled/waiting_owner/
+                                          failed/idle, as one JSON line
+                                          each; every app under
+                                          GB2_WORKSPACE/apps/ if no <app>
+                                          is named
+    tools/gb2 watch --loop               same, every --interval seconds
+      [--interval N] [--resume]          (default 300) forever; --resume
+                                          resumes (engine.application.
+                                          job_state.resume_job, the same
+                                          path `gb2 continue` uses, in
+                                          this SAME process) every app
+                                          judged "stalled" that pass --
+                                          never "waiting_owner"/"failed"
+                                          -- subject to that app's own
+                                          config.watch_max_resumes_per_
+                                          hour (default 3) per trailing
+                                          hour; past that it gives up
+                                          (a "watch.gave_up" ledger
+                                          event) instead of resuming
+                                          forever against a cause it
+                                          cannot fix
 
 Everything here calls existing engine.* functions (engine.steps.open_job
 .open_job, engine.processor.submit, engine.orbit.continue_job,
@@ -144,7 +196,7 @@ from engine.bootstrap import ensure_installed  # noqa: E402,F401 -- re-exported
 from engine.cli import _build_fakes, _drain  # noqa: E402,F401 -- re-exported
 from engine.ledger import Event  # noqa: E402,F401 -- re-exported
 
-from gb2lib import ops, release_ops, runner, shared, workspace  # noqa: E402
+from gb2lib import ops, release_ops, runner, shared, watch_ops, workspace  # noqa: E402
 
 # Flat re-exports of the names that used to live directly in this file,
 # for a caller that still does `gb2.<name>` (e.g. tests/unit/test_gb2*
@@ -169,6 +221,7 @@ cmd_run = runner.cmd_run
 cmd_fix = runner.cmd_fix
 cmd_change = runner.cmd_change
 cmd_approve_design = runner.cmd_approve_design
+cmd_approve_plan_edit = runner.cmd_approve_plan_edit
 cmd_continue = runner.cmd_continue
 cmd_approve_install = runner.cmd_approve_install
 cmd_ship = release_ops.cmd_ship
@@ -178,6 +231,7 @@ cmd_status = ops.cmd_status
 cmd_backup = ops.cmd_backup
 cmd_log = ops.cmd_log
 cmd_board = ops.cmd_board
+cmd_watch = watch_ops.cmd_watch
 cmd_doctor = ops.cmd_doctor
 cmd_diff = ops.cmd_diff
 cmd_sync = ops.cmd_sync
@@ -239,8 +293,10 @@ _HANDLERS = {
     "log": cmd_log, "diff": cmd_diff, "ship": cmd_ship,
     "skip-ship": cmd_skip_ship, "sync": cmd_sync, "resolve": cmd_resolve,
     "new": cmd_new, "change": cmd_change, "approve-design": cmd_approve_design,
+    "approve-plan-edit": cmd_approve_plan_edit,
     "approve-install": cmd_approve_install,
     "continue": cmd_continue, "board": cmd_board, "doctor": cmd_doctor,
+    "watch": cmd_watch,
 }
 
 
@@ -267,6 +323,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--also-own", dest="also_own", action="append", default=[],
                        help="widen the task currently being fixed with an extra "
                             "write path (repeatable) -- see engine.fixup.add_also_own")
+    p_fix.add_argument("--past-cap", dest="past_cap", action="store_true",
+                       help="allow one more fix round past JobPosition."
+                            "max_fix_rounds (default 2) -- refused otherwise "
+                            "once that many rounds have already been spent "
+                            "on this job since its last commit (see engine."
+                            "fixup.fix's own entry check); records a "
+                            "fix.past_cap ledger event")
+    p_fix.add_argument("--decline", dest="decline", action="append", default=[],
+                       help="refuse a pending edit request's path (repeatable): "
+                            "recorded as task.request_declined, never granted, "
+                            "and no longer blocks the resume")
 
     p_status = sub.add_parser("status")
     p_status.add_argument("app")
@@ -319,6 +386,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_approve_design = sub.add_parser("approve-design")
     p_approve_design.add_argument("app")
 
+    p_approve_plan_edit = sub.add_parser("approve-plan-edit")
+    p_approve_plan_edit.add_argument("app")
+    p_approve_plan_edit.add_argument("--reason", required=True,
+                                     help="why the owner edited a tests/scenes/ "
+                                          "file after the plan was already "
+                                          "reviewed -- recorded verbatim in "
+                                          "the plan.owner_amended ledger event "
+                                          "(engine.domain.plan_review."
+                                          "record_owner_plan_amend)")
+
     p_approve_install = sub.add_parser("approve-install")
     p_approve_install.add_argument("app")
 
@@ -334,6 +411,18 @@ def _build_parser() -> argparse.ArgumentParser:
                                  "at an early station, or if this names a "
                                  "station LATER than the one it is stopped "
                                  "at.")
+    p_continue.add_argument("--past-cap", dest="past_cap", action="store_true",
+                            help="allow one more early-station round past "
+                                 "JobPosition.max_fix_rounds (default 2) or "
+                                 "past a repeated review finding -- refused "
+                                 "otherwise once this job's own "
+                                 "facts/probe/plan/design attempt has already "
+                                 "been reopened that many times, or the plan "
+                                 "review just raised the exact same finding "
+                                 "it raised last round (see engine."
+                                 "application.job_state.early_station_"
+                                 "rounds_used; same flag `gb2 fix --past-cap` "
+                                 "uses, same escape hatch, different path)")
 
     sub.add_parser("doctor")
 
@@ -349,6 +438,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_board.add_argument("--queue", default=None,
                          help="path to a WORK_QUEUE-like markdown file "
                               "(optional)")
+
+    p_watch = sub.add_parser("watch")
+    p_watch.add_argument("apps", nargs="*", default=[],
+                         help="apps to judge (default: every app under "
+                              "GB2_WORKSPACE/apps/ with a config.json)")
+    p_watch.add_argument("--once", action="store_true",
+                         help="one pass and exit -- the default when "
+                              "--loop is not given")
+    p_watch.add_argument("--loop", action="store_true",
+                         help="judge every --interval seconds, forever "
+                              "(until Ctrl-C)")
+    p_watch.add_argument("--interval", type=float, default=300.0,
+                         help="seconds between passes under --loop "
+                              "(default 300)")
+    p_watch.add_argument("--resume", action="store_true",
+                         help="resume (engine.application.job_state.resume_job, "
+                              "the same path `gb2 continue` uses) every "
+                              "app this pass judges \"stalled\" -- never "
+                              "\"waiting_owner\"/\"failed\", subject to "
+                              "each app's own config.watch_max_resumes_"
+                              "per_hour (default 3)")
 
     return parser
 

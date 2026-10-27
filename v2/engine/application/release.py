@@ -26,6 +26,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from engine.infrastructure import evidence
+from engine.infrastructure.evidence import with_file_deps
 from engine.domain.approvals import ApprovalError, grant, parse_owner_message
 from engine.config import EngineConfig
 from engine.domain.records import Event, LedgerError
@@ -124,7 +125,20 @@ def ensure_full_bench(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
     other failure, surfaces as "passed": False."""
     project_config = config.projects[project]
     fp = evidence.fingerprint(project_config.repo, project_config.excludes)
-    if latest_full_bench_passed(ledger, attempt_id, fp):
+    # a review finding: the LOOKUP must use the same file-dep-
+    # aware evidence fingerprint engine.application.steps.suite_run.record_bench
+    # now RECORDS bench evidence against (with_file_deps), never the
+    # plain tree `fp` alone -- otherwise a project with file_dep_
+    # targets whose full bench genuinely passed is refused here
+    # anyway, because this lookup never finds a matching row (it was
+    # recorded keyed by the combined value). `fp` itself stays plain
+    # for the bench request's own payload below: engine.application.steps.
+    # suite_run._run_compute_fingerprint re-fingerprints the real repo
+    # tree and rejects a submitted payload["fp"] that does not match
+    # it bit-for-bit (StepFailed("tree_changed_since_submit")), so that
+    # value must never be folded with file-dep content.
+    evidence_fp = with_file_deps(fp, project_config.file_dep_targets)
+    if latest_full_bench_passed(ledger, attempt_id, evidence_fp):
         return {"ran": False, "passed": True, "fp": fp}
 
     payload: dict[str, object] = {"fp": fp, "scope": "full"}
@@ -153,9 +167,11 @@ def ensure_full_bench(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
         status = processor.run_request(project, request_id)
     request = ledger.request(request_id)
     return {
-        # The verdict is the ledger's own evidence for this exact fp,
-        # never request.status alone (see docstring).
-        "ran": True, "passed": latest_full_bench_passed(ledger, attempt_id, fp), "fp": fp,
+        # The verdict is the ledger's own evidence for this exact
+        # evidence_fp (file-dep-aware, same reasoning as the no-op
+        # check above), never request.status alone (see docstring).
+        "ran": True, "passed": latest_full_bench_passed(ledger, attempt_id, evidence_fp),
+        "fp": fp,
         "request_id": request_id, "status": request.status, "result": request.result,
     }
 

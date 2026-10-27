@@ -129,6 +129,19 @@ class AcceptanceResult:
     # "the empty tree"; callers (release/handoff) must treat it the same
     # as passed=False.
     fingerprint: str = ""
+    # a review finding (ckon: `fingerprint` above stays the PLAIN
+    # git tree hash -- engine.application.release_certificate.job_certificate_status
+    # diffs it against real git trees (`git diff`), which only ever
+    # works on an actual tree hash, never a value folded with
+    # file_dep_targets' own content. This field is the SEPARATE,
+    # file-dep-aware value (evidence.with_file_deps(fingerprint,
+    # project_cfg.file_dep_targets)) that same caller additionally
+    # compares, so a project whose shared package content changed
+    # since this acceptance run -- even though the app's own repo
+    # tree never moved -- is still caught as stale, the same gap
+    # already closed for commit/bench/review evidence. "" whenever
+    # `fingerprint` itself is "" (nothing to fold).
+    evidence_fingerprint: str = ""
     # True iff a scene (or the full suite) left the snapshot's own
     # HEAD-tracked content different from what _make_snapshot committed
     # -- a scene is still free to write a new, untracked scratch/output
@@ -373,10 +386,11 @@ def run_acceptance(config: EngineConfig, ledger: Ledger, project: str,
     passed = (not snapshot_mutated and full_suite_passed
               and all(s.passed for s in scenes) and not tree_changed)
     scenes_t = tuple(scenes)
+    evidence_fp = evidence.with_file_deps(before_fp, project_cfg.file_dep_targets)
     acc = AcceptanceResult(
         passed=passed, scenes=scenes_t, full_suite_passed=full_suite_passed,
         full_suite_returncode=full_suite_returncode, full_suite_tail=full_suite_tail,
-        tree_changed=tree_changed, fingerprint=before_fp,
+        tree_changed=tree_changed, fingerprint=before_fp, evidence_fingerprint=evidence_fp,
         snapshot_mutated=snapshot_mutated,
     )
     _write_acceptance_json(config, project, job_name, passed, full_suite_passed,
@@ -407,6 +421,7 @@ def _record(ledger: Ledger, project: str, attempt_id: str, job_name: str,
             "tree_changed": acc.tree_changed,
             "snapshot_mutated": acc.snapshot_mutated,
             "fingerprint": acc.fingerprint,
+            "evidence_fingerprint": acc.evidence_fingerprint,
             "reason": reason,
         },
     ))

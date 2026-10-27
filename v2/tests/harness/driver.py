@@ -48,7 +48,7 @@ FULL_STATION_OWNERS = {
     "probe": {"prober": (".gongbang/",)},
     "plan": {"planner": (".gongbang/", "tests/scenes/")},
     "design": {"designer": (".gongbang/",)},
-    "build": {"builder": ("src/",)},
+    "build": {"builder": ("src/", "tests/")},
     "review": {"reviewer": ("review.md",)},
 }
 
@@ -82,6 +82,25 @@ def fakes() -> Fakes:
     return Fakes(publisher=FakePublisher(), installer=FakeInstaller())
 
 
+def _with_test_owns(tasks: list[dict[str, object]]) -> list[dict[str, object]]:
+    """`tasks`, each with a synthetic tests/ owns path appended iff it
+    owns something under src/ with no tests/ entry of its own already --
+    validate_plan's own 결함 42 check (engine.domain.plan_model,
+    plans/-gongbang-entry-unify.md §C) refuses a build task
+    that owns src/ with no tests/ path to put its own test file under.
+    Same helper as tests/unit/test_full_orbit.py's own, duplicated here
+    since this harness module has no dependency on that test module."""
+    out: list[dict[str, object]] = []
+    for task in tasks:
+        owns = list(task.get("owns") or [])
+        has_src = any(str(p).startswith("src/") for p in owns)
+        has_tests = any(str(p).startswith("tests/") for p in owns)
+        if has_src and not has_tests:
+            owns = [*owns, f"tests/{task['id']}_test_owns.py"]
+        out.append({**task, "owns": owns})
+    return out
+
+
 def plan_json(*, ui: bool = False, tasks: list[dict[str, object]]) -> str:
     return json.dumps({
         "goal": "작은 기능 추가", "ui": ui,
@@ -89,7 +108,7 @@ def plan_json(*, ui: bool = False, tasks: list[dict[str, object]]) -> str:
             {"id": "s1", "actor_does": "요구사항을 확인한다", "app_shows": "통과한다",
              "where": "cli", "cmd": ["bash", _SCENE_SCRIPT_PATH], "covers": ["R1"]},
         ],
-        "tasks": tasks, "acceptance": ["요구사항대로 동작한다"],
+        "tasks": _with_test_owns(tasks), "acceptance": ["요구사항대로 동작한다"],
         "requirements": [{"id": "R1", "text": "요구사항대로 동작한다", "kind": "function"}],
     })
 

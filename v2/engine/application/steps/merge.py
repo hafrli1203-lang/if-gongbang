@@ -115,13 +115,18 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from engine.domain.records import Event
-from engine.domain.policy import Policy, owns_within_prefixes as _owns_within_prefixes
+from engine.domain.policy import (
+    Policy,
+    owns_within_prefixes as _owns_within_prefixes,
+    prefix_covers as _prefix_covers,
+)
 from engine.domain.stage_checks import other_station_record_violation
 from engine.application.processor import StepContext, StepDef, StepFailed
 from engine.application.steps.open_job import copy_root, dirty_paths, job_name_for
+from engine.infrastructure.skills import SKIP_DIRS as _DEPENDENCY_DIR_NAMES
 
 # Reserved for the planner role ONLY (engine.domain.plan's own module docstring:
 # "a builder station must never touch tests/scenes/") -- enforced here as
@@ -356,20 +361,50 @@ def _candidate_files(copy_path: Path, prefixes: tuple[str, ...],
     Still raises StepFailed("symlink_in_copy") for any candidate git
     status DOES report that turns out to be a symlink in the copy -- the
     rejection stays, just checked against the paths git itself names
-    rather than against every path a raw walk would have found."""
+    rather than against every path a raw walk would have found.
+
+    Prefix coverage is engine.domain.policy.prefix_covers -- the SAME
+    function the live write gate uses -- never this module's own
+    directory-vs-exact-file judgment call: a no-trailing-slash owns
+    entry (e.g. "src/new") covers only that exact path, never anything
+    nested under it, so a path the gate would have refused mid-run is
+    never silently folded in here either (a review finding,."""
     all_dirty = dirty_paths(copy_path, excludes)
     found: set[str] = set()
     for rel in all_dirty:
-        rel_path = Path(rel)
+        if _in_dependency_folder(rel):
+            # A dependency folder (node_modules, .venv, __pycache__, ...
+            # -- engine.infrastructure.skills.SKIP_DIRS, the SAME names that
+            # module already prunes a skill-file walk by) is never a
+            # merge candidate, regardless of this project's own
+            # `excludes` config: a project that never thought to list
+            # node_modules there (e.g. a Python app whose probe station
+            # happened to run `npm install`) must not have the whole
+            # merge fail just because npm itself creates
+            # node_modules/.bin/* symlinks (결함 51). Skipped here, before
+            # the symlink check below, so neither this candidate nor any
+            # other path inside the same dependency folder is ever
+            # raised on OR copied into the destination repo.
+            continue
         for prefix in prefixes:
-            prefix_path = Path(prefix)
-            if rel_path == prefix_path or _is_under(rel_path, prefix_path):
+            if _prefix_covers(prefix, rel):
                 target = copy_path / rel
                 if target.is_symlink():
                     raise StepFailed("symlink_in_copy")
                 found.add(rel)
                 break
     return found
+
+
+def _in_dependency_folder(rel: str) -> bool:
+    """True iff some directory component of `rel` is a known dependency
+    folder name (_DEPENDENCY_DIR_NAMES) -- e.g. "tests/bench/node_modules/
+    .bin/some-pkg" matches on "node_modules", wherever it sits in the
+    tree, same as _SKIP_DIRS already matches by bare directory name for
+    a skill-file walk. Only directory components count, never the final
+    (file) component itself, so a real tracked file literally named
+    e.g. "node_modules" (not a directory) is not exempted by this."""
+    return any(part in _DEPENDENCY_DIR_NAMES for part in PurePosixPath(rel).parent.parts)
 
 
 def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
@@ -411,6 +446,15 @@ def _compute_changes(ctx: StepContext) -> dict[str, dict[str, str]]:
                 role_changes[rel] = "modified"
         for prefix in prefixes:
             for rel in _ref_rels_under_prefix(repo, base_head, prefix):
+                # git's own pathspec match (_ref_rels_under_prefix) can be
+                # laxer than prefix_covers for a no-trailing-slash prefix
+                # that happens to be a directory in the base tree (git
+                # ls-tree then recurses into it); re-check against the
+                # same prefix_covers the gate uses so a deletion is only
+                # ever folded in here under the exact same rule as an
+                # added/modified path above (a review finding).
+                if not _prefix_covers(prefix, rel):
+                    continue
                 if not (copy_path / rel).exists():
                     _validate_rel(ctx, repo, policy, rel, role, station, job, explicit_owns)
                     role_changes[rel] = "deleted"

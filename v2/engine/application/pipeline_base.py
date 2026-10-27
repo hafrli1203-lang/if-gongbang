@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from engine.application import task_pipeline as orbit
 from engine.infrastructure import trusted
 from engine.config import EngineConfig
 from engine.domain.plan import Plan, PlanError, Task, load_plan
@@ -22,6 +21,15 @@ from engine.domain.stage_checks import check_facts_trusted
 from engine.application.processor import Fakes
 
 if TYPE_CHECKING:
+    # task_pipeline (every full_orbit_* module's own entry point) imports
+    # BACK into this module through the steps/repair/task_stage_runner/
+    # pipeline_stages chain -- importing it at module level here would be
+    # the exact circular import this module's own docstring forbids.
+    # `Run.processor_factory` below only ever needs this name as a quoted
+    # annotation (from __future__ import annotations means dataclass
+    # fields are never evaluated at runtime), so TYPE_CHECKING-only is
+    # correct, not a workaround.
+    from engine.application import task_pipeline as orbit
     from engine.infrastructure.db.ledger import Ledger
     from engine.application.job_state import JobPosition
 
@@ -74,6 +82,14 @@ class Run:
     job: str
     on_progress: ProgressCallback | None
     processor_factory: "orbit.ProcessorFactory | None"
+    # `gb2 continue --past-cap` (a past incident, 반장 지시: the SAME
+    # escape hatch `gb2 fix --past-cap` already gives the owner past
+    # repair.fix()'s own cap, given here to _resume_reopened_station's
+    # own early-station cap/no-progress check instead. False for every
+    # OTHER caller (plain `gb2 continue`, approve-design, approve-
+    # install, the continuation after `gb2 fix` -- none of those ever
+    # need to override this specific gate).
+    past_cap: bool = False
 
     def fakes_for(self, attempt_id: str) -> Fakes:
         return fakes_for(self.fakes, attempt_id)

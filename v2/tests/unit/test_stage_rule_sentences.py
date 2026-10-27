@@ -178,7 +178,7 @@ def _write_plan_for(repo: Path, job: str, scene_cmd: tuple[str, ...]) -> None:
             "cmd": list(scene_cmd), "covers": ["r1"],
         }],
         "tasks": [{
-            "id": "t1", "title": "작업", "detail": "", "owns": ["src/"],
+            "id": "t1", "title": "작업", "detail": "", "owns": ["src/", "tests/"],
             "depends_on": [], "covers": ["r1"],
         }],
         "acceptance": ["끝"],
@@ -199,7 +199,7 @@ def test_plan_json_written_to_the_schema_planner_prompt_states_loads_and_validat
     _write_plan_for(tmp_path, _JOB, ("python3", "tests/scenes/s1.py"))
 
     plan = load_plan(tmp_path, _JOB)
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_plan_json_whose_scene_does_not_actually_run_the_script_fails_validate_plan(
@@ -232,7 +232,7 @@ def test_plan_json_scene_cmd_with_the_safe_flags_the_rule_sentence_names_passes(
     )
 
     plan = load_plan(tmp_path, _JOB)
-    assert validate_plan(plan, tmp_path, build_prefixes=("src/",)) == []
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
 def test_plan_json_scene_cmd_with_a_value_taking_flag_still_fails_validate_plan(

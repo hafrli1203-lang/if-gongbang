@@ -36,7 +36,13 @@ import os
 import subprocess
 from pathlib import Path
 
-from engine.infrastructure.evidence import FingerprintError, fingerprint, range_tree, three_match_reason
+from engine.infrastructure.evidence import (
+    FingerprintError,
+    fingerprint,
+    range_tree,
+    three_match_reason,
+    with_file_deps,
+)
 from engine.infrastructure.gitutil import git_argv
 from engine.domain.records import Event
 from engine.application.processor import StepContext, StepDef, StepFailed
@@ -59,6 +65,21 @@ def _repo(ctx: StepContext) -> Path:
 
 def _excludes(ctx: StepContext) -> tuple[str, ...]:
     return _project_config(ctx).excludes
+
+
+def _file_dep_targets(ctx: StepContext) -> tuple[tuple[str, str], ...]:
+    """Same role as review._file_dep_targets/suite_run._file_dep_targets:
+    feeds evidence.with_file_deps so verify_three's three_match check
+    compares against the SAME kind of evidence fingerprint review/bench
+    now record (a review finding, -- `fp` itself (this step's own
+    journaled plain git tree hash) is untouched and keeps being used,
+    unchanged, for _build_range_tree's tree==fp check, the commit
+    message, _head_already_commits and record_commit: all of those
+    build or verify the REAL git tree/commit, which must never be
+    mixed with file-dep content (module docstring; close.py's own
+    fingerprint(repo)==HEAD^{tree} check elsewhere relies on the same
+    plain-tree invariant and is untouched by this)."""
+    return _project_config(ctx).file_dep_targets
 
 
 def _journal_payload(ctx: StepContext, step_name: str) -> dict[str, object]:
@@ -84,15 +105,24 @@ def _run_compute_fingerprint(ctx: StepContext) -> dict[str, object]:
     except FingerprintError as exc:
         raise StepFailed("no_fingerprint") from exc
     head = _rev_parse_head(_repo(ctx))
-    return {"fp": fp, "head": head}
+    # a review finding: `fp` stays the plain git tree hash every
+    # OTHER step in this file (git_commit/record_commit/the commit
+    # message/_head_already_commits) keeps using unchanged; `evidence_fp`
+    # is the separate, kit-content-aware value verify_three compares
+    # against review/bench's own recorded evidence fingerprints -- see
+    # _file_dep_targets' own docstring for why these must never be the
+    # same value here.
+    evidence_fp = with_file_deps(fp, _file_dep_targets(ctx))
+    return {"fp": fp, "evidence_fp": evidence_fp, "head": head}
 
 
 def _run_verify_three(ctx: StepContext) -> dict[str, object]:
     fp = str(_journal_payload(ctx, "compute_fingerprint")["fp"])
-    ok, reason = three_match_reason(ctx.ledger, ctx.attempt_id, fp)
+    evidence_fp = str(_journal_payload(ctx, "compute_fingerprint")["evidence_fp"])
+    ok, reason = three_match_reason(ctx.ledger, ctx.attempt_id, evidence_fp)
     if not ok:
         raise StepFailed(reason)
-    return {"fp": fp}
+    return {"fp": fp, "evidence_fp": evidence_fp}
 
 
 def _build_range_tree(ctx: StepContext, repo: Path, fp: str) -> str:

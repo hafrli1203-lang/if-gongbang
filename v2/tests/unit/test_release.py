@@ -89,6 +89,33 @@ def _commit(repo: Path, rel: str, content: str, message: str) -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
+def _with_file_dep_targets(rws: ReleaseWorkspace,
+                           targets: tuple[tuple[str, str], ...]) -> ReleaseWorkspace:
+    """A ReleaseWorkspace whose "gamma" project carries `file_dep_targets`
+    -- same role as tests/unit/test_steps_commit.py's own
+    `_with_file_dep_targets` helper, used here to exercise a review finding's
+    bench-evidence lookup fix (engine.application.release.ensure_full_bench /
+    engine.application.steps.publish._full_bench_passed_for_release)."""
+    project = replace(rws.config.projects["gamma"], file_dep_targets=targets)
+    config = replace(rws.config, projects={**rws.config.projects, "gamma": project})
+    return ReleaseWorkspace(rws.root, config, rws.ledger, rws.repo, rws.master_repo)
+
+
+def _seed_full_bench_with_file_deps(rws: ReleaseWorkspace, attempt_id: str,
+                                    targets: tuple[tuple[str, str], ...]) -> None:
+    """Like _seed_full_bench, but recorded against the file-dep-aware
+    evidence fingerprint (evidence.fingerprint(repo, excludes, targets))
+    -- the SAME kind of value engine.application.steps.suite_run.record_bench
+    now records real bench evidence against (a review finding). Reproduces
+    the P1 scenario: a project's full bench genuinely passed, recorded
+    bound to the combined fingerprint, and release's own lookups must
+    still find it."""
+    evidence_fp = evidence.fingerprint(
+        rws.repo, rws.config.projects["gamma"].excludes, targets)
+    record(rws.ledger, "gamma", attempt_id, "bench", evidence_fp,
+          payload={"passed": True, "scope": "full"})
+
+
 def _seed_full_bench(rws: ReleaseWorkspace, attempt_id: str) -> None:
     """Record a passing full-scope bench for rws.repo's CURRENT
     fingerprint -- advance_master's own defense-in-depth check
@@ -129,7 +156,8 @@ def _seed_plan_reviewed(rws: ReleaseWorkspace, attempt_id: str) -> None:
     ))
 
 
-def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None) -> None:
+def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None, *,
+                     evidence_fp: str | None = None) -> None:
     """Record a passing acceptance.recorded event for `attempt_id`,
     bound to `fp` (rws.repo's CURRENT fingerprint by default) --
     advance_master's job-level certificate check (engine.release.
@@ -150,12 +178,15 @@ def _seed_acceptance(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = No
         actor_id="processor", attempt_id=attempt_id,
         payload={"job": "test-job", "passed": True, "scenes": [],
                  "full_suite_passed": True, "tree_changed": False, "reason": None,
-                 "fingerprint": fp if fp is not None else _current_fp(rws)},
+                 "fingerprint": fp if fp is not None else _current_fp(rws),
+                 "evidence_fingerprint": evidence_fp if evidence_fp is not None
+                 else (fp if fp is not None else _current_fp(rws))},
     ))
 
 
 def _seed_app_security(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = None, *,
-                       policy_hash: str | None = None) -> None:
+                       policy_hash: str | None = None,
+                       evidence_fp: str | None = None) -> None:
     """Record a passing app_security.recorded event for `attempt_id`,
     bound to `fp` (rws.repo's CURRENT fingerprint by default) -- the
     OTHER half of the job certificate engine.release.
@@ -176,9 +207,26 @@ def _seed_app_security(rws: ReleaseWorkspace, attempt_id: str, fp: str | None = 
         actor_id="processor", attempt_id=attempt_id,
         payload={"passed": True, "findings": [], "ran": ["secret_scan"],
                  "fingerprint": fp if fp is not None else _current_fp(rws),
+                 "evidence_fingerprint": evidence_fp if evidence_fp is not None
+                 else (fp if fp is not None else _current_fp(rws)),
                  "policy_hash": (policy_hash if policy_hash is not None
                                  else app_security.security_policy_hash(rws.config))},
     ))
+
+
+def _seed_job_certificate_with_file_deps(
+    rws: ReleaseWorkspace, attempt_id: str, targets: tuple[tuple[str, str], ...],
+) -> str:
+    """Like _seed_job_certificate, but bound to the file-dep-aware
+    evidence fingerprint too (a review finding -- acceptance/app_security's
+    own "evidence_fingerprint" payload field). Returns that combined
+    value, so a caller can compare it against a LATER, changed-kit
+    recomputation."""
+    fp = _current_fp(rws)
+    evidence_fp = evidence.fingerprint(rws.repo, rws.config.projects["gamma"].excludes, targets)
+    _seed_acceptance(rws, attempt_id, fp, evidence_fp=evidence_fp)
+    _seed_app_security(rws, attempt_id, fp, evidence_fp=evidence_fp)
+    return evidence_fp
 
 
 def _seed_job_certificate(rws: ReleaseWorkspace, attempt_id: str) -> None:
@@ -695,6 +743,67 @@ def test_call_publisher_rechecks_full_bench_right_before_dispatch(
     assert publisher.calls == []
 
 
+def test_advance_master_full_bench_check_matches_evidence_recorded_with_file_dep_targets(
+    rws: ReleaseWorkspace,
+) -> None:
+    """a review finding reproduction: a project with file_dep_
+    targets whose full bench genuinely passed -- recorded bound to
+    the file-dep-aware evidence fingerprint, exactly what engine.
+    application.steps.suite_run.record_bench now records real bench
+    evidence against -- must still be found by advance_master's own
+    defense-in-depth check (engine.application.steps.publish.
+    _full_bench_passed_for_release). Before the fix, that check
+    re-fetched bench evidence keyed by the PLAIN tree fingerprint
+    alone, so this always refused ("full_bench_missing") even though
+    the bench truly passed."""
+    kit = rws.root / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+    fd_rws = _with_file_dep_targets(rws, targets)
+
+    attempt_id = _open(fd_rws, "job-p1-filedep")
+    sha = _commit(fd_rws.repo, "app.py", "v2\n", "advance")
+    request_id, _ = release.prepare(fd_rws.config, fd_rws.ledger, "gamma", attempt_id)
+    grant(fd_rws.ledger, "gamma", request_id, ttl_sec=3600)
+    _seed_full_bench_with_file_deps(fd_rws, attempt_id, targets)
+    _seed_job_certificate_with_file_deps(fd_rws, attempt_id, targets)
+
+    publisher = FakePublisher()
+    proc = Processor(fd_rws.config, fd_rws.ledger, Fakes(publisher, FakeInstaller()))
+    proc.register_defaults()
+    n = proc.run_once("gamma")
+
+    assert n > 0
+    req = fd_rws.ledger.request(request_id)
+    assert req.status == "done"
+    assert release.head_sha(fd_rws.master_repo) == sha
+
+
+def test_ensure_full_bench_is_a_noop_when_recorded_with_file_dep_target_content(
+    rws: ReleaseWorkspace,
+) -> None:
+    """Same a review finding reproduction, directly against
+    engine.application.release.ensure_full_bench (the other named call
+    site, release.py:126): the no-op path (latest_full_bench_passed)
+    must look up bench evidence by the combined, file-dep-aware
+    fingerprint, not the plain tree fingerprint alone."""
+    kit = rws.root / "_shared" / "kit2"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit2", str(kit)),)
+    fd_rws = _with_file_dep_targets(rws, targets)
+
+    attempt_id = _open(fd_rws, "job-p1-ensurebench")
+    _seed_full_bench_with_file_deps(fd_rws, attempt_id, targets)
+
+    fakes = Fakes(FakePublisher(), FakeInstaller())
+    result = release.ensure_full_bench(fd_rws.config, fd_rws.ledger, fakes, "gamma", attempt_id)
+
+    plain_fp = evidence.fingerprint(fd_rws.repo, fd_rws.config.projects["gamma"].excludes)
+    assert result == {"ran": False, "passed": True, "fp": plain_fp}
+
+
 # ---------------------------------------------------------------------------
 # ensure_full_bench / approve_and_run's full-suite-bench gate: a ship
 # must have a FULL-scope passing bench for the exact released
@@ -1033,6 +1142,58 @@ def test_job_certificate_status_true_after_seeding_both_halves(
         rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws))
     assert ok is True
     assert reason == ""
+
+
+def test_job_certificate_status_true_when_file_dep_target_content_unchanged(
+    rws: ReleaseWorkspace, tmp_path: Path,
+) -> None:
+    """a review finding control: a job certificate seeded bound to the
+    file-dep-aware evidence fingerprint still passes when nothing
+    (neither the repo nor the kit) has changed since, as long as the
+    caller passes the SAME file_dep_targets job_certificate_status
+    must now accept."""
+    kit = tmp_path / "_shared" / "kit3"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit3", str(kit)),)
+
+    attempt_id = _open(rws, "job-cert-fd-ok")
+    _seed_job_certificate_with_file_deps(rws, attempt_id, targets)
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws),
+        file_dep_targets=targets)
+    assert ok is True
+    assert reason == ""
+
+
+def test_job_certificate_status_refuses_when_file_dep_target_content_changed_since_certificate(
+    rws: ReleaseWorkspace, tmp_path: Path,
+) -> None:
+    """a review finding reproduction: acceptance/app_security both certified
+    while the kit held content v1 (recorded bound to that combined
+    evidence fingerprint); the kit's content then changes to v2 even
+    though gamma's own repo tree never moves at all. Before this fix,
+    job_certificate_status only ever diffed the PLAIN tree
+    fingerprints (identical here), so it would have certified release
+    on a certificate that no longer reflects what the dependency
+    actually is -- it must now refuse."""
+    kit = tmp_path / "_shared" / "kit4"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit4", str(kit)),)
+
+    attempt_id = _open(rws, "job-cert-fd-stale")
+    _seed_job_certificate_with_file_deps(rws, attempt_id, targets)
+
+    # The dependency's own content changes; gamma's repo itself does not.
+    (kit / "index.js").write_text("module.exports = 2;\n", encoding="utf-8")
+
+    ok, reason = release.job_certificate_status(
+        rws.ledger, "gamma", attempt_id, rws.repo, _current_fp(rws),
+        file_dep_targets=targets)
+    assert ok is False
+    assert reason == "release_requires_job_certificate:file_dep_target_changed"
 
 
 def test_job_certificate_status_finds_evidence_on_an_earlier_attempt_of_the_same_job(

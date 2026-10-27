@@ -55,6 +55,13 @@ from pathlib import Path
 # literal a third time.
 SCENES_PREFIX = "tests/scenes/"
 
+# validate_plan's own 결함 42 check (a build task touching src/ must
+# also own a tests/ path of its own) -- the two literal prefixes it
+# compares against, named here once rather than re-typed at the check
+# site and in plan_rule_sentences' own PLAN_TASK_TEST_OWNS_RULE text.
+SRC_OWNS_PREFIX = "src/"
+TEST_OWNS_PREFIX = "tests/"
+
 
 class PlanError(ValueError):
     """plan.json is missing, not valid JSON, does not match the fixed
@@ -523,6 +530,26 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
                     problems.append(
                         f"task {task.id}: owns {entry!r} is outside build prefixes {list(build_prefixes)!r}"
                     )
+        # 결함 42, plans/-gongbang-entry-unify.md
+        # §C): a build task whose owns touches src/ with no owns path of
+        # its own under tests/ reaches the build station with no test
+        # file to write at all -- the repeated real incident (an
+        # operator demanding tests, with none in the task's own `owns`
+        # to put them under, so the builder has to stop and ask).
+        # SKIPPED when `build_prefixes` is None, same reason the
+        # owns-subset check right above is: check_resumed_plan re-checks
+        # an ALREADY-REVIEWED plan on every resume, never a freshly
+        # written one -- this rule only ever needs to catch a NEW plan,
+        # at the one point (pipeline_planning.run_plan_and_review,
+        # quick_pipeline's own plan check) that calls validate_plan with
+        # a real build_prefixes.
+        for task in plan.tasks:
+            if (any(_prefix_covers(SRC_OWNS_PREFIX, entry) for entry in task.owns)
+                    and not any(_prefix_covers(TEST_OWNS_PREFIX, entry) for entry in task.owns)):
+                problems.append(
+                    f"task {task.id}: owns {SRC_OWNS_PREFIX} 경로가 있지만 "
+                    f"{TEST_OWNS_PREFIX} 아래 자기 시험 파일이 owns에 없다"
+                )
     tests_dir = repo / "tests"
     scenes_dir = tests_dir / "scenes"
     # A symlinked "tests" or "tests/scenes" directory would make
@@ -712,12 +739,22 @@ PLAN_JSON_VALID_RULE = (
 )
 
 
+# validate_plan's own 결함 42 check (src/ owns needs a tests/ owns of
+# its own, new plans only -- see that check's own comment for why it is
+# gated on build_prefixes rather than a separate "new vs resumed" flag).
+PLAN_TASK_TEST_OWNS_RULE = (
+    f'owns에 "{SRC_OWNS_PREFIX}" 아래 경로가 있는 작업(task)은 "{TEST_OWNS_PREFIX}" 아래 '
+    "자기 시험 파일 경로를 owns에 최소 하나 넣는다 -- 그 작업의 build 단계가 쓸 시험 "
+    "파일 자리를 미리 정해 두는 것이다."
+)
+
+
 def plan_rule_sentences() -> tuple[str, ...]:
     """Every rule sentence the full-orbit planner prompt (planner_prompt)
     must carry verbatim."""
     return (
         PLAN_SCHEMA_RULE, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
-        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_TASK_TEST_OWNS_RULE,
     )
 
 
@@ -726,15 +763,15 @@ def plan_rule_sentences_small() -> tuple[str, ...]:
     whose plan.json schema sentence is PLAN_SCHEMA_RULE_SMALL instead."""
     return (
         PLAN_SCHEMA_RULE_SMALL, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
-        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_TASK_TEST_OWNS_RULE,
     )
 
 
 __all__ = [
-    "SCENES_PREFIX",
+    "SCENES_PREFIX", "SRC_OWNS_PREFIX", "TEST_OWNS_PREFIX",
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "ordered_tasks", "requirement_coverers", "plan_owns_rule_sentence",
     "PLAN_SCHEMA_RULE", "PLAN_SCHEMA_RULE_SMALL", "PLAN_REQUIREMENT_SCENE_COVERAGE_RULE",
-    "PLAN_SCENE_EXIT0_RULE", "PLAN_SCENE_CMD_FLAGS_RULE",
+    "PLAN_SCENE_EXIT0_RULE", "PLAN_SCENE_CMD_FLAGS_RULE", "PLAN_TASK_TEST_OWNS_RULE",
     "plan_rule_sentences", "plan_rule_sentences_small",
 ]

@@ -186,8 +186,73 @@ def remap_pairs_for_roots(
     return tuple(pairs)
 
 
+def sandbox_file_dep_pairs(
+    root: Path, repo: Path, file_dep_targets: tuple[tuple[str, str], ...],
+) -> tuple[tuple[Path, Path], ...]:
+    """The ONE function every sandbox builder (engine.application.steps.
+    worker_sandbox.sandboxed_argv, engine.application.steps.suite_run.
+    _bench_sandbox_argv) calls to get (source, dest) pairs for
+    sandbox.wrap's own `readonly_remap` -- never remap_pairs_for_root/
+    remap_pairs_for_roots directly, which only compute the path
+    arithmetic and know nothing about whether bwrap can actually mount
+    there (결함 42,.
+
+    `root` is THIS call's own sandboxed root -- a worker's copy_root, or
+    the repo itself for an ordinary bench run (`run_tests`/`trust_checks`
+    pass the real repo for both `root` and `repo`, below, since they are
+    the same path there); `repo` is ALWAYS the project's real,
+    un-mirrored repo (ctx.config.projects[project].repo), even when
+    `root` is something else entirely -- a disposable acceptance/probe
+    snapshot (engine.application.acceptance_bench.run_in_bench_sandbox),
+    which never equals the real repo. Pairs are computed for BOTH
+    (remap_pairs_for_roots, duplicates dropped): a copy_links entry (e.g.
+    `node_modules`) is always a symlink back to the REAL repo (or, for a
+    disposable snapshot, a symlink into the real repo's own copy_links
+    target -- see suite_snapshot.link_snapshot_deps), so a further
+    escaping relative symlink inside it (`@scope/kit ->
+    ../../../_shared/kit`) resolves against the REAL repo's own parent
+    at the OS level, never against `root` -- the `root`-rooted pair is
+    therefore usually a no-op, but kept anyway (cheap, and correct for
+    the rarer copy_link_writable_subpaths shape, where a child symlink
+    is recreated with an ABSOLUTE target computed from `root`'s own
+    tree, not re-walked against the repo).
+
+    `root.config.projects[project].hidden_paths` (tools/gb2lib/
+    workspace.py's own `_setup_app_workspace`) hides the WHOLE apps root,
+    a project's `repo` included -- broader than `repo` alone, on
+    purpose, to keep one app's sandbox from seeing another app's source
+    tree. A `file_dep_targets` entry's own real target is typically a
+    SIBLING of `repo` (e.g. `repo/../_shared/kit`), so it sits inside
+    that same hidden ancestor and is never re-exposed by `repo` alone
+    (confirmed empirically: a readonly_remap keyed to a disposable
+    snapshot's own root, as every pre-결함-42 caller computed, never
+    named this sibling path at all, so the real target stayed hidden and
+    `require()` failed with MODULE_NOT_FOUND even though `repo` itself
+    was separately re-exposed). Each returned `dest` that does not yet
+    exist on the host is pre-created here, as an empty directory --
+    exactly the technique suite_run._bench_sandbox_argv's own
+    bench_readonly_paths loop already uses, and for the same reason:
+    bwrap can only auto-create a missing readonly_remap mountpoint under
+    an ancestor that is ITSELF currently writable, which a `dest` nested
+    under a `hidden` (tmpfs, later remounted read-only) ancestor is only
+    true of up until that remount -- a `dest` one level further out,
+    under the plain host mirror with no mount of its own at all, is
+    never writable, and bwrap fails closed there with "Can't mkdir
+    parents ...: Read-only file system" instead of creating it. Pre-
+    creating `dest` on the host, here, before `sandbox.wrap` ever runs,
+    means the later `--ro-bind` only ever mounts OVER an existing path,
+    the same shape as every other nested bind this codebase already
+    relies on."""
+    pairs = remap_pairs_for_roots((root, repo), file_dep_targets)
+    for _source, dest in pairs:
+        if not dest.exists():
+            dest.mkdir(parents=True, exist_ok=True)
+    return pairs
+
+
 __all__ = [
     "remap_pairs_for_roots",
+    "sandbox_file_dep_pairs",
     "FileDepTargetError",
     "discover_escaping_file_deps",
     "resolve_escaping_target",

@@ -51,12 +51,14 @@ def test_optional_scalar_fields_are_loaded_from_json(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, {
         "hook_timeout_sec": 5,
         "approval_ttl_sec": 60,
+        "watch_max_resumes_per_hour": 5,
         "stations": ["build", "review"],
         "optional_stations": ["review"],
     })
     config = EngineConfig.from_json(config_path)
     assert config.hook_timeout_sec == 5.0
     assert config.approval_ttl_sec == 60
+    assert config.watch_max_resumes_per_hour == 5
     assert config.stations == ("build", "review")
     assert config.optional_stations == ("review",)
 
@@ -68,6 +70,7 @@ def test_absent_optional_fields_keep_dataclass_defaults(tmp_path: Path) -> None:
     assert config.hooks == ()
     assert config.hook_timeout_sec == 2.0
     assert config.approval_ttl_sec == 4 * 3600
+    assert config.watch_max_resumes_per_hour == 3
 
 
 def test_unknown_top_level_key_rejected(tmp_path: Path) -> None:

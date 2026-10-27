@@ -63,7 +63,8 @@ def _small_plan_json(*, requirements: bool = True) -> str:
     return json.dumps({
         "goal": "작은 변경", "ui": False, "requirements": requirements_list,
         "scenes": scenes_list,
-        "tasks": [{"id": "t1", "title": "값 바꾸기", "detail": "", "owns": ["src/greeter/extra1.py"],
+        "tasks": [{"id": "t1", "title": "값 바꾸기", "detail": "",
+                  "owns": ["src/greeter/extra1.py", "tests/t1_test_owns.py"],
                   "depends_on": []}],
         "acceptance": ["요청이 반영된다"],
     })

@@ -95,6 +95,28 @@ class WorkerResult:
     turns: int | None
     requests: tuple[dict[str, object], ...]
     verdict: dict[str, object] | None
+    # The builder's own self-report of which station skills (engine.
+    # infrastructure.context's "## 이 칸의 스킬" block) it actually used --
+    # [{"name": str, "where": str}, ...], parsed from the builder's own
+    # final JSON's "skills_applied" (see parse_cli_shaped_result). Always
+    # () for a reviewer result (parse_cli_shaped_verdict/CodexRunner never
+    # populate it -- a reviewer has no station skills of its own to
+    # report applying). Never trusted on its own: engine.application.
+    # steps.worker_step._run_record_station is what turns this into the
+    # "skills.unapplied" ledger event by comparing it against what was
+    # actually injected, exactly like changed_paths is recomputed from
+    # the copy's own git status rather than taken from the worker's
+    # claim.
+    skills_applied: tuple[dict[str, object], ...] = ()
+    # usage.output_tokens from the CLI's own --output-format json result
+    # (see docs/stage3-runs/v1/S3-1.json for a real recorded shape: a
+    # top-level "usage" object with an int "output_tokens" alongside
+    # "total_cost_usd"/"num_turns" -- the same object this module already
+    # reads cost_usd/turns from). None when the CLI's result carries no
+    # such field (CodexRunner's -o verdict file has no "usage" at all) --
+    # engine.interface.board_render keeps reporting "기록 없음" for that case,
+    # never a fabricated 0.
+    tokens_out: int | None = None
 
 
 class WorkerRunner(Protocol):
@@ -206,8 +228,9 @@ def last_json_block(text: str) -> dict[str, object] | None:
 def parse_cli_shaped_result(stdout_path: Path) -> WorkerResult:
     """Shared parse_result for ClaudeRunner and ScriptedRunner: both leave
     a JSON object on stdout with "result" (free text whose tail is the
-    worker's own final JSON), "total_cost_usd", "num_turns" and
-    "is_error"."""
+    worker's own final JSON), "total_cost_usd", "num_turns", "is_error"
+    and (real claude CLI only -- see docs/stage3-runs/v1/S3-1.json) a
+    top-level "usage" object whose "output_tokens" is an int."""
     try:
         raw = json.loads(stdout_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -220,13 +243,23 @@ def parse_cli_shaped_result(stdout_path: Path) -> WorkerResult:
         cost = None
     if not (turns is None or isinstance(turns, int)):
         turns = None
+    usage = raw.get("usage")
+    tokens_out = usage.get("output_tokens") if isinstance(usage, dict) else None
+    if not isinstance(tokens_out, int):
+        tokens_out = None
     block = last_json_block(str(raw.get("result", "")))
     if block is None:
-        return WorkerResult(False, "unparseable_result", cost, turns, (), None)
+        return WorkerResult(False, "unparseable_result", cost, turns, (), None,
+                             tokens_out=tokens_out)
     summary = str(block.get("summary", ""))
     requests_raw = block.get("requests", [])
     requests = tuple(r for r in requests_raw if isinstance(r, dict)) \
         if isinstance(requests_raw, list) else ()
+    skills_raw = block.get("skills_applied", [])
+    skills_applied = tuple(
+        {"name": str(s.get("name", "")), "where": str(s.get("where", ""))}
+        for s in skills_raw if isinstance(s, dict) and s.get("name")
+    ) if isinstance(skills_raw, list) else ()
     status = block.get("status")
     # "blocked" is only acceptable together with at least one request the
     # owner can act on; a bare "blocked" is a failure like any other.
@@ -234,7 +267,8 @@ def parse_cli_shaped_result(stdout_path: Path) -> WorkerResult:
     ok = finished and not raw.get("is_error", False)
     return WorkerResult(
         ok=ok, summary=summary, cost_usd=cost, turns=turns,
-        requests=requests, verdict=None,
+        requests=requests, verdict=None, skills_applied=skills_applied,
+        tokens_out=tokens_out,
     )
 
 

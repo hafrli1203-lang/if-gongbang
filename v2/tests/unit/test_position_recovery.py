@@ -250,7 +250,7 @@ def test_c_crash_after_fix_finished_replays_the_fix_requests_exactly(
     run_stations = [e.payload for _s, e in ws.ledger.events("alpha", "request.submitted")
                     if e.attempt_id == fix_attempt and e.payload.get("kind") == "run_station"]
     assert len(run_stations) == 1, run_stations
-    assert run_stations[0]["payload"]["owns"] == ["src/greeter/extra1.py"]
+    assert run_stations[0]["payload"]["owns"] == ["src/greeter/extra1.py", "tests/t1_test_owns.py"]
     assert "Original request" in run_stations[0]["payload"]["task"]
 
 

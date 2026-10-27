@@ -36,8 +36,11 @@ def test_gather_filters_run_output_items() -> None:
     ctx = gather(config, "alpha", "facts", "재주문 기준이 뭐야")
     assert not ctx.failed
     titles = [i.title for i in ctx.items]
-    assert "안경원 재주문 기준" in titles
-    assert "어제 만든 초안" not in titles  # origin=="run_output" -- filtered
+    assert "[운영자 지정 · 메인] sample-app/guide.pdf" in titles
+    # origin is the library's display label "실행 결과" (AI run output) --
+    # filtered (결함 44: the old fake used the internal key and hid this).
+    assert not any("draft.md" in t for t in titles)
+    assert all(i.source != "library" for i in ctx.items)  # real citation kept
     kinds = {i.kind for i in ctx.items}
     assert kinds == {"library"}
 
@@ -83,6 +86,36 @@ def test_gather_server_hang_times_out_and_sets_failed_true() -> None:
     assert elapsed < 10.0  # well under the fake server's own 3600s sleep
 
 
+def test_gather_retries_once_after_a_single_cold_mcp_failure(tmp_path: Path) -> None:
+    """결함 49 (live,: the SAME job's "plan" station library
+    lookup timed out once while its own later "review" station lookup
+    (same command, a few seconds later on a less loaded host) succeeded
+    -- a one-off miss, not a broken server. gather() must retry the
+    whole round trip (a fresh spawn, never the dead process) once
+    before giving up, so a single cold/slow spawn under a busy host no
+    longer silently drops every item for that station."""
+    marker = tmp_path / "crashed-once.marker"
+    argv = (sys.executable, _FAKE_SERVER, f"--crash-once-marker={marker}")
+    config = _StubConfig(ContextConfig(library_mcp=LibraryMcpConfig(command=argv, timeout_sec=5.0)))
+
+    ctx = gather(config, "alpha", "plan", "재주문 기준이 뭐야")
+
+    assert marker.exists()  # the first spawn really did crash, not skipped
+    assert ctx.failed is False
+    titles = [i.title for i in ctx.items]
+    assert "[운영자 지정 · 메인] sample-app/guide.pdf" in titles
+
+
+def test_gather_still_fails_after_every_retry_is_exhausted() -> None:
+    """A server that crashes on EVERY spawn (never recovers) must still
+    end up Context.failed=True -- the retry (결함 49) softens a one-off
+    miss, it never masks a truly broken/misconfigured server."""
+    config = _StubConfig(_library_mcp_config(crash=True))
+    ctx = gather(config, "alpha", "plan", "질문")
+    assert ctx.failed is True
+    assert ctx.items == ()
+
+
 def test_gather_skips_notification_sent_before_the_real_reply() -> None:
     """A server that writes an id-less notification before the real
     tools/call reply must not have that notification mistaken for the
@@ -92,7 +125,7 @@ def test_gather_skips_notification_sent_before_the_real_reply() -> None:
     ctx = gather(config, "alpha", "facts", "재주문 기준이 뭐야")
     assert not ctx.failed
     titles = [i.title for i in ctx.items]
-    assert "안경원 재주문 기준" in titles
+    assert "[운영자 지정 · 메인] sample-app/guide.pdf" in titles
 
 
 def test_gather_flood_of_notifications_cannot_extend_the_overall_deadline() -> None:
@@ -358,3 +391,25 @@ def test_owner_decisions_are_never_cut(tmp_path) -> None:
     decisions.write_text("결정\n" * PER_ITEM_CAP + "LAST-DECISION", encoding="utf-8")
     config = SimpleNamespace(context=ContextConfig(decisions_paths={"p": str(decisions)}))
     assert "LAST-DECISION" in render_items(gather(config, "p", "build", "q").items)
+
+
+def test_44_real_library_mcp_injects_library_and_lessons() -> None:
+    """Defect 44: against the REAL library MCP (set GB2_REAL_LIBRARY_MCP to
+    its command; skipped where there is none, e.g. the public CI), gather()
+    must return library items AND lesson items -- it returned none for
+    weeks because the parser expected a shape the server never sends."""
+    import os
+    import shlex
+    import pytest
+    command = os.environ.get("GB2_REAL_LIBRARY_MCP")
+    if not command:
+        pytest.skip("GB2_REAL_LIBRARY_MCP not set: no real library on this host")
+    config = _StubConfig(ContextConfig(
+        library_mcp=LibraryMcpConfig(command=tuple(shlex.split(command)), timeout_sec=60),
+        lessons_app={"alpha": os.environ.get("GB2_REAL_LESSONS_APP", "workspace")},
+    ))
+    ctx = gather(config, "alpha", "facts", "광고 소재 제목")
+    kinds = [i.kind for i in ctx.items]
+    assert not ctx.failed
+    assert kinds.count("library") >= 1
+    assert kinds.count("lesson") >= 1

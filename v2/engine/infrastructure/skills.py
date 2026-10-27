@@ -8,12 +8,17 @@ Lookup order for `load_skill(roots, name)`:
   2. `<root>/<category>/<name>/SKILL.md` for each immediate subdirectory
      `<category>` of the root (one level of category folders, matching
      how ~/.claude/skills-library is laid out)
+  3. any deeper `.../<name>/SKILL.md` inside the root (installed skill
+     packs sit at `<category>/<pack>/skills/<name>/`); the shallowest
+     match wins, ties broken by path, and dependency/VCS folders are
+     never searched
 Roots are searched in order; the first match wins. A name not found in
 any root comes back as a SkillText with body=None -- callers (engine.
 context) must record that as a missing skill, never silently drop it.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +65,24 @@ def _skill_md_in(root: Path, name: str) -> Path | None:
             found = skill_path_in_root(root, candidate)
             if found is not None:
                 return found
+    return _deep_skill_md_in(root, name)
+
+
+SKIP_DIRS = frozenset({"node_modules", ".git", ".venv", "venv", "__pycache__"})
+_SKIP_DIRS = SKIP_DIRS
+
+
+def _deep_skill_md_in(root: Path, name: str) -> Path | None:
+    matches: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        current = Path(dirpath)
+        if current.name == name and "SKILL.md" in filenames:
+            matches.append(current / "SKILL.md")
+    for candidate in sorted(matches, key=lambda m: (len(m.parts), str(m))):
+        found = skill_path_in_root(root, candidate)
+        if found is not None:
+            return found
     return None
 
 
@@ -78,4 +101,4 @@ def load_skill(roots: tuple[str, ...], name: str) -> SkillText:
     return SkillText(name=name, path=None, body=None)
 
 
-__all__ = ["SkillText", "load_skill", "skill_path_in_root"]
+__all__ = ["SkillText", "load_skill", "skill_path_in_root", "SKIP_DIRS"]

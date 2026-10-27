@@ -257,6 +257,9 @@ _FLOW_BOUNDARY_UNREACHABLE_REASONS: dict[str, str] = {
         "only drives full-job entry points (run_full_job/continue_full_job/"
         "resume_job), same documented gap as test_t7_config_matrix.py's "
         "gb2_run_single_task_plus_release row",
+    "fixup.fix.past_cap": "only fires when the owner passes `gb2 fix <app> --past-cap` "
+        "past JobPosition.max_fix_rounds (결함 41) -- not reproduced by this harness's "
+        "plain one-review-failure fix scenario, which never spends more than one round",
     "fixup.fix.opening_failed": "only fires when open_job() itself raises while "
         "opening the fix's replacement attempt (e.g. the project is unexpectedly not "
         "CLOSED) -- not reproduced by this harness's plain one-review-failure fix "

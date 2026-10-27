@@ -37,6 +37,7 @@ def _full_project_dict(tmp_path: Path) -> dict[str, object]:
         "test_timeout_sec": 42,
         "bench_scope": "full",
         "related_cmd": ["npx", "vitest", "related", "--run", "{files}"],
+        "arch_check_cmd": ["python3", "tools/arch_check.py"],
         "builder_test_hint": "run related tests as you edit",
         "copy_links": ["node_modules"],
         "copy_link_writable_subpaths": {"node_modules": [".vite-temp", ".vite"]},
@@ -59,6 +60,7 @@ def _full_config_dict(tmp_path: Path) -> dict[str, object]:
         "hooks": ["hooks/ok.py"],
         "hook_timeout_sec": 5,
         "approval_ttl_sec": 60,
+        "watch_max_resumes_per_hour": 5,
         "stations": ["build", "review"],
         "optional_stations": ["review"],
         "workers": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from engine.domain.plan_model import SCENES_PREFIX
 from engine.infrastructure.workers.base import WorkerSpec
 
 # Same computation engine.application.steps.worker_step.ENGINE_ROOT uses -- never
@@ -34,7 +35,12 @@ _FINAL_JSON_INSTRUCTION = (
     "When you are done, reply with exactly ONE final JSON object, with "
     "no other text after it:\n"
     '{"status": "done" | "blocked" | "failed", "summary": "<short summary>", '
+    '"skills_applied": [{"name": "<exact name from a \\"## 이 칸의 스킬\\" '
+    'heading above>", "where": "<what you used it for>"}], '
     '"requests": [...]}\n'
+    'List every skill under "## 이 칸의 스킬" you actually used in '
+    '"skills_applied", with where/how; leave out one you did not use. '
+    'An empty array means none of them were used.\n'
     'Use "blocked" only when you cannot finish until the owner fulfils an '
     'entry in "requests" (e.g. a dependency install); "failed" means the '
     'task cannot be done at all.\n'
@@ -99,6 +105,59 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
     )
 
 
+def _is_plan_review_diff(changed_files: list[str]) -> bool:
+    """True iff every changed file lives under either a job's own
+    `.gongbang/<job>/` trail (plan.json, facts.md) or `SCENES_PREFIX`
+    (tests/scenes/*, the plan station's OWN write prefix alongside
+    .gongbang/ -- see EngineConfig.station_owners' "plan" entry and
+    engine.domain.plan_model's own module docstring: "the planner may
+    write them"). That is the exact shape of the plan-review stage's
+    diff (engine.application.quick_pipeline's own comment at "Review
+    the merged-but-uncommitted plan.json+facts.md+scenes change"):
+    this review runs BEFORE that trail is even committed, let alone
+    before any build task has written a single line of src/.
+    Narrowing the first cut of this check to ONLY ".gongbang/" missed
+    exactly this -- a real plan-review diff whose one changed file was
+    a tests/scenes/ script (sample-small4's own re-run after the first
+    fix, R-cb8b57faa538f671.result.json: still a false P1 because this
+    function said "no" to a plan review that in fact had no .gongbang/
+    file in it at all, only a scene script). An empty changed_files
+    list is never a plan review -- there is nothing a reviewer here,
+    plan or build, could judge (the caller's own coverage/empty-diff
+    handling, not this function's job).
+
+    Each entry here is one RAW `git diff --name-status` line (see
+    engine.application.steps.review._changed_files), e.g.
+    "A\\t.gongbang/<job>/plan.json" or, for a rename,
+    "R100\\told/path\\tnew/path" -- never a bare path. A third cut of
+    this check (sample-small4's SECOND re-run via `gb2 continue`, same
+    symptom again: R-e4b17f2ee77e134e.result.json) compared THAT raw
+    line's prefix against ".gongbang/"/SCENES_PREFIX and always
+    failed, since every real line starts with a status code and a
+    tab, not the path. The actual path is the text after the LAST tab
+    (a plain "A\\t<path>" line has exactly one; a rename's
+    "R100\\told\\tnew" has two -- `git diff --name-status` always
+    tab-separates this way, never a path containing a literal tab
+    itself)."""
+    if not changed_files:
+        return False
+    paths = (line.rsplit("\t", 1)[-1] for line in changed_files)
+    return all(p.startswith(".gongbang/") or p.startswith(SCENES_PREFIX) for p in paths)
+
+
+_PLAN_REVIEW_NOTE = (
+    "This is a PLAN review, not a code review: every changed file "
+    "listed above lives under a job's own .gongbang/<job>/ trail "
+    "(plan.json, facts.md, scenes/*). No build task has run yet, so "
+    "the original request's implementation has NOT been written and "
+    "is correctly absent from this diff -- do NOT report a finding "
+    "that the diff is missing the requested implementation. Judge "
+    "instead whether plan.json's tasks and scenes, if carried out as "
+    "written, would satisfy the original request (and whether facts.md "
+    "supports the values the plan uses).\n\n"
+)
+
+
 def review_prompt(spec: WorkerSpec, original_task: str, changed_files: list[str],
                    diff_text: str, coverage_sent: str) -> str:
     """A reviewer's full prompt: the ORIGINAL request text the builder
@@ -114,7 +173,22 @@ def review_prompt(spec: WorkerSpec, original_task: str, changed_files: list[str]
     explicitly and REQUIRED to echo it back as "coverage" in its own
     verdict JSON (never silently assumed by the caller), so a reviewer
     that did not actually see the whole change cannot report a verdict
-    that looks indistinguishable from one that did."""
+    that looks indistinguishable from one that did.
+
+    When `changed_files` is entirely a job's .gongbang/<job>/ trail
+    (_is_plan_review_diff), this is the plan-review stage
+    (engine.application.quick_pipeline.run_small_job /
+    engine.application.pipeline_planning's own plan-review Stage), called
+    BEFORE any build task runs -- 결함 53: without `_PLAN_REVIEW_NOTE`,
+    a reviewer sees the original request's real feature text next to a
+    diff that (correctly, at this stage) contains no src/ change at
+    all, and reports a P1 "requested implementation missing from diff"
+    (see tests/unit/test_worker_prompts.py's own regression test,
+    reproducing R-0109d7e9e000cf30.result.json from the sample-small3
+    probe run). A code-review diff (anything outside .gongbang/) never
+    gets this note -- it must keep judging the actual implementation,
+    same as always."""
+    plan_review_note = _PLAN_REVIEW_NOTE if _is_plan_review_diff(changed_files) else ""
     files_text = "\n".join(f"- {f}" for f in changed_files) or "(no changed files)"
     if coverage_sent == "full":
         scope_text = (
@@ -132,6 +206,7 @@ def review_prompt(spec: WorkerSpec, original_task: str, changed_files: list[str]
     return (
         f"Original request:\n{original_task}\n\n"
         f"Changed files:\n{files_text}\n\n"
+        f"{plan_review_note}"
         f"{scope_text}\n\n"
         f"Diff:\n{diff_text}\n\n"
         f"{_ARCHITECTURE_RULE_NOTE}"

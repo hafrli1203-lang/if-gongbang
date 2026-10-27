@@ -650,6 +650,20 @@ PROBE_TARGETS_INTERNAL_DOC_RULE = (
     "별도 줄(괄호로 감싼 줄이나 \"> \"로 시작하는 줄)에 적는다."
 )
 
+# 결함 52: 이 절은 "이 일이 의존하는" 대상만 적어야 하는데,
+# 앱이 이미 쓰고 있는 시험 러너(Python/pytest/Vitest 등 -- 그 프로젝트의
+# test_cmd/related_cmd로 이미 설정돼 엔진이 직접 실행하는 도구, 이번 요청이
+# 새로 끌어오는 것이 아님)를 적는 사고가 있었다 -- small 경로가 그 가짜
+# 대상 때문에 스스로 NEEDS_PROBE로 전체 작업에 넘어갔고, prober가 그
+# "대상"을 실제로 부르려고 엉뚱하게 `npm install`을 돌려 node_modules
+# 심링크(결함 51)까지 만들었다. check_probe_targets 자체는 이름만 보고
+# 판단하지 않는다 -- 이 구분은 작성자(워커)에게 거는 규칙이다.
+PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE = (
+    "이 앱이 이미 쓰고 있는 시험 러너(예: pytest, Vitest -- 프로젝트 설정의 "
+    "test_cmd/related_cmd로 이미 돌아가는 도구)는 이 절에 적지 않는다 -- "
+    "이번 요청이 새로 끌어오는 외부 대상이 아니라 앱이 전부터 쓰던 것이다."
+)
+
 # check_probe (and run_probe_scripts/_probe_observed in
 # engine.application.acceptance_probe, which checks the same two
 # conditions against the script's own real stdout rather than a
@@ -684,6 +698,7 @@ def facts_rule_sentences() -> tuple[str, ...]:
         PROBE_TARGETS_SECTION_FORMAT_RULE,
         PROBE_TARGETS_EMPTY_MARKER_RULE,
         PROBE_TARGETS_INTERNAL_DOC_RULE,
+        PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE,
     )
 
 
@@ -700,7 +715,7 @@ __all__ = [
     "check_probe_targets", "check_probe", "probe_target_id", "ProbeTargetsError",
     "FACTS_PASS_NEEDS_SOURCE_RULE", "FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE",
     "PROBE_TARGETS_SECTION_FORMAT_RULE", "PROBE_TARGETS_EMPTY_MARKER_RULE",
-    "PROBE_TARGETS_INTERNAL_DOC_RULE",
+    "PROBE_TARGETS_INTERNAL_DOC_RULE", "PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE",
     "PROBE_EXIT_AND_OK_LINE_RULE", "probe_log_format_rule",
     "facts_rule_sentences", "prober_rule_sentences",
     "station_record_prefixes", "other_station_record_violation",

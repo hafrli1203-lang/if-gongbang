@@ -11,11 +11,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from engine.infrastructure import evidence
-from engine.domain.policy import owns_within_prefixes
 from engine.domain.records import Event, RequestRow
-from engine.application.owner_approval import PENDING_KIND_WHITELIST
 
 if TYPE_CHECKING:
+    from engine.config import EngineConfig
     from engine.domain.plan import Plan
     from engine.infrastructure.db.ledger import Ledger
 
@@ -158,6 +157,113 @@ def _latest_merged_archive(ledger: Ledger, project: str, job_name: str,
             return archive_dir
     return None
 
+def fix_rounds_used(ledger: Ledger, project: str, job_name: str,
+                    exclude_attempt_id: str) -> int:
+    """How many times this job has already been through `gb2 fix` for a
+    failed review or bench request, since its last commit -- a pure read,
+    never a write. Walks the SAME earlier-attempts window
+    _latest_merged_archive does (_earlier_attempts_since_last_commit,
+    결함 37: never past a committed attempt) and counts an attempt
+    toward the total iff it itself closed on a failed review or bench
+    request (a run_station/merge crash that find_fix_target's own case
+    (b) carries forward is not, on its own, a round spent on review/
+    bench feedback -- it is the SAME round resuming after a crash, not
+    an extra one). Used by engine.application.repair.fix to enforce
+    JobPosition.max_fix_rounds (운영자 기준 "최대 2바퀴", `IF_공방_시스템_v2.md`)
+    BEFORE it ever opens a new replacement attempt -- see the module's
+    own 결함 41, plans/-gongbang-entry-unify.md
+    §B) for the real incident this exists for (sample-app T7 재시도 5바퀴
+    이상)."""
+    count = 0
+    for attempt in _earlier_attempts_since_last_commit(ledger, project, job_name,
+                                                        exclude_attempt_id):
+        if any(r.kind in ("review", "bench") and r.status == "failed"
+               for r in requests_for_attempt(ledger, project, attempt.attempt_id)):
+            count += 1
+    return count
+
+
+def review_findings_for_attempt(ledger: Ledger, project: str,
+                                attempt_id: str) -> list[object]:
+    """This attempt's own newest "review" evidence findings (plan
+    review or build-task review alike -- evidence.recorded's own
+    "review" kind carries the same {"findings": [...]} shape either
+    way), or [] if it never recorded one. The same read
+    _carried_findings_and_bench_tail already does inline for ITS OWN
+    purpose (crash-recovery carry-forward), exposed on its own for
+    review_findings_repeat's two callers (engine.application.repair.fix,
+    engine.application.pipeline_resume's plan-review early-station
+    reopen -- a past incident, 반장 지시."""
+    review_evidence = evidence.latest(ledger, attempt_id, "review")
+    if review_evidence is None:
+        return []
+    findings = review_evidence.payload.get("findings")
+    return findings if isinstance(findings, list) else []
+
+
+def previous_review_findings(ledger: Ledger, project: str, job_name: str,
+                             exclude_attempt_id: str) -> list[object]:
+    """The most recent EARLIER attempt's own review findings, in the
+    SAME since-last-commit window fix_rounds_used/_latest_merged_
+    archive use -- the round just before `exclude_attempt_id`'s own, to
+    compare against via review_findings_repeat. A thin public name for
+    the first element of _carried_findings_and_bench_tail's own return
+    (that function serves a different purpose there -- crash recovery,
+    not no-progress detection -- but the read is identical)."""
+    findings, _bench_tail = _carried_findings_and_bench_tail(ledger, project, job_name,
+                                                              exclude_attempt_id)
+    return findings
+
+
+def findings_key(findings: list[object]) -> frozenset[tuple[object, object, object]]:
+    """Normalizes a reviewer's findings list (each item a dict with
+    file/severity/note -- review evidence's own shape, repair_target.
+    find_fix_target's own review_findings) into a comparable set of
+    (file, severity, note) triples -- deliberately never `line` (반장
+    정의,: "같은 파일+같은 severity+note가 같은 것"), since the
+    same unresolved point can shift lines between rounds while still
+    being the identical finding a reviewer keeps raising."""
+    out: set[tuple[object, object, object]] = set()
+    for item in findings:
+        if isinstance(item, dict):
+            out.add((item.get("file"), item.get("severity"), item.get("note")))
+    return frozenset(out)
+
+
+def review_findings_repeat(current: list[object], previous: list[object]) -> bool:
+    """True iff `current` and `previous` are both non-empty and name
+    EXACTLY the same findings (findings_key equal) -- the no-progress
+    signal a past incident asks for: a review (build-task or plan, 반장 지시
+    "검토(구현 검토·계획 검토 모두)") that comes back with the
+    identical file+severity+note it already raised last round, meaning
+    the round spent in between changed nothing the reviewer cared
+    about. Never true for two empty lists -- a round with no findings
+    at all is not "the same finding repeated", it is something else
+    (e.g. a crash) this function has no opinion on."""
+    if not current or not previous:
+        return False
+    return findings_key(current) == findings_key(previous)
+
+
+def job_cost_usd(ledger: Ledger, project: str, job_name: str) -> float:
+    """This job's cumulative cost so far: every one of its attempts'
+    own station.finished cost_usd, summed -- the same formula
+    engine.interface.board_data._derive_job uses for its own cost_usd
+    column (board_data.py:242-244), duplicated here rather than
+    imported because that function is private and board-shaped (it
+    also needs request_status/repo/ledger_path just to build a whole
+    JobBoard row) -- a flow-layer needs_owner stop reporting "money
+    already spent so far" has no business importing the board layer."""
+    total = 0.0
+    attempt_ids = {a.attempt_id for a in ledger.attempts_for_job_name(project, job_name)}
+    for _seq, event in ledger.events(project, "station.finished"):
+        if event.attempt_id in attempt_ids:
+            cost = event.payload.get("cost_usd")
+            if isinstance(cost, (int, float)):
+                total += cost
+    return round(total, 4)
+
+
 def _carried_findings_and_bench_tail(ledger: Ledger, project: str, job_name: str,
                                      exclude_attempt_id: str,
                                      ) -> tuple[list[object], str | None]:
@@ -271,6 +377,28 @@ def find_fix_target(ledger: Ledger, project: str) -> FixTarget:
     run_station = next((r for r in requests if r.kind == "run_station"), None)
     if run_station is None:
         raise FixupError("no_failed_attempt: no run_station request for the current attempt")
+    # fix()'s own replacement run_station always resubmits as station
+    # "build" (engine.application.repair's station_prefixes lookup hardcodes
+    # it) -- this is only ever correct for an attempt whose ORIGINAL
+    # run_station was itself a "build" task. A facts/probe/plan/design
+    # station's attempt (e.g. `gb2 change --small`'s own combined
+    # "plan" station, run_station payload {"station": "plan", "role":
+    # "planner"}) that stopped at a failed review must never be treated
+    # as fixable here (결함 50) -- find_fix_target used to read its role
+    # back as builder_role regardless of station, and the "fix" attempt
+    # that followed hit station_role_not_authorized (station "build"
+    # has no role "planner") then merge's unknown_owner, leaving the
+    # attempt stuck active with no way forward. The owner's real path
+    # for an early-station stop is `gb2 continue` (engine.application.
+    # job_state.resume_job dispatches by the job's own position stage,
+    # e.g. STAGE_SMALL_PLAN -> engine.application.quick_pipeline.resume_small_plan),
+    # never `gb2 fix`.
+    run_station_station = str(run_station.payload.get("station") or "")
+    if run_station_station != "build":
+        raise FixupError(
+            "no_failed_attempt: current attempt's run_station was station "
+            f"{run_station_station!r}, not a build task -- use `gb2 continue` instead"
+        )
     builder_role = str(run_station.payload.get("role") or "builder")
     original_task = str(run_station.payload.get("task") or "")
 
@@ -330,6 +458,34 @@ def find_fix_target(ledger: Ledger, project: str) -> FixTarget:
 # compose the builder's task text
 # ---------------------------------------------------------------------
 
+def inject_context_into_fix_task(config: "EngineConfig", ledger: "Ledger", project: str,
+                                 job_name: str, task: str, full_job: bool) -> str:
+    """결함 48 (appX live #49/#50): compose_fix_task's own `task` is
+    plain text -- a fix round's own builder instructions never got a
+    "## 주입된 자료" block (company library/lesson/decision items,
+    station skills) at all, unlike a plain first-run build task
+    (engine.application.pipeline_tasks.run_tasks' own build_task_gate +
+    .prompt() call). Appends the SAME kind of block here, the same
+    way, for a full job only (one with a real plan.json to load) --
+    a plain single-task `gb2 run` job has no Plan object for
+    build_task_gate's own planned_skills()/review_query to work from,
+    and skipping context there is a no-op, never a crash; likewise if
+    plan.json cannot be loaded at all. Deferred import of
+    engine.application.pipeline_tasks (never a module-level one): that
+    module already imports THIS one (handed_off_requests_for_task,
+    handoff_note_text), so a module-level import the other way would
+    be a real cycle."""
+    if not full_job:
+        return task
+    from engine.application.pipeline_tasks import build_task_gate
+    from engine.domain.plan import PlanError, load_plan
+    try:
+        plan = load_plan(config.projects[project].repo, job_name)
+    except PlanError:
+        return task
+    return build_task_gate(config, ledger, project, plan, task).prompt(task)
+
+
 def compose_fix_task(target: FixTarget, extra: str, also_own: tuple[str, ...] = ()) -> str:
     """"Continue this task. Original request: ... [Review findings to
     address: ...] [Failing test output: ...] [Paths the owner added to
@@ -358,280 +514,28 @@ def compose_fix_task(target: FixTarget, extra: str, also_own: tuple[str, ...] = 
     return "\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------
-# --also-own: the owner widening one task's own write prefixes after a
-# fix finds work the builder is not allowed to touch (실제 사고,
-# sample-app 결함 26,: task T2 removed a field it owned, but
-# the only consumer of that field (src/lib/production/copy.ts) was in
-# NO task's `owns`, so a fix's builder could never actually land the
-# matching change there -- merge's own per-task narrowing
-# (engine.application.steps.merge._owner_prefixes) silently drops a
-# write outside `owns` rather than failing loudly, so the SAME review
-# finding kept coming back on every `gb2 fix`. plan.json itself stays
-# frozen evidence (never edited, same reasoning this module's own
-# module docstring gives for never re-deriving find_fix_target's result
-# from a tampered plan) -- the owner's grant is recorded as its own
-# ledger event instead, which engine.application.repair._fix_spec folds
-# into the REPLACEMENT attempt's run_station/merge "owns" (plan.json's
-# own owns, plus every such event's paths, for this one task only).
-# ---------------------------------------------------------------------
-
-OWNS_EXTENDED_KIND = "task.owns_extended"
-
-# The `requests` entry kind OWNS_SCOPE_REQUEST_RULE tells a builder to
-# use when it needs a path outside its own `owns` (결함 26's own
-# mechanism). It is NEVER a kind owner_approval.PENDING_KIND_WHITELIST
-# accepts (that whitelist is for install/scripts_change/
-# test_config_change, each shaped {"manifest", "change"} -- an "edit"
-# request is shaped {"path", "reason"} and is never submitted to any
-# processor at all), so it can only ever be resolved the way
-# add_also_own above already resolves it: the owner grants the path via
-# --also-own, recorded as this same OWNS_EXTENDED_KIND event. 결함 28
-# (sample-app T4, is exactly a pending "edit" request that
-# find_fix_target can never see (the attempt never failed -- it is
-# still `active`, simply stopped at job_state.STAGE_TASK_OWNER): see
-# engine.application.repair.approve_pending_edit and
-# engine.application.job_state's own "edit" branch in _request_fulfilled.
-EDIT_REQUEST_KIND = "edit"
-
-
-def is_owns_scope_request(request: dict[str, object]) -> bool:
-    """True iff `request` reports a path outside a task's own `owns` the
-    OWNS_SCOPE_REQUEST_RULE way -- a `kind="edit"` request, or (결함 31,
-    sample-app T4, a request of ANY kind this engine does not
-    otherwise recognize (owner_approval.PENDING_KIND_WHITELIST never
-    lists it) that still carries a non-empty string "path". A kind the
-    whitelist DOES list (install/scripts_change/test_config_change) is
-    never treated as an owns-scope report even if it happens to carry a
-    "path" key -- it keeps going through its own processor exactly as
-    before. engine.application.job_state._request_fulfilled and
-    repair_approval.approve_pending_edit both match on this instead of
-    the bare `kind == EDIT_REQUEST_KIND` check they used before 결함 31,
-    so a builder's own invented kind for the same report is approvable
-    the same way. engine.application.pipeline_tasks's own request_filter
-    (owning_later_task below) uses it too, to decide whether such a
-    report can be handed to a later task instead of stopping the job at
-    all."""
-    path = request.get("path")
-    if not isinstance(path, str) or not path:
-        return False
-    kind = request.get("kind")
-    if kind == EDIT_REQUEST_KIND:
-        return True
-    return kind not in PENDING_KIND_WHITELIST
-
-
-# 결함 31 (sample-app T4,: a build task's own owns-scope report
-# (is_owns_scope_request above) names a path that may already be listed
-# in a LATER task's own `owns` -- the plan already intends that later
-# task to touch it, so stopping the current task for the owner (the
-# classic 결함 26/28 path) would be asking the owner to approve
-# something the plan already settled. HANDOFF_KIND records that this
-# engine noticed and routed the report there instead; the later task's
-# own builder instructions get a note (handoff_note below) rather than
-# the owner ever seeing it, UNLESS no later task's `owns` covers the
-# path -- then it is left in `requests` exactly as an "edit" request
-# always was (is_owns_scope_request's own fallback keeps it approvable
-# via --also-own either way, per 결함 31's own extension of 결함 28's
-# fix).
-HANDOFF_KIND = "task.request_handed_to_task"
-
-HANDOFF_NOTE_PREFIX = "[앞 작업이 남긴 이 파일 관련 메모]"
-
-
-def owning_later_task(plan: "Plan", later_task_ids: tuple[str, ...], path: str) -> str | None:
-    """The id of the first task in `plan.tasks` whose id is in
-    `later_task_ids` and whose own `owns` already covers `path` -- None
-    if none does. `later_task_ids` is the caller's own remaining-tasks
-    list with the CURRENT task's id already dropped (run_tasks' own
-    `remaining_task_ids[1:]`) -- a task cannot hand a report to itself,
-    and an already-finished task's `owns` is no longer anyone's to
-    route to."""
-    for task in plan.tasks:
-        if task.id in later_task_ids and owns_within_prefixes((path,), task.owns):
-            return task.id
-    return None
-
-
-def record_request_handoff(ledger: "Ledger", project: str, job_name: str, attempt_id: str,
-                           from_task_id: str, to_task_id: str, request: dict[str, object]) -> None:
-    """Appends the one event recording that `request` (an owns-scope
-    report from `from_task_id`'s own attempt) was routed to `to_task_id`
-    instead of stopping the job for the owner -- the ledger's own
-    permanent record of the handoff (never just the note text folded
-    into `to_task_id`'s builder instructions, which a later resume
-    cannot read back out of a prompt string)."""
-    ledger.append(Event(
-        project=project, kind=HANDOFF_KIND, actor_kind="engine", actor_id="engine",
-        attempt_id=attempt_id,
-        payload={
-            "job_name": job_name, "from_task_id": from_task_id, "to_task_id": to_task_id,
-            "path": request.get("path"), "reason": request.get("reason"),
-            "kind": request.get("kind"),
-        },
-    ))
-
-
-def handoff_note_text(requests: list[dict[str, object]]) -> str:
-    """One `HANDOFF_NOTE_PREFIX` line per handed-off request, each
-    naming the path and the reason the earlier task gave -- appended to
-    a later task's own builder instructions (engine.application.
-    pipeline_tasks.run_tasks) so the builder knows why, without the
-    owner ever having to approve anything for it."""
-    lines = [
-        f"{HANDOFF_NOTE_PREFIX} {request.get('path')}: {request.get('reason')}"
-        for request in requests
-    ]
-    return "\n".join(lines)
-
-
-# Paths reserved for the engine's own bookkeeping records (every
-# station's own record under .gongbang/<job>/ -- facts.md, plan.json,
-# report.md, design/, screens/) and tests/scenes/ (reserved for the
-# planner alone, engine.application.steps.merge._PLANNER_ONLY_PREFIX) --
-# an owner's --also-own grant can never widen a task into either, the
-# same config-independent floor merge.py itself enforces for a worker's
-# own writes.
-ENGINE_RECORD_PREFIXES = (".gongbang/", "tests/scenes/")
-
-
-def _is_engine_record_path(rel: str) -> bool:
-    normalized = rel.rstrip("/")
-    for prefix in ENGINE_RECORD_PREFIXES:
-        base = prefix.rstrip("/")
-        if normalized == base or normalized.startswith(prefix):
-            return True
-    return False
-
-
-def _also_own_syntax_violation(raw: str) -> str | None:
-    """None iff `raw` is a plain repo-relative path with no escape --
-    never an absolute path, a ".." component, or any hidden (dot-
-    prefixed) path component (which would also always land under
-    .gongbang/ or some other dotfile no station record table lists by
-    name). Checked before _is_engine_record_path/the other-task-owns
-    check in validate_also_own, so a syntactically unsafe path is
-    always refused for this reason regardless of what else is true
-    about it."""
-    if not raw:
-        return "also_own_empty_path"
-    if raw.startswith("/") or Path(raw).is_absolute():
-        return "also_own_absolute"
-    parts = Path(raw).parts
-    if any(part == ".." for part in parts):
-        return "also_own_parent_reference"
-    if any(part.startswith(".") for part in parts):
-        return "also_own_hidden_component"
-    return None
-
-
-def _owns_overlap(a: str, b: str) -> bool:
-    """True iff `a` and `b` are the same path or one is a sub-path of
-    the other, under the same trailing-slash directory-vs-exact-file
-    convention engine.domain.policy.owns_within_prefixes already uses
-    for a station's own write prefixes -- reused here (never
-    reimplementing path normalization) to decide whether a new
-    --also-own grant collides with ANOTHER task's own `owns`."""
-    return owns_within_prefixes((a,), (b,)) or owns_within_prefixes((b,), (a,))
-
-
-def _other_tasks_owns(ledger: "Ledger", project: str, job_name: str, plan: "Plan",
-                      task_id: str, active_task_ids: "tuple[str, ...] | None" = None,
-                      ) -> tuple[str, ...]:
-    """Every OTHER task's own write prefixes for this job: plan.json's
-    own `owns` for every task but `task_id`, plus any EARLIER
-    --also-own grant recorded for a different task of the same job --
-    the full set a new grant must never collide with."""
-    # When the caller knows which tasks have NOT run yet (`active_task_ids`),
-    # only those still own their paths: a finished task's file may be
-    # touched by a later task with the owner's grant (결함 34, sample-app T4
-    # needing one export line in T11's ai-input.ts).
-    owns: list[str] = [entry for task in plan.tasks if task.id != task_id
-                       and (active_task_ids is None or task.id in active_task_ids)
-                       for entry in task.owns]
-    # The same release applies to a finished task's EXTRA --also-own grants
-    # (결함 38, sample-app T7 needing a test file T5 had been granted).
-    for _seq, event in ledger.events(project, OWNS_EXTENDED_KIND):
-        granted_to = event.payload.get("task_id")
-        if active_task_ids is not None and granted_to not in active_task_ids:
-            continue
-        if (event.payload.get("job_name") == job_name
-                and granted_to not in (None, task_id)):
-            raw = event.payload.get("paths")
-            if isinstance(raw, list):
-                owns.extend(str(p) for p in raw)
-    return tuple(owns)
-
-
-def validate_also_own(ledger: "Ledger", project: str, job_name: str, plan: "Plan",
-                      task_id: str, paths: tuple[str, ...],
-                      active_task_ids: "tuple[str, ...] | None" = None, *,
-                      station_prefixes: "tuple[str, ...] | None" = None) -> tuple[str, ...]:
-    """`paths`, unchanged, iff every one of them is acceptable --
-    (also refuses, when `station_prefixes` is given, a path outside the
-    build station's own write prefixes -- 결함 39: such a grant was
-    recorded and the run then died instantly on
-    owns_escapes_station_prefixes) --
-    raises FixupError on the FIRST one that is not (nothing recorded
-    either way; the caller only ever records once every path has
-    passed). Refuses:
-      - a syntactically unsafe path (_also_own_syntax_violation: an
-        absolute path, a ".." component, or a hidden path component);
-      - an engine record path (.gongbang/, tests/scenes/);
-      - a path that overlaps some OTHER task's own owns (plan.json's,
-        or an earlier --also-own grant for a different task)."""
-    other_owns = _other_tasks_owns(ledger, project, job_name, plan, task_id, active_task_ids)
-    for raw in paths:
-        reason = _also_own_syntax_violation(raw)
-        if reason is not None:
-            raise FixupError(f"{reason}:{raw}")
-        if _is_engine_record_path(raw):
-            raise FixupError(f"also_own_engine_record:{raw}")
-        if station_prefixes is not None and not owns_within_prefixes((raw,), station_prefixes):
-            raise FixupError(f"also_own_outside_station_prefixes:{raw}")
-        if any(_owns_overlap(raw, other) for other in other_owns):
-            raise FixupError(f"also_own_owned_by_other_task:{raw}")
-    return tuple(paths)
-
-
-def extended_owns_for_task(ledger: "Ledger", project: str, job_name: str,
-                           task_id: str) -> tuple[str, ...]:
-    """Every path ever granted to `task_id` of `job_name` by a past
-    --also-own call, oldest first, deduplicated -- empty if none ever
-    was. Read back by engine.application.repair._fix_spec (folded into
-    the replacement attempt's own run_station/merge "owns") and by
-    compose_fix_task's own `also_own` text."""
-    paths: list[str] = []
-    for _seq, event in ledger.events(project, OWNS_EXTENDED_KIND):
-        if event.payload.get("job_name") == job_name and event.payload.get("task_id") == task_id:
-            raw = event.payload.get("paths")
-            if isinstance(raw, list):
-                paths.extend(str(p) for p in raw)
-    seen: set[str] = set()
-    out: list[str] = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return tuple(out)
-
-
-def record_owns_extension(ledger: "Ledger", project: str, job_name: str, task_id: str,
-                          attempt_id: str, paths: tuple[str, ...]) -> None:
-    """Appends the one event that grants `paths` to `task_id` of
-    `job_name`, forever -- plan.json itself is never touched (frozen
-    evidence)."""
-    ledger.append(Event(
-        project=project, kind=OWNS_EXTENDED_KIND, actor_kind="owner", actor_id="owner",
-        attempt_id=attempt_id, payload={"job_name": job_name, "task_id": task_id,
-                                         "paths": list(paths)},
-    ))
-
+# Re-exported from repair_target_owns (split out to keep this module
+# under the 800-line architecture cap -- see that module's own
+# docstring). Imported here at the BOTTOM, after FixupError already
+# exists on this module's own namespace: repair_target_owns.
+# validate_also_own imports FixupError from here lazily, inside its own
+# function body, for exactly the same reason -- see its own comment.
+from engine.application.repair_target_owns import (  # noqa: E402
+    DECLINED_KIND, EDIT_REQUEST_KIND, ENGINE_RECORD_PREFIXES, HANDOFF_KIND,
+    HANDOFF_NOTE_PREFIX, OWNS_EXTENDED_KIND, declined_for_attempt, extended_owns_for_task,
+    handed_off_requests_for_task, handoff_note_text, is_owns_scope_request, owning_later_task,
+    record_owns_extension, record_request_declined, record_request_handoff, request_declined,
+    validate_also_own,
+)
 
 __all__ = [
+    "DECLINED_KIND", "record_request_declined", "request_declined", "declined_for_attempt",
     "FixupError", "FixTarget", "find_fix_target", "compose_fix_task", "requests_for_attempt",
     "ARCHIVE_MARKER_FILES", "OWNS_EXTENDED_KIND", "EDIT_REQUEST_KIND", "ENGINE_RECORD_PREFIXES",
     "validate_also_own", "extended_owns_for_task", "record_owns_extension",
     "is_owns_scope_request", "owning_later_task", "record_request_handoff", "handoff_note_text",
-    "HANDOFF_KIND", "HANDOFF_NOTE_PREFIX",
+    "handed_off_requests_for_task", "inject_context_into_fix_task",
+    "HANDOFF_KIND", "HANDOFF_NOTE_PREFIX", "fix_rounds_used",
+    "review_findings_for_attempt", "previous_review_findings", "findings_key",
+    "review_findings_repeat", "job_cost_usd",
 ]

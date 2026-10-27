@@ -391,3 +391,67 @@ def test_fingerprint_handles_a_quote_leading_filename(tmp_path: Path) -> None:
     batched = fingerprint(repo)
     reference = _old_range_tree(repo)
     assert batched == reference
+
+
+# ---- a review finding: fingerprint covers file_dep_targets content -
+
+def test_fingerprint_unaffected_by_file_dep_targets_when_omitted(repo: Path) -> None:
+    """Zero regression: every existing caller passes no third argument at
+    all, so fingerprint() must still return exactly what it always did --
+    this is the whole reason the new capability is opt-in."""
+    assert fingerprint(repo) == fingerprint(repo, ())
+
+
+def test_fingerprint_changes_when_file_dep_target_content_changes(
+        tmp_path: Path, repo: Path) -> None:
+    """Reproduction (a review finding): a project depends on a package OUTSIDE
+    its own repo via `file:../_shared/kit` -- none of that package's
+    content is part of `repo`'s own git tree, so the plain tree
+    fingerprint never moves when it changes, even though the real code
+    a test run executes against did. fingerprint(repo, excludes,
+    file_dep_targets=...) must differ once the target's content
+    differs."""
+    kit = tmp_path / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+
+    before = fingerprint(repo, (), targets)
+    (kit / "index.js").write_text("module.exports = 2;\n", encoding="utf-8")
+    after = fingerprint(repo, (), targets)
+
+    assert before != after
+    # The repo's own tree hash alone is untouched by the kit edit --
+    # confirms the divergence comes from the file_dep content, not a
+    # side effect on repo itself.
+    assert fingerprint(repo) == fingerprint(repo)
+
+
+def test_fingerprint_with_file_dep_targets_differs_from_plain_tree_hash(
+        tmp_path: Path, repo: Path) -> None:
+    """The file-dep-aware fingerprint must never collide with the plain
+    tree hash (it is not a git ref -- export_tree()/commit-building
+    callers must keep using range_tree()/fingerprint(repo, excludes)
+    with no targets, never this combined form)."""
+    kit = tmp_path / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+
+    plain = fingerprint(repo)
+    combined = fingerprint(repo, (), targets)
+    assert combined != plain
+
+
+def test_fingerprint_file_dep_target_missing_is_stable_not_silently_equal(
+        tmp_path: Path, repo: Path) -> None:
+    """A target that does not exist (never resolved, or removed) must
+    still contribute a fixed, distinct value -- never silently collapse
+    to "no file deps at all" (which would make a dependency that
+    vanished indistinguishable from one that was never declared)."""
+    missing = tmp_path / "_shared" / "does-not-exist"
+    targets = (("../_shared/does-not-exist", str(missing)),)
+
+    with_missing = fingerprint(repo, (), targets)
+    without_targets = fingerprint(repo)
+    assert with_missing != without_targets

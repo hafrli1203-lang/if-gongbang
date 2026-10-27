@@ -562,6 +562,7 @@ def test_record_appends_app_security_recorded_event(
     assert events[0].payload == {
         "passed": result.passed, "findings": list(result.findings),
         "ran": list(result.ran), "fingerprint": result.fingerprint,
+        "evidence_fingerprint": result.evidence_fingerprint,
         "policy_hash": result.policy_hash,
     }
     assert seq > 0

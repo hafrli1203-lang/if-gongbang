@@ -251,6 +251,81 @@ def test_26_refuse_no_task_currently_being_fixed(workspace: Workspace) -> None:
         fixup.add_also_own(workspace.config, workspace.ledger, "alpha", ("src/x.py",))
 
 
+_T2_OWNED_PATH = "src/other/t2_build_owned.py"
+
+
+def test_26_a_finished_earlier_task_path_can_be_granted_to_the_task_being_fixed(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """a review finding: find_fix_target.add_also_own calls
+    validate_also_own with no active_task_ids at all, so a FINISHED
+    task's plan.json `owns` still blocks a later --also-own grant for
+    the SAME path -- unlike approve_pending_edit (결함 28's own entry
+    point), which already passes `pos.remaining_task_ids` and so
+    already releases a finished task's owns (결함 34/38).
+
+    Repro: t1 (owns _TASK_OWNED_PATH) finishes and commits normally;
+    t2's build then writes outside its own owns, into
+    _TASK_OWNED_PATH -- the exact path t1 already finished with. The
+    owner must still be able to --also-own it onto t2."""
+    ws = _tfo._full_orbit_workspace(workspace)
+    job_name = "also-own-finished-task-job"
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "첫 작업", "detail": "",
+         "owns": [_TASK_OWNED_PATH], "depends_on": []},
+        {"id": "t2", "title": "둘째 작업", "detail": "",
+         "owns": [_T2_OWNED_PATH], "depends_on": []},
+    ])
+    stub = _tfo._RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n"},  # t1: lands cleanly.
+            # t2's attempt 1: reaches outside its own owns into t1's
+            # already-finished path -- merge drops it, review flags it.
+            {_T2_OWNED_PATH: "VALUE_B = 1\n", _TASK_OWNED_PATH: "VALUE_A = 2  # t2 touch\n"},
+            # t2's fix attempt: same write, landable once widened.
+            {_T2_OWNED_PATH: "VALUE_B = 1\n", _TASK_OWNED_PATH: "VALUE_A = 2  # t2 touch\n"},
+        ],
+    })
+    review_steps, review_calls = _review_queue_steps([
+        (True, []),  # plan review
+        (True, []),  # t1's review
+        (False, [{"severity": "P1", "reason": f"{_TASK_OWNED_PATH} 도 함께 고쳐야 한다"}]),
+        (True, []),  # t2's fix review
+    ])
+    factory = _processor_factory_with_review(stub, review_steps)
+    _tfo._install_fake_acceptance_and_handoff(monkeypatch, [_tfo._FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "둘째 작업이 첫 파일도 고친다",
+        processor_factory=factory,
+    )
+
+    assert first.status == "failed", first
+    assert review_calls == [True, True, False]
+    assert (ws.alpha / _TASK_OWNED_PATH).read_text(encoding="utf-8") == "VALUE_A = 1\n"
+
+    # RED (before the fix): also_own_owned_by_other_task -- t1 is
+    # finished, its plan.json owns must no longer block t2's grant.
+    granted = fixup.add_also_own(ws.config, ws.ledger, "alpha", (_TASK_OWNED_PATH,))
+    assert granted == (_TASK_OWNED_PATH,)
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    result = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                       processor_factory=factory)
+    full_outcome = position.resume_after_fix(
+        ws.config, ws.ledger, fakes_for, "alpha", result, processor_factory=factory,
+    )
+
+    assert review_calls == [True, True, False, True]
+    assert result.outcome.status == "done", result.outcome
+    assert full_outcome is not None and full_outcome.status == "done", full_outcome
+    assert (ws.alpha / _TASK_OWNED_PATH).read_text(encoding="utf-8") == "VALUE_A = 2  # t2 touch\n"
+
+
 # ---- (c) the instructions/prompt carry the new sentences verbatim ----
 
 def test_26_compose_fix_task_lists_the_owner_added_paths() -> None:
@@ -301,11 +376,14 @@ _EDIT_PATH_NOT_REQUESTED = "src/other/not_requested.py"
 
 
 def _station_stub_with_requests(queues: dict[str, list[dict[str, str]]], target_station: str,
-                                reported: list[dict[str, object]]):
+                                reported: list[dict[str, object]], *, on_call: int = 1):
     """Like tests.unit.test_full_orbit._station_stub_with_one_owner_request,
-    but reports every dict in `reported` (not just one) on the FIRST
+    but reports every dict in `reported` (not just one) on the `on_call`-th
     call for `target_station` -- 결함 28's own scenario needs TWO
-    pending edit requests in the same stop, not one."""
+    pending edit requests in the same stop, not one. `on_call` (결함 46)
+    lets a caller put that stop on a LATER call to the same station --
+    e.g. the acceptance-fix round's own synthesized task, which is
+    always the second (or later) "build" call, never the first."""
     stub = _tfo._RunStationStub(queues)
     base_steps = stub.steps
     calls = {"n": 0}
@@ -315,7 +393,7 @@ def _station_stub_with_requests(queues: dict[str, list[dict[str, str]]], target_
         if station != target_station:
             return base_steps(ctx)
         calls["n"] += 1
-        if calls["n"] > 1:
+        if calls["n"] != on_call:
             return base_steps(ctx)
 
         def _run(ctx: StepContext) -> dict[str, object]:
@@ -459,6 +537,311 @@ def test_28_also_own_approves_both_pending_edit_requests_and_resumes_the_same_at
     pos = load_position(ws.ledger, "alpha", job_name)
     if pos is not None and pos.stage == STAGE_TASK_OWNER:
         assert outstanding_requests(ws.ledger, "alpha", pos) == ()
+
+
+def test_43_decline_resolves_an_edit_request_that_cannot_be_granted(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 43 (sample-app T8): a builder asked to delete an engine-record
+    file (never grantable with --also-own), so the request stayed outstanding
+    forever and every resume stopped again in 0.02 min. The owner can now
+    decline a pending edit request: recorded, no longer blocks, path not
+    granted."""
+    job_name = "edit-stop-decline-job"
+    ws, first, factory, _review_calls = _edit_requests_stop(workspace, job_name)
+    assert first.status == "needs_owner", first
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    with pytest.raises(fixup.FixupError, match=f"decline_not_requested:{_EDIT_PATH_NOT_REQUESTED}"):
+        fixup.approve_pending_edit(ws.config, ws.ledger, "alpha", (), fakes_for,
+                                   declined=(_EDIT_PATH_NOT_REQUESTED,))
+    pos = load_position(ws.ledger, "alpha", job_name)
+    assert len(outstanding_requests(ws.ledger, "alpha", pos)) == 2
+
+    _tfo._install_fake_acceptance_and_handoff(
+        monkeypatch, [_tfo._FakeAcceptanceResult(passed=True)],
+    )
+    outcome = fixup.approve_pending_edit(
+        ws.config, ws.ledger, "alpha", (_EDIT_PATH_A,), fakes_for,
+        declined=(_EDIT_PATH_B,), processor_factory=factory,
+    )
+    assert outcome.status == "done", outcome
+    assert (ws.alpha / _EDIT_PATH_A).read_text(encoding="utf-8") == "EDIT_A = 1\n"
+    assert not (ws.alpha / _EDIT_PATH_B).exists()  # declined: never granted
+    declined = [e.payload for _s, e in ws.ledger.events("alpha", "task.request_declined")]
+    assert [d.get("path") for d in declined] == [_EDIT_PATH_B]
+
+
+def test_45_decline_note_reaches_the_resumed_worker(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live appX #49: the owner declined a test-file edit and gave a
+    direction ("keep the single transaction"), but the resumed builder was
+    told only that its scope had been widened -- nothing about the refusal
+    or the owner's words, so it would ask for the same edit again."""
+    job_name = "edit-stop-decline-note-job"
+    ws, first, factory, _review_calls = _edit_requests_stop(workspace, job_name)
+    assert first.status == "needs_owner", first
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    _tfo._install_fake_acceptance_and_handoff(
+        monkeypatch, [_tfo._FakeAcceptanceResult(passed=True)],
+    )
+    note = "묶음 처리 유지: 기존 시험을 고치지 말고 범위 안에서 방법을 찾는다"
+    fixup.approve_pending_edit(
+        ws.config, ws.ledger, "alpha", (_EDIT_PATH_A,), fakes_for,
+        declined=(_EDIT_PATH_B,), decline_note=note, processor_factory=factory,
+    )
+    declined = [e.payload for _s, e in ws.ledger.events("alpha", "task.request_declined")]
+    assert declined[-1].get("note") == note
+    resumed = [str(e.payload) for _s, e in ws.ledger.events("alpha", "request.submitted")
+               if e.payload.get("kind") == "run_station"][-1]
+    assert _EDIT_PATH_B in resumed and "운영자 거절" in resumed
+    assert note in resumed
+
+
+def test_codex_p2_3_a_later_grant_for_the_same_path_drops_the_earlier_decline() -> None:
+    """a review finding: declined_for_attempt returns EVERY decline
+    ever recorded for this attempt, with no regard for whether the
+    owner later re-requested and GRANTED that same path (--also-own /
+    approve_pending_edit, task.owns_extended) after declining it.
+    Repro: same attempt declines path P, then later grants P -- the
+    resumed worker's own task text must carry ONLY the grant ("직접
+    고친다"), never also the stale decline ("고치지 않는다") for the
+    SAME path, which rerun_task_owner_stop's own
+    declined_followup_note(declined) + edit_approved_followup_task_text
+    would otherwise fold in side by side."""
+    from types import SimpleNamespace
+    from engine.application.repair_target import (
+        DECLINED_KIND, OWNS_EXTENDED_KIND, declined_for_attempt,
+    )
+
+    events: list[tuple[str, dict[str, object]]] = [
+        (DECLINED_KIND, {"job_name": "j", "task_id": "t1", "path": "a.ts", "note": "n1"}),
+        (DECLINED_KIND, {"job_name": "j", "task_id": "t1", "path": "b.ts", "note": "n2"}),
+        # The owner changes their mind about a.ts and grants it after all.
+        (OWNS_EXTENDED_KIND, {"job_name": "j", "task_id": "t1", "paths": ["a.ts"]}),
+    ]
+
+    class _Ledger:
+        def events(self, project, kind):
+            return [(i, SimpleNamespace(payload=p, attempt_id="att-1"))
+                    for i, (k, p) in enumerate(events) if k == kind]
+
+    out = declined_for_attempt(_Ledger(), "p", "j", "t1", "att-1")
+    # a.ts was later granted -- no longer reported as declined.
+    assert ("a.ts", "n1") not in out
+    # b.ts was never granted -- still reported.
+    assert ("b.ts", "n2") in out
+
+
+# ---- 결함 46 (appX live #4,: approve_pending_edit's own
+# "does this task still exist in plan.json" check compared `t.id ==
+# pos.task_id` against plan.tasks directly -- for an edit request
+# raised during an ACCEPTANCE-FIX round (pos.fixing=True), pos.task_id
+# is the fix round's own synthesized id ("fix-1", pipeline_tasks.py's
+# own fix_task), which is NEVER one of plan.tasks's real ids (exactly
+# like pipeline_resume_tasks.task_for's own fixing branch never looks
+# it up there either) -- so every such approval/decline raised
+# "no_task_being_fixed" forever: the owner's `--decline` for appX's
+# own tests/reference-kind.test.ts could not even be submitted. ------
+
+def _fix_round_edit_requests_stop(workspace: Workspace, job_name: str,
+                                  monkeypatch: pytest.MonkeyPatch):
+    """Like `_edit_requests_stop`, but the stop happens on the
+    ACCEPTANCE-FIX round's own synthesized task (`fixing=True`, task id
+    `"fix-1"`), not the plan's original task: the first attempt
+    finishes and FAILS acceptance, and the fix round itself is the one
+    that reports the two pending edit requests."""
+    ws = _tfo._full_orbit_workspace(workspace)
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "필드 정리", "detail": "",
+         "owns": [_TASK_OWNED_PATH], "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [
+            # Attempt 1: the original task t1, finishes cleanly.
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n"},
+            # Attempt 2: the fix round's own synthesized task -- the
+            # owned file again, plus the two out-of-owns edit paths it
+            # reports instead of writing outright.
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n", _EDIT_PATH_A: "EDIT_A = 1\n",
+             _EDIT_PATH_B: "EDIT_B = 1\n"},
+        ],
+    }
+    edit_requests = [
+        {"kind": EDIT_REQUEST_KIND, "path": _EDIT_PATH_A, "reason": "copy.ts 도 고쳐야 한다"},
+        {"kind": EDIT_REQUEST_KIND, "path": _EDIT_PATH_B, "reason": "readout.ts 도 고쳐야 한다"},
+    ]
+    stub, steps_fn = _station_stub_with_requests(queues, "build", edit_requests, on_call=2)
+    # Three "review" requests: plan review, task t1's own build review
+    # (the first attempt, before acceptance ever runs), and the fix
+    # round's own build review (after the owner's approval resumes it).
+    review_steps, review_calls = _review_queue_steps([(True, []), (True, []), (True, [])])
+
+    def factory(config, ledger, fakes):
+        proc = _tfo.Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", review_steps)
+        return proc
+
+    _tfo._install_fake_acceptance_and_handoff(monkeypatch, [
+        _tfo._FakeAcceptanceResult(passed=False, scenes=(_tfo._FakeSceneResult("s1", False),)),
+        _tfo._FakeAcceptanceResult(passed=True),
+    ])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "owns 밖 결과 반영 확인",
+        processor_factory=factory,
+    )
+    return ws, first, factory, review_calls
+
+
+def test_46_edit_request_stop_during_a_fix_round_records_two_pending_requests(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_name = "fix-round-edit-stop-job"
+    ws, first, _factory, _review_calls = _fix_round_edit_requests_stop(
+        workspace, job_name, monkeypatch)
+
+    assert first.status == "needs_owner", first
+    pos = load_position(ws.ledger, "alpha", job_name)
+    assert pos is not None and pos.stage == STAGE_TASK_OWNER and pos.fixing is True
+    assert pos.task_id == "fix-1"
+    kinds_paths = {(r.get("kind"), r.get("path")) for r in pos.pending_requests}
+    assert kinds_paths == {
+        (EDIT_REQUEST_KIND, _EDIT_PATH_A), (EDIT_REQUEST_KIND, _EDIT_PATH_B),
+    }
+    # Before the fix: this raised FixupError("no_task_being_fixed")
+    # instead -- the fix round's own task id is never in plan.tasks.
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    with pytest.raises(fixup.FixupError, match="also_own_not_requested"):
+        fixup.approve_pending_edit(ws.config, ws.ledger, "alpha",
+                                   (_EDIT_PATH_NOT_REQUESTED,), fakes_for)
+
+
+def test_46_owner_can_approve_and_decline_an_edit_request_raised_during_a_fix_round(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual appX incident: the owner approved nothing and
+    declined one path with a direction note -- reproduced here with one
+    approval and one decline (test_43/45's own shape), so both the
+    grant path and the decline path are both proven live on a FIX round
+    task, not just the original task."""
+    job_name = "fix-round-edit-stop-approve-job"
+    ws, first, factory, _review_calls = _fix_round_edit_requests_stop(
+        workspace, job_name, monkeypatch)
+    assert first.status == "needs_owner", first
+    stopped_attempt_id = first.attempt_id
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    note = "묶음 처리 유지: 범위 안에서 방법을 찾는다"
+    outcome = fixup.approve_pending_edit(
+        ws.config, ws.ledger, "alpha", (_EDIT_PATH_A,), fakes_for,
+        declined=(_EDIT_PATH_B,), decline_note=note, processor_factory=factory,
+    )
+
+    assert outcome.status == "done", outcome
+    assert outcome.attempt_id == stopped_attempt_id
+    assert (ws.alpha / _EDIT_PATH_A).read_text(encoding="utf-8") == "EDIT_A = 1\n"
+    assert not (ws.alpha / _EDIT_PATH_B).exists()  # declined: never granted
+    declined = [e.payload for _s, e in ws.ledger.events("alpha", "task.request_declined")]
+    assert [d.get("path") for d in declined] == [_EDIT_PATH_B]
+    assert declined[-1].get("note") == note
+
+
+# ---- a review finding, a past incident's own additional scope):
+# run_acceptance_and_handoff's own in-memory `rounds` started at 0 on
+# EVERY call -- including advance_past_task's own resume after a fix
+# round's task attempt itself stopped needs_owner mid-round (exactly
+# test_46's own scenario above) and was resumed. A job that had
+# already spent max_fix_rounds got max_fix_rounds MORE every time it
+# was resumed, with no --past-cap ever asked for. ----------------------
+
+def test_codex_p1_acceptance_fix_round_cap_persists_across_a_resume(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """max_fix_rounds=1: round 1 ("fix-1") stops on two pending edit
+    requests, is approved and finishes -- 1 round now spent. Acceptance
+    still fails; the bug re-entered the loop with `rounds` reset to 0
+    (0 < max_fix_rounds(1) again) and opened ANOTHER round (even
+    colliding on the same "fix-1" id); fixed, no second round opens at
+    all (1 round already spent >= cap 1) and the job ends "failed"/
+    "max_fix_rounds_exceeded" instead of spending a round past the cap
+    with no owner override."""
+    job_name = "p1-acceptance-cap-resume-job"
+    ws = _tfo._full_orbit_workspace(workspace)
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "필드 정리", "detail": "",
+         "owns": [_TASK_OWNED_PATH], "depends_on": []},
+    ])
+    queues = {
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n"},  # attempt 1: original task t1
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n", _EDIT_PATH_A: "EDIT_A = 1\n",
+             _EDIT_PATH_B: "EDIT_B = 1\n"},  # attempt 2: fix round 1 ("fix-1")
+            # If the bug survives, a THIRD build call happens here (a
+            # second round opened past the cap) -- never consumed once
+            # the cap actually holds.
+            {_TASK_OWNED_PATH: "VALUE_A = 1\n"},
+        ],
+    }
+    edit_requests = [
+        {"kind": EDIT_REQUEST_KIND, "path": _EDIT_PATH_A, "reason": "copy.ts 도 고쳐야 한다"},
+        {"kind": EDIT_REQUEST_KIND, "path": _EDIT_PATH_B, "reason": "readout.ts 도 고쳐야 한다"},
+    ]
+    stub, steps_fn = _station_stub_with_requests(queues, "build", edit_requests, on_call=2)
+    review_steps, review_calls = _review_queue_steps([(True, []), (True, []), (True, [])])
+
+    def factory(config, ledger, fakes):
+        proc = _tfo.Processor(config, ledger, fakes)
+        proc.register_defaults()
+        proc.register("run_station", steps_fn)
+        proc.register("review", review_steps)
+        return proc
+
+    _tfo._install_fake_acceptance_and_handoff(monkeypatch, [
+        _tfo._FakeAcceptanceResult(passed=False, scenes=(_tfo._FakeSceneResult("s1", False),)),
+        _tfo._FakeAcceptanceResult(passed=False, scenes=(_tfo._FakeSceneResult("s1", False),)),
+    ])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "owns 밖 결과 반영 확인",
+        max_fix_rounds=1, processor_factory=factory,
+    )
+    assert first.status == "needs_owner", first
+    pos = load_position(ws.ledger, "alpha", job_name)
+    assert pos is not None and pos.stage == STAGE_TASK_OWNER and pos.fixing is True
+    assert pos.task_id == "fix-1"
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    build_calls_before = len([c for c in stub.calls if c[0] == "build"])
+    outcome = fixup.approve_pending_edit(
+        ws.config, ws.ledger, "alpha", (_EDIT_PATH_A, _EDIT_PATH_B), fakes_for,
+        processor_factory=factory,
+    )
+
+    assert outcome.status == "failed", outcome
+    assert outcome.reason == "max_fix_rounds_exceeded", outcome
+    # Exactly one MORE build call happened to finish fix round 1 --
+    # never a third one (a second round opened past the cap).
+    build_calls_after = len([c for c in stub.calls if c[0] == "build"])
+    assert build_calls_after - build_calls_before == 1
 
 
 # ---- 결함 31 (sample-app T4,: after 결함 28's --also-own
@@ -824,11 +1207,19 @@ def test_40_fix_path_hands_later_task_paths_off() -> None:
     """Defect 40 (sample-app T7): on the `gb2 fix` path an edit request for a
     path a LATER task owns stopped the job for the owner (and --also-own then
     refused it as another task's path) -- the handoff filter (defect 31) was
-    only wired into the first run and plain resume, never the fix path."""
+    only wired into the first run and plain resume, never the fix path.
+
+    The fix now runs through the one shared task_stage_runner.run_task_stages
+    (defect 33b/40's shared root cause -- see flow-map.md "같은 일을 하는
+    입구가 여럿인 곳"), which builds the handoff filter itself from the
+    HandoffContext repair.fix passes it: still every build-task attempt
+    (first run, resume, and fix alike) goes through the SAME filter-building
+    code, just no longer duplicated at each call site."""
     import inspect
     from engine.application import repair
     source = inspect.getsource(repair.fix)
-    assert "request_filter=_fix_request_filter(" in source
+    assert "handoff=_fix_handoff(" in source
+    assert "run_task_stages(" in source
 
 
 def test_37_carried_archive_never_crosses_a_committed_attempt(tmp_path) -> None:
@@ -860,8 +1251,284 @@ def test_37_carried_archive_never_crosses_a_committed_attempt(tmp_path) -> None:
 
 
 def test_35_worker_sandbox_maps_file_deps_for_copy_and_repo() -> None:
-    """The worker sandbox must call the two-root mapping (defect 35)."""
+    """The worker sandbox must call the two-root mapping (defect 35),
+    through the one shared, mount-safe helper (defect 42, --
+    see tests/acceptance/test_t13_file_dep_real_sandbox.py for the real
+    bwrap reproduction this helper's own mkdir-precreate fixes)."""
     import inspect
     from engine.application.steps import worker_sandbox
     source = inspect.getsource(worker_sandbox)
-    assert "remap_pairs_for_roots(\n        (spec.copy_root, repo)" in source
+    assert "file_deps.sandbox_file_dep_pairs(\n        spec.copy_root, repo" in source
+
+
+# ---- 결함 41, plans/-gongbang-entry-unify.md §B):
+# `gb2 fix` had no round cap -- a job could cycle failed-review ->
+# fix() -> failed-review forever (appX T7 재시도 5바퀴 이상, real
+# incident). engine.application.repair_target.fix_rounds_used counts
+# how many of this job's earlier attempts, since its last commit,
+# closed on a failed review/bench -- engine.application.repair.fix
+# refuses (FixupError, NOTHING recorded) once that count reaches
+# JobPosition.max_fix_rounds (default 2), unless the owner passes
+# `past_cap=True` (tools/gb2lib.runner.cmd_fix's own `--past-cap`),
+# which allows exactly one more round and records "fix.past_cap". ----
+
+_ROUNDS_OWNED_PATH = "src/greeter/rounds_owns.py"
+
+
+def test_41_fix_rounds_used_counts_only_failed_review_bench_attempts_since_commit() -> None:
+    from types import SimpleNamespace
+    from engine.application import repair_target as rt
+
+    # Three earlier attempts of the same job, newest first (as
+    # attempts_for_job_name itself returns, per that method's own
+    # contract -- _earlier_attempts_since_last_commit reverses it):
+    # #1 failed at review (counts), #2's own commit request is "done"
+    # (the walk stops there, same 결함 37 boundary fix_rounds_used
+    # reuses), #3 (older than the commit) must never be reached.
+    attempts = [
+        SimpleNamespace(attempt_id="#1"),
+        SimpleNamespace(attempt_id="#2"),
+        SimpleNamespace(attempt_id="#3"),
+    ]
+    requests_by_attempt = {
+        "#1": [SimpleNamespace(kind="review", status="failed")],
+        "#2": [SimpleNamespace(kind="commit", status="done")],
+        "#3": [SimpleNamespace(kind="review", status="failed")],
+    }
+
+    class _Ledger:
+        def attempts_for_job_name(self, project, job_name):
+            return list(reversed(attempts))
+
+    orig = rt.requests_for_attempt
+    rt.requests_for_attempt = lambda ledger, project, a: requests_by_attempt[a]
+    try:
+        assert rt.fix_rounds_used(_Ledger(), "p", "j", "#current") == 1
+    finally:
+        rt.requests_for_attempt = orig
+
+
+def test_41_fix_refuses_with_nothing_recorded_once_rounds_are_exhausted(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _tfo._full_orbit_workspace(workspace)
+    job_name = "rounds-cap-job"
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "값 바꾸기", "detail": "",
+         "owns": [_ROUNDS_OWNED_PATH], "depends_on": []},
+    ])
+    stub = _tfo._RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {_ROUNDS_OWNED_PATH: "VALUE = 1\n"},  # attempt 1 (first run)
+            {_ROUNDS_OWNED_PATH: "VALUE = 2\n"},  # attempt 2 (fix round 1)
+            {_ROUNDS_OWNED_PATH: "VALUE = 3\n"},  # attempt 3 (fix round 2)
+        ],
+    })
+    # Every review fails -- this job never passes on its own; only the
+    # round-cap refusal (never a real fix) ends this test.
+    # Three DIFFERENT findings (never the SAME file+severity+note twice
+    # in a row) -- this test is about the round-COUNT cap, not a past incident's
+    # own no_progress (repeated-finding) check, which has its own tests
+    # in tests/unit/test_full_orbit.py.
+    review_steps, review_calls = _review_queue_steps([
+        (True, []),   # plan review
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r1"}]),   # attempt 1
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r2"}]),   # fix round 1
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r3"}]),   # fix round 2
+    ])
+    factory = _processor_factory_with_review(stub, review_steps)
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "값 바꾸기",
+        processor_factory=factory,
+    )
+    assert first.status == "failed", first
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    # Round 1: 0 earlier failed-review attempts < max_fix_rounds(2) -- allowed.
+    round1 = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                       processor_factory=factory)
+    assert round1.outcome.status == "failed", round1.outcome
+
+    # Round 2: 1 earlier failed-review attempt < 2 -- still allowed.
+    round2 = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                       processor_factory=factory)
+    assert round2.outcome.status == "failed", round2.outcome
+
+    started_before = ws.ledger.events("alpha", "fix.started")
+    attempt_before = ws.ledger.project("alpha").current_attempt_id
+
+    # Round 3: 2 earlier failed-review attempts >= max_fix_rounds(2) --
+    # refused, with NOTHING recorded (no new "fix.started" event, no
+    # change to the project's current attempt).
+    with pytest.raises(fixup.FixupError, match="fix_rounds_exhausted:2"):
+        fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                 processor_factory=factory)
+
+    assert ws.ledger.events("alpha", "fix.started") == started_before
+    assert ws.ledger.project("alpha").current_attempt_id == attempt_before
+    assert review_calls == [True, False, False, False]
+
+
+def test_41_past_cap_allows_one_more_round_and_records_the_event(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _tfo._full_orbit_workspace(workspace)
+    job_name = "rounds-past-cap-job"
+    plan_json = _tfo._plan_json(tasks=[
+        {"id": "t1", "title": "값 바꾸기", "detail": "",
+         "owns": [_ROUNDS_OWNED_PATH], "depends_on": []},
+    ])
+    stub = _tfo._RunStationStub({
+        "facts": [{f".gongbang/{job_name}/facts.md": _FACTS_NO_TARGET}],
+        "plan": [_tfo._plan_queue_entry(job_name, plan_json)],
+        "build": [
+            {_ROUNDS_OWNED_PATH: "VALUE = 1\n"},  # attempt 1 (first run)
+            {_ROUNDS_OWNED_PATH: "VALUE = 2\n"},  # attempt 2 (fix round 1)
+            {_ROUNDS_OWNED_PATH: "VALUE = 3\n"},  # attempt 3 (fix round 2)
+            {_ROUNDS_OWNED_PATH: "VALUE = 4\n"},  # attempt 4 (--past-cap round)
+        ],
+    })
+    # Three DIFFERENT findings, same reasoning as the test above.
+    review_steps, review_calls = _review_queue_steps([
+        (True, []),
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r1"}]),
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r2"}]),
+        (False, [{"severity": "P1", "file": _ROUNDS_OWNED_PATH, "note": "r3"}]),
+        (True, []),  # the --past-cap round finally passes
+    ])
+    factory = _processor_factory_with_review(stub, review_steps)
+    _tfo._install_fake_acceptance_and_handoff(monkeypatch, [_tfo._FakeAcceptanceResult(passed=True)])
+
+    first = full_orbit.run_full_job(
+        ws.config, ws.ledger, _tfo._fakes(), "alpha", job_name, "값 바꾸기",
+        processor_factory=factory,
+    )
+    assert first.status == "failed", first
+
+    def fakes_for(_attempt_id: str):
+        return _tfo._fakes()
+
+    fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for, processor_factory=factory)
+    fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for, processor_factory=factory)
+
+    past_cap_events_before = ws.ledger.events("alpha", "fix.past_cap")
+
+    round3 = fixup.fix(ws.config, ws.ledger, "alpha", "", fakes_for,
+                       processor_factory=factory, past_cap=True)
+
+    assert round3.outcome.status == "done", round3.outcome
+    assert len(ws.ledger.events("alpha", "fix.past_cap")) == len(past_cap_events_before) + 1
+    assert review_calls == [True, False, False, False, True]
+
+
+# ---- 결함 42, plans/-gongbang-entry-unify.md §C):
+# a NEW plan whose build task owns src/ with no tests/ owns path of its
+# own reaches the build station with nowhere to put a test file -- the
+# repeated real incident (운영자가 테스트를 요구하면 작업 owns에 시험
+# 파일이 없어 작업자가 멈추고 권한 요청). engine.domain.plan_model.
+# validate_plan now refuses this for any caller with a real
+# build_prefixes (a NEW plan check); engine.domain.plan_review.
+# check_resumed_plan (an ALREADY-REVIEWED plan's resume check) calls
+# validate_plan with build_prefixes=None, so this rule never re-fires
+# on resume -- same None-skip gate the owns-subset check already uses.
+
+def test_42_src_owns_without_tests_owns_is_a_problem() -> None:
+    from engine.domain.plan_model import Plan, Task, validate_plan
+
+    plan = Plan(
+        goal="g", ui=False, scenes=(),
+        tasks=(Task(id="t1", title="x", detail="", owns=("src/a.py",), depends_on=()),),
+        acceptance=(), requirements=(),
+    )
+    problems = validate_plan(plan, workspace_repo_stub(), build_prefixes=("src/", "tests/"))
+    assert any("tests/" in p and "t1" in p for p in problems), problems
+
+
+def test_42_src_owns_with_a_tests_owns_path_passes(tmp_path) -> None:
+    from engine.domain.plan_model import Plan, Task, validate_plan
+
+    plan = Plan(
+        goal="g", ui=False, scenes=(),
+        tasks=(Task(id="t1", title="x", detail="",
+                    owns=("src/a.py", "tests/a_test.py"), depends_on=()),),
+        acceptance=(), requirements=(),
+    )
+    # (plan has no requirements, which validate_plan already flags
+    # separately via plan_requirements_missing -- irrelevant to this
+    # rule, so only this rule's own message is checked for absence.)
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/"))
+    assert not any("자기 시험 파일" in p for p in problems), problems
+
+
+def test_42_rule_is_skipped_when_build_prefixes_is_none_resumed_plan_path() -> None:
+    from engine.domain.plan_model import Plan, Task, validate_plan
+
+    plan = Plan(
+        goal="g", ui=False, scenes=(),
+        tasks=(Task(id="t1", title="x", detail="", owns=("src/a.py",), depends_on=()),),
+        acceptance=(), requirements=(),
+    )
+    # check_resumed_plan's own call shape (engine.domain.plan_review) --
+    # build_prefixes=None must never raise this rule's own problem,
+    # even though the SAME plan fails it above with real prefixes.
+    problems = validate_plan(plan, workspace_repo_stub(), build_prefixes=None)
+    assert not any("자기 시험 파일" in p for p in problems), problems
+
+
+def test_42_check_resumed_plan_never_raises_the_new_rule(tmp_path) -> None:
+    """check_resumed_plan (the actual resume-path caller) must stay
+    exactly as permissive about owns as it already is -- this rule is
+    wired into validate_plan's own build_prefixes-gated block, the same
+    one check_resumed_plan already calls with build_prefixes=None."""
+    import json
+    from engine.domain.plan_model import plan_path
+    from engine.domain.plan_review import check_resumed_plan
+
+    job = "job-42"
+    plan_json = {
+        "goal": "목표", "ui": False,
+        "requirements": [{"id": "r1", "text": "요구", "kind": "function"}],
+        "scenes": [{"id": "s1", "actor_does": "a", "app_shows": "b", "where": "/",
+                    "cmd": ["python3", "tests/scenes/s1.py"], "covers": ["r1"]}],
+        "tasks": [{"id": "t1", "title": "작업", "detail": "", "owns": ["src/only.py"],
+                   "depends_on": [], "covers": ["r1"]}],
+        "acceptance": ["끝"],
+    }
+    path = plan_path(tmp_path, job)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan_json, ensure_ascii=False), encoding="utf-8")
+    script = tmp_path / "tests" / "scenes" / "s1.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+
+    class _Ledger:
+        def events(self, project, kind):
+            return []
+
+    problems = check_resumed_plan(_Ledger(), "p", job, tmp_path)
+    assert not any("자기 시험 파일" in p for p in problems), problems
+    # "plan_never_reviewed" is expected (no plan.reviewed event) -- the
+    # point here is only that the new owns rule never adds to it.
+    assert problems == ["plan_never_reviewed"], problems
+
+
+def test_42_rule_sentence_appears_in_both_planner_and_small_prompts() -> None:
+    from engine.application.stage_prompts import planner_prompt, small_prompt
+    from engine.domain.plan_model import PLAN_TASK_TEST_OWNS_RULE
+
+    assert PLAN_TASK_TEST_OWNS_RULE in planner_prompt("요청", "job1", "facts")
+    assert PLAN_TASK_TEST_OWNS_RULE in small_prompt("요청", "job1")
+
+
+def workspace_repo_stub():
+    """A throwaway Path validate_plan's scene checks can `.exists()`/
+    `.is_symlink()` against safely -- this file's 결함 42 tests never
+    give `plan` any scenes, so nothing under it is ever actually read."""
+    import tempfile
+    from pathlib import Path
+    return Path(tempfile.mkdtemp())

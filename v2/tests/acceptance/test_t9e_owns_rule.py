@@ -129,7 +129,7 @@ def test_27_plan_whose_owns_follows_the_sentence_passes_for_the_same_project(
 ) -> None:
     ws = _narrowed(workspace)
     prefixes = build_prefixes(ws.config)
-    _write_plan(ws.alpha, _JOB, owns=["src/app.py"])
+    _write_plan(ws.alpha, _JOB, owns=["src/app.py", "tests/app_test.py"])
 
     plan = load_plan(ws.alpha, _JOB)
     assert validate_plan(plan, ws.alpha, prefixes) == []

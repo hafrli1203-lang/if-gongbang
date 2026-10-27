@@ -103,6 +103,17 @@ def _fmt_cost(cost_usd: float | None) -> str:
     return f"${cost_usd:.2f}"
 
 
+def _fmt_tokens(tokens_out: int | None) -> str:
+    # G16: no station.finished event has ever carried a tokens_out
+    # value (see engine.interface.board_data.JobBoard's own docstring) --
+    # "기록 없음" says so plainly rather than showing "0" or "-", which
+    # would both read as "this job used no/an unknown amount of
+    # tokens" instead of "this number was never recorded at all".
+    if tokens_out is None:
+        return "기록 없음"
+    return f"{tokens_out:,}"
+
+
 def _fmt_day(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -212,13 +223,17 @@ def _render_jobs_table(apps: list[AppBoard]) -> str:
             f'<td><span class="badge {badge_cls}">{_esc(job.status)}</span></td>'
             f"<td>{_esc(job.stage)}</td>"
             f"<td>{job.attempt_count}</td>"
+            f"<td>{job.ai_request_count}</td>"
+            f"<td>{job.fix_round_count}</td>"
             f"<td>{_esc(_fmt_duration(job.duration_sec))}</td>"
             f"<td>{_esc(_fmt_cost(job.cost_usd))}</td>"
+            f"<td>{_esc(_fmt_tokens(job.tokens_out))}</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr><th>앱</th><th>작업</th><th>상태</th><th>단계</th>"
-        "<th>시도</th><th>걸린 시간</th><th>비용</th></tr></thead>"
+        "<th>시도</th><th>요청</th><th>수정 회차</th><th>걸린 시간</th>"
+        "<th>비용</th><th>출력 토큰</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 

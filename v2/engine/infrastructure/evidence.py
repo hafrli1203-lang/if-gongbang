@@ -17,6 +17,29 @@ path's content is hashed into a temporary index and written as a tree.
 Any git failure, a symlink pointing outside the work tree, or a nested
 repository raises FingerprintError. Callers treat "no fingerprint" as
 "refuse" (never as pass).
+
+fingerprint()'s optional third argument, `file_dep_targets` (Codex
+P1-b,: a project may depend on a package OUTSIDE its own
+repo via a `file:../...` package.json dependency (engine.application.
+steps.file_deps -- ProjectConfig.file_dep_targets carries each such
+dependency's already-resolved (relspec, absolute target dir) pair).
+None of that target's content is part of `repo`'s own git tree, so the
+PLAIN tree hash never moves when it changes even though the real code
+a test run executes against did (reproduction: a kit's content edited
+between two evidence checks, the app's own fingerprint stays
+identical). Passing `file_dep_targets` folds a content hash of every
+such target directory into the returned value. This is **opt-in and
+additive only** -- every existing caller, passing no third argument
+(or `()`), gets back exactly the plain git tree hash, unchanged, same
+as before this was added; this is required, not incidental, since
+`range_tree()`'s own return value is still used to build a REAL git
+commit (engine.application.steps.commit) and compared directly against
+`git rev-parse HEAD^{tree}` (engine.application.steps.close) -- mixing
+in external content there would corrupt the former and make the
+latter's comparison permanently fail for any project with a file dep.
+The combined value, when targets are given, is therefore deliberately
+NOT a git tree hash at all (never pass it to `export_tree()` or any
+other git-ref-expecting call) -- see `_combine_with_file_deps`.
 """
 from __future__ import annotations
 
@@ -34,9 +57,84 @@ class FingerprintError(Exception):
     """Fingerprint could not be computed; treat as refusal."""
 
 
-def fingerprint(repo: Path, excludes: tuple[str, ...] = ()) -> str:
-    """Return a 40-char git tree hash for the commit-tree range of `repo`."""
-    return range_tree(Path(repo), excludes)
+def fingerprint(repo: Path, excludes: tuple[str, ...] = (),
+                 file_dep_targets: tuple[tuple[str, str], ...] = ()) -> str:
+    """Return a 40-char git tree hash for the commit-tree range of `repo`,
+    or -- only when `file_dep_targets` is non-empty -- a combined hash
+    that also covers those targets' own content (module docstring)."""
+    tree_hash = range_tree(Path(repo), excludes)
+    if not file_dep_targets:
+        return tree_hash
+    return _combine_with_file_deps(tree_hash, file_dep_targets)
+
+
+def with_file_deps(tree_fp: str, file_dep_targets: tuple[tuple[str, str], ...]) -> str:
+    """Fold `file_dep_targets`' own content into an ALREADY-COMPUTED tree
+    fingerprint (one `fingerprint(repo, excludes)` or `range_tree(repo,
+    excludes)` already returned, with no targets), exactly as `fingerprint
+    (repo, excludes, file_dep_targets)` would have from scratch -- for a
+    caller (engine.application.steps.review/suite_run/commit, wiring
+    a review finding's evidence-match fix) that already holds the plain tree
+    fingerprint for its OWN purposes (a live `tree_changed_during_*`
+    recheck, or the actual git commit/export -- both of which must stay
+    on the pure tree hash, never this combined one) and only needs a
+    SECOND, separate value to record/compare as evidence -- never pays
+    for walking the repo's own git tree a second time just to fold in
+    the file deps. `()` returns `tree_fp` unchanged, matching
+    fingerprint()'s own no-op case."""
+    if not file_dep_targets:
+        return tree_fp
+    return _combine_with_file_deps(tree_fp, file_dep_targets)
+
+
+def _combine_with_file_deps(
+        tree_hash: str, file_dep_targets: tuple[tuple[str, str], ...]) -> str:
+    """sha256 of `tree_hash` plus every (relspec, target) pair's own
+    content hash, sorted by relspec for a deterministic result
+    regardless of input order. Deliberately never equal to `tree_hash`
+    itself (even the empty-targets case is never routed here --
+    fingerprint() returns the plain tree_hash directly then), so a
+    caller can never mistake this for a real git tree hash."""
+    digest = hashlib.sha256(tree_hash.encode("ascii"))
+    for relspec, target in sorted(file_dep_targets, key=lambda pair: pair[0]):
+        digest.update(b"\0")
+        digest.update(relspec.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+        digest.update(_directory_content_hash(Path(target)).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _directory_content_hash(target: Path) -> str:
+    """sha256 over every regular file's (relative-posix-path, content)
+    found under `target`, sorted by path. A fixed sentinel digest
+    ("file_dep_target_missing", hashed like any other input rather than
+    returned bare) when `target` is not an existing directory -- a
+    dependency whose target vanished (or was never resolved, e.g. a
+    gb2-managed copy's own nesting mismatch -- engine.application.
+    steps.file_deps' own module docstring) must still contribute a
+    stable, DISTINCT value, never silently collapse to "same as no
+    file deps at all". Symlinks are skipped (never dereferenced here;
+    file_deps.validate_escaping_target already refuses a target whose
+    own immediate children are hidden/symlinked in ways that would
+    matter, and this hash only needs to be deterministic, not a
+    faithful full copy)."""
+    digest = hashlib.sha256()
+    if not target.is_dir():
+        digest.update(b"file_dep_target_missing")
+        return digest.hexdigest()
+    for dirpath, dirnames, filenames in os.walk(target):
+        dirnames.sort()
+        rel_dir = Path(dirpath).relative_to(target)
+        for name in sorted(filenames):
+            full = Path(dirpath) / name
+            if full.is_symlink() or not full.is_file():
+                continue
+            rel = (rel_dir / name).as_posix() if rel_dir != Path(".") else name
+            digest.update(rel.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            digest.update(sha256_file(full).encode("ascii"))
+            digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def range_tree(repo: Path, excludes: tuple[str, ...] = ()) -> str:

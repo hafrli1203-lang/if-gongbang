@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from dataclasses import replace
 
 from engine.evidence import fingerprint, record
 from engine.fakes.installer import FakeInstaller
@@ -71,6 +72,78 @@ def test_commit_fails_when_fingerprints_differ(workspace: Workspace) -> None:
 
     assert n == 0
     req = workspace.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "fingerprints_differ"}
+
+
+def _with_file_dep_targets(workspace: Workspace, targets: tuple[tuple[str, str], ...]) -> Workspace:
+    project = replace(workspace.config.projects["alpha"], file_dep_targets=targets)
+    config = replace(workspace.config, projects={**workspace.config.projects, "alpha": project})
+    return Workspace(workspace.root, config, workspace.ledger, workspace.alpha, workspace.beta)
+
+
+def test_commit_matches_evidence_recorded_with_file_dep_target_content(
+        workspace: Workspace, tmp_path) -> None:
+    """a review finding, the GREEN side: when review/bench record
+    their evidence bound to the file-dep-aware fingerprint (what
+    engine.application.steps.review/suite_run now do), and the repo AND
+    the kit are both still exactly what they were when that evidence
+    was recorded, commit's own verify_three (now comparing the SAME
+    kind of fingerprint, evidence._file_dep_targets wired through
+    compute_fingerprint) must still agree -- this is the "nothing
+    actually changed" control alongside the next test's "kit changed"
+    case."""
+    kit = tmp_path / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+    ws = _with_file_dep_targets(workspace, targets)
+
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "job-fd1", "full", roles=("builder",))
+    evidence_fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes, targets)
+    record(ws.ledger, "alpha", attempt_id, "review", evidence_fp, payload={"passed": True})
+    record(ws.ledger, "alpha", attempt_id, "bench", evidence_fp, payload={"passed": True})
+
+    rid = submit(ws.ledger, "alpha", attempt_id, "commit", {"message": "ok"}, "owner")
+    proc = _proc(ws)
+    n = proc.run_once("alpha")
+
+    assert n == 1
+    assert ws.ledger.request(rid).status == "done"
+
+
+def test_commit_refuses_when_file_dep_target_content_changed_after_review(
+        workspace: Workspace, tmp_path) -> None:
+    """a review finding, the reproduction: review/bench recorded
+    their evidence while the kit held content v1; before commit runs,
+    the kit's content changes to v2 (the real code a build now depends
+    on is different), even though alpha's OWN repo tree never changed
+    at all. Before this fix, commit's verify_three compared only the
+    plain tree fingerprint, which never moved either -- so commit would
+    have gone ahead and committed on evidence that no longer reflects
+    what the dependency actually is. It must now refuse
+    ("fingerprints_differ"), forcing a fresh review/bench instead of a
+    silent, stale pass."""
+    kit = tmp_path / "_shared" / "kit"
+    kit.mkdir(parents=True)
+    (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    targets = (("../_shared/kit", str(kit)),)
+    ws = _with_file_dep_targets(workspace, targets)
+
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "job-fd2", "full", roles=("builder",))
+    evidence_fp = fingerprint(ws.alpha, ws.config.projects["alpha"].excludes, targets)
+    record(ws.ledger, "alpha", attempt_id, "review", evidence_fp, payload={"passed": True})
+    record(ws.ledger, "alpha", attempt_id, "bench", evidence_fp, payload={"passed": True})
+
+    # The dependency's own content changes; alpha's repo itself does not.
+    (kit / "index.js").write_text("module.exports = 2;\n", encoding="utf-8")
+
+    rid = submit(ws.ledger, "alpha", attempt_id, "commit", {"message": "late kit change"}, "owner")
+    proc = _proc(ws)
+    n = proc.run_once("alpha")
+
+    assert n == 0
+    req = ws.ledger.request(rid)
     assert req.status == "failed"
     assert req.result == {"reason": "fingerprints_differ"}
 

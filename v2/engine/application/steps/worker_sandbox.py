@@ -417,8 +417,14 @@ def sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     # (node_modules/@sample-app/kit -> ../../../_shared/kit) resolves
     # against the repo's own parent, never the copy's -- the pair is
     # mapped for BOTH roots or the builder sees an empty package.
-    readonly_remap = file_deps.remap_pairs_for_roots(
-        (spec.copy_root, repo), ctx.config.projects[ctx.project].file_dep_targets)
+    # 결함 42: mapping the pair is not enough on its own --
+    # file_deps.sandbox_file_dep_pairs (not remap_pairs_for_roots
+    # directly) also pre-creates a dest that does not exist on the host,
+    # since the real target usually sits inside hidden_paths' broader
+    # apps-root hide (one level beyond `repo` itself) and bwrap cannot
+    # mkdir a mountpoint there once that hide is remounted read-only.
+    readonly_remap = file_deps.sandbox_file_dep_pairs(
+        spec.copy_root, repo, ctx.config.projects[ctx.project].file_dep_targets)
     try:
         return sandbox.wrap(
             argv, cwd=spec.workdir, writable=writable, hidden=hidden,
