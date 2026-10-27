@@ -98,7 +98,9 @@ def _agent_app_hit(prompt: str, allow: list[str]) -> str | None:
         return None
     allow_set = set(allow)
     for name in names:
-        if name in allow_set or len(name) < 3:
+        # dot folders (.claude, .git, ...) are settings, not apps (seen live: ".claude" in a
+        # worker prompt about login files was fenced as an out-of-scope app)
+        if name in allow_set or len(name) < 3 or name.startswith("."):
             continue
         if re.search(r"(?<![\w/-])" + re.escape(name) + r"(?![\w-])", prompt):
             return name

@@ -84,6 +84,15 @@ def test_sed_pattern_word_is_not_an_app_write(tmp_path: Path, monkeypatch) -> No
     assert sf.decide({"tool_name": "Bash", "tool_input": {"command": cmd}}) is None
 
 
+def test_agent_prompt_naming_a_dot_folder_passes(tmp_path: Path, monkeypatch) -> None:
+    apps = _apps(tmp_path)
+    (apps / ".claude").mkdir()
+    monkeypatch.setattr(sf, "APPS_ROOT", str(apps))
+    monkeypatch.setattr(sf, "SCOPE_FILE", str(_scope(tmp_path, ["demo-app"])))
+    out = sf.decide({"tool_name": "Agent", "tool_input": {"prompt": "작업자 HOME의 .claude 폴더 로그인 파일 크기만 본다"}})
+    assert out is None
+
+
 def test_gb2_run_inside_scope_passes(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sf, "SCOPE_FILE", str(_scope(tmp_path, ["demo-app"])))
     out = sf.decide({"tool_name": "Bash", "tool_input": {"command": "gb2 fix demo-app"}})
