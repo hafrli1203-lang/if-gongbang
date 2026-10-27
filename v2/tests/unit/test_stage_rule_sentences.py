@@ -235,6 +235,73 @@ def test_plan_json_scene_cmd_with_the_safe_flags_the_rule_sentence_names_passes(
     assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
 
 
+# --------------------------------------------------------------------- 결함 54 ---
+#, node-small gb2 change: a planner named a vitest scene
+# script "welcome-greeting.scene.ts" -- scene_script_arg accepted it (a
+# safe tests/scenes/ path) and the token existence check found the file,
+# so validate_plan passed, yet vitest's own default discovery pattern
+# (test.include: `**/*.{test,spec}.?(c|m)[jt]s?(x)`) never matches a
+# ".scene.ts" file -- every acceptance run printed "No test files
+# found", exit 1, forever (max_fix_rounds_exceeded). Only the vitest
+# runner needs this check: python3/python/node/bash/sh run the named
+# file directly, with no discovery step of their own to miss it.
+
+def test_plan_json_vitest_scene_named_outside_vitest_discovery_fails_validate_plan(
+    tmp_path: Path,
+) -> None:
+    scene_script = tmp_path / "tests" / "scenes" / "welcome-greeting.scene.ts"
+    _write(scene_script, "test('x', () => {})\n")
+    _write_plan_for(
+        tmp_path, _JOB,
+        ("npx", "vitest", "run", "tests/scenes/welcome-greeting.scene.ts"),
+    )
+
+    plan = load_plan(tmp_path, _JOB)
+    problems = validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/"))
+    assert any("scene_file_not_discoverable" in p for p in problems), problems
+
+
+def test_plan_json_vitest_scene_named_test_ts_passes_validate_plan(
+    tmp_path: Path,
+) -> None:
+    scene_script = tmp_path / "tests" / "scenes" / "welcome-greeting.test.ts"
+    _write(scene_script, "test('x', () => {})\n")
+    _write_plan_for(
+        tmp_path, _JOB,
+        ("npx", "vitest", "run", "tests/scenes/welcome-greeting.test.ts"),
+    )
+
+    plan = load_plan(tmp_path, _JOB)
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
+
+
+def test_plan_json_non_vitest_runner_scene_file_name_is_never_checked_for_discoverability(
+    tmp_path: Path,
+) -> None:
+    # python3/node/bash/sh run the named file directly -- no discovery
+    # step to fail, so a ".scene.py" name must stay fine for them.
+    scene_script = tmp_path / "tests" / "scenes" / "welcome-greeting.scene.py"
+    _write(scene_script, "import sys\nsys.exit(0)\n")
+    _write_plan_for(tmp_path, _JOB, ("python3", "tests/scenes/welcome-greeting.scene.py"))
+
+    plan = load_plan(tmp_path, _JOB)
+    assert validate_plan(plan, tmp_path, build_prefixes=("src/", "tests/")) == []
+
+
+def test_plan_scene_file_discoverable_rule_sentence_appears_verbatim_in_planner_prompt() -> None:
+    from engine.domain.plan_model import PLAN_SCENE_FILE_DISCOVERABLE_RULE
+
+    text = planner_prompt("요청 내용", _JOB, "facts.md 내용")
+    assert PLAN_SCENE_FILE_DISCOVERABLE_RULE in text
+
+
+def test_plan_scene_file_discoverable_rule_sentence_appears_verbatim_in_small_prompt() -> None:
+    from engine.domain.plan_model import PLAN_SCENE_FILE_DISCOVERABLE_RULE
+
+    text = small_prompt("요청 내용", _JOB)
+    assert PLAN_SCENE_FILE_DISCOVERABLE_RULE in text
+
+
 def test_plan_json_scene_cmd_with_a_value_taking_flag_still_fails_validate_plan(
     tmp_path: Path,
 ) -> None:

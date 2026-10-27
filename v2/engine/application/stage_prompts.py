@@ -12,8 +12,8 @@ from pathlib import Path
 from engine.domain.plan import Task
 from engine.domain.plan_model import (
     PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE, PLAN_SCENE_CMD_FLAGS_RULE,
-    PLAN_SCENE_EXIT0_RULE, PLAN_SCHEMA_RULE, PLAN_SCHEMA_RULE_SMALL, PLAN_TASK_TEST_OWNS_RULE,
-    plan_owns_rule_sentence,
+    PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_FILE_DISCOVERABLE_RULE, PLAN_SCHEMA_RULE,
+    PLAN_SCHEMA_RULE_SMALL, PLAN_TASK_TEST_OWNS_RULE, plan_owns_rule_sentence,
 )
 from engine.domain.policy import OWNS_SCOPE_REQUEST_RULE
 from engine.domain.stage_checks import (
@@ -117,7 +117,8 @@ def planner_prompt(request: str, job: str, facts_md: str, tool_catalog: str = ""
         f"{probe_part}\n\n"
         f".gongbang/{job}/plan.json 과, 필요하면 tests/scenes/ 아래 장면 "
         f"스크립트를 쓴다. {PLAN_SCHEMA_RULE} {PLAN_JSON_VALID_RULE} "
-        f"{PLAN_SCENE_EXIT0_RULE} {PLAN_SCENE_CMD_FLAGS_RULE} {PLAN_TASK_TEST_OWNS_RULE} "
+        f"{PLAN_SCENE_EXIT0_RULE} {PLAN_SCENE_CMD_FLAGS_RULE} "
+        f"{PLAN_SCENE_FILE_DISCOVERABLE_RULE} {PLAN_TASK_TEST_OWNS_RULE} "
         "작업(task)마다 owns에 그 작업이 "
         "쓸 파일·폴더만 적는다(다른 작업의 소유 경로와 겹치지 않게 나눈다)."
         f"{owns_rule_part} "
@@ -179,7 +180,8 @@ def small_prompt(request: str, job: str, tool_catalog: str = "",
         "(기능은 kind \"function\", 권한·데이터 분리 같은 보안 요구는 kind "
         f"\"security\"). {PLAN_REQUIREMENT_SCENE_COVERAGE_RULE} 장면이 없는 requirement가 "
         f"있으면 이 계획은 통과하지 못한다. {PLAN_SCENE_EXIT0_RULE} "
-        f"{PLAN_SCENE_CMD_FLAGS_RULE} {PLAN_TASK_TEST_OWNS_RULE} "
+        f"{PLAN_SCENE_CMD_FLAGS_RULE} {PLAN_SCENE_FILE_DISCOVERABLE_RULE} "
+        f"{PLAN_TASK_TEST_OWNS_RULE} "
         f"tasks[0].owns에는 이 작업이 쓸 파일·폴더만 적는다.{owns_rule_part}\n\n"
         f"{_ARCHITECTURE_LAYER_NOTE}"
         + tools_part

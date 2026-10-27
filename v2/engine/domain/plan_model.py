@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -418,6 +419,30 @@ _SUPPORTED_SCENE_RUNNERS: tuple[tuple[str, ...], ...] = (
 # like one of these.
 _SAFE_SCENE_CMD_FLAGS: tuple[str, ...] = ("--no-color", "--no-cache", "--silent")
 
+# vitest's own default test-discovery pattern (its `test.include` option,
+# left unset by every tools/templates/new-app vite.config.js --
+# defineConfig({}) -- so this is the pattern vitest itself falls back
+# to, not a value this engine invented): `**/*.{test,spec}.?(c|m)[jt]s?(x)`.
+# 결함 54, node-small gb2 change): a scene cmd
+# ["npx", "vitest", "run", "tests/scenes/welcome-greeting.scene.ts"]
+# passes scene_script_arg (a safe tests/scenes/ path) and the token
+# existence check right above (the file is really there), yet vitest
+# itself never discovers a ".scene.ts" file -- "No test files found",
+# exit 1, every attempt, forever (max_fix_rounds_exceeded). Only the
+# ("npx", "vitest", "run") runner needs this: python3/python/node/bash/
+# sh (the other _SUPPORTED_SCENE_RUNNERS entries) run the named file
+# directly, with no discovery step of their own to miss it.
+_VITEST_DISCOVERABLE_RE = re.compile(r"\.(?:test|spec)\.(?:[cm])?[jt]sx?$")
+
+# Same tuple as _SUPPORTED_SCENE_RUNNERS' own vitest entry -- referenced,
+# never retyped, so the two can never drift on which prefix counts as
+# "the vitest runner".
+_VITEST_RUNNER_PREFIX: tuple[str, ...] = _SUPPORTED_SCENE_RUNNERS[-1]
+
+
+def _vitest_discoverable(path: str) -> bool:
+    return _VITEST_DISCOVERABLE_RE.search(path) is not None
+
 
 def _is_safe_scene_path(token: str) -> bool:
     """True iff `token` is a tests/scenes/ file path with no escape --
@@ -590,7 +615,18 @@ def validate_plan(plan: Plan, repo: Path, build_prefixes: "tuple[str, ...] | Non
                 continue
             if resolved != scenes_root and scenes_root not in resolved.parents:
                 problems.append(f"scene {scene.id}: script escapes tests/scenes/: {token}")
-        if scene.covers and scene_script_arg(scene.cmd) is None:
+        scene_arg = scene_script_arg(scene.cmd)
+        if (scene_arg is not None
+                and tuple(scene.cmd[:len(_VITEST_RUNNER_PREFIX)]) == _VITEST_RUNNER_PREFIX
+                and not _vitest_discoverable(scene_arg)):
+            # scene_script_arg already proved the vitest runner's next
+            # real token IS this tests/scenes/ file and it exists on
+            # disk -- but vitest's own default discovery pattern
+            # (_VITEST_DISCOVERABLE_RE) still never matches it, so
+            # every acceptance run of this scene fails with "No test
+            # files found" regardless (결함 54).
+            problems.append(f"scene {scene.id}: scene_file_not_discoverable: {scene_arg}")
+        if scene.covers and scene_arg is None:
             # A scene claiming it demonstrates a requirement must
             # actually RUN a planner-owned script under tests/scenes/
             # via a supported runner -- ["true", "tests/scenes/x.py"]
@@ -733,6 +769,14 @@ PLAN_SCENE_CMD_FLAGS_RULE = (
 # head off before it happens, rather than only explaining it after a
 # reopened station already repeated it (see plan_check_failure_note in
 # engine.application.pipeline_planning for the after-the-fact half).
+PLAN_SCENE_FILE_DISCOVERABLE_RULE = (
+    '장면의 cmd가 "npx vitest run"일 때는 장면 스크립트 파일 이름이 '
+    "vitest 기본 시험 탐색 규칙(파일명이 \".test.ts\"/\".spec.ts\" 등 "
+    '".test"나 ".spec"으로 끝나야 함)에 맞아야 한다 -- 그 밖의 이름'
+    "(예: \".scene.ts\")은 파일이 있어도 vitest가 찾지 못해 "
+    '"No test files found"로 매번 실패한다.'
+)
+
 PLAN_JSON_VALID_RULE = (
     "plan.json은 유효한 JSON이어야 한다 -- 문자열 안의 쌍따옴표는 \\\"로 "
     "이스케이프한다. 쓴 뒤 직접 파싱해 보고 확인한다."
@@ -754,7 +798,8 @@ def plan_rule_sentences() -> tuple[str, ...]:
     must carry verbatim."""
     return (
         PLAN_SCHEMA_RULE, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
-        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_TASK_TEST_OWNS_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_SCENE_FILE_DISCOVERABLE_RULE,
+        PLAN_TASK_TEST_OWNS_RULE,
     )
 
 
@@ -763,7 +808,8 @@ def plan_rule_sentences_small() -> tuple[str, ...]:
     whose plan.json schema sentence is PLAN_SCHEMA_RULE_SMALL instead."""
     return (
         PLAN_SCHEMA_RULE_SMALL, PLAN_JSON_VALID_RULE, PLAN_REQUIREMENT_SCENE_COVERAGE_RULE,
-        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_TASK_TEST_OWNS_RULE,
+        PLAN_SCENE_EXIT0_RULE, PLAN_SCENE_CMD_FLAGS_RULE, PLAN_SCENE_FILE_DISCOVERABLE_RULE,
+        PLAN_TASK_TEST_OWNS_RULE,
     )
 
 
@@ -772,6 +818,7 @@ __all__ = [
     "Scene", "Task", "Tool", "Requirement", "Plan", "PlanError", "plan_path", "load_plan",
     "validate_plan", "ordered_tasks", "requirement_coverers", "plan_owns_rule_sentence",
     "PLAN_SCHEMA_RULE", "PLAN_SCHEMA_RULE_SMALL", "PLAN_REQUIREMENT_SCENE_COVERAGE_RULE",
-    "PLAN_SCENE_EXIT0_RULE", "PLAN_SCENE_CMD_FLAGS_RULE", "PLAN_TASK_TEST_OWNS_RULE",
+    "PLAN_SCENE_EXIT0_RULE", "PLAN_SCENE_CMD_FLAGS_RULE", "PLAN_SCENE_FILE_DISCOVERABLE_RULE",
+    "PLAN_TASK_TEST_OWNS_RULE",
     "plan_rule_sentences", "plan_rule_sentences_small",
 ]

@@ -33,6 +33,7 @@ engine's own sandbox="bwrap" callers already fail closed in that case
 (sandbox.SandboxUnavailable)."""
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -66,7 +67,9 @@ def _node_runs_in_bwrap() -> bool:
 
 
 needs_bwrap = pytest.mark.skipif(
-    not _node_runs_in_bwrap(), reason="bwrap unavailable, or node not runnable inside bwrap on this host",
+    not _node_runs_in_bwrap() or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="bwrap unavailable, node not runnable inside bwrap, or a GitHub Actions runner "
+           "(node lives where the engine's own sandbox hides it; these checks target the real host)",
 )
 
 
