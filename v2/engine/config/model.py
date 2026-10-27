@@ -503,7 +503,7 @@ class EngineConfig:
                     raise ValueError("bench_readonly_path_forbidden")
         # reference_paths is deliberately NOT validated here -- see
         # ProjectConfig.reference_paths's own docstring: the real checks
-        # (overlap with secrets_dir/home/ledger/repos/hidden_paths/real
+        # (overlap with secrets_dir, home, ledger, repos, hidden_paths, real
         # HOME, hidden path components) run once, in
         # engine.infrastructure.reference_snapshot.snapshot_references,
         # never at config load (a P1 fix -- a host-filesystem

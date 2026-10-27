@@ -122,6 +122,19 @@ def test_1_facts_header_with_extra_words_is_accepted_by_the_real_checker(
     assert check_facts(repo, "jobA") == []
 
 
+
+def _source_at(rev: str, path: str) -> str:
+    """`path` as of `rev` in this checkout's own git history; skips (with the
+    reason) when that history is absent -- the public copy ships without the
+    private commit history these RED-proof tests read from."""
+    import pytest
+    spec = f"{rev}:{path}"
+    if subprocess.run(["git", "-C", str(REPO_ROOT), "cat-file", "-e", spec],
+                      capture_output=True).returncode != 0:
+        pytest.skip(f"git history for {spec} is not in this checkout")
+    return subprocess.run(["git", "-C", str(REPO_ROOT), "cat-file", "blob", spec],
+                          check=True, capture_output=True, text=True).stdout
+
 def test_1_red_against_the_pre_fix_checker_loaded_from_git_history(
     tmp_path: Path,
 ) -> None:
@@ -132,10 +145,7 @@ def test_1_red_against_the_pre_fix_checker_loaded_from_git_history(
     proving this is a real regression lock, not a tautology."""
     import types
 
-    old_src = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "show", "2be9e64^:engine/domain/stage_checks.py"],
-        check=True, capture_output=True, text=True,
-    ).stdout
+    old_src = _source_at("2be9e64^", "engine/domain/stage_checks.py")
     old_mod = types.ModuleType("_t9_old_stage_checks")
     old_mod.__dict__["__file__"] = "<git show 2be9e64^>"
     exec(compile(old_src, "<git show 2be9e64^:engine/domain/stage_checks.py>", "exec"),
@@ -321,10 +331,7 @@ def test_4_red_sys_executable_unconditionally_was_the_pre_fix_argv(
     python built in test_4_resolved_probe_python_is_not_the_engines_own_
     hidden_venv above, that old, unconditional choice is exactly the
     hidden interpreter the fix no longer picks."""
-    old_src = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "show", "c9e5568^:engine/application/acceptance_probe.py"],
-        check=True, capture_output=True, text=True,
-    ).stdout
+    old_src = _source_at("c9e5568^", "engine/application/acceptance_probe.py")
     assert '".py": (sys.executable,)' in old_src, (
         "pre-fix acceptance_probe.py no longer has the unconditional "
         "sys.executable mapping this repro assumes -- check the commit range")
