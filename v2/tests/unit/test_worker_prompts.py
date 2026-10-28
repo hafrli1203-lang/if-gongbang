@@ -13,7 +13,7 @@ from engine.workers.prompts import (
 # Configurable, not a fixed check -- MASTER_RULES 업종 하드코딩 금지,
 # verified across 2+ industries, not just the absence of one name.
 _BANNED_INDUSTRY_WORDS = (
-    "안경원", "미용실", "병원", "카페", "헬스장", "피트니스", "부동산",
+    "세차장", "미용실", "병원", "카페", "헬스장", "피트니스", "부동산",
     "옷가게", "쇼핑몰", "레스토랑", "학원", "세탁소",
 )
 
