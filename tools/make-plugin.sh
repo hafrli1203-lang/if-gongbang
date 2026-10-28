@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Packages chosen workspace skills into a Claude Code plugin folder (owner 2026-10-17: "자주 쓰는 것·필요한 것을 스킬화하거나
-# 플러그인으로"). Nothing is installed or published: the output is a folder you can point `claude plugin` at, or commit
+# Packages chosen workspace skills into a Claude Code plugin folder. Nothing is installed or published: the output is a folder you can point `claude plugin` at, or commit
 # into this (private) repository under plugin/. Layout follows the official plugins: .claude-plugin/plugin.json + skills/<name>/SKILL.md.
 # usage: make-plugin.sh <plugin-name> <out-dir> <skill-name>... [--from DIR]   (default DIR: ~/.claude/skills)
 #   make-plugin.sh if-gongbang-ops ./plugin 월요일-브리핑 광고-운영-점검 스킬-만들기
