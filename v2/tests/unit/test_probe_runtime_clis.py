@@ -157,4 +157,4 @@ def test_probe_js_target_spawning_a_real_cli_sees_it_under_bwrap(
 
     assert "SPAWN_ERROR" not in results[0].stdout_tail
     assert "sh-found" in results[0].stdout_tail
-    assert results[0].ok is True
+    assert results[0].ok is True, (results[0].url, results[0].contacts, results[0].stdout_tail[-300:])

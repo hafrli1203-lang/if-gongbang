@@ -459,7 +459,7 @@ def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
     )
     assert "SPAWN_ERROR" not in results_b[0].stdout_tail, results_b[0].stdout_tail
     assert "fakecli-found" in results_b[0].stdout_tail
-    assert results_b[0].ok is True
+    assert results_b[0].ok is True, (results_b[0].url, results_b[0].contacts, results_b[0].stdout_tail[-300:])
 
 
 # ---- 6. the prober prompt states the exact "PROBE OK <doc>" rule --------
