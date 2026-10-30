@@ -127,12 +127,14 @@ def _relay(client: socket.socket, upstream: socket.socket, contact: _Contact) ->
                     except OSError:
                         pass
                     continue
-                dst.sendall(data)
+                # Record BEFORE forwarding: once the client has the bytes it
+                # may finish and the engine may read the record at once.
                 if key.data == "up":
                     contact.bytes_up += len(data)
                 else:
                     contact.bytes_down += len(data)
                     contact.digest.update(data)
+                dst.sendall(data)
     except OSError:
         return
     finally:

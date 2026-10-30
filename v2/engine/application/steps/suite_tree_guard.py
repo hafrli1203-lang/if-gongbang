@@ -120,8 +120,14 @@ def _walk_dirs(root: Path):
 def lock_tree_dirs(root: Path) -> None:
     """Strip every write bit from every directory under `root`
     (deepest first is unnecessary: chmod on a directory never needs
-    write access to its parent)."""
+    write access to its parent). The root directory itself stays
+    writable when Vite < 6 must write its bundled config beside a
+    root-level config file (vite_writes_beside_config); the whole-tree
+    comparison still fails the run if anything is left behind."""
+    keep_root = vite_writes_beside_config(root)
     for directory in _walk_dirs(root):
+        if keep_root and directory == root:
+            continue
         mode = stat.S_IMODE(directory.lstat().st_mode)
         directory.chmod(mode & ~_WRITE_BITS)
 
