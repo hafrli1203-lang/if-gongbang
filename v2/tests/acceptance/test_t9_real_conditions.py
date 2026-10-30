@@ -420,9 +420,10 @@ def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
         "if (r.error) { console.log('SPAWN_ERROR:' + r.error.code); }\n"
         "else { console.log(r.stdout.toString().trim());\n"
         "       const p = new URL(process.env.HTTP_PROXY);\n"
-        f"       http.get({{host: p.hostname, port: p.port, path: {json.dumps(url)}}}, (res) => {{\n"
-        "         res.resume();\n"
-        f"         res.on('end', () => console.log({json.dumps('PROBE OK ' + url)})); }}); }}\n"
+        "       const s = require('net').connect(Number(p.port), p.hostname, () => {\n"
+        f"         s.end({json.dumps('GET ' + url + ' HTTP/1.1' + chr(13) + chr(10) + 'Host: x' + chr(13) + chr(10) + 'Connection: close' + chr(13) + chr(10) + chr(13) + chr(10))}); }});\n"
+        "       s.on('data', () => {});\n"
+        f"       s.on('end', () => console.log({json.dumps('PROBE OK ' + url)})); }}\n"
     )
 
     # (a) not configured -> the probe sandbox's default `readonly` set

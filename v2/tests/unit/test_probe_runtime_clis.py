@@ -144,10 +144,13 @@ def test_probe_js_target_spawning_a_real_cli_sees_it_under_bwrap(
             "} else {\n"
             "  console.log(r.stdout.toString().trim());\n"
             "  const p = new URL(process.env.HTTP_PROXY);\n"
-            f"  http.get({{host: p.hostname, port: p.port, path: '{url}'}}, (res) => {{\n"
-            "    res.resume();\n"
-            f"    res.on('end', () => console.log('PROBE OK {url}'));\n"
+            # Raw TCP to the proxy: never re-proxied by Node's own
+            # NODE_USE_ENV_PROXY support (which some Node builds honor).
+            "  const s = require('net').connect(Number(p.port), p.hostname, () => {\n"
+            f"    s.end('GET {url} HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n\\r\\n');\n"
             "  });\n"
+            "  s.on('data', () => {});\n"
+            f"  s.on('end', () => console.log('PROBE OK {url}'));\n"
             "}\n",
             encoding="utf-8",
         )
