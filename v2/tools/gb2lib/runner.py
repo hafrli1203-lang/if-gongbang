@@ -1,8 +1,11 @@
-"""`gb2 run`/`gb2 fix`/`gb2 continue`/`gb2 change`/`gb2 approve-design`/
-`gb2 approve-install`: driving a job -- a single `run_station`+review+
-bench task (`run`/`fix`), or the full orbit (`change`/`continue`/
-`approve-design`/`approve-install`, same engine.full_orbit entry
-points `workspace.cmd_new` uses) -- through the engine."""
+"""`gb2 run`/`gb2 fix`/`gb2 change`/`gb2 continue`: driving a job -- a
+single `run_station`+review+bench task (`run`/`fix`), or the full
+orbit (`change`/`continue`, same engine.full_orbit entry points
+`workspace.cmd_new` uses) -- through the engine. The three owner-
+approval commands (`approve-design`/`approve-plan-edit`/`approve-
+install`) live in tools/gb2lib/approve_ops.py instead, split out to
+keep this file under the 800-line architecture cap (docs/standards/
+architecture.md §3)."""
 from __future__ import annotations
 
 import argparse
@@ -17,13 +20,11 @@ from engine.cli import _build_fakes, _drain, _job_name_for_attempt
 from engine.config import EngineConfig
 from engine.ledger import Event, Ledger
 from engine.steps.open_job import open_job
+from engine.application.driver_session import driver_session
 
 from . import ops, shared, workspace
 
-__all__ = [
-    "cmd_run", "cmd_fix", "cmd_change", "cmd_approve_design", "cmd_approve_plan_edit",
-    "cmd_continue", "cmd_approve_install",
-]
+__all__ = ["cmd_run", "cmd_fix", "cmd_change", "cmd_continue"]
 
 
 # --------------------------------------------------------------------
@@ -108,6 +109,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
+      with driver_session(ledger, args.app):
         # Only "builder" gets a worker copy -- the reviewer runs
         # against its own fresh snapshot (engine.steps.review),
         # never a pre-made copy_root.
@@ -203,6 +205,30 @@ def _report_no_progress(ledger: Ledger, app: str, message: str) -> int:
     return 2
 
 
+def _report_owns_scope_stuck(ledger: Ledger, app: str, message: str) -> int:
+    """`gb2 fix <app>` refused (결함 66, same root as 결함 58/65) because
+    the attempt about to be replaced already hit
+    fixup.OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD live-gate denials for
+    reason "outside_allowed_path" -- fixup.fix itself recorded NOTHING
+    for this refusal, same as the two sibling reports above. Unlike
+    those two, there is exactly one real next step (never a vague
+    "try a narrower instruction" or "accept it as a known issue"): the
+    owner names each denied path with `--also-own`, same 결함 64-style
+    "next" shape those two reports already use."""
+    denied_paths = json.loads(message[len(fixup.OWNS_SCOPE_STUCK_PREFIX):])
+    also_own_calls = " ".join(f'--also-own "{path}"' for path in denied_paths)
+    summary = {
+        "app": app, "status": "needs_owner", "reason": "owns_scope_stuck",
+        "denied_paths": denied_paths,
+        "next": [
+            f'필요한 경로를 넓혀 다시: gb2 fix {app} {also_own_calls}',
+            "지적을 알려진 문제로 받아들이기: 운영자 결정",
+        ],
+    }
+    print(json.dumps(summary, ensure_ascii=False))
+    return 2
+
+
 def cmd_fix(args: argparse.Namespace) -> int:
     """Continue the app's current job attempt after it failed at review
     or bench (engine.fixup.fix): closes that attempt (archiving, never
@@ -261,6 +287,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
+      with driver_session(ledger, args.app):
         from engine import position
         from engine.application.repair_approval import NOT_TASK_OWNER_EDIT_STOP
 
@@ -319,6 +346,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
                 return _report_fix_rounds_exhausted(ledger, args.app, message)
             if message.startswith(fixup.NO_PROGRESS_PREFIX):
                 return _report_no_progress(ledger, args.app, message)
+            if message.startswith(fixup.OWNS_SCOPE_STUCK_PREFIX):
+                return _report_owns_scope_stuck(ledger, args.app, message)
             return shared.err_json(message, 1)
 
         full_outcome = position.resume_after_fix(
@@ -326,6 +355,11 @@ def cmd_fix(args: argparse.Namespace) -> int:
         )
         wall_sec = time.monotonic() - start
         if full_outcome is not None:
+            from engine.application import auto_pilot
+
+            full_outcome = auto_pilot.auto_settle(config, ledger, fakes_for, args.app,
+                                                  result.job_name, full_outcome,
+                                                  on_progress=shared.progress_printer)
             summary = shared.summarize_full_outcome(config, ledger, args.app, full_outcome, wall_sec)
         else:
             summary = _summarize(config, ledger, args.app, result.new_attempt_id,
@@ -371,6 +405,7 @@ def _run_small_job_and_report(args: argparse.Namespace, config: EngineConfig,
     (engine.small_orbit's own per-station timing) either way; a
     fallback also carries "small_fallback_reason"."""
     from engine import small_orbit
+    from engine import state as state_module
 
     try:
         config, fakes_for = shared.fakes_builder(config, args.app)
@@ -380,16 +415,28 @@ def _run_small_job_and_report(args: argparse.Namespace, config: EngineConfig,
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
     try:
-        outcome = small_orbit.run_small_job(
-            config, ledger, fakes_for, args.app, job_name, request,
-            on_progress=shared.progress_printer,
-        )
+      # driver_session: without it `gb2 watch`
+      # read a small job's pre-first-request window as "no live driver"
+      # and could start a concurrent resume.
+      with driver_session(ledger, args.app):
+        try:
+            outcome = small_orbit.run_small_job(
+                config, ledger, fakes_for, args.app, job_name, request,
+                max_fix_rounds=config.projects[args.app].max_fix_rounds,
+                on_progress=shared.progress_printer,
+            )
+        except state_module.ProjectOpenError as exc:
+            return shared.err_json(str(exc), 1)
+        from engine.application import auto_pilot
+
         full_outcome = small_orbit.maybe_full_fallback(
             config, ledger, fakes_for, args.app, job_name, request, outcome,
             on_progress=shared.progress_printer,
         )
         if full_outcome is not None:
             job_name = small_orbit.fallback_job_name(job_name)
+            full_outcome = auto_pilot.auto_settle(config, ledger, fakes_for, args.app, job_name,
+                                                  full_outcome, on_progress=shared.progress_printer)
             wall_sec = time.monotonic() - start
             summary = shared.summarize_full_outcome(config, ledger, args.app, full_outcome, wall_sec)
             summary["durations_ms"] = {
@@ -397,8 +444,23 @@ def _run_small_job_and_report(args: argparse.Namespace, config: EngineConfig,
             }
             summary["small_fallback_reason"] = outcome.reason
         else:
+            settled = auto_pilot.auto_settle(config, ledger, fakes_for, args.app, job_name,
+                                             outcome, on_progress=shared.progress_printer)
             wall_sec = time.monotonic() - start
-            summary = shared.summarize_small_outcome(config, ledger, args.app, outcome, wall_sec)
+            if settled is outcome:
+                # auto_settle made no move at all (nothing it recognized to
+                # auto-resolve, or outcome.status was never "needs_owner")
+                # -- still the original SmallOutcome shape.
+                summary = shared.summarize_small_outcome(config, ledger, args.app, settled,
+                                                         wall_sec)
+            else:
+                # auto_settle performed at least one auto action and
+                # resumed through engine.full_orbit.continue_full_job,
+                # whose outcome is always a FullOutcome from here on
+                # (job_state.resume_job's own RESUME_TABLE dispatch,
+                # never a SmallOutcome again).
+                summary = shared.summarize_full_outcome(config, ledger, args.app, settled,
+                                                        wall_sec)
     finally:
         ledger.close()
 
@@ -424,6 +486,11 @@ def cmd_change(args: argparse.Namespace) -> int:
     if doctor_error:
         return shared.err_json(doctor_error, 1)
     workspace.verify_app_repo_identity(args.app)
+    # Fresh base first: a job that opens on a stale gb2/work
+    # re-does work the default branch already has.
+    sync = workspace.sync_work_branch_if_behind(args.app)
+    if sync.get("behind"):
+        print(json.dumps({"base_sync": sync}, ensure_ascii=False), file=sys.stderr)
     config = EngineConfig.from_json(config_path)
 
     job_name = args.job_name or f"gb2-change-{int(time.time())}"
@@ -432,116 +499,6 @@ def cmd_change(args: argparse.Namespace) -> int:
     return shared.run_full_job_and_report(args, config, job_name, request)
 
 
-def cmd_approve_plan_edit(args: argparse.Namespace) -> int:
-    """`gb2 approve-plan-edit <app> --reason "<사유>"`: the owner's
-    re-approval for the CURRENT job's plan after the owner has edited
-    a tests/scenes/ file post-review (plan.json itself is never
-    touched -- see engine.domain.plan_review.record_owner_plan_amend's
-    own docstring for the full contract). No TTY gate (unlike
-    approve-design/approve-install's "승인 <job>" line): this command
-    is owner-only by construction already -- a builder runs inside the
-    engine's sandbox and has no path to invoke `gb2` at all, and
-    engine.application.repair_target never hands tests/scenes/ to a
-    worker in the first place, so there is no non-owner caller to gate
-    against here.
-
-    Refused (exit 1, nothing recorded) if there is no active job for
-    this app, or if record_owner_plan_amend itself refuses (blank
-    reason, unreadable/invalid plan, never reviewed, or nothing
-    changed since the last review). On success, prints {"job_name":
-    ..., "reason": ..., "changed": ...} and returns 0 -- this command
-    only re-approves the plan; it does NOT resume the job itself
-    (`gb2 fix`/`gb2 continue` does that separately, same as any other
-    owner action)."""
-    config_path = shared.app_workspace(args.app) / "config.json"
-    if not config_path.exists():
-        return shared.err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
-    workspace.verify_app_repo_identity(args.app)
-    config = EngineConfig.from_json(config_path)
-
-    from engine.domain.plan_review import record_owner_plan_amend
-
-    ledger = Ledger.open(config.ledger_path)
-    try:
-        project_row = ledger.project(args.app)
-        attempt_id = project_row.current_attempt_id
-        if attempt_id is None:
-            return shared.err_json("no_active_job", 1)
-        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
-        if job_name is None:
-            return shared.err_json("no_active_job", 1)
-        repo = config.projects[args.app].repo
-
-        problems = record_owner_plan_amend(
-            ledger, args.app, attempt_id, repo, job_name, args.reason or "",
-        )
-        if problems:
-            return shared.err_json(f"refused: {'; '.join(problems)}", 1)
-
-        changed = None
-        for _seq, event in ledger.events(args.app, "plan.owner_amended"):
-            if event.attempt_id == attempt_id and event.payload.get("job") == job_name:
-                changed = event.payload.get("changed")
-        print(json.dumps({"job_name": job_name, "reason": args.reason, "changed": changed},
-                         ensure_ascii=False))
-        return 0
-    finally:
-        ledger.close()
-
-
-def cmd_approve_design(args: argparse.Namespace) -> int:
-    """`gb2 approve-design <app>`: the owner's TTY-only approval gate
-    for engine.gates.check_design_approved -- requires the owner to
-    TYPE the exact "승인 <job>" line (never accepted non-interactively,
-    refused with exit 4 before anything is read from stdin, same
-    convention as `release_ops.cmd_ship`'s release approval), appends a
-    `design.approved` ledger event carrying {"job": job_name}, then
-    resumes the job with engine.full_orbit.continue_full_job -- which
-    only makes progress past the design station once that event is
-    there for this job (engine.gates.check_design_approved)."""
-    config_path = shared.app_workspace(args.app) / "config.json"
-    if not config_path.exists():
-        return shared.err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
-    workspace.verify_app_repo_identity(args.app)
-    if not sys.stdin.isatty():
-        return shared.err_json("refused: non-interactive shell, approve-design requires a TTY", 4)
-    config = EngineConfig.from_json(config_path)
-    try:
-        config, fakes_for = shared.fakes_builder(config, args.app)
-    except ValueError as exc:
-        return shared.err_json(str(exc), 1)
-
-    from engine import full_orbit
-
-    ledger = Ledger.open(config.ledger_path)
-    try:
-        project_row = ledger.project(args.app)
-        attempt_id = project_row.current_attempt_id
-        if attempt_id is None:
-            return shared.err_json("no_active_job", 1)
-        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
-
-        owner_text = input(f'type the approval line exactly ("승인 {job_name}"): ')
-        if owner_text != f"승인 {job_name}":
-            return shared.err_json("refused: approval line did not match, nothing changed", 1)
-
-        ledger.append(Event(
-            project=args.app, kind="design.approved", actor_kind="owner",
-            actor_id="owner", attempt_id=attempt_id, payload={"job": job_name},
-        ))
-
-        start = time.monotonic()
-        outcome = full_orbit.continue_full_job(
-            config, ledger, fakes_for, args.app, job_name, on_progress=shared.progress_printer,
-        )
-        wall_sec = time.monotonic() - start
-        summary = shared.summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
-    finally:
-        ledger.close()
-
-    shared.append_run_log(args.app, {"job_name": job_name, **summary})
-    print(json.dumps(summary, ensure_ascii=False))
-    return shared.exit_code_for_full_outcome(str(summary["status"]))
 
 
 def cmd_continue(args: argparse.Namespace) -> int:
@@ -579,6 +536,7 @@ def cmd_continue(args: argparse.Namespace) -> int:
 
     ledger = Ledger.open(config.ledger_path)
     try:
+      with driver_session(ledger, args.app):
         project_row = ledger.project(args.app)
         attempt_id = project_row.current_attempt_id
         if attempt_id is None:
@@ -599,6 +557,10 @@ def cmd_continue(args: argparse.Namespace) -> int:
                 )
         except full_orbit.ForceReopenError as exc:
             return shared.err_json(f"force_reopen_refused: {exc}", 1)
+        from engine.application import auto_pilot
+
+        outcome = auto_pilot.auto_settle(config, ledger, fakes_for, args.app, job_name, outcome,
+                                         on_progress=shared.progress_printer)
         wall_sec = time.monotonic() - start
         summary = shared.summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
     finally:
@@ -608,92 +570,49 @@ def cmd_continue(args: argparse.Namespace) -> int:
     print(json.dumps(summary, ensure_ascii=False))
     return shared.exit_code_for_full_outcome(str(summary["status"]))
 
-
-def cmd_approve_install(args: argparse.Namespace) -> int:
-    """`gb2 approve-install <app>`: TTY-only approval for every pending
-    owner request a station asked for (any kind engine.owner.
-    PENDING_KIND_WHITELIST allows: install, scripts_change,
-    test_config_change) -- a build task (engine.
-    full_orbit.STAGE_TASK_OWNER) or an earlier facts/probe/plan/design
-    station (STAGE_EARLY_STATION) -- found via engine.full_orbit.
-    pending_owner_requests, the station.finished "requests" entry a
-    full-orbit job is currently stopped on. Shows what manifest/change
-    each one is asking for, requires the owner to TYPE the exact "승인 <job>" line (same
-    TTY convention as `cmd_approve_design`/`release_ops.cmd_ship`,
-    refused outright on a non-interactive shell), then submits/approves
-    each one through the EXISTING engine.owner.validate_pending/
-    approve_pending gate -- never re-implementing that validation here
-    -- and drains the processor queue (engine.cli._drain, imported here
-    as `_drain`) so the install actually runs before anything else
-    happens. Only once every pending request is confirmed "done" does
-    this resume the job with engine.full_orbit.continue_full_job, which
-    (since b0c8208) reruns the builder task that stopped from where it
-    left off, rather than skipping straight to review."""
+def cmd_close(args: argparse.Namespace) -> int:
+    """Foreman close: when the
+    engine stopped at a review/bench cap and the foreman finished the job
+    BY HAND in the app repo, the ledger still said OPEN and the board
+    showed the app as stuck. This closes the current attempt normally --
+    engine.application.repair.close_failed_attempt, the same archive-then-
+    close path `gb2 fix` runs first (work is archived, never discarded) --
+    and leaves the project CLOSED. Refuses (exit 1, nothing changed) when
+    the app is not initialized, has no current attempt, or is already
+    CLOSED. `--reason` is recorded on the publish cancellation."""
     config_path = shared.app_workspace(args.app) / "config.json"
     if not config_path.exists():
         return shared.err_json(f"not initialized: run `gb2 init {args.app}` first", 1)
-    workspace.verify_app_repo_identity(args.app)
-    if not sys.stdin.isatty():
-        return shared.err_json("refused: non-interactive shell, approve-install requires a TTY", 4)
     config = EngineConfig.from_json(config_path)
-    try:
-        config, fakes_for = shared.fakes_builder(config, args.app)
-    except ValueError as exc:
-        return shared.err_json(str(exc), 1)
-
-    from engine import full_orbit
-    from engine import owner as owner_module
-
     ledger = Ledger.open(config.ledger_path)
+    row = ledger.project(args.app)
+    attempt_id = row.current_attempt_id
+    if not attempt_id:
+        return shared.err_json("no current attempt to close", 1)
+    if row.state == "CLOSED":
+        return shared.err_json(f"already CLOSED ({attempt_id})", 1)
+    from engine.application import release as release_mod
+    from engine.application.repair import FixupError, close_failed_attempt
+    from .release_ops import _publish_request_ids_for_attempt
+    reason = getattr(args, "reason", None) or "closed_by_foreman"
+    # close_failed_attempt drains the project
+    # queue, so a publish left 'running' (approved, certified, interrupted
+    # before dispatch) would be RESUMED by a "close" -- a close must never
+    # deploy. Refuse on any running/unknown publish; `gb2 resolve` or
+    # `gb2 skip-ship` own that decision.
+    for request_id in _publish_request_ids_for_attempt(ledger, args.app, attempt_id):
+        status = ledger.request(request_id).status
+        if status in ("running", "unknown"):
+            return shared.err_json(
+                f"refused: publish request {request_id} is '{status}' -- run `gb2 resolve` "
+                "or `gb2 skip-ship` first; close never dispatches a deploy", 3)
     try:
-        project_row = ledger.project(args.app)
-        attempt_id = project_row.current_attempt_id
-        if attempt_id is None:
-            return shared.err_json("no_active_job", 1)
-        job_name = _job_name_for_attempt(ledger, args.app, attempt_id)
-
-        # Every owner action kind a station can propose (install,
-        # scripts_change, test_config_change), still unfulfilled against
-        # the current manifest.
-        pending = [req for req in full_orbit.pending_owner_requests(
-                       ledger, args.app, job_name, repo=config.projects[args.app].repo)
-                   if req.get("kind") in owner_module.PENDING_KIND_WHITELIST]
-        if not pending:
-            return shared.err_json("no_pending_owner_request", 1)
-
-        print(json.dumps({"job_name": job_name, "pending_owner_requests": pending},
-                         ensure_ascii=False, indent=1, sort_keys=True), file=sys.stderr)
-
-        owner_text = input(f'type the approval line exactly ("승인 {job_name}"): ')
-        if owner_text != f"승인 {job_name}":
-            return shared.err_json("refused: approval line did not match, nothing changed", 1)
-
-        from engine import position as position_module
-
-        stop = position_module.load_position(ledger, args.app, job_name)
-        for request in pending:
-            try:
-                request_id = owner_module.approve_pending(
-                    config, ledger, args.app, attempt_id, request,
-                    confirm=True, confirm_source="tty",
-                    proposal=(position_module.proposal_id(ledger, args.app, stop, request)
-                              if stop is not None else None),
-                )
-            except ValueError as exc:
-                return shared.err_json(f"approve_pending_refused: {exc}", 1)
-            status = _drain(config, ledger, args.app, attempt_id, request_id)
-            if status != "done":
-                return shared.err_json(f"install_request_failed: {request_id} status={status}", 3)
-
-        start = time.monotonic()
-        outcome = full_orbit.continue_full_job(
-            config, ledger, fakes_for, args.app, job_name, on_progress=shared.progress_printer,
-        )
-        wall_sec = time.monotonic() - start
-        summary = shared.summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
-    finally:
-        ledger.close()
-
-    shared.append_run_log(args.app, {"job_name": job_name, **summary})
-    print(json.dumps(summary, ensure_ascii=False))
-    return shared.exit_code_for_full_outcome(str(summary["status"]))
+        with driver_session(ledger, args.app):
+            release_mod.cancel_pending_publish(ledger, args.app, attempt_id, reason)
+            archive = close_failed_attempt(config, ledger, _build_fakes(config, args.app, attempt_id, None),
+                                           args.app, attempt_id)
+    except FixupError as exc:
+        return shared.err_json(f"close failed: {exc}", 2)
+    print(json.dumps({"closed": attempt_id, "archive": str(archive), "reason": reason,
+                      "state": ledger.project(args.app).state}, ensure_ascii=False))
+    return 0

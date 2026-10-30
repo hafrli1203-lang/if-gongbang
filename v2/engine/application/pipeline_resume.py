@@ -177,6 +177,46 @@ def _early_station_round_stop(run: Run, pos: JobPosition, station: str) -> FullO
     return None
 
 
+def _owner_approved_current_plan(run: Run) -> bool:
+    """True iff the latest plan.reviewed event for this job was recorded
+    by the OWNER (`gb2 approve-plan-edit`, actor_kind "owner") and names
+    the CURRENT plan.json digest -- the foreman took the plan over after
+    a review stop. A planner/reviewer-recorded plan.reviewed
+    (actor "processor") never counts here: that path already has its own
+    maybe_rerun_plan_review digest check."""
+    from engine.domain.plan_review import plan_digest
+    from engine.domain.plan_model import plan_path
+
+    latest = None
+    for _seq, event in run.ledger.events(run.project, "plan.reviewed"):
+        if event.payload.get("job") == run.job:
+            latest = event
+    if latest is None or latest.actor_kind != "owner":
+        return False
+    path = plan_path(run.repo, run.job)
+    if not path.is_file():
+        return False
+    return latest.payload.get("digest") == plan_digest(path)
+
+
+def _continue_from_owner_approved_plan(run: Run, pos: JobPosition) -> FullOutcome:
+    """Same two steps run_plan_and_review takes after a passing review
+    (commit the plan trail, then go on to design/close on the SAME
+    attempt), minus the planner and the reviewer: the owner's approval
+    is the review."""
+    from engine.application.pipeline_stages import commit_job_trail
+    from engine.application.pipeline_base import PLANNER_ROLE
+
+    attempt_id = pos.attempt_id or ""
+    commit_job_trail(run.config, run.ledger, run.project, attempt_id, run.job,
+                     f"gongbang: {run.job} - plan (owner approved)", station="plan",
+                     role=PLANNER_ROLE)
+    return probe_plan_design_close(run.config, run.ledger, run.fakes, run.project, run.job,
+                                    attempt_id, str(pos.get("request", "")), max_fix_rounds(pos),
+                                    run.on_progress, run.processor_factory, start="design",
+                                    probe_text=str(pos.get("probe_text", "")))
+
+
 def _resume_reopened_station(run: Run, pos: JobPosition) -> FullOutcome:
     """A facts/probe/plan/design station that crashed, failed, or stopped
     on its own content (probe failure, plan review) reruns on a FRESH
@@ -210,6 +250,8 @@ def _resume_reopened_station(run: Run, pos: JobPosition) -> FullOutcome:
             and pos.stop_reason.startswith("probe_targets_invalid:")
             and _facts_still_invalid(run, pos)):
         station = "facts"
+    if pos.stage == STAGE_PLAN_REVIEW and _owner_approved_current_plan(run):
+        return _continue_from_owner_approved_plan(run, pos)
     stop = _early_station_round_stop(run, pos, station)
     if stop is not None:
         return stop
@@ -389,6 +431,11 @@ def resume_design_approval(run: Run, pos: JobPosition) -> FullOutcome:
         return stop
     if not check_design_approved(run.ledger, run.project, run.job):
         return FullOutcome("needs_owner", "design_approval", attempt_id, None)
+    # close_early_attempt_then_tasks itself calls design_approval_
+    # still_matches (that ONE shared entry point
+    # covers this caller, resume_early_close, AND the first-time path,
+    # so there is no second, independent copy of the check to drift
+    # out of sync with it here).
     return close_early_attempt_then_tasks(run, attempt_id, plan, max_fix_rounds(pos))
 
 
@@ -435,7 +482,8 @@ def resume_security_fix(run: Run, pos: JobPosition) -> FullOutcome:
         return resume_acceptance(run, pos)
     return finish_after_handoff(run.config, run.ledger, run.project, run.job, plan,
                                  pos.attempt_id or "", Path(str(pos.get("report_path", ""))),
-                                 max_fix_rounds(pos))
+                                 max_fix_rounds(pos), fakes=run.fakes,
+                                 on_progress=run.on_progress, processor_factory=run.processor_factory)
 
 
 

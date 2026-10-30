@@ -21,7 +21,7 @@ from engine.application import task_pipeline as orbit
 from engine.infrastructure import trusted
 from engine.config import EngineConfig
 from engine.application.pipeline_base import (
-    DESIGNER_ROLE, EARLY_ROLES, FACTS_ROLE, PLANNER_ROLE, PROBER_ROLE, PROBE_LOG_CAP,
+    DESIGNER_ROLE, EARLY_ROLES, FACTS_ROLE, PLANNER_ROLE, PROBER_ROLE,
     FullOutcome, ProgressCallback, Run, checked_facts, fakes_for, trusted_text,
 )
 from engine.application.pipeline_stages import (
@@ -49,73 +49,12 @@ from engine.application.stage_prompts import (
     designer_prompt, facts_prompt, planner_prompt, prober_prompt,
 )
 from engine.application.steps.open_job import copy_root
+from engine.application.probe_report import (
+    evidence_record, previous_probe_runs_text, probe_records_text,
+)
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
-
-
-def probe_log_path(repo: Path, job_name: str, index: int) -> Path:
-    from engine.domain.stage_checks import probe_target_id
-
-    return repo / ".gongbang" / job_name / "probe" / f"{probe_target_id(index)}.log"
-
-
-
-def _capture_probe_logs(repo: Path, job_name: str, targets: list[tuple[str, str]],
-                        ) -> list[tuple[str, Path, trusted.Trusted]]:
-    """Every target's probe log as checked (engine.infrastructure.trusted.capture), right
-    after the engine's own probe run passed; a log that cannot be read
-    safely is left out, the same as an unreadable one in the prompt."""
-    captured: list[tuple[str, Path, trusted.Trusted]] = []
-    for i, (name, _url) in enumerate(targets):
-        path = probe_log_path(repo, job_name, i)
-        try:
-            captured.append((name, path, trusted.capture(path)))
-        except OSError:
-            continue
-    return captured
-
-
-capture_probe_logs = _capture_probe_logs
-
-
-
-def verified_probe_text(captured: list[tuple[str, Path, trusted.Trusted]],
-                         ) -> tuple[str, str | None]:
-    """("## 실측 결과" text built from the captured logs, None), or ("",
-    the first target whose log changed since it was checked)."""
-    parts: list[str] = []
-    for name, path, t in captured:
-        text = trusted_text(t, path)
-        if text is None:
-            return "", name
-        parts.append(f"### {name}\n{text[:PROBE_LOG_CAP]}")
-    if not parts:
-        return "", None
-    return "## 실측 결과\n" + "\n\n".join(parts), None
-
-
-
-def probe_logs_text(repo, job_name: str, targets: list[tuple[str, str]]) -> str:
-    """Every target's own probe log (capped at PROBE_LOG_CAP chars
-    each), under one "## 실측 결과" heading -- "" if `targets` is empty
-    or none of the logs can be read (check_probe already gated on
-    them existing and saying PROBE OK before this is ever called, so
-    a read failure here would mean the file vanished in between)."""
-    parts: list[str] = []
-    from engine.domain.stage_checks import probe_target_id
-
-    for i, (name, _url) in enumerate(targets):
-        path = repo / ".gongbang" / job_name / "probe" / f"{probe_target_id(i)}.log"
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        parts.append(f"### {name}\n{text[:PROBE_LOG_CAP]}")
-    if not parts:
-        return ""
-    return "## 실측 결과\n" + "\n\n".join(parts)
-
 
 
 def append_owner_request_resume_note(config: EngineConfig, attempt_id: str, role: str,
@@ -177,13 +116,14 @@ def _run_probe(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
     # attempt -- engine.domain.ids/submit's own request_id is deterministic from
     # this payload, so an unchanged prompt would collide with the FIRST
     # run's already-"done" request and never actually run again (the
-    # RunStationStub-shaped bug this fixed). The previous attempt's own
-    # already-committed logs (if any -- "" on a job's first probe call)
-    # make the retry's payload genuinely different, and give the worker
-    # real context on what failed last time.
-    previous_logs = probe_logs_text(repo, job_name, targets)
-    probe_prompt_text = (f"{base_probe_text}\n\n이전 시도 로그(다시 시도한다):\n{previous_logs}"
-                         if previous_logs else base_probe_text)
+    # RunStationStub-shaped bug this fixed). The engine's own earlier
+    # probe.executed records for this attempt (none on a job's first
+    # probe call; their count grows with every run) make the retry's
+    # payload genuinely different, and give the worker the engine's
+    # account of what failed last time -- never its own old log.
+    previous_runs = previous_probe_runs_text(ledger, project, attempt_id)
+    probe_prompt_text = (f"{base_probe_text}\n\n이전 시도(다시 시도한다):\n{previous_runs}"
+                         if previous_runs else base_probe_text)
     probe_gate = station_context_gate(config, ledger, project, attempt_id, "probe", request)
     if probe_gate.unmet is not None:
         return stop_early_station_for_unmet_context(
@@ -204,9 +144,10 @@ def _run_probe(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
         return full, ""
     commit_job_trail(config, ledger, project, attempt_id, job_name,
                       f"gongbang: {job_name} - probe")
-    # Pass/fail comes from the engine's own run of each probe script
-    # (probe.executed: script, return code, output); the worker's log
-    # text ("PROBE OK") is supporting context only.
+    # Pass/fail AND the planner's probe section both come only from the
+    # engine's own run of each probe script (probe.executed: exit code,
+    # captured output, timestamps, script hash, proxy contacts) -- the
+    # worker's own .log files never reach the planner.
     from engine import acceptance as acceptance_mod
 
     evidence = acceptance_mod.run_probe_scripts(config, ledger, project, attempt_id,
@@ -218,13 +159,7 @@ def _run_probe(config: EngineConfig, ledger: Ledger, fakes: Fakes, project: str,
         record_event(ledger, project, job_name, STAGE_PROBE_RETRY, attempt_id, stop_reason=reason,
                 request=request, max_fix_rounds=max_fix_rounds)
         return FullOutcome("needs_owner", reason, attempt_id, None), ""
-    probe_text, changed = verified_probe_text(_capture_probe_logs(repo, job_name, targets))
-    if changed is not None:
-        reason = f"probe_log_changed_after_check:{changed}"[:200]
-        record_event(ledger, project, job_name, STAGE_PROBE_RETRY, attempt_id, stop_reason=reason,
-                request=request, max_fix_rounds=max_fix_rounds)
-        return FullOutcome("needs_owner", reason, attempt_id, None), ""
-    return None, probe_text
+    return None, probe_records_text(evidence_record(e) for e in evidence)
 
 
 run_probe = _run_probe
@@ -459,8 +394,8 @@ def run_plan_and_review(config: EngineConfig, ledger: Ledger, fakes: Fakes, proj
     # Review the planner's own merged-but-uncommitted change (plan.json +
     # tests/scenes/) BEFORE it is committed as the orchestrator's own plan
     # trail -- otherwise it becomes every later reviewer's base_head
-    # (nothing to diff against) and is never judged by anyone (Codex
-    # finding). One plain review Stage on this same attempt; the diff it
+    # (nothing to diff against) and is never judged by anyone. One plain review Stage on this same
+    # attempt; the diff it
     # sees is exactly base_head..current (this merge's own files, nothing
     # else has touched the tree yet).
     plan_review_outcome = orbit.continue_job(
@@ -638,7 +573,24 @@ def close_early_attempt_then_tasks(run: "Run", attempt_id: str, plan: Plan,
     """Planning (and design approval, for a UI plan) is finished: record
     that, close the shared early attempt, then run the plan's tasks. A
     crash anywhere in the close resumes here (STAGE_EARLY_CLOSE), so the
-    same close request is finished, never a new one opened."""
+    same close request is finished, never a new one opened.
+
+    this is the ONE function every path into the
+    build stage funnels through -- the first-time path right after
+    check_design_approved passes, `resume_design_approval` (an owner-
+    approval resume), AND `resume_early_close` (a crash-and-continue
+    resume of the close itself), the last of which had NO design-
+    content check of its own at all. design_approval_still_matches is
+    therefore called HERE, once, so every one of those three callers
+    is covered uniformly -- never re-implemented per caller, and never
+    missing from whichever one a future caller adds. A design.approved
+    event with no recorded target_version (or none at all -- a non-UI
+    plan) passes through unchanged (see that function's own
+    docstring)."""
+    from engine.application.office_approval import design_approval_still_matches
+
+    if not design_approval_still_matches(run.ledger, run.project, run.job, run.repo):
+        return FullOutcome("needs_owner", "design_approval_stale", attempt_id, None)
     if record:
         record_event(run.ledger, run.project, run.job, STAGE_EARLY_CLOSE, attempt_id,
                 max_fix_rounds=max_fix_rounds)

@@ -10,8 +10,12 @@ superseded) collapses every Korean-only name to the same fallback id,
 and "Naver API"/"Naver_API" to the same id too, letting one passing
 script silently stand in for several distinct targets. Each run
 appends one probe.executed ledger event ({id, name, script,
-returncode, stdout_tail, url, sha256, fingerprint}) regardless of
-outcome -- `url` is the target's own official-doc URL
+returncode, stdout_tail, url, sha256, fingerprint, expected_host,
+contacts, reached, started_at, finished_at}) regardless of outcome --
+`stdout_tail` is the output the ENGINE captured from its own run,
+`contacts` is what the engine's recording proxy saw that run send to
+which host (engine.infrastructure.probe_proxy), and pass/fail is
+judged on those, never on anything the probe worker wrote -- `url` is the target's own official-doc URL
 (check_probe_targets' (name, url) tuple); `sha256` is the probe
 script's own bytes hashed at the moment it ran ("" when there was no
 script to hash); `fingerprint` is the disposable snapshot's own tree
@@ -39,13 +43,16 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from engine.domain import stage_checks as gates
 from engine.domain import ids
+from engine.domain.probe_observation import target_host, target_reached
 from engine.infrastructure import trusted as _trusted
+from engine.infrastructure.probe_proxy import RecordingProxy, proxy_env
 from engine.config import EngineConfig
 from engine.domain.records import Event
 from engine.application.steps.suite_run import bench_env
@@ -81,6 +88,16 @@ class ProbeEvidence:
     # real repo right before the snapshot was built) -- "" when no
     # snapshot was ever built (no_fingerprint).
     fingerprint: str = ""
+    # What the engine's own recording proxy saw during THIS run (see
+    # engine.domain.probe_observation for the record shape) -- the
+    # evidence `ok` is judged on, never the script's own output.
+    contacts: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    # True iff `contacts` show a real response from the target's host.
+    reached: bool = False
+    # UTC ISO-8601 timestamps the engine took right before starting and
+    # right after the script exited ("" when nothing was run).
+    started_at: str = ""
+    finished_at: str = ""
 
 
 _PROBE_EXTENSIONS = (".py", ".sh", ".js")
@@ -190,16 +207,34 @@ def _probe_snapshot_dir(config: EngineConfig, attempt_id: str, probe_id: str) ->
 
 
 def _record_probe_executed(ledger: Ledger, project: str, attempt_id: str,
-                           probe_id: str, name: str, script: str, returncode: int,
-                           stdout_tail: str, *, url: str = "", sha256: str = "",
-                           fingerprint: str = "") -> None:
+                           evidence: "ProbeEvidence") -> None:
     ledger.append(Event(
         project=project, kind="probe.executed", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
-        payload={"id": probe_id, "name": name, "script": script,
-                 "returncode": returncode, "stdout_tail": stdout_tail,
-                 "url": url, "sha256": sha256, "fingerprint": fingerprint},
+        payload={"id": evidence.id, "name": evidence.name, "script": evidence.script,
+                 "returncode": evidence.returncode, "stdout_tail": evidence.stdout_tail,
+                 "url": evidence.url, "sha256": evidence.sha256,
+                 "fingerprint": evidence.fingerprint,
+                 "expected_host": target_host(evidence.url) or "",
+                 "contacts": [dict(c) for c in evidence.contacts],
+                 "reached": evidence.reached,
+                 "started_at": evidence.started_at, "finished_at": evidence.finished_at},
     ))
+
+
+def _not_run(ledger: Ledger, project: str, attempt_id: str, probe_id: str, name: str,
+             url: str, reason: str, *, script: str = "", sha256: str = "",
+             fingerprint: str = "") -> "ProbeEvidence":
+    """One fail-closed result for a target whose script never ran."""
+    evidence = ProbeEvidence(
+        id=probe_id, name=name, script=script, returncode=-1, stdout_tail=reason,
+        ok=False, url=url, sha256=sha256, fingerprint=fingerprint)
+    _record_probe_executed(ledger, project, attempt_id, evidence)
+    return evidence
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 # The marker a probe script's own stdout must print, followed by the
@@ -214,14 +249,91 @@ _PROBE_OK_MARK = "PROBE OK"
 
 
 def _probe_observed(returncode: int, tail: str, url: str) -> bool:
-    """True iff the script both exited 0 AND its own stdout/stderr tail
-    names `_PROBE_OK_MARK` together with THIS target's own url on the
-    same line -- exit 0 alone proves nothing about whether the script
-    ever actually contacted (or even looked at) the target: a no-op
-    script (`exit 0`, or one probing a different target entirely)
-    would otherwise "pass" and get recorded as having observed this
-    target, when it never actually exercised it at all."""
+    """Legacy output check, kept for compatibility: exit 0 and a
+    `PROBE OK <url>` line. Necessary but never sufficient -- the
+    script writes this text itself; run_probe_scripts additionally
+    requires the engine's own proxy to have seen the target reached."""
     return returncode == 0 and f"{_PROBE_OK_MARK} {url}" in tail
+
+
+def _execute_behind_proxy(
+    config: EngineConfig, project: str, attempt_id: str, snapshot: Path,
+    argv: list[str], env: dict[str, str],
+) -> tuple[int, str, tuple[dict[str, object], ...], str, str]:
+    """Runs `argv` in the probe bench sandbox with its HTTP(S) traffic
+    routed through a fresh RecordingProxy -> (returncode, the engine-
+    captured stdout+stderr tail, the proxy's contact records, started_at,
+    finished_at). One proxy per run, so a contact can only ever count
+    for the target whose script produced it."""
+    project_cfg = config.projects[project]
+    with RecordingProxy() as proxy:
+        run_env = {**env, **proxy_env(proxy.url)}
+        started_at = _now()
+        returncode, tail = run_in_bench_sandbox(
+            config, project, attempt_id, snapshot, argv, run_env,
+            project_cfg.test_timeout_sec, net=True, extra_readonly=(project_cfg.repo,),
+            runtime_clis=project_cfg.probe_runtime_clis)
+        finished_at = _now()
+    return returncode, tail, proxy.contacts(), started_at, finished_at
+
+
+def _interpreter_for(config: EngineConfig, project: str,
+                     script: Path) -> tuple[str, ...] | None:
+    """The interpreter argv prefix for `script`, or None when its python3
+    would be invisible inside the probe sandbox (see
+    _probe_python_blocked)."""
+    if script.suffix != ".py":
+        return _PROBE_INTERPRETERS[script.suffix]
+    python_path = _resolve_system_python()
+    if _probe_python_blocked(python_path, _probe_hidden_roots(config, project)):
+        return None
+    return (python_path,)
+
+
+def _probe_one_target(
+    config: EngineConfig, ledger: Ledger, project: str, attempt_id: str,
+    job_name: str, index: int, name: str, url: str, fp: str, env: dict[str, str],
+) -> ProbeEvidence:
+    project_cfg = config.projects[project]
+    probe_id = gates.probe_target_id(index)
+    snapshot = _probe_snapshot_dir(config, attempt_id, probe_id)
+    _make_snapshot(project_cfg.repo, snapshot, fp)
+    _link_snapshot_deps(project_cfg, project_cfg.repo, snapshot)
+    script = _probe_script_path(snapshot, job_name, probe_id)
+    if script is None:
+        return _not_run(ledger, project, attempt_id, probe_id, name, url,
+                        "script_missing", fingerprint=fp)
+    interpreter = _interpreter_for(config, project, script)
+    if interpreter is None:
+        return _not_run(ledger, project, attempt_id, probe_id, name, url,
+                        "python_runtime_hidden", script=str(script), fingerprint=fp)
+    # Capture the script's bytes from THIS snapshot, then verify them
+    # again immediately before the sandbox executes it (see
+    # engine.infrastructure.trusted): a TrustViolation means something
+    # touched the snapshot in between, and the script never runs.
+    try:
+        captured_script = _trusted.capture(script)
+    except _trusted.TrustCaptureError:
+        return _not_run(ledger, project, attempt_id, probe_id, name, url,
+                        "script_missing", script=str(script), fingerprint=fp)
+    script_sha256 = captured_script.digest
+    try:
+        _trusted.verify(captured_script, script)
+    except _trusted.TrustViolation:
+        return _not_run(ledger, project, attempt_id, probe_id, name, url,
+                        "script_changed_before_run", script=str(script),
+                        sha256=script_sha256, fingerprint=fp)
+    returncode, tail, contacts, started_at, finished_at = _execute_behind_proxy(
+        config, project, attempt_id, snapshot, _probe_argv(script, interpreter), env)
+    reached = target_reached(url, contacts)
+    ok = (reached and _probe_observed(returncode, tail, url) and script.exists())
+    evidence = ProbeEvidence(
+        id=probe_id, name=name, script=str(script), returncode=returncode,
+        stdout_tail=tail, ok=ok, url=url, sha256=script_sha256, fingerprint=fp,
+        contacts=contacts, reached=reached, started_at=started_at,
+        finished_at=finished_at)
+    _record_probe_executed(ledger, project, attempt_id, evidence)
+    return evidence
 
 
 def run_probe_scripts(
@@ -230,124 +342,39 @@ def run_probe_scripts(
 ) -> tuple["ProbeEvidence", ...]:
     """Runs each target's own probe script (see module docstring), each
     inside its OWN disposable snapshot of the repo's current
-    fingerprinted tree (one snapshot per target, never one shared
-    snapshot every target's script runs in turn -- see
-    _probe_snapshot_dir: sharing one snapshot would let target i's own
-    script rewrite target j's script or inputs before j ever runs,
-    while j's own recorded fingerprint still claims the ORIGINAL tree),
-    and appends one probe.executed ledger event per target, in order. Each target's script/log id is engine.domain.stage_checks.
-    probe_target_id(i) -- its 1-based POSITION in `targets`, never
-    derived from its name -- so two targets can never collide onto the
-    same id/script/log regardless of how similar or non-ASCII their
-    names are (see module docstring). A target with no script at any
-    of the known extensions gets returncode=-1, stdout_tail=
-    "script_missing", ok=False -- never raises, so one missing script
-    does not stop the rest of the targets from being probed and
-    recorded.
+    fingerprinted tree (one snapshot per target, so target i's script
+    can never rewrite target j's script or inputs before j runs), and
+    appends one probe.executed ledger event per target, in order. A
+    target's script/log id is engine.domain.stage_checks.
+    probe_target_id(i) -- its 1-based POSITION in `targets`. A target
+    with no script gets returncode=-1, stdout_tail="script_missing",
+    ok=False -- never raises, so one missing script does not stop the
+    rest of the targets from being probed and recorded.
 
-    `ok` additionally requires the script's own stdout/stderr tail to
-    say `_PROBE_OK_MARK` together with THAT target's own url
-    (_probe_observed) -- exit 0 by itself is never enough, since a
-    script that never actually contacts its target (or contacts the
-    wrong one) can still exit 0 (see _probe_observed's own docstring).
+    `ok` is the engine's own observation, not the script's word: the
+    script runs behind a fresh RecordingProxy
+    (engine.infrastructure.probe_proxy), and the target counts only
+    when that proxy saw a real response from the host of the target's
+    own facts.md address (engine.domain.probe_observation.
+    target_reached) -- AND the script exited 0 with the legacy
+    `PROBE OK <url>` line. A script that prints the line without
+    contacting the target, or contacts some other host, fails; a
+    target whose facts.md value has no http(s) address cannot be
+    observed and fails too.
 
-    Each snapshot is rebuilt fresh from whatever the repo's own
-    fingerprinted tree is RIGHT NOW (never a tree recorded earlier by
-    some other step) -- the caller (engine.application.pipeline) always commits
-    the prober's own changes to the repo before calling this, so every
-    target's snapshot contains the just-committed probe scripts. A
-    fingerprint that cannot be computed at all (passed in as `fp`,
-    from engine.application.acceptance._fingerprint_or_none) fails every target
-    closed, the same "script_missing"-shaped, never-raising outcome,
-    under its own stdout_tail reason "no_fingerprint", rather than
-    running anything against an unreadable tree."""
+    A fingerprint that cannot be computed at all fails every target
+    closed under stdout_tail "no_fingerprint", without running
+    anything against an unreadable tree."""
     from engine.application.acceptance import _fingerprint_or_none
 
     project_cfg = config.projects[project]
-    repo = project_cfg.repo
     env = bench_env(bench_ctx(config, project, attempt_id))
-    timeout_sec = project_cfg.test_timeout_sec
-    results: list[ProbeEvidence] = []
-    fp = _fingerprint_or_none(repo, project_cfg.excludes)
+    fp = _fingerprint_or_none(project_cfg.repo, project_cfg.excludes)
     if fp is None:
-        for i, (name, url) in enumerate(targets):
-            probe_id = gates.probe_target_id(i)
-            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                                   "", -1, "no_fingerprint", url=url)
-            results.append(ProbeEvidence(
-                id=probe_id, name=name, script="", returncode=-1,
-                stdout_tail="no_fingerprint", ok=False, url=url))
-        return tuple(results)
-
-    for i, (name, url) in enumerate(targets):
-        probe_id = gates.probe_target_id(i)
-        snapshot = _probe_snapshot_dir(config, attempt_id, probe_id)
-        _make_snapshot(repo, snapshot, fp)
-        _link_snapshot_deps(project_cfg, repo, snapshot)
-        script = _probe_script_path(snapshot, job_name, probe_id)
-        if script is None:
-            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                                   "", -1, "script_missing", url=url, fingerprint=fp)
-            results.append(ProbeEvidence(
-                id=probe_id, name=name, script="", returncode=-1,
-                stdout_tail="script_missing", ok=False, url=url, fingerprint=fp))
-            continue
-        if script.suffix == ".py":
-            python_path = _resolve_system_python()
-            if _probe_python_blocked(python_path, _probe_hidden_roots(config, project)):
-                _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                                       str(script), -1, "python_runtime_hidden",
-                                       url=url, fingerprint=fp)
-                results.append(ProbeEvidence(
-                    id=probe_id, name=name, script=str(script), returncode=-1,
-                    stdout_tail="python_runtime_hidden", ok=False, url=url,
-                    fingerprint=fp))
-                continue
-            interpreter: tuple[str, ...] = (python_path,)
-        else:
-            interpreter = _PROBE_INTERPRETERS[script.suffix]
-        # Capture the script's bytes from THIS snapshot, then verify
-        # them again immediately before the sandbox actually executes
-        # it -- never a single read trusted to still hold at exec time
-        # (see engine.infrastructure.trusted's module docstring: the gap this closes
-        # is the same one for every check-then-later-use pair in this
-        # codebase, not something special to acceptance scenes). The
-        # disposable snapshot has no other writer, so this should
-        # never trip; a TrustViolation here means something DID touch
-        # the snapshot between the two reads, and the script must then
-        # never run at all -- not "run it anyway since exit 0 would
-        # look the same as success".
-        try:
-            captured_script = _trusted.capture(script)
-        except _trusted.TrustCaptureError:
-            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                                   str(script), -1, "script_missing", url=url,
-                                   fingerprint=fp)
-            results.append(ProbeEvidence(
-                id=probe_id, name=name, script=str(script), returncode=-1,
-                stdout_tail="script_missing", ok=False, url=url, fingerprint=fp))
-            continue
-        script_sha256 = captured_script.digest
-        try:
-            _trusted.verify(captured_script, script)
-        except _trusted.TrustViolation:
-            _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                                   str(script), -1, "script_changed_before_run",
-                                   url=url, sha256=script_sha256, fingerprint=fp)
-            results.append(ProbeEvidence(
-                id=probe_id, name=name, script=str(script), returncode=-1,
-                stdout_tail="script_changed_before_run", ok=False, url=url,
-                sha256=script_sha256, fingerprint=fp))
-            continue
-        returncode, tail = run_in_bench_sandbox(
-            config, project, attempt_id, snapshot, _probe_argv(script, interpreter), env,
-            timeout_sec, net=True, extra_readonly=(repo,),
-            runtime_clis=project_cfg.probe_runtime_clis)
-        ok = _probe_observed(returncode, tail, url) and script.exists()
-        _record_probe_executed(ledger, project, attempt_id, probe_id, name,
-                               str(script), returncode, tail, url=url,
-                               sha256=script_sha256, fingerprint=fp)
-        results.append(ProbeEvidence(
-            id=probe_id, name=name, script=str(script), returncode=returncode,
-            stdout_tail=tail, ok=ok, url=url, sha256=script_sha256, fingerprint=fp))
-    return tuple(results)
+        return tuple(
+            _not_run(ledger, project, attempt_id, gates.probe_target_id(i), name, url,
+                     "no_fingerprint")
+            for i, (name, url) in enumerate(targets))
+    return tuple(
+        _probe_one_target(config, ledger, project, attempt_id, job_name, i, name, url, fp, env)
+        for i, (name, url) in enumerate(targets))

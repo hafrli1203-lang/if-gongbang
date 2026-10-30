@@ -81,6 +81,7 @@ from engine.application import repair as fixup
 from engine.domain import ids
 from engine.infrastructure import procs
 from engine.infrastructure import sandbox
+from engine.application.steps import worker_shell_jail
 from engine.infrastructure.reference_snapshot import ensure_snapshot_for_attempt
 from engine.config import McpServerConfig
 from engine.infrastructure.gitutil import git_argv
@@ -521,6 +522,8 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     env["HOME"] = str(home_dir)
     writable = (_stations_dir(ctx),)
     from engine.application.steps.worker_step import ENGINE_ROOT
+    from engine.application.steps.worker_sandbox import CLI_SHELL_SNAPSHOT_SUBDIR
+    (home_dir / CLI_SHELL_SNAPSHOT_SUBDIR).mkdir(parents=True, exist_ok=True)
 
     # The reviewer may import this engine package inside the sandbox too.
     # reference_paths (ProjectConfig): same engine-owned, read-only
@@ -548,12 +551,30 @@ def _sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
               + ctx.config.projects[ctx.project].hidden_paths)
     if real_home is not None:
         hidden += (real_home,)
-    try:
+
+    def wrap_cli(extra_writable: tuple[Path, ...] = (),
+                 extra_readonly: tuple[Path, ...] = ()) -> list[str]:
         return sandbox.wrap(
-            argv, cwd=spec.workdir, writable=writable, hidden=hidden,
-            readonly=readonly, symlinks=symlinks, net=True,
+            argv, cwd=spec.workdir, writable=writable + extra_writable, hidden=hidden,
+            readonly=readonly + extra_readonly, symlinks=symlinks, net=True,
             mode=ctx.config.sandbox, child_env=env,
+            protected_roots=(ctx.config.secrets_dir,),
         )
+
+    # A reviewer CLI with a shell prefix (claude) runs its commands in the
+    # network-less second layer: the frozen snapshot, read-only, and none
+    # of the CLI's own HOME.
+    command_readonly = ((spec.workdir, ENGINE_ROOT, home_dir / CLI_SHELL_SNAPSHOT_SUBDIR)
+                        + tuple(entry.path for entry in snapshot_entries))
+    try:
+        return worker_shell_jail.wrap_for_runner(
+            runner, mode=ctx.config.sandbox, env=env, wrap_cli=wrap_cli,
+            root=worker_shell_jail.jail_root(
+                ctx.config.home, ids.attempt_dirname(ctx.attempt_id), spec.station, spec.role),
+            policy=lambda: worker_shell_jail.CommandPolicy(
+                cwd=spec.workdir, writable=(), readonly=command_readonly,
+                readonly_remap=(), hidden=hidden + sandbox.HOST_SOCKET_DIRS),
+            protected_roots=(ctx.config.secrets_dir,))
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc
 

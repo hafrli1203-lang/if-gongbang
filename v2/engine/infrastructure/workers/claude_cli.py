@@ -98,7 +98,11 @@ def _mcp_config_dir(spec: WorkerSpec) -> Path:
     (station._sandboxed_argv: `readonly += (spec.gate_facts_path.
     parent,)`), so writing this file into it needs no separate sandbox
     mount of its own -- the `claude` CLI can still read it from inside
-    the sandbox via that existing bind.
+    the sandbox via that existing bind. Under sandbox mode "bwrap" the
+    shell and hook commands the CLI runs execute in a second sandbox
+    where this one file is masked (engine.application.steps.
+    worker_sandbox._command_policy), so only the CLI process tree's own
+    layer can read it.
 
     Raises ValueError if spec.gate_facts_path is None: ClaudeRunner's
     own `needs_gate = True` means every real engine.application.steps.worker_step call
@@ -118,8 +122,11 @@ def _mcp_config_dir(spec: WorkerSpec) -> Path:
     return spec.gate_facts_path.parent
 
 
+MCP_CONFIG_NAME = "mcp-config.json"
+
+
 def _mcp_config_path(spec: WorkerSpec) -> Path:
-    return _mcp_config_dir(spec) / "mcp-config.json"
+    return _mcp_config_dir(spec) / MCP_CONFIG_NAME
 
 
 def _write_mcp_config_file(spec: WorkerSpec, mcp_servers: dict[str, McpServerConfig]) -> Path:
@@ -195,6 +202,18 @@ class ClaudeRunner:
     # write_stdin_file and passes it as procs.spawn's stdin_path, never
     # stdin_devnull).
     prompt_via_stdin = True
+    # The CLI's documented shell-prefix env var: every Bash tool command
+    # and every hook command is run as `<prefix> '<command>'` (observed
+    # on this host's CLI). Under sandbox mode "bwrap" the engine points
+    # it at the shell-jail client, so those commands run in a second,
+    # network-less sandbox (engine.application.steps.worker_shell_jail).
+    shell_prefix_env = "CLAUDE_CODE_SHELL_PREFIX"
+
+    def local_shell_commands(self) -> tuple[str, ...]:
+        """Hook commands the shell-jail client runs in the CLI's own layer
+        rather than the command layer: the policy gate, so code running
+        among the worker's commands cannot reach the gate process."""
+        return (_gate_command(),)
 
     def argv(self, spec: WorkerSpec, worker: WorkerConfig) -> list[str]:
         argv = ["claude", "-p"]

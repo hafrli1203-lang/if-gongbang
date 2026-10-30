@@ -375,10 +375,13 @@ def acceptance_fix_rounds_used(ledger: Ledger, project: str, job_name: str) -> i
     return len(attempt_ids)
 
 
-def load_position(ledger: Ledger, project: str, job: str) -> JobPosition | None:
-    """The newest position recorded for `job` (any of `job.position`,
-    legacy `full_orbit.cursor`, legacy `full_orbit.progress`, by seq), with
-    the fix journal folded in. None if nothing was ever recorded."""
+def _latest_position_record(ledger: Ledger, project: str,
+                            job: str) -> tuple[int, JobPosition] | None:
+    """The newest raw position record for `job` (any of `job.position`,
+    legacy `full_orbit.cursor`, legacy `full_orbit.progress`, by seq),
+    BEFORE the fix journal is folded in -- shared by load_position and
+    current_position_seq so the two never disagree on which record is
+    "the newest one"."""
     latest: tuple[int, JobPosition] | None = None
     for kind, parse in _READERS:
         for seq, event in ledger.events(project, kind):
@@ -386,9 +389,39 @@ def load_position(ledger: Ledger, project: str, job: str) -> JobPosition | None:
                 continue
             if latest is None or seq > latest[0]:
                 latest = (seq, parse(event.payload))
+    return latest
+
+
+def load_position(ledger: Ledger, project: str, job: str) -> JobPosition | None:
+    """The newest position recorded for `job`, with the fix journal
+    folded in. None if nothing was ever recorded."""
+    latest = _latest_position_record(ledger, project, job)
     if latest is None:
         return None
     return _with_fix_journal(ledger, project, latest[1])
+
+
+def current_position_seq(ledger: Ledger, project: str, job: str) -> int | None:
+    """The ledger seq of the newest position record for `job` (same
+    record load_position reads, before the fix journal fold -- the fold
+    never changes which raw record is newest). None if nothing was ever
+    recorded for `job`.
+
+    결함 F1: used as a stable anchor for one owner-resume episode on a
+    build task (engine.application.pipeline_resume_tasks.
+    rerun_task_owner_stop). That stop's own position event is recorded
+    once, when the task stops for the owner, and stays "the newest
+    position" through any number of crash/retry resumes of answering
+    it -- a NEW position (a later stop, or the task finishing) is only
+    recorded once this resume's own run_station request actually
+    reaches a terminal state. Counting `request.submitted` events with
+    seq <= this anchor therefore excludes a retry's own earlier,
+    not-yet-recorded submission (which always lands at a HIGHER seq,
+    after this very stop), so recomputing the count on a crash-retry
+    gives back the exact same number every time -- never a retry's own
+    partial work inflating it into looking like a brand-new resume."""
+    latest = _latest_position_record(ledger, project, job)
+    return latest[0] if latest is not None else None
 
 
 def opening_roles(pos: JobPosition) -> tuple[str, ...] | None:
@@ -684,7 +717,8 @@ from engine.application.job_state_requests import (  # noqa: E402
 )
 
 __all__ = [
-    "JobPosition", "FixState", "record_position", "load_position", "pending_owner_requests",
+    "JobPosition", "FixState", "record_position", "load_position", "current_position_seq",
+    "pending_owner_requests",
     "resume_job", "resume_job_from", "resume_after_fix", "FLOW_BOUNDARIES", "STAGES",
     "fix_opened_position", "fix_opened_attempt", "task_stop_position", "without_release",
     "is_full_job", "stages_spec", "stages_from_spec", "opening_roles", "proposal_id",

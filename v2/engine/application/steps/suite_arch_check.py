@@ -22,6 +22,24 @@ from engine.infrastructure import sandbox
 # extra_readonly=()) -> (wrapped_argv, child_env).
 SandboxArgvFn = Callable[..., tuple[list[str], dict[str, str]]]
 
+# arch_check.py --json's own violation shape (this module's docstring,
+# "run_arch_check" entry): {"check", "file", "detail"}, all strings. A
+# tool whose stdout parses as JSON but whose violations don't match
+# this -- {}, a bare string/number, a dict missing one of the three
+# fields, or a non-string value for one of them -- must never fall
+# through to "existing_violation_count" as if it were real pre-existing
+# data: that would silently hide a broken arch_check tool AND any real
+# violations it was supposed to report (F3,. Caught as the
+# same StepFailed("arch_check_failed") a crashed tool or non-JSON
+# stdout already gets, in `run` below.
+_REQUIRED_VIOLATION_FIELDS = ("check", "file", "detail")
+
+
+def _is_well_formed_violation(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return all(isinstance(item.get(field), str) for field in _REQUIRED_VIOLATION_FIELDS)
+
 
 def tool_readonly_paths(project: ProjectConfig) -> tuple[Path, ...]:
     """Every absolute-path token inside project.arch_check_cmd that
@@ -96,6 +114,8 @@ def run(ctx: StepContext, *, project: ProjectConfig, repo: Path,
         raise StepFailed("arch_check_failed") from exc
     violations = data.get("violations") if isinstance(data, dict) else None
     if not isinstance(violations, list):
+        raise StepFailed("arch_check_failed")
+    if not all(_is_well_formed_violation(v) for v in violations):
         raise StepFailed("arch_check_failed")
     changed = set(dirty_paths(repo, project.excludes))
     new_violations = [v for v in violations

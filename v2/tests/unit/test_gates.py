@@ -278,15 +278,47 @@ def test_check_probe_targets_raises_on_malformed_line(tmp_path: Path) -> None:
         check_probe_targets(tmp_path, "job")
 
 
-def test_check_probe_targets_raises_on_non_bullet_line(tmp_path: Path) -> None:
+def test_check_probe_targets_skips_a_non_bullet_line_with_no_address(tmp_path: Path) -> None:
+    """A non-bullet line that carries no address ("://") cannot be a
+    target -- it is prose (a wrapped explanation that did not close its
+    own parenthesis on the same line stopped a real job twice) -- so it
+    is skipped rather than raised."""
     text = (
         "## 외부 대상\n"
         "- stripe: https://docs.stripe.com/api\n"
         "그냥 글 (불릿 아님)\n"
     )
     _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [("stripe", "https://docs.stripe.com/api")]
+
+
+def test_check_probe_targets_still_raises_on_a_non_bullet_line_with_an_address(
+    tmp_path: Path,
+) -> None:
+    """A non-bullet line that DOES carry an address must still raise --
+    only address-free prose is forgiven; a target written in the wrong
+    shape must never vanish."""
+    text = (
+        "## 외부 대상\n"
+        "- stripe: https://docs.stripe.com/api\n"
+        "https://docs.stripe.com/other (불릿 아님)\n"
+    )
+    _write_facts(tmp_path, "job", text)
     with pytest.raises(ProbeTargetsError):
         check_probe_targets(tmp_path, "job")
+
+
+def test_check_probe_targets_drops_an_in_house_target_from_the_list(tmp_path: Path) -> None:
+    """A "- name: (사내)" target has no public address and cannot be
+    reached from the probe sandbox -- it is excluded from the returned
+    list (checked by build/acceptance instead), not raised as malformed."""
+    text = (
+        "## 외부 대상\n"
+        "- stripe: https://docs.stripe.com/api\n"
+        "- 내부 설정 API: (사내)\n"
+    )
+    _write_facts(tmp_path, "job", text)
+    assert check_probe_targets(tmp_path, "job") == [("stripe", "https://docs.stripe.com/api")]
 
 
 def test_check_probe_targets_skips_explicit_note_lines(tmp_path: Path) -> None:

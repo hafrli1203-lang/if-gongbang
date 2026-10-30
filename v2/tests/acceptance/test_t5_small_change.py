@@ -10,10 +10,11 @@ already exercises, proving two things T3 alone cannot:
      landing the same file, passing the same real `npx vitest run`,
      and writing the same .gongbang/<job>/report.md 대조표.
   2. the same release gating a full job gets: with `--with-release`
-     configured, `gb2 change --small` stops needs_owner/
-     "release_approval" exactly like a full job does (never deploys on
-     its own), and a REAL `gb2 ship` (typed into a pty, same as T3's
-     own ship test) deploys it exactly once.
+     configured, `gb2 change --small` approves and runs that same
+     release request in the SAME call (engine.application.auto_pilot.
+     auto_settle, no-approval-stops policy) exactly like a full job does --
+     the fake deploy script runs exactly once, with no separate `gb2
+     ship` needed.
 
 Helpers below are deliberately duplicated from test_t3_gb2_node_e2e.py
 in trimmed, one-task form rather than imported -- see this project's
@@ -507,10 +508,12 @@ def test_gb2_change_small_with_release_stops_for_approval_then_ships_once(
 ) -> None:
     """Same release gating a full job gets (engine.full_orbit.
     _maybe_release_or_done/finalize_release -- engine.small_orbit never
-    writes its own release logic, see that module's own docstring):
-    `--small` stops needs_owner/"release_approval" instead of deploying
-    on its own, and a real `gb2 ship` (typed into a pty) then deploys
-    exactly once."""
+    writes its own release logic, see that module's own docstring).
+    Policy (no approval stops): `--small` used to
+    stop needs_owner/"release_approval" and wait for a separate `gb2
+    ship`; engine.application.auto_pilot.auto_settle now approves and
+    runs that same publish request in the SAME `gb2 change --small`
+    call, so the deploy already happened by the time this returns."""
     apps_root = tmp_path / "source"
     workspace = tmp_path / "workspace"
     apps_root.mkdir()
@@ -534,24 +537,16 @@ def test_gb2_change_small_with_release_stops_for_approval_then_ships_once(
 
     change_result = _run_gb2(
         ["change", app, _REQUEST, "--job-name", job_name, "--small"], env)
-    assert change_result.returncode == 2, (change_result.stdout, change_result.stderr)
+    assert change_result.returncode == 0, (change_result.stdout, change_result.stderr)
     change_summary = json.loads(change_result.stdout)
-    assert change_summary["status"] == "needs_owner"
-    assert change_summary["reason"] == "release_approval"
-    assert not deploy_log.exists()
+    assert change_summary["status"] == "done", change_summary
 
     status_result = _run_gb2(["status", app], env)
     assert status_result.returncode == 0, (status_result.stdout, status_result.stderr)
     status = json.loads(status_result.stdout)
+    assert status["state"] == "CLOSED"
     publish_requests = [r for r in status["queued_requests"] if r["kind"] == "publish"]
-    assert len(publish_requests) == 1
-    request_id = publish_requests[0]["request_id"]
-
-    ship_result = _run_gb2_with_approval(["ship", app], env, f"승인 {request_id}")
-    assert ship_result.returncode == 0, (ship_result.stdout, ship_result.stderr)
-    ship_summary = json.loads(ship_result.stdout)
-    assert ship_summary["publish"]["status"] == "done"
-    assert ship_summary["status"] == "done"
+    assert publish_requests == []
 
     assert deploy_log.exists()
     deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()

@@ -236,7 +236,118 @@ def test_find_fix_target_and_compose_task_carry_review_findings(
     assert "Review findings to address:" in task
     assert "missing null check" in task
     assert "Failing test output:" not in task
-    assert "Extra: please re-check auth too" in task
+    # 결함 63: extra (운영자·반장 지시) is a clearly labeled section placed
+    # BEFORE the original task, never buried after it as a bare "Extra:"
+    # label a long original task could push past where a worker reading
+    # top-to-bottom stops paying attention.
+    assert "## 이번 회차 운영자·반장 지시 (최우선)" in task
+    assert "please re-check auth too" in task
+    assert task.index("이번 회차 운영자·반장 지시") < task.index("Continue this task")
+
+
+def _seed_gate_log_denial(ledger, project: str, attempt_id: str, path: str) -> None:
+    """One "gate_log.decision" event shaped exactly as
+    engine.application.steps.worker_gate_log.import_gate_log itself
+    appends for a real "policy.decided" denial with reason
+    "outside_allowed_path" -- the engine's own forgery-resistant import
+    of gate.log, never the raw worker-writable log file."""
+    ledger.append(Event(
+        project=project, kind="gate_log.decision", actor_kind="gate_log",
+        actor_id="builder", attempt_id=attempt_id,
+        payload={"orig_kind": "policy.decided", "allowed": False,
+                 "reason": "outside_allowed_path", "path": path,
+                 "request_id": "r1", "log_line": 1},
+    ))
+
+
+def test_fix_refuses_when_the_failed_attempt_hit_repeated_owns_denials(
+    workspace: Workspace,
+) -> None:
+    """결함 66: `fix()` must stop BEFORE composing/opening another round
+    once the attempt about to be replaced already hit
+    fixup.OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD "outside_allowed_path"
+    gate denials -- another round's builder would just retry the same
+    denied write, since nothing about its own owns changed. The refusal
+    message carries the distinct denied paths (as a JSON list) so
+    tools/gb2lib.runner.cmd_fix can tell the owner exactly which
+    `--also-own <path>` call unblocks it."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "owns-stuck-job",
+                          "full", ("builder", "reviewer"))
+    outcome = orbit.continue_job(
+        workspace.config, workspace.ledger, _fakes(), "alpha", attempt_id,
+        [orbit.Stage("run_station",
+                     {"station": "build", "role": "builder", "task": "add the feature"}),
+         orbit.Stage("merge", {"copies": [
+             {"role": "builder", "station": "build",
+              "path": str(copy_root(workspace.config, attempt_id, "builder"))},
+         ]}),
+         orbit.Stage("review", {"role": "reviewer"})],
+        processor_factory=_processor_factory(
+            review_passed=False,
+            review_findings=[{"severity": "P1", "summary": "needs a new test file"}],
+        ),
+    )
+    assert outcome.status == "failed"
+
+    for n in range(5):
+        _seed_gate_log_denial(workspace.ledger, "alpha", attempt_id,
+                              f"tests/new_scene_{n}.py")
+
+    def fakes_for(aid: str) -> Fakes:
+        return _fakes()
+
+    with pytest.raises(fixup.FixupError) as exc_info:
+        fixup.fix(workspace.config, workspace.ledger, "alpha", "", fakes_for)
+    message = str(exc_info.value)
+    assert message.startswith(fixup.OWNS_SCOPE_STUCK_PREFIX)
+    import json as _json
+    denied = _json.loads(message[len(fixup.OWNS_SCOPE_STUCK_PREFIX):])
+    assert sorted(denied) == sorted(f"tests/new_scene_{n}.py" for n in range(5))
+    # Nothing was opened for this refusal -- same "no ledger write
+    # beyond the refusal itself" guarantee FIX_ROUNDS_EXHAUSTED_PREFIX/
+    # NO_PROGRESS_PREFIX already give.
+    assert _fix_opened(workspace.ledger, "alpha") == []
+
+
+def test_compose_fix_task_always_repeats_the_owns_scope_reminder() -> None:
+    """결함 66: every fix round's own composed task must carry the
+    owns-scope reminder (OWNS_SCOPE_REQUEST_RULE, plus the fix-specific
+    next step) again, regardless of extra/findings/also_own -- the
+    original task's own copy of the same reminder can be buried or cut
+    off by _capped_original_task after enough rounds, and a builder
+    stuck outside its owns must be told to stop and report, not keep
+    retrying a write the live gate already denies."""
+    target = fixup.FixTarget(
+        attempt_id="a#1", job_id="j1", job_name="job",
+        builder_role="builder", reviewer_role="reviewer",
+        original_task="do the thing", failing_kind="bench",
+        failing_reason=None, review_findings=[], bench_tail=None,
+    )
+    task = fixup.compose_fix_task(target, "")
+    assert "owns 밖의 파일을 고쳐야 하면 직접 고치지 않는다" in task
+    assert "--also-own" in task
+
+
+def test_compose_fix_task_caps_a_long_nested_original_task(workspace: Workspace) -> None:
+    """결함 63: `original_task` is read back from a PREVIOUS fix round's
+    own composed task text (run_station.payload["task"] -- see
+    find_fix_target's docstring), which nests every earlier round's text
+    inside it. Left uncapped, this grows round over round without bound
+    (a live case reached 253,883 chars). compose_fix_task must cap how
+    much of it is carried forward, keeping the newest material (the
+    tail) and noting how much was cut -- never silently dropping the
+    newest round's own content from the middle or front."""
+    long_original = "x" * 30_000 + "THE_NEWEST_TAIL_MARKER"
+    target = fixup.FixTarget(
+        attempt_id="a#1", job_id="j1", job_name="job",
+        builder_role="builder", reviewer_role="reviewer",
+        original_task=long_original, failing_kind="bench",
+        failing_reason=None, review_findings=[], bench_tail=None,
+    )
+    task = fixup.compose_fix_task(target, "")
+    assert "THE_NEWEST_TAIL_MARKER" in task
+    assert len(task) < len(long_original)
+    assert "생략" in task
 
 
 # ---------------------------------------------------------------------
@@ -502,7 +613,10 @@ def test_fix_continues_a_failed_bench_keeping_the_earlier_change_and_adding_the_
     assert "Continue this task. Original request: investigate the initials bug" in result.task
     assert "Failing test output:" in result.task
     assert "test_initials" in result.task
-    assert "Extra: please finish the fix" in result.task
+    assert "## 이번 회차 운영자·반장 지시 (최우선)" in result.task
+    assert "please finish the fix" in result.task
+    assert (result.task.index("이번 회차 운영자·반장 지시")
+            < result.task.index("Continue this task"))
 
     assert result.outcome.status == "done"
     assert seen_stages == ["run_station", "merge", "review", "bench", "commit", "report", "close"]

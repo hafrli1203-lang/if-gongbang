@@ -17,9 +17,11 @@ from engine.steps.open_job import open_job
 from tests.conftest import Workspace, git
 from tests.fixtures.sample_app import make_sample
 from tests.plan_stub import Plan, Scene
+from tests.probe_target import contacting_py_script, serve_target
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox.available(), reason="bwrap not available on this host",
 )
 
 
@@ -157,19 +159,18 @@ def test_failing_full_suite_fails_acceptance_even_with_a_passing_scene(
     assert acc.passed is False
 
 
-def test_scene_mutation_runs_against_a_snapshot_not_the_real_repo(
+def test_scene_writing_a_new_file_at_the_snapshot_root_is_refused(
     workspace: Workspace,
 ) -> None:
     """Scenes/the full suite run against a disposable snapshot of the
-    tree (engine.acceptance's module docstring), never the real repo --
-    a scene writing a new file lands in the snapshot only. This is the
-    fix for the old loophole: a scene used to run IN the real repo, so
-    a before/after fingerprint comparison around it could be fooled by
-    a scene that mutated a file, ran the test, then restored it before
-    the "after" read -- the restore made that diff look clean. Fixing
-    the tree BEFORE any scene runs and never letting a scene touch the
-    real repo at all closes that: there is nothing left for a scene to
-    usefully "restore" to fool."""
+    tree (engine.acceptance's module docstring), never the real repo,
+    and that snapshot is immutable while the scene runs -- untracked
+    paths at its ROOT included: a new root-level file could be an
+    execution substitute (a config file, a module a loose import
+    resolves first). Under sandbox="none" the barrier is the snapshot's
+    own directory chmod (suite_tree_guard.lock_tree_dirs), so the
+    write itself raises PermissionError and the scene fails; nothing
+    was mutated and the real repo is untouched."""
     ws = _sample_workspace(workspace)
     attempt_id = _open(ws)
     plan = Plan(
@@ -182,23 +183,24 @@ def test_scene_mutation_runs_against_a_snapshot_not_the_real_repo(
 
     acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
 
-    assert acc.scenes[0].passed is True
+    assert acc.scenes[0].passed is False
+    assert "Permission denied" in acc.scenes[0].tail
+    assert acc.snapshot_mutated is False
     assert acc.full_suite_passed is True
     assert acc.tree_changed is False
-    assert acc.passed is True
-    # The scene's write never reached the real repo.
+    assert acc.passed is False
     assert not (ws.alpha / "untracked_by_scene.txt").exists()
 
     data = json.loads(acceptance_path(ws.config, "alpha", "job1").read_text(encoding="utf-8"))
     assert data["tree_changed"] is False
-    assert data["passed"] is True
+    assert data["passed"] is False
     assert data["fingerprint"] == acc.fingerprint
     assert len(data["fingerprint"]) == 40
 
     events = [e for _seq, e in ws.ledger.events("alpha", "acceptance.recorded")]
     assert events[0].payload["tree_changed"] is False
     assert events[0].payload["fingerprint"] == acc.fingerprint
-    assert events[0].payload["reason"] is None
+    assert events[0].payload["reason"] == "scenes_or_suite_failed"
 
 
 def test_scene_patching_a_tracked_file_fails_the_scene_outright(
@@ -371,9 +373,12 @@ def test_scene_that_drops_an_untracked_config_file_does_not_leak_into_the_next_s
 
     acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
 
-    assert acc.scenes[0].passed is True
+    # s1's write is refused outright (the snapshot is immutable while a
+    # stage runs); s2 runs in its own fresh snapshot and sees nothing.
+    assert acc.scenes[0].passed is False
     assert acc.scenes[1].passed is True
-    assert acc.passed is True
+    assert acc.snapshot_mutated is False
+    assert acc.passed is False
     # Never reached the real repo either.
     assert not (ws.alpha / "config.override.json").exists()
 
@@ -399,9 +404,10 @@ def test_scene_that_poisons_a_cache_dir_does_not_leak_into_the_full_suite(
 
     acc = run_acceptance(ws.config, ws.ledger, "alpha", attempt_id, plan)
 
-    assert acc.scenes[0].passed is True
+    assert acc.scenes[0].passed is False  # mkdir refused
+    assert acc.snapshot_mutated is False
     assert acc.full_suite_passed is True
-    assert acc.passed is True
+    assert acc.passed is False
     assert not (ws.alpha / ".pytest_cache_poison").exists()
 
 
@@ -430,17 +436,14 @@ def test_run_probe_scripts_runs_existing_script_and_records_evidence(
     probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
     # "t1" -- 1-based position in the targets list (engine.gates.
-    # probe_target_id), never derived from the target's own name.
-    # _probe_observed requires the marker AND this exact target's own
-    # url on the same stdout line, not just the bare marker.
-    (probe_dir / "t1.py").write_text(
-        "print('PROBE OK https://docs.stripe.com/api')\n", encoding="utf-8",
-    )
-
-    results = run_probe_scripts(
-        ws.config, ws.ledger, "alpha", attempt_id, "job1",
-        [("stripe", "https://docs.stripe.com/api")],
-    )
+    # probe_target_id), never derived from the target's own name. The
+    # script must really reach the target (a local fake server) through
+    # the engine's recording proxy, and print the legacy line too.
+    with serve_target() as url:
+        (probe_dir / "t1.py").write_text(contacting_py_script(url), encoding="utf-8")
+        results = run_probe_scripts(
+            ws.config, ws.ledger, "alpha", attempt_id, "job1", [("stripe", url)],
+        )
 
     assert len(results) == 1
     assert results[0].id == "t1"
@@ -502,15 +505,14 @@ def test_run_probe_scripts_colliding_names_get_distinct_ids_and_scripts(
     attempt_id = _open(ws)
     probe_dir = ws.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    # _probe_observed requires the marker AND this target's own url.
-    (probe_dir / "t1.py").write_text("print('PROBE OK https://a')\n", encoding="utf-8")
     # t2 has no script at all -- must be reported missing, not silently
     # covered by t1's passing script.
-
-    results = run_probe_scripts(
-        ws.config, ws.ledger, "alpha", attempt_id, "job1",
-        [("Naver API", "https://a"), ("Naver_API", "https://b")],
-    )
+    with serve_target("/a") as url_a:
+        (probe_dir / "t1.py").write_text(contacting_py_script(url_a), encoding="utf-8")
+        results = run_probe_scripts(
+            ws.config, ws.ledger, "alpha", attempt_id, "job1",
+            [("Naver API", url_a), ("Naver_API", "https://b")],
+        )
 
     assert [r.id for r in results] == ["t1", "t2"]
     assert results[0].ok is True
@@ -736,8 +738,7 @@ def test_scene_edited_in_the_race_window_before_the_old_check_point_is_still_cau
 def test_stripping_covers_after_review_is_still_caught_even_with_a_stale_caller_plan(
     workspace: Workspace,
 ) -> None:
-    """Codex goal review 5, P1 (acceptance.py:634/full_orbit.py:1446):
-    the previous gating condition for whether run_acceptance even runs
+    """The previous gating condition for whether run_acceptance even runs
     engine.plan.verify_reviewed_scenes was "does the Plan object the
     caller passed in still claim any `covers`" -- but a plan.json
     edited AFTER review to simply delete every `covers` entry makes
@@ -872,9 +873,8 @@ def test_scene_cannot_shadow_a_tracked_package_with_a_new_untracked_file(
     tracked package directory (src/greeter/, here) -- an untracked
     package shadowing a tracked module -- must fail to write it under
     sandbox="bwrap" (engine.acceptance.
-    _tracked_directories' own read-only bind), unlike a scratch/output
-    file at the snapshot's own root (test_scene_mutation_runs_against_
-    a_snapshot_not_the_real_repo and friends -- that keeps working)."""
+    _tracked_directories' own read-only bind); the snapshot root is
+    covered separately (test_acceptance_tree_guard.py)."""
     ws = _sample_workspace(workspace)
     ws = Workspace(ws.root, replace(ws.config, sandbox="bwrap"), ws.ledger,
                   ws.alpha, ws.beta)

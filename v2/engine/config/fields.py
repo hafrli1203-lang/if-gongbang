@@ -406,6 +406,12 @@ def _project_number(value: object, name: str, field_name: str) -> float:
     return float(value)
 
 
+def _project_int(value: object, name: str, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"project {name!r}: {field_name} must be an integer")
+    return value
+
+
 def _project_writable_subpaths(value: object, name: str) -> dict[str, tuple[str, ...]]:
     if not isinstance(value, dict):
         raise ValueError(f"project {name!r}: copy_link_writable_subpaths must be an object")
@@ -542,6 +548,12 @@ PROJECT_FIELDS: tuple[ProjectFieldSpec, ...] = (
     ProjectFieldSpec("arch_check_cmd",
                       lambda v, base, name: tuple(_str_list(v)),
                       lambda base, name: (), lambda v: list(v)),
+    # Default 2, not 5: ENGINE.md's
+    # 완성 원칙 is "fix then re-review, at most 2 rounds, then the foreman"
+    # and JobPosition's own default is 2 -- the CLI passed this 5 through.
+    ProjectFieldSpec("max_fix_rounds",
+                      lambda v, base, name: _project_int(v, name, "max_fix_rounds"),
+                      lambda base, name: 2, lambda v: v),
     ProjectFieldSpec("builder_test_hint",
                       lambda v, base, name: _project_opt_str(
                           v, name, "builder_test_hint", null_ok_msg=True),

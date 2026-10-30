@@ -65,6 +65,7 @@ def ensure_installed(repo: Path, install_cmd: tuple[str, ...], *,
                      allow_lifecycle_scripts: bool = False,
                      sandbox_mode: str = "none",
                      hidden_paths: tuple[Path, ...] = (),
+                     protected_roots: tuple[Path, ...] = (),
                      net: bool = True) -> BootstrapResult:
     """Run `install_cmd` inside `repo`, but only iff `repo/node_modules/
     _INSTALLED_MARKER` does not exist yet -- NOT just `node_modules`
@@ -92,7 +93,8 @@ def ensure_installed(repo: Path, install_cmd: tuple[str, ...], *,
         result = run_install_cmd(
             repo, install_cmd, timeout_sec=timeout_sec,
             allow_lifecycle_scripts=allow_lifecycle_scripts,
-            sandbox_mode=sandbox_mode, hidden_paths=hidden_paths, net=net,
+            sandbox_mode=sandbox_mode, hidden_paths=hidden_paths,
+            protected_roots=protected_roots, net=net,
         )
     except (OSError, subprocess.TimeoutExpired, sandbox.SandboxUnavailable) as exc:
         return BootstrapResult(

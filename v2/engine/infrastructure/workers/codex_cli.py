@@ -1,5 +1,6 @@
-"""Codex CLI reviewer runner. Read-only sandbox (`-s read-only`): the
-reviewer only ever looks at the repo, never writes to it, so it needs no
+"""Codex CLI reviewer runner. Read-only sandbox (`-s read-only`, codex's
+own Landlock+seccomp enforcement for the commands it runs): the reviewer
+only ever looks at the repo, never writes to it, so it needs no
 PreToolUse gate of its own."""
 from __future__ import annotations
 
@@ -39,8 +40,20 @@ class CodexRunner:
         schema_path.parent.mkdir(parents=True, exist_ok=True)
         write_verdict_schema(schema_path)
         reasoning = worker.reasoning or _DEFAULT_REASONING
+        # -s read-only with codex's Landlock+seccomp sandbox for the
+        # commands the reviewer runs (features.use_legacy_landlock): the
+        # default read-only mode spawns a second bwrap inside the engine's
+        # own, and nested user namespaces are refused on this host ("No
+        # permissions to create new namespace" -- every reviewer command
+        # used to die in 0 ms). The Landlock path needs no new namespace;
+        # measured inside the engine's bwrap with this codex version:
+        # commands run, outbound sockets fail "Operation not permitted",
+        # writes fail. workspace-write is refused in combination with this
+        # feature ("permission profiles requiring direct runtime
+        # enforcement are incompatible with --use-legacy-landlock").
         return [
-            "codex", "exec", "-s", "read-only", "--skip-git-repo-check",
+            "codex", "exec", "-s", "read-only",
+            "-c", "features.use_legacy_landlock=true", "--skip-git-repo-check",
             "-C", str(spec.workdir),
             "-c", f'model_reasoning_effort="{reasoning}"',
             "--output-schema", str(schema_path),

@@ -26,6 +26,7 @@ from engine.config.fields import (
 from engine.config.io import to_json_dict, write_json
 from engine.config.model import (
     EngineConfig, McpServerConfig, ProjectConfig, ReleaseConfig, WorkerConfig,
+    realpath_overlaps,
 )
 from engine.config.context_settings import ContextConfig, LibraryMcpConfig
 
@@ -36,4 +37,4 @@ from engine.config.context_settings import ContextConfig, LibraryMcpConfig
 _OMIT = OMIT
 
 __all__ = ["EngineConfig", "ProjectConfig", "ReleaseConfig", "WorkerConfig",
-           "McpServerConfig", "to_json_dict", "write_json"]
+           "McpServerConfig", "to_json_dict", "write_json", "realpath_overlaps"]

@@ -63,16 +63,45 @@ def proposal_id(ledger: "Ledger", project: str, pos: JobPosition, request: dict)
     return f"{pos.attempt_id}:{proposal_seq(ledger, project, pos.attempt_id, request)}"
 
 
+def _head_manifest_bytes(repo: Path, manifest: str) -> bytes | None:
+    """`manifest`'s content as committed at `repo`'s current HEAD, or
+    None if it does not exist there (or HEAD/git itself cannot be read).
+    Deliberately never the raw working-tree file (결함 69, 마케팅 채팅
+    job gb2-change-1793123186): engine.application.steps.open_job._make_copies
+    always materializes a worker's own copy via `git archive HEAD`, so a
+    manifest write engine.application.steps.install's own installer step left
+    sitting uncommitted in the working tree is invisible to every copy
+    made from HEAD -- `gb2 approve-install` must judge "already satisfied"
+    by the exact same state those copies see, or a resumed builder keeps
+    re-reporting a request the owner already approved forever."""
+    import subprocess
+
+    from engine.infrastructure.gitutil import git_argv
+
+    try:
+        result = subprocess.run(
+            git_argv(repo, "show", f"HEAD:{manifest}"),
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def _manifest_holds(repo: Path, manifest: str, change: object) -> bool:
-    """True iff the repository's current `manifest` already carries
-    `change` (a JSON manifest's sections, or a line manifest's lines)."""
+    """True iff the repository's manifest AT HEAD (never the working
+    tree -- see _head_manifest_bytes) already carries `change` (a JSON
+    manifest's sections, or a line manifest's lines). A manifest write
+    that exists only in the working tree, not yet committed, does not
+    hold the change for this check's purposes."""
     import json
 
     from engine.infrastructure.installers import InstallFailed, merge_one_level, validate_add_lines
 
-    try:
-        data = (repo / manifest).read_bytes()
-    except OSError:
+    data = _head_manifest_bytes(repo, manifest)
+    if data is None:
         return False
     if not isinstance(change, dict):
         return False

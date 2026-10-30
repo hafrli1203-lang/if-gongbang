@@ -101,7 +101,24 @@
         "index.html",
         "vite.config.js",
         "vite.config.ts",
-        "vite.config.mjs"
+        "vite.config.mjs",
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+        "vitest.config.js",
+        "vitest.config.ts",
+        "vitest.config.mjs",
+        "tsconfig.json",
+        "tsconfig.build.json",
+        "playwright.config.ts",
+        "playwright.config.js",
+        "postcss.config.js",
+        "postcss.config.mjs",
+        "tailwind.config.js",
+        "tailwind.config.ts",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts"
       ]
     }
   },

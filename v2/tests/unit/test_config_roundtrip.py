@@ -38,6 +38,7 @@ def _full_project_dict(tmp_path: Path) -> dict[str, object]:
         "bench_scope": "full",
         "related_cmd": ["npx", "vitest", "related", "--run", "{files}"],
         "arch_check_cmd": ["python3", "tools/arch_check.py"],
+        "max_fix_rounds": 7,
         "builder_test_hint": "run related tests as you edit",
         "copy_links": ["node_modules"],
         "copy_link_writable_subpaths": {"node_modules": [".vite-temp", ".vite"]},

@@ -169,6 +169,22 @@ def _full_spec(ctx: StepContext) -> tuple[WorkerSpec, object, object]:
         # the worker is actually running.
         if not owns or not _owns_within_prefixes(owns, prefixes):
             raise StepFailed("owns_escapes_station_prefixes")
+        # 결함 66: narrow `prefixes` to `owns` HERE, the same way
+        # engine.domain.policy.Policy.check narrows its own local
+        # `prefixes` to `owns` once facts.owns is set. Before this, the
+        # builder's own prompt text (build_prompt's "You may only write
+        # files under these paths" line, below) was built from the
+        # STATION-WIDE `prefixes` -- e.g. a project's full "tests/, src/"
+        # build prefixes -- while the live gate it actually has to pass
+        # had already narrowed to this one task's `owns` (a fix round's
+        # own narrow owns, e.g. two exact files). A worker told the wide
+        # set and enforced against the narrow one kept retrying a write
+        # the gate had already decided, every retry landing one more
+        # "outside_allowed_path" gate_log denial for nothing. `prefixes`
+        # and `owns` are never shown to the worker as two different
+        # "allowed" lists again: whichever one the gate actually
+        # enforces this round is the only one the prompt names.
+        prefixes = owns
     patterns = ctx.config.station_terminal_allow.get(station, {}).get(role, ())
     generation = ctx.ledger.attempt(ctx.attempt_id).generation
 

@@ -19,6 +19,7 @@ from engine.config import EngineConfig
 from engine.infrastructure.gitutil import git_argv
 from engine.application.steps.open_job import is_within as _is_within
 from engine.application.steps.open_job import link_entry_children
+from engine.application.steps.suite_tree_guard import unlock_tree_dirs
 
 _SNAPSHOT_GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "engine", "GIT_AUTHOR_EMAIL": "engine@local",
@@ -55,7 +56,7 @@ def snapshot_dir(config: EngineConfig, attempt_id: str, label: str) -> Path:
     return config.home / "acceptance" / ids.attempt_dirname(attempt_id) / label
 
 
-def make_snapshot(repo: Path, dest: Path, fp: str) -> None:
+def make_snapshot(repo: Path, dest: Path, fp: str) -> str:
     """Materialize exactly the content `fp` (evidence.fingerprint's tree
     hash for `repo`, taken by the caller BEFORE anything runs) into a
     fresh, self-contained copy at `dest` -- evidence.export_tree (ls-
@@ -84,8 +85,15 @@ def make_snapshot(repo: Path, dest: Path, fp: str) -> None:
         dirty), only comparing the resulting tree hash to the
         certified `fp` can. Both checks run here, at the one place
         every snapshot in this codebase is built, rather than
-        separately by each caller."""
+        separately by each caller.
+
+    Returns that verified HEAD^{tree} (always equal to `fp`), so a
+    caller can record in evidence exactly which tree the run it is
+    about to start executes. A stale `dest` whose directories a
+    previous run locked (suite_tree_guard.lock_tree_dirs) is unlocked
+    first, so its removal cannot fail on a read-only directory."""
     if dest.exists():
+        unlock_tree_dirs(dest)
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     evidence.export_tree(repo, fp, dest)
@@ -113,6 +121,7 @@ def make_snapshot(repo: Path, dest: Path, fp: str) -> None:
         raise SnapshotIntegrityError(
             f"{dest}'s own committed tree {head_tree} does not match certified fingerprint {fp}"
         )
+    return head_tree
 
 
 def tracked_file_paths(snapshot: Path) -> tuple[Path, ...]:
@@ -136,14 +145,12 @@ def tracked_file_paths(snapshot: Path) -> tuple[Path, ...]:
 def tracked_directories(snapshot: Path) -> tuple[Path, ...]:
     """Absolute paths, under `snapshot`, of every directory that
     contains at least one HEAD-tracked file -- EXCLUDING `snapshot`
-    itself (a scene/test dropping a brand-new, untracked scratch/output file at
-    the snapshot's own ROOT is existing, accepted, test-covered
-    behavior (engine.application.acceptance's own "must keep working" sibling-leak
-    tests); what must NOT keep working is a scene/test planting a
-    brand-new file INSIDE an existing tracked package directory, e.g. a
-    sibling module next to a real one that a loose `import` could
-    resolve first -- "a scene can create an untracked package
-    shadowing a tracked module". lock_tracked_files' per-file chmod
+    itself, which a caller that needs it immutable binds read-only as
+    a whole (suite_run._bench_sandbox_argv's `root_readonly`; the
+    acceptance snapshots and the bench both do). Each of these blocks
+    a scene/test planting a brand-new file INSIDE an existing tracked
+    package directory, e.g. a sibling module next to a real one that a
+    loose `import` could resolve first. lock_tracked_files' per-file chmod
     cannot stop this at all (it only strips write bits from files that
     already exist); binding each of THESE directories read-only in the
     bwrap sandbox (callers' extra_readonly) does, since a read-only-
@@ -168,10 +175,11 @@ def lock_tracked_files(tracked: tuple[Path, ...]) -> None:
     Directories are left untouched, and so is anything that is not,
     right now, a plain tracked file (a symlink git tracked, or a path a
     prior stage already turned into something else) -- only pre-
-    existing tracked FILES lose their write bit, so a scene/test can
-    still create a brand-new, untracked file anywhere, including next
-    to tracked content (must keep working -- see tracked_directories
-    for the one place that must NOT keep working).
+    existing tracked FILES lose their write bit. Creating NEW entries is
+    blocked separately: by the read-only root bind under bwrap, and by
+    suite_tree_guard.lock_tree_dirs' directory chmod under "none"; any
+    entry that still appears is caught by suite_tree_guard's whole-tree
+    manifest comparison.
 
     This alone does not stop deleting a tracked file and writing a new
     one back at the same path -- unlink is governed by the PARENT

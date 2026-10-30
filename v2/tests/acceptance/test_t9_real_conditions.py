@@ -69,11 +69,13 @@ import pytest
 
 from engine.infrastructure import sandbox as sandbox_mod
 from tests.conftest import GIT_ENV, git
+from tests.probe_target import contacting_py_script, probe_target, serve_target  # noqa: F401
+from tests.security_gate import bwrap_skipif
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox_mod.available(),
+_needs_bwrap = bwrap_skipif(
+    sandbox_mod.available(),
     reason="bwrap not available on this host -- defects 4/5 (hidden probe "
            "python / hidden probe-sandbox CLI) can only be reproduced under "
            "a real bwrap sandbox; skipped rather than faked.",
@@ -357,17 +359,16 @@ def test_4_py_probe_target_runs_for_real_under_bwrap_without_the_hidden_venv(
                           roles=("builder",))
     probe_dir = workspace.alpha / ".gongbang" / "job4" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.py").write_text(
-        "import sys\n"
-        "print('python says hi:', sys.version.split()[0])\n"
-        "print('PROBE OK https://docs.example/py')\n",
-        encoding="utf-8",
-    )
-
-    results = run_probe_scripts(
-        config, workspace.ledger, "alpha", attempt_id, "job4",
-        [("Some API", "https://docs.example/py")],
-    )
+    with serve_target() as url:
+        (probe_dir / "t1.py").write_text(
+            "import sys\n"
+            "print('python says hi:', sys.version.split()[0])\n"
+            + contacting_py_script(url),
+            encoding="utf-8",
+        )
+        results = run_probe_scripts(
+            config, workspace.ledger, "alpha", attempt_id, "job4", [("Some API", url)],
+        )
 
     assert results[0].stdout_tail != "python_runtime_hidden", results[0].stdout_tail
     assert "python says hi" in results[0].stdout_tail
@@ -379,7 +380,7 @@ def test_4_py_probe_target_runs_for_real_under_bwrap_without_the_hidden_venv(
 
 @_needs_bwrap
 def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
-    workspace, monkeypatch, tmp_path: Path,
+    workspace, monkeypatch, tmp_path: Path, probe_target,
 ) -> None:
     """Mirrors the live incident's second half exactly: a .js probe
     target shells out to a real CLI (standing in for `claude`/`codex`,
@@ -409,12 +410,19 @@ def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
     def fake_resolve_runtime(name: str) -> sandbox_mod2.RuntimeMounts:
         return fake_mounts if name == "fakecli" else sandbox_mod2.RuntimeMounts()
 
+    url = probe_target("/cli")
+    # After the CLI check, reach the target through the engine's proxy
+    # (HTTP_PROXY) with node's own http client.
     script = (
         "const { spawnSync } = require('child_process');\n"
+        "const http = require('http');\n"
         f"const r = spawnSync({json.dumps(str(fake_bin))}, []);\n"
         "if (r.error) { console.log('SPAWN_ERROR:' + r.error.code); }\n"
         "else { console.log(r.stdout.toString().trim());\n"
-        "       console.log('PROBE OK https://docs.example/cli'); }\n"
+        "       const p = new URL(process.env.HTTP_PROXY);\n"
+        f"       http.get({{host: p.hostname, port: p.port, path: {json.dumps(url)}}}, (res) => {{\n"
+        "         res.resume();\n"
+        f"         res.on('end', () => console.log({json.dumps('PROBE OK ' + url)})); }}); }}\n"
     )
 
     # (a) not configured -> the probe sandbox's default `readonly` set
@@ -427,7 +435,7 @@ def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
     (probe_dir_a / "t1.js").write_text(script, encoding="utf-8")
     results_a = run_probe_scripts(
         replace(workspace.config, sandbox="bwrap"), workspace.ledger, "alpha", attempt_a,
-        "job5a", [("cli api", "https://docs.example/cli")],
+        "job5a", [("cli api", url)],
     )
     assert "SPAWN_ERROR" in results_a[0].stdout_tail, results_a[0].stdout_tail
     assert results_a[0].ok is False
@@ -447,7 +455,7 @@ def test_5_probe_js_target_spawning_a_cli_finds_it_only_when_configured(
     (probe_dir_b / "t1.js").write_text(script, encoding="utf-8")
     results_b = run_probe_scripts(
         config_b, workspace.ledger, "beta", attempt_b, "job5b",
-        [("cli api", "https://docs.example/cli")],
+        [("cli api", url)],
     )
     assert "SPAWN_ERROR" not in results_b[0].stdout_tail, results_b[0].stdout_tail
     assert "fakecli-found" in results_b[0].stdout_tail

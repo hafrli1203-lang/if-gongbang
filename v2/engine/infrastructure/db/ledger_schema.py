@@ -17,6 +17,16 @@ SCHEMA_VERSION = 2  # v2: locks.pid (process-liveness lock reclaim). No
 # migration logic exists yet -- a v1 ledger (created before this column
 # existed) must be refused by open(), not opened and later crash the
 # first time acquire_lock() reads a pid column that isn't there.
+#
+# office_approval_nonces is
+# deliberately NOT a SCHEMA_VERSION bump: Ledger.create()/open() both
+# run `CREATE TABLE IF NOT EXISTS` for it (see Ledger's own docstring
+# for why) instead of adding it to SCHEMA_SQL below -- a purely
+# additive retrofit onto any EXISTING v2 ledger file, so updating this
+# engine never breaks an installation that predates the office-
+# approval feature. A real schema_version bump (with a real migration
+# path) is still the right tool for a column/shape CHANGE to an
+# existing table; this is additive-only and does not need one.
 
 SCHEMA_SQL = """
 CREATE TABLE events(
@@ -107,8 +117,21 @@ CREATE TABLE locks(
 );
 """
 
+# office_approval_nonces: added via CREATE TABLE IF NOT EXISTS (Ledger.
+# create()/open(), never SCHEMA_SQL above) -- see SCHEMA_VERSION's own
+# comment for why this table is deliberately additive-only.
+OFFICE_APPROVAL_NONCES_DDL = """
+CREATE TABLE IF NOT EXISTS office_approval_nonces(
+  project TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  consumed_ts REAL NOT NULL,
+  PRIMARY KEY(project, nonce)
+);
+"""
+
 __all__ = [
     "SCHEMA_VERSION", "GATE_LOG_IMPORT_KIND", "STATES", "REQUEST_STATUSES",
     "STEP_STATUSES", "EVIDENCE_KINDS", "LedgerError", "Event", "ProjectRow",
     "AttemptRow", "RequestRow", "StepRow", "ApprovalRow", "EvidenceRow", "SCHEMA_SQL",
+    "OFFICE_APPROVAL_NONCES_DDL",
 ]

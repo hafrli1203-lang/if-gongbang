@@ -21,13 +21,11 @@ run_tests            Speed default (project.bench_scope, "related" unless
                      fingerprint's fp would silently lose whatever an
                      install request just wrote into a gitignored
                      destination like .deps/ or node_modules/, breaking
-                     the install-then-test flow), but every tracked
-                     file AND tracked directory is bind-mounted read-
-                     only alongside it (_bench_immutable_source, the
-                     same bench_snapshot.tracked_file_paths/
-                     tracked_directories engine.application.acceptance uses for ITS
-                     OWN disposable snapshot, so the bench cannot write
-                     tracked source) --
+                     the install-then-test flow), but the repo is
+                     bound read-only as a whole (root_readonly: only
+                     declared copy_link_writable_subpaths get scratch
+                     write access) and every tracked file/directory
+                     too (_bench_immutable_source) --
                      an explicit environment built from config.
                      worker_env_passthrough only (never the processor's
                      own full os.environ, which may carry secrets a
@@ -104,6 +102,7 @@ engine.application.steps.suite_zero_tests.
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import os
@@ -125,6 +124,7 @@ from engine.application.steps.suite_select import full_scope_argv
 from engine.application.steps.suite_snapshot import tracked_directories, tracked_file_paths
 from engine.application.steps.suite_zero_tests import VITEST_NO_TESTS_RE as _VITEST_NO_TESTS_RE
 from engine.application.steps.suite_zero_tests import looks_like_zero_tests_ran
+from engine.application.steps.suite_tree_guard import new_scratch_root, scratch_writable_pairs, vite_writes_beside_config
 from engine.application.steps.suite_zero_tests import ran_zero_tests as _ran_zero_tests
 
 # 4000 chars matches engine.infrastructure.publishers' own _TAIL_CHARS
@@ -132,7 +132,6 @@ from engine.application.steps.suite_zero_tests import ran_zero_tests as _ran_zer
 # for record_bench's own evidence payload to carry a useful amount of
 # output on a failed run -- see _run_record_bench).
 _TAIL_CHARS = 4000
-
 
 def _project_config(ctx: StepContext):
     return ctx.config.projects[ctx.project]
@@ -201,9 +200,10 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
                         extra_readonly: tuple[Path, ...] = (),
                         extra_symlinks: tuple[tuple[Path, Path], ...] = (),
                         extra_writable: tuple[Path, ...] = (),
+                        root_readonly: bool = False,
                         ) -> tuple[list[str], dict[str, str]]:
-    """Bench sandbox policy: writable = the repo itself (test runners
-    write __pycache__/coverage/etc there). readonly = repo/.git,
+    """Bench sandbox policy: writable = the repo itself, unless
+    `root_readonly` (see below). readonly = repo/.git,
     mounted AFTER the repo's own writable bind (deeper path wins) so
     test code cannot plant a `core.fsmonitor`/hook command there for a
     later engine-side git call (evidence.fingerprint et al.) to execute
@@ -249,33 +249,36 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     test suite needing a toolchain cache under the real home, e.g.
     installed browser binaries, without getting the rest of it).
 
-    extra_symlinks: forwarded straight into sandbox.wrap()'s own
-    `symlinks` tuple, on top of whatever this function itself adds
-    (none, today) -- a caller needing a worker-style CLI mounted
-    inside this same bench sandbox (engine.application.acceptance_bench.
-    run_in_bench_sandbox, for a project's probe_runtime_clis) passes
-    the `.symlinks` half of engine.application.steps.worker_sandbox.
-    cli_runtime_mounts()'s return value here, with the `.readonly` half
-    going into `extra_readonly` instead. Defaults to `()`, so every
-    pre-existing caller's mount list is unchanged.
+    extra_symlinks / extra_writable: forwarded into sandbox.wrap()'s
+    `symlinks` / added to `writable` (a deeper mount wins, so a path
+    under the read-only bench_home stays writable) -- the `.symlinks` /
+    `.writable` parts of worker_sandbox.cli_runtime_mounts() for a
+    probe's probe_runtime_clis (run_in_bench_sandbox); without the
+    writable part a probe's own CLI could not write its login state
+    under the disposable $HOME. Both default to `()`.
 
-    extra_writable: additional WRITABLE mounts, added on top of
-    `writable` below regardless of bench_home_writable -- a deeper
-    mount always wins (sandbox.wrap), so a path under _bench_home_dir()
-    passed here stays writable even though bench_home itself defaults
-    to read-only. The only existing caller (run_in_bench_sandbox, for a
-    project's probe_runtime_clis) passes the `.writable` third of
-    engine.application.steps.worker_sandbox.cli_runtime_mounts()'s own
-    return value (결함 20,: without this, a probe script's
-    own `codex exec` could never write ".codex/..." under its
-    disposable $HOME and failed closed with a bare sandbox "Read-only
-    file system" error). Defaults to `()`, so every pre-existing
-    caller's mount list is unchanged.
+    root_readonly: `repo` itself is bound READ-ONLY instead of writable,
+    so the run cannot add, replace or delete anything anywhere under
+    it -- untracked and ignored paths included (a new root-level
+    vitest.config.*, a node_modules symlink, a patched dependency).
+    The only writes left inside `repo` are the project's declared
+    copy_link_writable_subpaths, each backed by a fresh scratch
+    directory OUTSIDE `repo` (suite_tree_guard.scratch_writable_pairs);
+    /tmp (tmpfs) and the isolated $HOME are unaffected. bwrap only:
+    sandbox="none" has no mounts, see suite_tree_guard for what covers
+    that mode.
     """
     bench_home = _bench_home_dir(ctx)
     child_env = {**env, "HOME": str(bench_home)}
-    writable = (repo,) + extra_writable
-    readonly: tuple[Path, ...] = (repo / ".git",) + extra_readonly
+    root_readonly = root_readonly and not vite_writes_beside_config(repo)
+    writable = extra_writable if root_readonly else (repo,) + extra_writable
+    readonly: tuple[Path, ...] = ((repo,) if root_readonly else ()) + (
+        (repo / ".git",) + extra_readonly)
+    writable_remap: tuple[tuple[Path, Path], ...] = ()
+    if root_readonly and ctx.config.sandbox == "bwrap":
+        scratch = new_scratch_root(
+            ctx.config.home / "jobs" / ids.attempt_dirname(ctx.attempt_id) / "bench_scratch")
+        writable_remap = scratch_writable_pairs(_project_config(ctx), repo, scratch)
     readonly_remap: tuple[tuple[Path, Path], ...] = ()
     if ctx.config.bench_home_writable:
         writable += (bench_home,)
@@ -288,6 +291,8 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     real_home_path = Path(real_home) if real_home else None
     if real_home_path is not None:
         hidden += (real_home_path,)
+    if not net:
+        hidden += sandbox.HOST_SOCKET_DIRS
     for entry in ctx.config.bench_readonly_paths:
         if not entry.exists():
             continue
@@ -342,8 +347,10 @@ def _bench_sandbox_argv(ctx: StepContext, repo: Path, argv: list[str],
     try:
         wrapped = sandbox.wrap(
             argv, cwd=repo, writable=writable, hidden=hidden, readonly=readonly,
-            readonly_remap=readonly_remap, symlinks=extra_symlinks, net=net,
+            readonly_remap=readonly_remap, symlinks=extra_symlinks,
+            writable_remap=writable_remap, net=net,
             mode=ctx.config.sandbox, child_env=child_env,
+            protected_roots=(ctx.config.secrets_dir,),
         )
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc
@@ -365,7 +372,7 @@ def _run_test_cmd(ctx: StepContext, repo: Path, test_cmd: list[str],
                   env: dict[str, str], *,
                   extra_readonly: tuple[Path, ...] = ()) -> tuple[int, str]:
     argv, child_env = _bench_sandbox_argv(ctx, repo, list(test_cmd), env,
-                                          extra_readonly=extra_readonly)
+                                          extra_readonly=extra_readonly, root_readonly=True)
     # mode="bwrap": child_env reaches the child via an inherited pipe
     # fd (sandbox.wrap()'s `--args FD`, never a literal `--setenv
     # NAME VALUE` in argv -- see sandbox.pass_fds_for's docstring);
@@ -415,12 +422,9 @@ def _bench_immutable_source(ctx: StepContext) -> tuple[Path, ...]:
     A bwrap bind mount is per-process and never touches the host
     filesystem's own permissions, so binding these same paths read-only
     for just the duration of this one sandboxed test run is safe on the
-    real, ongoing, shared repo in a way chmod never would be -- this is
-    source and dependencies mounted immutably, without isolating
-    scratch output from import paths (sandbox="none" has no bind
-    mounts at all, so this protection does not apply there -- the same
-    documented, not-chased limitation this codebase already accepts
-    elsewhere for that mode)."""
+    real, ongoing, shared repo in a way chmod never would be (callers
+    also bind the repo root itself read-only: root_readonly). Under
+    sandbox="none" there are no bind mounts at all (documented limit)."""
     repo = _repo(ctx)
     return tracked_file_paths(repo) + tracked_directories(repo)
 
@@ -546,7 +550,7 @@ def _run_run_arch_check(ctx: StepContext) -> dict[str, object]:
         ctx, project=project, repo=_repo(ctx),
         extra_readonly=extra_readonly, env=_bench_env(ctx),
         timeout_sec=_timeout_sec(ctx), sandbox_mode=ctx.config.sandbox,
-        sandbox_argv_fn=_bench_sandbox_argv,
+        sandbox_argv_fn=functools.partial(_bench_sandbox_argv, root_readonly=True),
     )
 
 
@@ -609,7 +613,7 @@ def _make_case(ctx: StepContext, test_cmd: tuple[str, ...], repo: Path,
     name = str(spec["name"])
     env = _case_env(base_env, spec)
     argv, child_env = _bench_sandbox_argv(ctx, repo, [*test_cmd, selector], env,
-                                          extra_readonly=extra_readonly)
+                                          extra_readonly=extra_readonly, root_readonly=True)
     popen_env = sandbox.exec_env(ctx.config.sandbox, child_env)
     pass_fds = sandbox.pass_fds_for(argv)
     captured: dict[str, object] = {}

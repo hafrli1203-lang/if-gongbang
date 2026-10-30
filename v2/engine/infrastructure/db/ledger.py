@@ -24,9 +24,9 @@ from pathlib import Path
 from engine.infrastructure.db.ledger_backup import backup
 from engine.infrastructure.db.ledger_handlers import HANDLERS
 from engine.infrastructure.db.ledger_schema import (
-    EVIDENCE_KINDS, GATE_LOG_IMPORT_KIND, REQUEST_STATUSES, SCHEMA_SQL, SCHEMA_VERSION,
-    STATES, STEP_STATUSES, ApprovalRow, AttemptRow, Event, EvidenceRow, LedgerError,
-    ProjectRow, RequestRow, StepRow,
+    EVIDENCE_KINDS, GATE_LOG_IMPORT_KIND, OFFICE_APPROVAL_NONCES_DDL, REQUEST_STATUSES,
+    SCHEMA_SQL, SCHEMA_VERSION, STATES, STEP_STATUSES, ApprovalRow, AttemptRow, Event,
+    EvidenceRow, LedgerError, ProjectRow, RequestRow, StepRow,
 )
 
 
@@ -47,6 +47,7 @@ class Ledger:
         conn = sqlite3.connect(str(path))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA_SQL)
+        conn.executescript(OFFICE_APPROVAL_NONCES_DDL)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
         return Ledger(conn, path)
@@ -54,7 +55,15 @@ class Ledger:
     @staticmethod
     def open(path: Path) -> "Ledger":
         """Open an existing ledger. Raises LedgerError if missing, not a
-        database, or PRAGMA user_version != SCHEMA_VERSION."""
+        database, or PRAGMA user_version != SCHEMA_VERSION.
+
+        Also runs OFFICE_APPROVAL_NONCES_DDL (`CREATE TABLE IF NOT
+        EXISTS`) every time, right after the version check passes --
+        this table is deliberately NOT part of SCHEMA_VERSION (see that
+        constant's own comment): a ledger file created by an engine
+        build from before the office-approval feature existed still
+        opens here exactly as before, and simply gains the table on
+        this first open, idempotent on every open after that."""
         if not path.exists():
             raise LedgerError(f"ledger missing: {path}")
         conn = sqlite3.connect(str(path))
@@ -71,6 +80,8 @@ class Ledger:
                 f"wrong schema version: expected {SCHEMA_VERSION}, got {version}"
             )
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(OFFICE_APPROVAL_NONCES_DDL)
+        conn.commit()
         return Ledger(conn, path)
 
     def close(self) -> None:
@@ -195,6 +206,38 @@ class Ledger:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def consume_office_approval_nonce(self, project: str, nonce: str) -> bool:
+        """Atomically mark (project, nonce) as used. Returns True iff
+        THIS call is the one that actually consumed it (its first use
+        ever); False if it was already recorded -- by this process, an
+        earlier call, or a DIFFERENT process/connection racing against
+        this one on the same sqlite file (two office-
+        approval verifications of the identical token must never BOTH
+        succeed).
+
+        Uses INSERT OR IGNORE + rowcount, the exact same race-safe
+        idiom acquire_lock() above already uses, instead of a SELECT-
+        then-INSERT pair: a plain read-then-write has a gap where two
+        callers both see "not yet used" and both decide to proceed --
+        this does not (SQLite's own file-level write serialization
+        between the two connections' INSERTs decides which commits
+        first; the loser's INSERT OR IGNORE is a no-op and its rowcount
+        is 0).
+
+        This table is NOT one of the generic derived-table effects
+        append()/HANDLERS applies (engine.infrastructure.db.ledger_handlers) --
+        unlike every OTHER kind of derived state, consumption here
+        must be the single source of truth for "already used", decided
+        by the INSERT itself, not by a handler that runs after a
+        caller has already decided an event is worth appending."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO office_approval_nonces(project, nonce, consumed_ts)"
+            " VALUES (?,?,?)",
+            (project, nonce, time.time()),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
 
     # ---- reads -----------------------------------------------------
     def lock_holder(self, project: str) -> str | None:

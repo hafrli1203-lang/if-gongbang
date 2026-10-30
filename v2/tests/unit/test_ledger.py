@@ -30,9 +30,17 @@ def test_open_old_version_1_ledger_raises(tmp_path: Path) -> None:
     """N7: the locks table gained a pid column without a SCHEMA_VERSION
     bump, so a ledger created before that change (user_version=1) opens
     fine under the old check and then crashes the first time
-    acquire_lock() reads the (now-missing) pid column. SCHEMA_VERSION is
-    now 2 with no migration in stage 1: a version-1 ledger must be
-    refused at open() instead of crashing later."""
+    acquire_lock() reads the (now-missing) pid column. SCHEMA_VERSION
+    is 2 with no migration in stage 1: a version-1 ledger must be
+    refused at open() instead of crashing later.
+
+    (office_approval_nonces, is deliberately
+    NOT a SCHEMA_VERSION bump -- see test_open_retrofits_office_
+    approval_nonces_table_onto_an_existing_v2_ledger below, and
+    SCHEMA_VERSION's own comment in engine.infrastructure.db.
+    ledger_schema for why: a purely additive table is added via
+    `CREATE TABLE IF NOT EXISTS` on every open(), never gated by this
+    version number at all.)"""
     from engine.ledger import SCHEMA_VERSION
 
     assert SCHEMA_VERSION == 2
@@ -422,3 +430,81 @@ def test_attempt_project_resolves_owning_project(tmp_path: Path) -> None:
     with pytest.raises(LedgerError):
         ledger.attempt_project("J-unknown#1")
     ledger.close()
+
+
+# ---- consume_office_approval_nonce -----------------------
+
+def test_consume_office_approval_nonce_is_single_use(tmp_path: Path) -> None:
+    ledger = Ledger.create(tmp_path / "ledger.sqlite")
+    ledger.register_project("alpha")
+
+    assert ledger.consume_office_approval_nonce("alpha", "n1") is True
+    assert ledger.consume_office_approval_nonce("alpha", "n1") is False
+    # a different project's identical nonce string is a distinct key
+    assert ledger.consume_office_approval_nonce("beta", "n1") is True
+    ledger.close()
+
+
+def test_consume_office_approval_nonce_rejects_concurrent_reuse_across_connections(
+    tmp_path: Path,
+) -> None:
+    """The real deployment shape this guards: two SEPARATE processes
+    (two office-token verification calls, each its own `gb2` process)
+    opening their own Ledger connection against the SAME sqlite file
+    and racing to consume the identical nonce. Exactly one of the two
+    connections' INSERTs may win -- the loser must see False, never
+    both seeing True."""
+    ledger_path = tmp_path / "ledger.sqlite"
+    first = Ledger.create(ledger_path)
+    first.register_project("alpha")
+    second = Ledger.open(ledger_path)
+    try:
+        first_result = first.consume_office_approval_nonce("alpha", "shared-nonce")
+        second_result = second.consume_office_approval_nonce("alpha", "shared-nonce")
+        assert (first_result, second_result) == (True, False)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_open_retrofits_office_approval_nonces_table_onto_an_existing_v2_ledger(
+    tmp_path: Path,
+) -> None:
+    """bumping SCHEMA_VERSION to add
+    office_approval_nonces made every PRE-EXISTING v2 ledger file
+    unopenable ("wrong schema version: expected 3, got 2") regardless
+    of whether that installation ever uses the office-approval
+    feature. The table must instead be retrofitted additively: build a
+    ledger file using the SAME real SCHEMA_SQL/SCHEMA_VERSION main.py
+    itself uses (`main의 실제 v2 DDL`), confirm it genuinely has no
+    office_approval_nonces table yet, then Ledger.open() it and prove
+    the table now exists AND nonce consumption is still atomic."""
+    from engine.infrastructure.db.ledger_schema import SCHEMA_SQL, SCHEMA_VERSION
+
+    path = tmp_path / "pre_existing_v2.sqlite"
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA_SQL)
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    conn.commit()
+    tables_before = {
+        row[0] for row in
+        conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "office_approval_nonces" not in tables_before
+    conn.close()
+
+    ledger = Ledger.open(path)
+    try:
+        assert ledger.consume_office_approval_nonce("alpha", "n1") is True
+        assert ledger.consume_office_approval_nonce("alpha", "n1") is False
+    finally:
+        ledger.close()
+
+    # Re-opening again (the table already exists this time) must still
+    # work and still be the same, idempotent no-op DDL.
+    ledger2 = Ledger.open(path)
+    try:
+        assert ledger2.consume_office_approval_nonce("alpha", "n2") is True
+    finally:
+        ledger2.close()

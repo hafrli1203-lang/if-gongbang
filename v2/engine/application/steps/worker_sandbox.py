@@ -12,12 +12,13 @@ from typing import TYPE_CHECKING
 
 from engine.domain import ids
 from engine.infrastructure import sandbox
-from engine.infrastructure.reference_snapshot import ensure_snapshot_for_attempt
+from engine.infrastructure.reference_snapshot import SnapshotEntry, ensure_snapshot_for_attempt
 from engine.infrastructure.workers.claude_cli import ClaudeRunner
 from engine.infrastructure.workers.codex_cli import CodexRunner
 from engine.domain.records import Event
 from engine.application.processor import StepContext, StepFailed
 from engine.application.steps import file_deps
+from engine.application.steps import worker_shell_jail
 from engine.application.steps.worker_paths import stations_dir
 
 if TYPE_CHECKING:
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
 
 
 ENGINE_ROOT = Path(__file__).resolve().parents[3]
+# Where the claude CLI keeps the shell snapshot each command sources
+# (observed on this host: `source ~/.claude/shell-snapshots/<file>`).
+CLI_SHELL_SNAPSHOT_SUBDIR = Path(".claude") / "shell-snapshots"
 
 
 def _other_project_repos(ctx: StepContext) -> tuple[Path, ...]:
@@ -50,6 +54,11 @@ def _hidden_roots(ctx: StepContext, repo: Path) -> tuple[Path, ...]:
     # source checkout a generated `repo` worktree was cloned from,
     # which the sandbox's own whole-tree "--ro-bind / /" base would
     # otherwise still expose read-only by its real absolute path.
+    # secrets_dir here already covers the office-approval HMAC key
+    # (engine.application.office_approval.resolve_key_path -- a FIXED
+    # filename inside secrets_dir, never an operator-configurable path
+    # elsewhere; see that module's own docstring) -- no separate entry
+    # needed for it.
     return ((ctx.config.home, ctx.config.secrets_dir, repo)
             + _other_project_repos(ctx)
             + ctx.config.projects[ctx.project].hidden_paths)
@@ -425,11 +434,59 @@ def sandboxed_argv(ctx: StepContext, spec: WorkerSpec, argv: list[str],
     # mkdir a mountpoint there once that hide is remounted read-only.
     readonly_remap = file_deps.sandbox_file_dep_pairs(
         spec.copy_root, repo, ctx.config.projects[ctx.project].file_dep_targets)
-    try:
+    def wrap_cli(extra_writable: tuple[Path, ...] = (),
+                 extra_readonly: tuple[Path, ...] = ()) -> list[str]:
         return sandbox.wrap(
-            argv, cwd=spec.workdir, writable=writable, hidden=hidden,
-            readonly=readonly, readonly_remap=readonly_remap, symlinks=symlinks, net=True,
-            mode=ctx.config.sandbox, child_env=env,
+            argv, cwd=spec.workdir, writable=writable + extra_writable, hidden=hidden,
+            readonly=readonly + extra_readonly, readonly_remap=readonly_remap,
+            symlinks=symlinks, net=True, mode=ctx.config.sandbox, child_env=env,
+            protected_roots=(ctx.config.secrets_dir,),
         )
+
+    try:
+        return worker_shell_jail.wrap_for_runner(
+            runner, mode=ctx.config.sandbox, env=env, wrap_cli=wrap_cli,
+            root=worker_shell_jail.jail_root(
+                ctx.config.home, ids.attempt_dirname(ctx.attempt_id), spec.station, spec.role),
+            policy=lambda: _command_policy(ctx, spec, home_dir, safe_copy_link_mounts,
+                                           snapshot_entries, readonly_remap, hidden),
+            protected_roots=(ctx.config.secrets_dir,))
     except sandbox.SandboxUnavailable as exc:
         raise StepFailed("sandbox_unavailable") from exc
+
+
+def _command_policy(ctx: StepContext, spec: WorkerSpec, home_dir: Path,
+                    safe_copy_link_mounts: tuple[tuple[str, Path], ...],
+                    snapshot_entries: tuple[SnapshotEntry, ...],
+                    readonly_remap: tuple[tuple[Path, Path], ...],
+                    hidden: tuple[Path, ...]) -> worker_shell_jail.CommandPolicy:
+    """Layer B (the worker's shell commands) for a builder: the worker's
+    own copy and its configured writable copy_links subpaths writable,
+    and read-only the same project material layer A gets -- never the
+    CLI's HOME (login files), the gate-ro directory (MCP launch config,
+    gate facts) or the stations dir: the policy-gate hook runs in layer A
+    (ClaudeRunner.local_shell_commands). The CLI's own shell-snapshot
+    directory is re-exposed read-only: the CLI sources a snapshot file
+    from there at the start of each command."""
+    writable: tuple[Path, ...] = (spec.copy_root,)
+    readonly: tuple[Path, ...] = tuple(target for _e, target in safe_copy_link_mounts)
+    readonly += tuple(entry.path for entry in snapshot_entries)
+    subpaths_config = ctx.config.projects[ctx.project].copy_link_writable_subpaths
+    for entry, _target in safe_copy_link_mounts:
+        link_subpaths = subpaths_config.get(entry, ())
+        if link_subpaths:
+            readonly += (spec.copy_root / entry,)
+            writable += tuple(spec.copy_root / entry / sub for sub in link_subpaths)
+    snapshots = home_dir / CLI_SHELL_SNAPSHOT_SUBDIR
+    snapshots.mkdir(parents=True, exist_ok=True)
+    readonly += (ENGINE_ROOT, snapshots)
+    from engine.application.steps.worker_gate_log import allowed_mcp_servers
+    try:
+        granted = allowed_mcp_servers(ctx, spec.station)
+    except AttributeError:  # a context with no request (direct/unit callers)
+        granted = {}
+    browser = any("playwright" in name.lower() or "browser" in name.lower() for name in granted)
+    return worker_shell_jail.CommandPolicy(
+        cwd=spec.workdir, writable=writable, readonly=readonly,
+        readonly_remap=readonly_remap,
+        hidden=hidden + sandbox.HOST_SOCKET_DIRS, net=browser)

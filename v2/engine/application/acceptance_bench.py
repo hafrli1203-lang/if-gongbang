@@ -33,6 +33,7 @@ def run_in_bench_sandbox(
     argv: list[str], env: dict[str, str], timeout_sec: float, *, net: bool = False,
     extra_readonly: tuple[Path, ...] = (),
     runtime_clis: tuple[str, ...] = (),
+    root_readonly: bool = False,
 ) -> tuple[int, str]:
     """(returncode, tail) for one command run exactly the way
     engine.application.steps.suite_run.run_tests runs the real suite. A command
@@ -64,7 +65,11 @@ def run_in_bench_sandbox(
     isolated bench $HOME (suite_run.bench_home_dir -- never the real
     operator HOME) with that CLI's minimal login files and returns the
     binary/symlink mounts to add; empty (default) changes nothing
-    about the mounts bench_sandbox_argv already builds."""
+    about the mounts bench_sandbox_argv already builds.
+
+    root_readonly: forwarded to bench_sandbox_argv -- `repo` (the
+    disposable snapshot) is bound read-only as a whole; acceptance's
+    scenes and full suite always pass True."""
     extra_symlinks: tuple[tuple[Path, Path], ...] = ()
     extra_writable: tuple[Path, ...] = ()
     if runtime_clis:
@@ -80,7 +85,7 @@ def run_in_bench_sandbox(
         wrapped_argv, child_env = bench_sandbox_argv(
             bench_ctx(config, project, attempt_id), repo, argv, env, net=net,
             extra_readonly=extra_readonly, extra_symlinks=extra_symlinks,
-            extra_writable=extra_writable)
+            extra_writable=extra_writable, root_readonly=root_readonly)
     except sandbox.SandboxUnavailable as exc:
         return -1, f"sandbox_unavailable: {exc}"
     popen_env = sandbox.exec_env(config.sandbox, child_env)

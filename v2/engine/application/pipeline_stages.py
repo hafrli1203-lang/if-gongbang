@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable
 
 from engine.infrastructure import context as context_mod
 from engine.domain import faults
+from engine.domain import state
 from engine.config import EngineConfig
 from engine.application.pipeline_base import (
     BUILDER_ROLE, FullOutcome, ProgressCallback, Run, fakes_for,
@@ -392,7 +393,24 @@ def open_with_intent(config: EngineConfig, ledger: Ledger, project: str,
     first: `intent` without an attempt id, carrying the roles to open
     with (engine.application.job_state.opening_roles). A crash between that record
     and the caller's own position on the attempt resumes by adopting the
-    attempt open_job made, or opening it (reconcile_opening)."""
+    attempt open_job made, or opening it (reconcile_opening).
+
+    Checks the project is CLOSED BEFORE recording that opening intent
+    (결함 64b): `open_job` itself already refuses -- under its own
+    project lock -- anything other than CLOSED, but it does so AFTER
+    this function's own `record_position` call had already appended a
+    job.position event (stage e.g. "small_plan"/"facts", attempt_id
+    None) for a job that was never actually opened. A caller like `gb2
+    change` against a project with another job still OPEN hit exactly
+    that: a stray job.position row left behind by a call that never
+    got past this refusal. This check is a plain, unlocked read -- the
+    authoritative, race-safe refusal is still `open_job`'s own (under
+    `ledger.acquire_lock`) -- it exists only to keep the ordinary,
+    single-caller rejection from writing anything at all."""
+    if ledger.project(project).state != "CLOSED":
+        raise state.ProjectOpenError(
+            "project_open: close or finish the current job first"
+        )
     record_position(ledger, project, replace(
         intent, attempt_id=None, extra={**intent.extra, "roles": list(roles)}))
     attempt_id = open_job(config, ledger, project, intent.job, "full", roles)

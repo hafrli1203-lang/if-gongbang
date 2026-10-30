@@ -68,6 +68,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from engine.domain.records import LedgerError
+from engine.application.driver_session import driver_lock_key
 from engine.application.job_state import STAGES, load_position, pending_owner_requests
 from engine.infrastructure import procs as proc_lib
 
@@ -110,12 +111,17 @@ def _job_name_for_attempt(ledger: "Ledger", project: str, attempt_id: str) -> st
 def driver_alive(ledger: "Ledger", project: str) -> bool:
     """True iff the project's own processor lock (Ledger.acquire_lock/
     release_lock keyed by the plain project name -- never a composite
-    key like "install:{project}", a different lock entirely) is
-    currently held by a pid still alive on this host."""
-    pid = ledger.lock_pid(project)
-    if pid is None:
-        return False
-    return proc_lib.is_alive(pid)
+    key like "install:{project}", a different lock entirely) OR the
+    driver marker (engine.application.driver_session, key
+    "driver:{project}", held for a whole `gb2 run/change/continue/fix`
+    command) is currently held by a pid still alive on this host. The
+    marker closes the between-requests gap in which a live driver used
+    to read as dead, live watch misjudgments)."""
+    for key in (project, driver_lock_key(project)):
+        pid = ledger.lock_pid(key)
+        if pid is not None and proc_lib.is_alive(pid):
+            return True
+    return False
 
 
 def worker_alive(ledger: "Ledger", attempt_id: str | None) -> bool:

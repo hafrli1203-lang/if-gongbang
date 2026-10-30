@@ -95,41 +95,22 @@ under must therefore do so at the OUTER layer (the first, non-nested
 wrap() call that launches the whole worker/bench process tree), not by
 having code running inside that sandbox invoke wrap() a second time.
 
- follow-up (the actual mitigation for the OUTER layer, since
-nesting is closed off): engine.application.steps.worker_step/review now build each
-worker/reviewer's $HOME as a fresh, per-attempt directory (see
-prepare_worker_home below) seeded with ONLY the real CLI's own login/
-credentials file, instead of mounting the real operator HOME wholesale
-read-only. The real HOME is hidden outright. Residual, accepted limit:
-ANY code the worker/reviewer's allowed Bash command runs (same
-unresolved nested-sandbox gap above) can still read that one login
-file inside ITS OWN worker HOME -- e.g. a worker-run test file could
-open $HOME/.claude/.credentials.json -- since it is a real file needed
-for the CLI itself to authenticate and there is no narrower OS-level
-primitive available on this host to hand the CLI process its own
-credential while denying it to a child the CLI spawns. This is a much
-smaller blast radius than before (one CLI's own login file, inside a
-disposable per-attempt directory, instead of the operator's entire
-real HOME -- other apps' configs, other CLIs' credentials, ssh keys),
-not a complete closure.
+Mitigation at the OUTER layer, since nesting is closed off: each
+worker/reviewer's $HOME is a fresh, per-attempt directory (see
+prepare_worker_home below) seeded with ONLY the real CLI's own login
+file; the real operator HOME is hidden outright.
 
-Same shape, separate instance: a worker/reviewer whose runner carries
-mcp_servers gets its MCP launch config (server names, argv, and any
-embedded env_passthrough secrets such as API keys -- see
-engine.infrastructure.workers.claude_cli._write_mcp_config_file) written to a file
-under the engine's own gate-ro directory and passed to the CLI as
-`--mcp-config <path>`. That directory is mounted read-only into the
-WHOLE worker/reviewer sandbox (so the gate hook, and the CLI itself,
-can read it), not narrowed to the CLI process alone -- there is no OS-
-level primitive on this host (same gap as the credentials-file one
-above) to hand the CLI its own `--mcp-config` file while denying read
-access to a child the CLI's allowed Bash command spawns. Current
-limit, not fixed by anything in this module: ANY code that command
-runs can read that file and recover the MCP servers' own secrets,
-exactly as it could read the CLI's own login file. Closing this would
-need a separate MCP relay process (something standing between the
-sandboxed worker and the real MCP server, holding the secret itself
-rather than handing it to the sandbox at all) -- out of scope here.
+The CLI's own login file and its MCP launch config (written under the
+engine's gate-ro directory and passed as `--mcp-config <path>`, see
+engine.infrastructure.workers.claude_cli._write_mcp_config_file) must
+stay readable to the CLI. Code the CLI's shell tool runs must not see
+them: for a runner with a shell-prefix setting, the engine therefore
+starts TWO sibling sandboxes from the host instead of one -- the CLI in
+one, every shell/hook command in a second one with no shared network
+and neither file mounted (engine.infrastructure.shell_broker,
+engine.application.steps.worker_shell_jail). A runner without such a
+setting (codex) relies on the CLI's own Landlock-based command sandbox
+instead, which blocks network and writes but not reads; see ENGINE.md.
 """
 from __future__ import annotations
 
@@ -138,6 +119,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from engine.config import realpath_overlaps
 
 _KNOWN_MODES = frozenset({"none", "bwrap"})
 
@@ -152,7 +135,20 @@ _available_cache: bool | None = None
 # env dict).
 _bwrap_path_cache: str | None = None
 
-_SELF_TEST_TIMEOUT_SEC = 1.0
+# 10s, not 1s: the self-test is a trivial `true` under bwrap, but on a
+# loaded host (load avg ~30 on 12 cores, on a live job)
+# the 1s budget expired and the whole process was pinned to
+# "sandbox_unavailable" although bwrap itself was fine (0.07s once
+# retried). A timeout is NOT cached below for the same reason.
+_SELF_TEST_TIMEOUT_SEC = 10.0
+
+
+# Host directories holding unix sockets of host services (D-Bus, systemd's
+# resolver -- a DNS channel --, database and VPN daemons; /var/run is a
+# symlink here). A sandbox without a shared network namespace still
+# reaches a path socket that the "--ro-bind / /" base exposes, so every
+# network-less sandbox hides these too. /tmp is already a fresh tmpfs.
+HOST_SOCKET_DIRS: tuple[Path, ...] = (Path("/run"),)
 
 
 class SandboxUnavailable(Exception):
@@ -181,7 +177,11 @@ def available() -> bool:
         _available_cache = result.returncode == 0
         if _available_cache:
             _bwrap_path_cache = os.path.realpath(bwrap)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        # Transient (host under load): do not cache, so the next caller
+        # re-probes instead of the process staying "unavailable" for good.
+        return False
+    except OSError:
         _available_cache = False
     return _available_cache
 
@@ -252,8 +252,10 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
          hidden: tuple[Path, ...] = (), readonly: tuple[Path, ...] = (),
          readonly_remap: tuple[tuple[Path, Path], ...] = (),
          symlinks: tuple[tuple[Path, Path], ...] = (),
+         writable_remap: tuple[tuple[Path, Path], ...] = (),
          net: bool = False, mode: str = "none",
-         child_env: dict[str, str] | None = None) -> list[str]:
+         child_env: dict[str, str] | None = None,
+         protected_roots: tuple[Path, ...] = ()) -> list[str]:
     """Build the argv engine.infrastructure.procs.spawn should actually exec. Callers
     must pass the RETURNED argv to subprocess with env=exec_env(mode,
     child_env), not with `child_env` directly -- see exec_env()'s
@@ -314,7 +316,33 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
     follows it, matters for that, and that path must already be
     covered by the caller's own `readonly`/`writable`/`readonly_remap`
     if it needs to be reachable).
-    """
+
+    `writable_remap`: (host_source, sandbox_dest) pairs, each mounted
+    `--bind <host_source> <sandbox_dest>` -- the writable twin of
+    `readonly_remap`, for giving a path inside an otherwise read-only
+    root a scratch directory that lives OUTSIDE that root (whatever the
+    child writes there never lands in the root's own host tree). Both
+    must already exist on the host (a missing destination under a
+    read-only bind cannot be created by bwrap); a pair whose source is
+    missing is skipped. Sorted, conflict-checked and protected_roots-
+    checked exactly like a plain `writable` entry, by destination.
+
+    `protected_roots`: absolute host paths that
+    may NEVER be re-exposed by `readonly`, `writable`, or a
+    `readonly_remap` SOURCE, regardless of what alias/destination it
+    is mounted at -- checked against each mount's own REAL (realpath)
+    source via engine.config.realpath_overlaps, the SAME function
+    EngineConfig's own __post_init__ uses for file_dep_targets/
+    bench_readonly_paths, so config-load time and this, the actual
+    mount-time choke point every sandbox builder in this engine goes
+    through, can never disagree. Raises ValueError (fail closed)
+    rather than silently mounting. This is deliberately separate from
+    `hidden` -- a `hidden` root MAY legitimately have some of its OWN
+    content re-exposed on purpose (e.g. bench_readonly_paths re-
+    exposing a toolchain cache dir from under an otherwise-hidden real
+    HOME); `protected_roots` is for the handful of paths (secrets_dir)
+    that must never be re-exposed under ANY alias, by ANY caller, full
+    stop."""
     if mode not in _KNOWN_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
     if mode == "none":
@@ -347,6 +375,12 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
         if not real.exists():
             continue
         mounts.append((_depth(real), "rw", real, real))
+    for source, dest in writable_remap:
+        real_source = _real(source)
+        real_dest = _real(dest)
+        if not real_source.exists() or not real_dest.exists():
+            continue
+        mounts.append((_depth(real_dest), "rw", real_source, real_dest))
     for target, dest in symlinks:
         # `dest` is deliberately NOT passed through _real()/realpath:
         # it typically does not exist on the host at all (it is a path
@@ -374,6 +408,22 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
             "and writable/readonly"
         )
 
+    # protected_roots: the mount-time half of the one shared check (see
+    # this function's own docstring) -- every `rw`/`ro` mount's SOURCE
+    # (already realpath'd above, via _real) is checked against each
+    # protected root, in BOTH directions, regardless of which `hidden`/
+    # `readonly`/`writable`/`readonly_remap` tuple it came from or what
+    # alias/destination it is mounted at.
+    if protected_roots:
+        for _depth_val, kind, source, _dest in mounts:
+            if kind not in ("ro", "rw"):
+                continue
+            for root in protected_roots:
+                if realpath_overlaps(source, root):
+                    raise ValueError(
+                        f"sandbox mount would re-expose a protected root: {source}"
+                    )
+
     mounts.sort(key=lambda m: m[0])
 
     hide_dests = [dest for _d, k, _s, dest in mounts if k == "hide"]
@@ -393,12 +443,12 @@ def wrap(argv: list[str], *, cwd: Path, writable: tuple[Path, ...] = (),
     # tuple covers.
     mounts = [m for m in mounts
              if m[1] != "symlink" or any(_is_strict_ancestor(hd, m[3]) for hd in hide_dests)]
-    rw_dests = [dest for _d, k, _s, dest in mounts if k == "rw"]
-    for rw_dest in rw_dests:
-        for hide_dest in hide_dests:
-            if _is_strict_ancestor(rw_dest, hide_dest) and \
-                    mounts.index((_depth(rw_dest), "rw", rw_dest, rw_dest)) > \
-                    mounts.index((_depth(hide_dest), "hide", hide_dest, hide_dest)):
+    for rw_index, (_d, kind, _s, rw_dest) in enumerate(mounts):
+        if kind != "rw":
+            continue
+        for hide_index, (_d2, kind2, _s2, hide_dest) in enumerate(mounts):
+            if kind2 == "hide" and _is_strict_ancestor(rw_dest, hide_dest) \
+                    and rw_index > hide_index:
                 raise ValueError(
                     f"sandbox mount order violation: writable {rw_dest} "
                     f"would be mounted after hidden descendant {hide_dest}"
@@ -509,11 +559,15 @@ def pass_fds_for(argv: list[str]) -> tuple[int, ...]:
     descriptor", exit 1), never a silent fallback to an unset
     environment, but that failure is still wrong: always wire this
     through, never assume an empty tuple is harmless to skip."""
-    try:
+    if "--args" in argv:
         idx = argv.index("--args")
-    except ValueError:
-        return ()
-    return (int(argv[idx + 1]),)
+        return (int(argv[idx + 1]),)
+    # A two-layer shell-jail launcher (engine.infrastructure.shell_broker
+    # `launch`) carries both layers' env pipes as `--pass-fd N` tokens.
+    if len(argv) > 3 and argv[3] == "launch":
+        return tuple(int(argv[i + 1]) for i, token in enumerate(argv[:-1])
+                     if token == "--pass-fd")
+    return ()
 
 
 def close_fds(fds: tuple[int, ...]) -> None:

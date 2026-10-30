@@ -17,7 +17,7 @@ from engine.station_prompts import (
 # test bodies below. 2+ different industries, matching the rule's own
 # "최소 2개 업종" verification requirement.
 _BANNED_INDUSTRY_WORDS = (
-    "세차장", "미용실", "병원", "카페", "헬스장", "피트니스", "부동산",
+    "안경원", "미용실", "병원", "카페", "헬스장", "피트니스", "부동산",
     "옷가게", "쇼핑몰", "레스토랑", "학원", "세탁소",
 )
 

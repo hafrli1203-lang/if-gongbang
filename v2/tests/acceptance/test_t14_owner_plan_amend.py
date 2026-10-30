@@ -155,3 +155,48 @@ def test_record_owner_plan_amend_refuses_blank_reason(tmp_path: Path) -> None:
     problems = record_owner_plan_amend(ledger, "alpha", "attempt-1", tmp_path, "job", "   ")
     assert problems == ["reason_required"]
     assert list(ledger.events("alpha", "plan.owner_amended")) == []
+
+
+# ---- (g) expected_current_digest pinning --------
+# ---- -- the signed/pinned digest is what gets STORED, never a ---------
+# ---- further, independent re-read of the file ------------------------
+
+def test_record_owner_plan_amend_stores_the_pinned_digest_verbatim(tmp_path: Path) -> None:
+    """tools/gb2lib/approve_ops.py's --office-token path pins a plan_
+    edit_target_version ONCE and passes it both to verify_office_token
+    (expected_target_version) and here (expected_current_digest). The
+    resulting plan.reviewed event's own "digest" field must be that
+    EXACT pinned value -- record_plan_reviewed must never recompute it
+    a further time from disk."""
+    from engine.domain.plan_review import plan_digest
+    from engine.domain.plan_model import plan_path
+
+    ledger = _reviewed_ledger_with_scene(tmp_path)
+    _edit_scene_file(tmp_path, "pass  # owner widened the fake DB mock\n")
+    current_digest = plan_digest(plan_path(tmp_path, "job"))
+
+    problems = record_owner_plan_amend(
+        ledger, "alpha", "attempt-1", tmp_path, "job", "office 승인 경로 테스트",
+        expected_current_digest=current_digest,
+    )
+    assert problems == []
+
+    reviewed_events = [e for _s, e in ledger.events("alpha", "plan.reviewed")
+                       if e.payload.get("job") == "job"]
+    assert reviewed_events[-1].payload["digest"] == current_digest
+
+
+def test_record_owner_plan_amend_refuses_when_pinned_digest_is_stale(tmp_path: Path) -> None:
+    """If the plan moved AFTER the caller pinned expected_current_digest
+    (e.g. a further edit landed between office-token verification and
+    this call), record_owner_plan_amend must refuse rather than record
+    an approval for content the signed digest never actually covered."""
+    ledger = _reviewed_ledger_with_scene(tmp_path)
+    _edit_scene_file(tmp_path, "pass  # owner widened the fake DB mock\n")
+
+    problems = record_owner_plan_amend(
+        ledger, "alpha", "attempt-1", tmp_path, "job", "stale pin 테스트",
+        expected_current_digest="not-the-real-digest",
+    )
+    assert problems == ["plan_changed_after_verification"]
+    assert list(ledger.events("alpha", "plan.owner_amended")) == []

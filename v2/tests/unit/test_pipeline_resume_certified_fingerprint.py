@@ -55,25 +55,26 @@ def _plant_secret(repo: Path) -> None:
 _EMPTY_PLAN = Plan(goal="", ui=False, scenes=(), tasks=(), acceptance=())
 
 
-def _latest_certified_fingerprint(ledger: Ledger, project: str) -> str:
-    rows = list(ledger.events(project, "job.position"))
-    assert rows, "no job.position event recorded at all"
-    _seq, latest = rows[-1]
-    return str(latest.payload.get("extra", {}).get("certified_fingerprint", ""))
-
-
 def _run_for(ws: Workspace, job_name: str) -> Run:
     return Run(config=ws.config, ledger=ws.ledger,
               fakes=Fakes(FakePublisher(), FakeInstaller()),
               project="alpha", job=job_name, on_progress=None, processor_factory=None)
 
 
-def test_finish_after_handoff_records_plain_fingerprint_with_no_file_dep_targets(
+def test_finish_after_handoff_proceeds_past_a_failed_security_check_with_no_file_dep_targets(
     workspace: Workspace,
 ) -> None:
-    """Regression lock: a project with no file_dep_targets must keep
-    getting exactly the old plain tree fingerprint recorded -- no
-    behavior change for the common case."""
+    """Policy (no approval stops; a failed security check is
+    recorded and the job keeps going): finish_after_handoff no
+    longer stops needs_owner on a failed security check, so it no
+    longer records a certified_fingerprint either (that value only
+    ever existed to let a LATER resume of that stop detect a moved
+    HEAD -- resume_security_fix itself, and the certified_fingerprint
+    comparison it does, are both unchanged and still covered directly
+    by the two tests below this one; there is simply no forward-path
+    stop left to record one from any more). It proceeds straight to
+    "done" (no `release` configured here) and records
+    "security.auto_passed" instead."""
     job_name = "certfp-plain"
     attempt_id = open_job(workspace.config, workspace.ledger, "alpha", job_name,
                           "full", roles=("builder",))
@@ -82,20 +83,21 @@ def test_finish_after_handoff_records_plain_fingerprint_with_no_file_dep_targets
     outcome = finish_after_handoff(workspace.config, workspace.ledger, "alpha", job_name,
                                    _EMPTY_PLAN, attempt_id, Path("report.md"), 2)
 
-    assert outcome.status == "needs_owner"
-    plain_fp = evidence.fingerprint(workspace.alpha, workspace.config.projects["alpha"].excludes)
-    assert _latest_certified_fingerprint(workspace.ledger, "alpha") == plain_fp
+    assert outcome.status == "done", outcome
+    auto_passed = [e for _seq, e in workspace.ledger.events("alpha", "security.auto_passed")]
+    assert len(auto_passed) == 1
+    assert auto_passed[0].payload["confirm_source"] == "auto"
 
 
-def test_finish_after_handoff_records_file_dep_aware_fingerprint(
+def test_finish_after_handoff_proceeds_past_a_failed_security_check_with_file_dep_targets(
     workspace: Workspace, tmp_path: Path,
 ) -> None:
-    """a review finding (4) reproduction, record side: a project WITH
-    file_dep_targets must record the file-dep-aware evidence
-    fingerprint (evidence.with_file_deps), not the plain tree
-    fingerprint alone -- otherwise the lookup side (resume_
-    security_fix) can never tell the kit's own content apart from
-    "nothing changed"."""
+    """Same point as the sibling test above, for a project WITH
+    file_dep_targets configured -- the file-dep-aware fingerprint logic
+    this once exercised is still real code (evidence.with_file_deps),
+    but nothing on the forward path calls it any more now that a
+    failed security check never stops the job; only the SAME two
+    legacy-resume tests below still exercise it directly."""
     kit = tmp_path / "_shared" / "kit"
     kit.mkdir(parents=True)
     (kit / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
@@ -109,12 +111,10 @@ def test_finish_after_handoff_records_file_dep_aware_fingerprint(
     outcome = finish_after_handoff(ws.config, ws.ledger, "alpha", job_name,
                                    _EMPTY_PLAN, attempt_id, Path("report.md"), 2)
 
-    assert outcome.status == "needs_owner"
-    plain_fp = evidence.fingerprint(ws.alpha, ws.config.projects["alpha"].excludes)
-    expected = evidence.with_file_deps(plain_fp, targets)
-    recorded = _latest_certified_fingerprint(ws.ledger, "alpha")
-    assert recorded == expected
-    assert recorded != plain_fp  # must actually fold the kit in, not a no-op
+    assert outcome.status == "done", outcome
+    auto_passed = [e for _seq, e in ws.ledger.events("alpha", "security.auto_passed")]
+    assert len(auto_passed) == 1
+    assert auto_passed[0].payload["confirm_source"] == "auto"
 
 
 def test_resume_security_fix_reruns_acceptance_when_file_dep_target_content_changed(

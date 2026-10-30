@@ -26,6 +26,7 @@ __all__ = [
     "validate_app_name", "is_within",
     "app_workspace", "read_run_log", "append_run_log",
     "git", "err_json",
+    "approval_recorded_summary",
     "exit_code_for_full_outcome", "progress_printer",
     "summarize_full_outcome", "summarize_small_outcome",
     "scripted_workers_dir", "apply_scripted_workers", "fakes_builder",
@@ -143,6 +144,22 @@ def git(args: list[str], cwd: Path) -> str:
 def err_json(message: str, code: int) -> int:
     print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
     return code
+
+
+def approval_recorded_summary(app: str, job_name: str, event_kind: str) -> dict[str, object]:
+    """Printed by a TTY approval command (결함 64) once the approval
+    ledger event itself is appended and nothing else -- the owner's
+    own TTY process is never held open past that for a `continue_full_
+    job` build loop that can run for minutes: `gb2 watch --loop
+    --resume` already resumes every stopped job on its own, and an
+    owner who wants THIS process to keep driving it passes
+    `--continue` instead (unchanged: the original one-shot behavior,
+    still covered by its own tests)."""
+    return {
+        "app": app, "job_name": job_name, "event": event_kind,
+        "next": f"gb2 continue {app} (또는 watch --loop --resume가 자동으로 이어감); "
+                f"바로 이어가려면 이 명령에 --continue",
+    }
 
 
 def exit_code_for_full_outcome(status: str) -> int:
@@ -334,26 +351,55 @@ def run_full_job_and_report(args, config: EngineConfig,
     this same init instead of refusing "app_exists" -- see
     `workspace._scaffold_new_app_repo`'s own docstring."""
     from engine import full_orbit
+    from engine import state as state_module
 
     try:
         config, fakes_for = fakes_builder(config, args.app)
     except ValueError as exc:
         return err_json(str(exc), 1)
 
+    from engine.application.driver_session import driver_session
+
     ledger = Ledger.open(config.ledger_path)
     start = time.monotonic()
+    # driver_session: the whole command (open -> stations -> auto_settle)
+    # reads as a live driver to `gb2 watch`, not only the moments a
+    # processor lock is held (engine.application.driver_session).
     try:
-        outcome = full_orbit.run_full_job(
-            config, ledger, fakes_for, args.app, job_name, request,
-            on_progress=progress_printer,
-        )
+      with driver_session(ledger, args.app):
+        try:
+            outcome = full_orbit.run_full_job(
+                config, ledger, fakes_for, args.app, job_name, request,
+                max_fix_rounds=config.projects[args.app].max_fix_rounds,
+                on_progress=progress_printer,
+            )
+        except state_module.ProjectOpenError as exc:
+            return err_json(str(exc), 1)
+        # new_app_marker is unlinked HERE -- right after run_full_job
+        # has actually returned an outcome, exactly as before this
+        # module gained auto_settle (see this function's own
+        # docstring) -- and, critically, BEFORE auto_settle's own
+        # design/install/release auto-actions run. The marker
+        # (`.gongbang-new`) lives directly under the project's own
+        # source repo (release.master_repo, for a `--with-release`
+        # job): auto_settle's own auto-approved `advance_master` step
+        # requires that repo be completely clean (engine.application.
+        # steps.publish's own "master_not_clean" check, which also
+        # refuses an untracked-and-not-ignored file, not only a
+        # tracked one) -- leaving the marker in place until AFTER
+        # auto_settle ran (as a plain reordering bug first had it)
+        # made every `--with-release` auto-pilot run fail that check
+        # on its own leftover marker file.
+        if new_app_marker is not None:
+            new_app_marker.unlink(missing_ok=True)
+        from engine.application import auto_pilot
+
+        outcome = auto_pilot.auto_settle(config, ledger, fakes_for, args.app, job_name, outcome,
+                                         on_progress=progress_printer)
         wall_sec = time.monotonic() - start
         summary = summarize_full_outcome(config, ledger, args.app, outcome, wall_sec)
     finally:
         ledger.close()
-
-    if new_app_marker is not None:
-        new_app_marker.unlink(missing_ok=True)
 
     append_run_log(args.app, {"job_name": job_name, **summary})
     print(json.dumps(summary, ensure_ascii=False))

@@ -126,15 +126,21 @@ def _seed_probe(ws: Workspace, attempt_id: str, target_id: str, url: str, *,
                 ok: bool = True) -> None:
     """Mirrors engine.acceptance.run_probe_scripts' own 'probe.executed'
     event -- 'ok' is never a stored field (see evidence_graph._probe_ok's
-    own docstring); this seeds returncode/stdout_tail so recomputing it
-    yields `ok`."""
+    own docstring); this seeds returncode/stdout_tail and the proxy's
+    contact record so recomputing it yields `ok`."""
+    from urllib.parse import urlsplit
+
     tail = f"PROBE OK {url}" if ok else "boom"
+    contacts = ([{"host": urlsplit(url).hostname, "port": 443, "method": "CONNECT",
+                  "connected": True, "bytes_up": 1, "bytes_down": 1,
+                  "response_sha256": "y" * 64}] if ok else [])
     ws.ledger.append(Event(
         project="alpha", kind="probe.executed", actor_kind="processor",
         actor_id="processor", attempt_id=attempt_id,
         payload={"id": target_id, "name": target_id, "script": "probe.py",
                  "returncode": 0 if ok else 1, "stdout_tail": tail,
-                 "url": url, "sha256": "x" * 64, "fingerprint": "probe-fp"},
+                 "url": url, "sha256": "x" * 64, "fingerprint": "probe-fp",
+                 "contacts": contacts, "reached": ok},
     ))
 
 

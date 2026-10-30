@@ -14,9 +14,10 @@ import pytest
 from engine import procs, sandbox
 from engine.ledger import Event
 from tests.conftest import Workspace
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox.available(), reason="bwrap not available on this host",
 )
 _needs_fork = pytest.mark.skipif(
     not hasattr(os, "fork"), reason="os.fork not available on this host",

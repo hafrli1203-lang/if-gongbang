@@ -510,6 +510,40 @@ def test_full_spec_task_unchanged_when_no_builder_test_hint_configured(
     assert spec.task.count("\n\n") <= 1
 
 
+def test_full_spec_prompt_names_owns_not_station_wide_prefixes(
+    workspace: Workspace,
+) -> None:
+    """결함 66: a task's own narrow `owns` (e.g. a fix round's exact two
+    files) is the SAME boundary engine.domain.policy.Policy.check
+    actually enforces once facts.owns is set (that module narrows its
+    own local `prefixes` to `owns` before the real write check) -- the
+    worker's own prompt text must name that same narrow boundary, never
+    the station's full build prefixes ("src/, lib/, docs/, package.json"
+    for alpha's 'build'/'builder' -- see _station_workspace). Before the
+    fix, build_prompt was handed the station-wide prefixes regardless of
+    `owns`, so a worker told it could write under "lib/" kept retrying a
+    write the live gate had already narrowed away and denied."""
+    ws = _station_workspace(workspace)
+    attempt_id = open_job(ws.config, ws.ledger, "alpha", "owns-prompt-job",
+                          "full", ("builder",))
+    rid = submit_request(
+        ws.ledger, "alpha", attempt_id, "run_station",
+        {"station": "build", "role": "builder", "task": "fix the bug", "owns": ["src/"]},
+        "owner",
+    )
+    request = ws.ledger.request(rid)
+    fakes = Fakes(publisher=FakePublisher(), installer=FakeInstaller(),
+                  runners={"scripted": ScriptedRunner(ws.root / "script.json")})
+    ctx = station.StepContext(config=ws.config, ledger=ws.ledger, fakes=fakes,
+                              request=request, project="alpha", attempt_id=attempt_id)
+
+    spec, _worker, _runner = station._full_spec(ctx)
+
+    assert "src/" in spec.task
+    assert "lib/" not in spec.task
+    assert "docs/" not in spec.task
+
+
 def _seed_context_injected(ws: Workspace, attempt_id: str, station: str,
                            skills: list[str]) -> None:
     """A minimal context.injected event, same shape engine.infrastructure.context.

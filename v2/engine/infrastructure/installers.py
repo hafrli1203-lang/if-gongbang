@@ -157,6 +157,7 @@ def run_install_cmd(repo: Path, install_cmd: tuple[str, ...], *,
                      allow_lifecycle_scripts: bool = False,
                      sandbox_mode: str = "none",
                      hidden_paths: tuple[Path, ...] = (),
+                     protected_roots: tuple[Path, ...] = (),
                      net: bool = True) -> subprocess.CompletedProcess[bytes]:
     """The one place `install_cmd` is actually spawned, shared by
     RealInstaller.apply (a manifest-change install) and
@@ -195,6 +196,7 @@ def run_install_cmd(repo: Path, install_cmd: tuple[str, ...], *,
         argv = sandbox.wrap(
             list(cmd), cwd=repo, writable=(repo, tmp_home),
             hidden=hidden, net=net, mode=sandbox_mode, child_env=child_env,
+            protected_roots=protected_roots,
         )
         popen_env = sandbox.exec_env(sandbox_mode, child_env)
         pass_fds = sandbox.pass_fds_for(argv)
@@ -272,6 +274,7 @@ class RealInstaller:
                  allow_lifecycle_scripts: bool = False,
                  sandbox_mode: str = "none",
                  hidden_paths: tuple[Path, ...] = (),
+                 protected_roots: tuple[Path, ...] = (),
                  net: bool = True) -> None:
         self.repo = Path(repo)
         self.install_cmd = install_cmd
@@ -280,6 +283,7 @@ class RealInstaller:
         self.allow_lifecycle_scripts = allow_lifecycle_scripts
         self.sandbox_mode = sandbox_mode
         self.hidden_paths = hidden_paths
+        self.protected_roots = protected_roots
         self.net = net
 
     def _marker_path(self, key: str) -> Path:
@@ -305,7 +309,7 @@ class RealInstaller:
                 self.repo, self.install_cmd, timeout_sec=self.timeout_sec,
                 allow_lifecycle_scripts=self.allow_lifecycle_scripts,
                 sandbox_mode=self.sandbox_mode, hidden_paths=self.hidden_paths,
-                net=self.net,
+                protected_roots=self.protected_roots, net=self.net,
             )
         except sandbox.SandboxUnavailable as exc:
             manifest.write_bytes(before)

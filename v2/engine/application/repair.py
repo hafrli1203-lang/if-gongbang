@@ -113,8 +113,9 @@ from engine.application import task_pipeline as orbit
 from engine.application import release as release_mod
 from engine.config import EngineConfig
 from engine.application.repair_target import (
-    ARCHIVE_MARKER_FILES, FixTarget, FixupError, compose_fix_task, extended_owns_for_task,
-    find_fix_target, fix_rounds_used, inject_context_into_fix_task, job_cost_usd,
+    ARCHIVE_MARKER_FILES, FixTarget, FixupError, OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD,
+    compose_fix_task, extended_owns_for_task, find_fix_target, fix_rounds_used,
+    inject_context_into_fix_task, job_cost_usd, outside_allowed_path_denials,
     previous_review_findings, record_owns_extension, requests_for_attempt,
     review_findings_repeat, validate_also_own,
 )
@@ -183,6 +184,25 @@ FIX_ROUNDS_EXHAUSTED_PREFIX = "fix_rounds_exhausted:"
 # tools/gb2lib.runner.cmd_fix matches on this exact prefix the same way
 # it already matches FIX_ROUNDS_EXHAUSTED_PREFIX.
 NO_PROGRESS_PREFIX = "no_progress:"
+
+# fix()'s own THIRD entry-check refusal reason (결함 66, same root as
+# 결함 58/65: an instruction built in one place drifting from the
+# boundary enforced in another): "<this prefix><json list of the
+# distinct denied paths>" -- the attempt about to be replaced already
+# hit OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD or more live-gate denials
+# for reason "outside_allowed_path" (repair_target.
+# outside_allowed_path_denials, reading the engine's own forgery-
+# resistant gate_log.decision import -- never the raw worker-writable
+# log). Reusing the SAME "refuse before spending another round, report
+# a needs_owner shape instead of a bare error" shape
+# FIX_ROUNDS_EXHAUSTED_PREFIX/NO_PROGRESS_PREFIX already use (no new
+# state machine): a builder that keeps retrying a write the gate
+# already denied is not making progress either, and the owner's actual
+# next step is narrower than either of those two ("widen owns for this
+# one path", not "give up" or "try a smaller instruction") -- see
+# tools/gb2lib.runner.cmd_fix's own matching branch for the "gb2 fix
+# <app> --also-own <path>" hint this prints.
+OWNS_SCOPE_STUCK_PREFIX = "owns_scope_stuck:"
 
 # ---------------------------------------------------------------------
 # close the failed attempt, recover its archive
@@ -426,6 +446,18 @@ def fix(config: EngineConfig, ledger: Ledger, project: str, extra: str,
         # first-ever fix has none) -- never a second number invented here.
         max_rounds = cap_pos.max_fix_rounds if cap_pos is not None else 2
         rounds_used = fix_rounds_used(ledger, project, job_name, old_attempt_id)
+        # 결함 66: checked BEFORE both the no-progress and the round-cap
+        # check below, and NEVER bypassed by `past_cap` (unlike those
+        # two) -- widening owns is the only thing that changes the
+        # outcome of another round once the live gate has already
+        # denied this many writes for the SAME reason on the attempt
+        # about to be replaced; `--past-cap` means "I accept the risk
+        # of another round", not "I accept paying for a round the gate
+        # will deny the same way again".
+        denied_paths = outside_allowed_path_denials(ledger, project, old_attempt_id)
+        if len(denied_paths) >= OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD:
+            distinct_paths = sorted(set(denied_paths))
+            raise FixupError(f"{OWNS_SCOPE_STUCK_PREFIX}{json.dumps(distinct_paths)}")
         # a past incident (반장 지시,: checked BEFORE the cap itself,
         # so it also catches a job that has not yet reached max_fix_rounds
         # -- only for "review" (build-task review; engine.application.
@@ -680,7 +712,8 @@ from engine.application.repair_approval import approve_pending_edit  # noqa: E40
 __all__ = [
     "FixupError", "FixTarget", "FixResult", "find_fix_target",
     "compose_fix_task", "close_failed_attempt", "fix", "original_task", "add_also_own",
-    "approve_pending_edit", "FIX_ROUNDS_EXHAUSTED_PREFIX",
+    "approve_pending_edit", "FIX_ROUNDS_EXHAUSTED_PREFIX", "NO_PROGRESS_PREFIX",
+    "OWNS_SCOPE_STUCK_PREFIX",
 ]
 
 

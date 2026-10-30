@@ -101,6 +101,7 @@ def _build_fakes(config: EngineConfig, project: str, attempt_id: str,
         marker_dir=config.home / "jobs" / ids.attempt_dirname(attempt_id) / "installs",
         sandbox_mode=config.sandbox,
         hidden_paths=_installer_hidden_paths(config, project),
+        protected_roots=(config.secrets_dir,),
     )
     runners: dict[str, object] = {"claude": ClaudeRunner(), "codex": CodexRunner()}
     if script_path is not None:

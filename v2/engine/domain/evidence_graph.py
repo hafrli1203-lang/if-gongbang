@@ -67,10 +67,11 @@ one ever runs:
   - 'probe.executed' (engine.application.acceptance.run_probe_scripts) -- one per
     external target (engine.domain.stage_checks.check_probe_targets, by POSITION id
     "t1", "t2", ...) this job's own attempts ever actually probed; the
-    newest one per id, recomputed the same way engine.application.acceptance._
-    probe_observed does (exit 0 AND the target's own url named
-    alongside the "PROBE OK" marker in the captured stdout/stderr
-    tail), must read "ok". The inventory of ids this is checked
+    newest one per id, recomputed the same way engine.application.
+    acceptance_probe judges it (exit 0, the target's own url named
+    alongside the "PROBE OK" marker in the engine-captured output, AND
+    the event's own proxy "contacts" showing the target's host
+    answered -- engine.domain.probe_observation), must read "ok". The inventory of ids this is checked
     against is the FROZEN plan.reviewed manifest's own
     "probe_target_ids" (facts.md's declared targets AT REVIEW TIME --
     see engine.domain.plan_review.record_plan_reviewed), union whatever this
@@ -116,6 +117,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from engine.domain.plan import requirement_coverers
+from engine.domain.probe_observation import target_reached
 
 if TYPE_CHECKING:
     from engine.infrastructure.db.ledger import Ledger
@@ -398,16 +400,20 @@ def _task_review_passed(ledger: Ledger, attempt_id: str) -> bool:
     return not latest.stale and latest.payload.get("passed") is True
 
 
-# Mirrors engine.application.acceptance._probe_observed's own formula exactly (kept
-# as its own local copy, not an import of that private name, for the
-# same "outside this module's owned scope" reason _latest_plan_reviewed
-# documents) -- exit 0 alone proves nothing about whether a probe
-# script ever actually contacted its own target.
+# Mirrors engine.application.acceptance_probe's own pass rule: the
+# legacy output check (exit 0 and "PROBE OK <url>", kept as its own
+# local copy) AND the engine's proxy contact records showing the
+# target's host actually answered (engine.domain.probe_observation).
+# The output check alone proves nothing -- the script prints it itself.
 _PROBE_OK_MARK = "PROBE OK"
 
 
-def _probe_ok(returncode: object, stdout_tail: object, url: object) -> bool:
-    return returncode == 0 and f"{_PROBE_OK_MARK} {url}" in str(stdout_tail or "")
+def _probe_ok(returncode: object, stdout_tail: object, url: object,
+              contacts: object) -> bool:
+    if not isinstance(url, str) or not isinstance(contacts, list):
+        return False
+    return (returncode == 0 and f"{_PROBE_OK_MARK} {url}" in str(stdout_tail or "")
+            and target_reached(url, contacts))
 
 
 def _probe_target_results(
@@ -430,7 +436,7 @@ def _probe_target_results(
         latest_seq[target_id] = seq
         results[target_id] = _probe_ok(
             event.payload.get("returncode"), event.payload.get("stdout_tail"),
-            event.payload.get("url"),
+            event.payload.get("url"), event.payload.get("contacts"),
         )
     return results
 

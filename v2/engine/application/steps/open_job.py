@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from engine.domain import ids
+from engine.application.steps.open_job_sweep import sweep_stale_tmp_dirs
 from engine.infrastructure import procs
 from engine.domain import state
 from engine.infrastructure.gitutil import git_argv
@@ -177,6 +178,7 @@ def _reconcile_orphaned_intents(ledger: Ledger, project: str, config: EngineConf
         for candidate in (copies_root / dirname, copies_root / f".tmp-{dirname}"):
             if candidate.exists():
                 shutil.rmtree(candidate, ignore_errors=True)
+    sweep_stale_tmp_dirs(ledger, project, config)
 
 
 def open_job(config: EngineConfig, ledger: Ledger, project: str, job_name: str,

@@ -13,6 +13,10 @@ fixture) and asserts only on the step's OWN behavior:
   the tool itself fails to  -> bench fails ("arch_check_failed"),
     run (missing script,       before any violation is counted  test_d
     output isn't the shape)
+  a violation ITEM doesn't  -> bench fails ("arch_check_failed"),
+    match {check,file,detail}  same as test_d -- a malformed item      test_f
+    (missing field, wrong      must never silently become an
+    type, or not a dict)       "existing_violation_count" bump
 """
 from __future__ import annotations
 
@@ -20,6 +24,8 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from engine.application.processor import Fakes, Processor
 from engine.application.processor import submit as submit_request
@@ -164,6 +170,48 @@ def test_d_tool_itself_failing_to_run_fails_bench(workspace: Workspace) -> None:
     assert req.result == {"reason": "arch_check_failed"}
     # Never got far enough to record ANY bench evidence -- run_arch_check
     # itself raised, before record_bench's evidence.record ever runs.
+    assert ws.ledger.evidence(attempt_id, "bench") == []
+
+
+@pytest.mark.parametrize("malformed_violations", [
+    pytest.param([{}], id="empty_dict"),
+    pytest.param(["garbage", 3], id="non_dict_items"),
+    pytest.param(["just a string"], id="string_item"),
+    pytest.param([{"check": "file_size", "file": "src/greeter/__init__.py"}], id="missing_detail"),
+    pytest.param(
+        [{"check": "file_size", "file": "src/greeter/__init__.py", "detail": 5}],
+        id="wrong_type_detail",
+    ),
+])
+def test_f_malformed_violation_item_fails_as_arch_check_failed(
+    workspace: Workspace, malformed_violations: object,
+) -> None:
+    """F3: a violations list that parses as JSON but whose items don't
+    match arch_check.py --json's own {"check", "file", "detail"} shape
+    (this module's docstring) must never be silently absorbed into
+    "existing_violation_count" -- that would hide a broken tool (or a
+    real violation it failed to report correctly) behind a passing
+    bench run. Same failure as test_d: StepFailed("arch_check_failed"),
+    before any bench evidence is recorded."""
+    sample = make_sample(workspace.root / "t12f", 1, Path(sys.executable))
+    (sample.repo / "fake_arch.py").write_text(_FAKE_ARCH_CHECK, encoding="utf-8")
+    (sample.repo / "arch_fixture.json").write_text(
+        json.dumps(malformed_violations), encoding="utf-8")
+    git(sample.repo, "add", "-A")
+    git(sample.repo, "commit", "-q", "-m", "add fake arch_check with malformed fixture")
+    project = replace(
+        workspace.config.projects["alpha"],
+        repo=sample.repo, test_cmd=sample.test_cmd, install_cmd=sample.install_cmd,
+        manifest=sample.manifest, bench_cases=sample.bench_cases,
+        arch_check_cmd=(sys.executable, "fake_arch.py"),
+    )
+    config = replace(workspace.config, projects={**workspace.config.projects, "alpha": project})
+    ws = Workspace(workspace.root, config, workspace.ledger, sample.repo, workspace.beta)
+
+    attempt_id, rid = _run_bench(ws)
+    req = ws.ledger.request(rid)
+    assert req.status == "failed"
+    assert req.result == {"reason": "arch_check_failed"}
     assert ws.ledger.evidence(attempt_id, "bench") == []
 
 

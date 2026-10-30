@@ -924,6 +924,65 @@ def test_cmd_fix_calls_fixup_fix_with_the_app_and_extra_text(
     assert calls == [("demo", "also check the edge case")]
 
 
+def test_cmd_fix_reports_owns_scope_stuck_with_also_own_next_step(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """결함 66: when engine.fixup.fix refuses with
+    fixup.OWNS_SCOPE_STUCK_PREFIX (the attempt about to be replaced
+    already hit repeated live-gate "outside_allowed_path" denials),
+    cmd_fix must print a needs_owner shape (exit 2) naming the denied
+    paths and the exact `gb2 fix <app> --also-own <path>` call that
+    unblocks it -- never the bare err_json(message, 1) every OTHER
+    FixupError gets."""
+    import json as _json
+
+    from engine import fixup as fixup_module
+
+    apps_dir = tmp_path / "apps"
+    apps_dir.mkdir()
+    monkeypatch.setattr(gb2.shared, "APPS_DIR", apps_dir)
+    monkeypatch.setenv("GB2_APPS_ROOT", str(tmp_path / "source"))
+    workspace = apps_dir / "demo"
+    workspace.mkdir()
+    (workspace / "home").mkdir()
+    (workspace / "secrets").mkdir()
+    source_repo = _make_source_repo(tmp_path / "source" / "demo")
+    repo_dir = _worktree_repo(source_repo, workspace / "repo")
+
+    config = EngineConfig(
+        ledger_path=workspace / "ledger.sqlite", home=workspace / "home",
+        secrets_dir=workspace / "secrets",
+        projects={"demo": ProjectConfig("demo", repo_dir)},
+        station_owners={},
+    )
+    config = write_json(config, workspace / "config.json")
+    ledger = Ledger.create(config.ledger_path)
+    ledger.register_project("demo")
+    ledger.close()
+
+    denied = ["tests/new_scene_0.py", "tests/new_scene_1.py"]
+
+    def _fake_fix(cfg, ledger_, project, extra, fakes_for, **kwargs):
+        raise fixup_module.FixupError(
+            f"{fixup_module.OWNS_SCOPE_STUCK_PREFIX}{_json.dumps(denied)}"
+        )
+
+    monkeypatch.setattr(gb2.fixup, "fix", _fake_fix)
+
+    code = gb2.main(["fix", "demo"])
+
+    assert code == 2
+    captured = capsys.readouterr()
+    summary = _json.loads(captured.out.strip().splitlines()[-1])
+    assert summary["status"] == "needs_owner"
+    assert summary["reason"] == "owns_scope_stuck"
+    assert summary["denied_paths"] == denied
+    assert any("--also-own" in step for step in summary["next"])
+    for path in denied:
+        assert path in summary["next"][0]
+
+
 def test_cmd_fix_leaves_the_release_decision_to_fixup_and_continues_the_full_job(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2024,7 +2083,7 @@ def test_approve_install_finds_and_resumes_an_early_station_request(
     ])
     monkeypatch.setenv("GB2_SCRIPTED_WORKERS", str(scripts_dir))
 
-    code = gb2.main(["approve-install", "demo"])
+    code = gb2.main(["approve-install", "demo", "--continue"])
 
     # Before the fix, pending_owner_requests never saw a STAGE_EARLY_STATION
     # stop, so this always failed with "no_pending_install_request" (exit
@@ -2069,12 +2128,16 @@ def test_approve_install_offers_every_owner_request_kind_not_only_installs(
         return "R-approved"
 
     monkeypatch.setattr(owner_module, "approve_pending", _approve)
-    monkeypatch.setattr(gb2.runner, "_drain", lambda *a, **k: "done")
+    # cmd_approve_install now lives in tools/gb2lib/approve_ops.py (split
+    # out of runner.py to stay under the 800-line architecture cap, E1)
+    # and imports its own `_drain` name from engine.cli -- patch THAT
+    # module's binding, not runner's.
+    monkeypatch.setattr(gb2.approve_ops, "_drain", lambda *a, **k: "done")
     monkeypatch.setattr(full_orbit_module, "continue_full_job",
                         lambda *a, **k: full_orbit_module.FullOutcome(
                             "needs_owner", "design_approval", job["attempt_id"], None))
 
-    code = gb2.main(["approve-install", "demo"])
+    code = gb2.main(["approve-install", "demo", "--continue"])
 
     assert approved == [scripts_request]
     assert code == 2, code

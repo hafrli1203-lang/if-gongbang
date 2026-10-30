@@ -18,8 +18,8 @@ Any git failure, a symlink pointing outside the work tree, or a nested
 repository raises FingerprintError. Callers treat "no fingerprint" as
 "refuse" (never as pass).
 
-fingerprint()'s optional third argument, `file_dep_targets` (Codex
-P1-b,: a project may depend on a package OUTSIDE its own
+fingerprint()'s optional third argument, `file_dep_targets`:
+a project may depend on a package OUTSIDE its own
 repo via a `file:../...` package.json dependency (engine.application.
 steps.file_deps -- ProjectConfig.file_dep_targets carries each such
 dependency's already-resolved (relspec, absolute target dir) pair).

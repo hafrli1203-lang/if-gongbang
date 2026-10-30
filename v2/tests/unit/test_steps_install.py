@@ -3,6 +3,8 @@ installer failure modes, and evidence invalidation."""
 from __future__ import annotations
 
 import json
+import subprocess
+from dataclasses import replace
 
 import pytest
 
@@ -10,11 +12,11 @@ from engine import ids
 from engine.faults import CrashInjected, Faults
 from engine.fakes.installer import FakeInstaller
 from engine.fakes.publisher import FakePublisher
-from engine.installers import InstallFailed, Installer
+from engine.installers import InstallFailed, Installer, RealInstaller
 from engine.processor import Fakes, Processor, submit
 from engine.steps import install
 from engine.steps.open_job import open_job
-from tests.conftest import Workspace
+from tests.conftest import GIT_ENV, Workspace
 
 
 def _processor(workspace: Workspace, holder: str = "p1",
@@ -552,3 +554,121 @@ def test_lines_manifest_matches_ignores_surrounding_whitespace(tmp_path: Path) -
     manifest = tmp_path / "requirements.txt"
     manifest.write_text("zod>=3,<4\n", encoding="utf-8")
     assert _lines_manifest_matches(manifest, {"add_lines": [" zod>=3,<4 "]}) is True
+
+
+# ---- 결함 69: an owner-approved manifest change is committed to HEAD, ----
+# ---- never left satisfied only in the working tree ----------------------
+
+def _head_blob(repo, rel: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", f"HEAD:{rel}"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _git_status_short(repo) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "status", "--short"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def test_install_commits_the_json_manifest_change_onto_head(workspace: Workspace) -> None:
+    """A real approved install (kind="install", a package.json dependency
+    -- the real-app shape) must land on HEAD, not just the working tree,
+    AND leave the repo clean (결함 69)."""
+    attempt_id = open_job(workspace.config, workspace.ledger, "alpha", "deps-commit",
+                           "full", ("builder",))
+    rid = submit(workspace.ledger, "alpha", attempt_id, "install", {
+        "manifest": "package.json", "change": {"dependencies": {"zod": "3.0.0"}},
+    }, "owner")
+    proc = _processor(workspace)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    head = json.loads(_head_blob(workspace.alpha, "package.json"))
+    assert head["dependencies"] == {"zod": "3.0.0"}
+    assert _git_status_short(workspace.alpha).strip() == ""
+
+
+def test_install_commits_a_lines_manifest_dependency_onto_head(workspace: Workspace) -> None:
+    """Same contract for a line-list manifest (requirements.txt
+    add_lines -- the real-app install(dependencies) shape), through the
+    REAL installer (RealInstaller, install_cmd a no-op) rather than the
+    fake, so this exercises the same code path the live app uses."""
+    (workspace.alpha / "requirements.txt").write_text("flask==2.0\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace.alpha), "add", "requirements.txt"],
+                   check=True, capture_output=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(workspace.alpha), "commit", "-q", "-m", "add reqs"],
+                   check=True, capture_output=True, env=GIT_ENV)
+    project = replace(workspace.config.projects["alpha"], manifest="requirements.txt")
+    config = replace(workspace.config, projects={**workspace.config.projects, "alpha": project})
+    attempt_id = open_job(config, workspace.ledger, "alpha", "deps-lines", "full", ("builder",))
+    rid = submit(workspace.ledger, "alpha", attempt_id, "install", {
+        "manifest": "requirements.txt", "change": {"add_lines": ["jsdom==25.0.0"]},
+    }, "owner")
+    fakes = Fakes(publisher=FakePublisher(),
+                 installer=RealInstaller(repo=workspace.alpha, install_cmd=("true",),
+                                         marker_dir=workspace.root / "markers"))
+    proc = Processor(config=config, ledger=workspace.ledger, fakes=fakes, holder="p1")
+    proc.register("install", install.steps)
+    n = proc.run_once("alpha")
+    assert n == 1
+    assert workspace.ledger.request(rid).status == "done"
+    head = _head_blob(workspace.alpha, "requirements.txt")
+    assert "jsdom==25.0.0" in head.splitlines()
+    assert _git_status_short(workspace.alpha).strip() == ""
+
+
+def test_manifest_holds_ignores_an_uncommitted_working_tree_only_change(
+    workspace: Workspace,
+) -> None:
+    """RED-for-결함-69: a manifest change written straight into the
+    working tree (never committed -- exactly what a pre-fix installer
+    left behind, or an owner's own unrelated direct edit) must NOT count
+    as "already satisfied". `gb2 approve-install` (job_state_requests.
+    request_fulfilled -> _manifest_holds) must keep treating the owner
+    request as pending until the SAME content is actually on HEAD."""
+    from engine.application.job_state_requests import _manifest_holds
+
+    change = {"scripts": {"start": "node src/server/http/start.js"}}
+    manifest = workspace.alpha / "package.json"
+    current = json.loads(manifest.read_text(encoding="utf-8"))
+    current.setdefault("scripts", {})["start"] = "node src/server/http/start.js"
+    manifest.write_text(json.dumps(current), encoding="utf-8")  # working tree only
+
+    assert _manifest_holds(workspace.alpha, "package.json", change) is False
+
+    subprocess.run(["git", "-C", str(workspace.alpha), "add", "package.json"],
+                   check=True, capture_output=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(workspace.alpha), "commit", "-q", "-m", "ship it"],
+                   check=True, capture_output=True, env=GIT_ENV)
+
+    assert _manifest_holds(workspace.alpha, "package.json", change) is True
+
+
+def test_sync_installed_manifests_refreshes_the_builders_own_copy(
+    workspace: Workspace,
+) -> None:
+    """결함 69's other half: once a manifest change is committed to HEAD
+    in the real repo, a build task resumed on the SAME attempt must see
+    it in its OWN already-materialized copy too (engine.application.steps.
+    open_job._make_copies never refreshes it on its own) -- otherwise it
+    keeps reporting the identical request forever."""
+    from engine.application.pipeline_resume_tasks import sync_installed_manifests
+
+    (workspace.alpha / "package.json").write_text(
+        json.dumps({"scripts": {"start": "node x.js"}}), encoding="utf-8")
+    build_copy = workspace.root / "stale-builder-copy"
+    build_copy.mkdir()
+    (build_copy / "package.json").write_text(json.dumps({"scripts": {}}), encoding="utf-8")
+
+    pending = (
+        {"kind": "scripts_change", "manifest": "package.json",
+         "change": {"scripts": {"start": "node x.js"}}},
+        {"kind": "edit", "path": "src/foo.py", "reason": "x"},  # no manifest -- skipped
+    )
+    sync_installed_manifests(workspace.alpha, build_copy, pending)
+
+    copied = json.loads((build_copy / "package.json").read_text(encoding="utf-8"))
+    assert copied["scripts"]["start"] == "node x.js"

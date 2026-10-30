@@ -27,9 +27,11 @@ from __future__ import annotations
 import pytest
 
 from engine.infrastructure import sandbox as sandbox_mod
+from tests.probe_target import contacting_py_script, probe_target  # noqa: F401
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox_mod.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox_mod.available(), reason="bwrap not available on this host",
 )
 
 
@@ -38,7 +40,7 @@ _needs_bwrap = pytest.mark.skipif(
 #          "PROBE OK <url>" output
 
 def test_19_doc_url_with_trailing_explanation_still_matches_the_real_probe(
-    workspace,
+    workspace, probe_target,
 ) -> None:
     """The real incident (마케팅 채팅 job, 실측 재실행): a
     real facts.md bullet read "- Claude Code CLI(...): https://docs.
@@ -53,7 +55,7 @@ def test_19_doc_url_with_trailing_explanation_still_matches_the_real_probe(
     from engine.domain.stage_checks import check_probe_targets
     from engine.steps.open_job import open_job
 
-    doc_url = "https://docs.claude.com/en/docs/claude-code/cli-reference"
+    doc_url = probe_target("/en/docs/claude-code/cli-reference")
     facts_text = (
         "## 외부 대상\n"
         f"- Claude Code CLI(코드 실행): {doc_url} "
@@ -75,8 +77,7 @@ def test_19_doc_url_with_trailing_explanation_still_matches_the_real_probe(
     # The real script a prober would actually write: it only ever knows
     # (and prints) the bare address, never the planner's own trailing
     # explanation.
-    (probe_dir / "t1.py").write_text(
-        f"print('PROBE OK {doc_url}')\n", encoding="utf-8")
+    (probe_dir / "t1.py").write_text(contacting_py_script(doc_url), encoding="utf-8")
 
     results = run_probe_scripts(
         workspace.config, workspace.ledger, "alpha", attempt_id, "job19",
@@ -111,7 +112,7 @@ def test_19_red_the_unsplit_url_never_matches_the_scripts_real_output() -> None:
 
 @_needs_bwrap
 def test_20_probe_runtime_cli_gets_its_own_home_writable_subpath(
-    workspace, monkeypatch,
+    workspace, monkeypatch, probe_target,
 ) -> None:
     """The real incident (마케팅 채팅 job, 실측 재실행): a
     real `codex exec` run as a probe's own configured probe_runtime_
@@ -157,12 +158,15 @@ def test_20_probe_runtime_cli_gets_its_own_home_writable_subpath(
 
     monkeypatch.setattr(worker_sandbox.sandbox, "resolve_runtime", fake_resolve_runtime)
 
+    target_url = probe_target("/codex")
     script = (
         "import subprocess\n"
+        "import urllib.request\n"
         f"r = subprocess.run([{str(fake_bin)!r}], capture_output=True, text=True)\n"
         "print((r.stdout or '') + (r.stderr or ''))\n"
         "if 'CODEX_WROTE_OK' in (r.stdout or ''):\n"
-        "    print('PROBE OK https://docs.example/codex')\n"
+        f"    urllib.request.urlopen({target_url!r}, timeout=10).read()\n"
+        f"    print('PROBE OK {target_url}')\n"
     )
 
     config = replace(
@@ -184,7 +188,7 @@ def test_20_probe_runtime_cli_gets_its_own_home_writable_subpath(
         (probe_dir / "t1.py").write_text(script, encoding="utf-8")
         return run_probe_scripts(
             config, workspace.ledger, project, attempt_id, job_name,
-            [("codex cli", "https://docs.example/codex")],
+            [("codex cli", target_url)],
         )
 
     # RED: reproduces the pre-fix shape by forcing CLI_HOME_WRITABLE_

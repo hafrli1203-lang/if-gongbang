@@ -45,7 +45,7 @@ def _entries_under(root: Path) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Codex repro 1: a protected root's own DESCENDANT (not just the root
+# Repro 1: a protected root's own DESCENDANT (not just the root
 # itself) must be rejected too.
 # ---------------------------------------------------------------------------
 
@@ -60,7 +60,7 @@ def test_snapshot_rejects_entry_under_secrets_dir(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex repro 2: another project's repo (not just THIS project's own)
+# Repro 2: another project's repo (not just THIS project's own)
 # must be rejected too.
 # ---------------------------------------------------------------------------
 
@@ -75,7 +75,7 @@ def test_snapshot_rejects_entry_under_another_projects_repo(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# Codex repro 3: a NESTED .env* (not just one directly inside the
+# Repro 3: a NESTED .env* (not just one directly inside the
 # configured entry) must never be copied into the snapshot.
 # ---------------------------------------------------------------------------
 
@@ -96,7 +96,7 @@ def test_snapshot_does_not_copy_nested_dotenv_file(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex repro 4: content is pinned at first snapshot -- swapping the
+# Repro 4: content is pinned at first snapshot -- swapping the
 # source for a symlink (even to somewhere forbidden) afterward must
 # have NO effect on an already-made snapshot.
 # ---------------------------------------------------------------------------

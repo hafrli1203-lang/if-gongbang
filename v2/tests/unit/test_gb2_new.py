@@ -646,6 +646,35 @@ def test_cmd_change_requires_change_request_text(
     assert run_calls == []
 
 
+def test_cmd_change_reports_a_friendly_error_instead_of_crashing_when_project_already_open(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """결함 64b: `open_with_intent`'s own CLOSED pre-check (engine.
+    application.pipeline_stages) raises engine.state.ProjectOpenError
+    when another job is still OPEN on this project -- this is run_full_
+    job_and_report's job to turn into a friendly {"error": ...} JSON
+    (exit 1) instead of letting a raw TransitionError traceback crash
+    the CLI."""
+    from engine import state as state_module
+
+    _init_demo_app(gb2, tmp_path, monkeypatch)
+    run_calls, _ = _install_fake_full_orbit(monkeypatch)
+
+    def _raise_project_open(*args: object, **kwargs: object) -> None:
+        raise state_module.ProjectOpenError(
+            "project_open: close or finish the current job first"
+        )
+
+    sys.modules["engine.full_orbit"].run_full_job = _raise_project_open  # type: ignore[attr-defined]
+
+    code = gb2.main(["change", "demo", "뭔가 바꿔줘"])
+
+    assert code == 1
+    printed = json.loads(capsys.readouterr().err.strip())
+    assert "project_open" in printed["error"]
+
+
 def test_cmd_change_calls_run_full_job_against_the_initialized_app(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -711,14 +740,54 @@ def test_cmd_approve_design_refuses_wrong_approval_line(
     assert continue_calls == []
 
 
-def test_cmd_approve_design_appends_event_and_calls_continue_full_job(
+def test_cmd_approve_design_by_default_records_approval_and_returns_without_continuing(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """결함 64: approve-design used to call continue_full_job in the
+    SAME process right after recording the approval, holding the
+    owner's own TTY for however long that build loop ran. The default
+    now is to record the approval and return -- `gb2 continue`/`gb2
+    watch --loop --resume` picks the job back up, named in the
+    printed "next" hint."""
+    config, _attempt_id = _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    _force_tty_approval(monkeypatch, "승인 gb2-new-1000")
+    _run_calls, continue_calls = _install_fake_full_orbit(monkeypatch)
+    capsys.readouterr()  # discard `gb2 init`'s own stdout from setup above
+
+    code = gb2.main(["approve-design", "demo"])
+
+    assert code == 0
+    assert continue_calls == []
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["job_name"] == "gb2-new-1000"
+    assert "gb2 continue" in printed["next"]
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        approved = [
+            event for _seq, event in ledger.events("demo", "design.approved")
+            if event.payload.get("job") == "gb2-new-1000"
+        ]
+    finally:
+        ledger.close()
+    assert len(approved) == 1
+    # approve-design now pins+stores
+    # target_version on EVERY approval, TTY included (not only the
+    # office-token path) -- engine.application.pipeline_resume's own
+    # design_approval_still_matches compares against this later.
+    assert isinstance(approved[0].payload.get("target_version"), str)
+    assert approved[0].payload["target_version"]
+
+
+def test_cmd_approve_design_with_continue_flag_appends_event_and_calls_continue_full_job(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, attempt_id = _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
     _force_tty_approval(monkeypatch, "승인 gb2-new-1000")
     _run_calls, continue_calls = _install_fake_full_orbit(monkeypatch)
 
-    code = gb2.main(["approve-design", "demo"])
+    code = gb2.main(["approve-design", "demo", "--continue"])
 
     assert code == 0
     assert len(continue_calls) == 1
@@ -800,7 +869,50 @@ def test_cmd_approve_install_refuses_wrong_approval_line(
     assert continue_calls == []
 
 
-def test_cmd_approve_install_approves_runs_install_then_continues(
+def test_cmd_approve_install_by_default_approves_drains_and_returns_without_continuing(
+    gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """결함 64: same split as approve-design -- approve+drain the
+    pending install(s), record the audit trail, then return instead of
+    calling continue_full_job in this same process."""
+    config, attempt_id = _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
+    config_path = config.ledger_path.parent / "config.json"
+    config = _make_install_harmless(config, config_path)
+    install_request = {"kind": "install", "manifest": "package.json",
+                       "change": {"dependencies": {"left-pad": "^1.0.0"}}}
+    _force_tty_approval(monkeypatch, "승인 gb2-new-1000")
+    _run_calls, continue_calls = _install_fake_full_orbit(
+        monkeypatch, pending_requests=(install_request,))
+    capsys.readouterr()  # discard `gb2 init`'s own stdout from setup above
+
+    code = gb2.main(["approve-install", "demo"])
+
+    assert code == 0
+    assert continue_calls == []
+    printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert printed["job_name"] == "gb2-new-1000"
+    assert "gb2 continue" in printed["next"]
+
+    ledger = Ledger.open(config.ledger_path)
+    try:
+        recorded = [
+            event for _seq, event in ledger.events("demo", "install.recorded")
+            if event.attempt_id == attempt_id
+        ]
+        approved = [
+            event for _seq, event in ledger.events("demo", "owner.approved")
+            if event.attempt_id == attempt_id
+        ]
+    finally:
+        ledger.close()
+    assert len(recorded) == 1
+    assert recorded[0].payload["manifest"] == "package.json"
+    assert recorded[0].payload["change"] == install_request["change"]
+    assert len(approved) == 1
+
+
+def test_cmd_approve_install_with_continue_flag_approves_runs_install_then_continues(
     gb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, attempt_id = _init_demo_app_with_open_attempt(gb2, tmp_path, monkeypatch)
@@ -812,7 +924,7 @@ def test_cmd_approve_install_approves_runs_install_then_continues(
     _run_calls, continue_calls = _install_fake_full_orbit(
         monkeypatch, pending_requests=(install_request,))
 
-    code = gb2.main(["approve-install", "demo"])
+    code = gb2.main(["approve-install", "demo", "--continue"])
 
     assert code == 0
     assert len(continue_calls) == 1

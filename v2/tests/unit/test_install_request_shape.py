@@ -102,6 +102,56 @@ def test_line_list_manifest_request_built_as_instructed_is_approved(
     assert (ok, reason) == (True, "ok")
 
 
+def test_scripts_change_shape_text_names_its_own_kind_not_sections() -> None:
+    """결함 65: the scripts_change/test_config_change shape must name
+    the correct kind (so a worker files the right one), not the
+    dependency-section list "install" uses -- that list is exactly
+    what rejected a legitimate "scripts" edit with
+    manifest_section_not_allowed before this fix."""
+    text = install_request_shape_text("package.json", kind="scripts_change")
+    assert '"kind": "scripts_change"' in text
+    for section in JSON_INSTALL_SECTIONS:
+        assert section not in text
+
+
+def test_build_prompt_names_scripts_change_and_test_config_change_kinds(
+    tmp_path: Path,
+) -> None:
+    """결함 65: build_prompt's instruction must also cover the two
+    non-install whitelisted kinds (engine.application.owner_approval.
+    PENDING_KIND_WHITELIST), not only "install" -- before this fix a
+    worker had no instructed shape for a non-dependency manifest edit
+    (e.g. a package.json "scripts" entry) and filed it as "install"
+    instead, which is always rejected for that shape."""
+    spec = _spec(tmp_path)
+    text = build_prompt(spec, ("src/",), (r"ls",), (), manifest="package.json")
+    assert '"kind": "scripts_change"' in text
+    assert '"kind": "test_config_change"' in text
+
+
+def test_scripts_change_request_built_as_instructed_is_approved(
+    workspace: Workspace, tmp_path: Path,
+) -> None:
+    """The real incident this defect fixes: a worker wanted to add a
+    package.json "start" script and (with no scripts_change shape
+    instructed) filed it as kind="install", which
+    owner_approval.validate_pending always rejects for a "scripts"
+    section. Built with the NOW-instructed scripts_change shape, the
+    exact same script entry must be approved -- a round trip against
+    the real owner_approval.validate_pending, not a re-derived check."""
+    spec = _spec(tmp_path)
+    prompt_text = build_prompt(spec, ("src/",), (r"ls",), (), manifest="package.json")
+    assert '"kind": "scripts_change"' in prompt_text
+
+    ws = _with_manifest(workspace, "package.json")
+    request = {
+        "kind": "scripts_change", "manifest": "package.json",
+        "change": {"scripts": {"start": "node src/server/http/start.js"}},
+    }
+    ok, reason = validate_pending(ws.config, "alpha", request)
+    assert (ok, reason) == (True, "ok")
+
+
 def test_json_manifest_add_lines_shape_is_still_rejected(
     workspace: Workspace,
 ) -> None:
@@ -114,4 +164,6 @@ def test_json_manifest_add_lines_shape_is_still_rejected(
     }
     ok, reason = validate_pending(ws.config, "alpha", request)
     assert ok is False
-    assert reason == "manifest_section_not_allowed"
+    # 결함 65: renamed from "manifest_section_not_allowed" to an
+    # actionable reason -- still a rejection, just a different WHY.
+    assert reason == "use_scripts_change_kind"

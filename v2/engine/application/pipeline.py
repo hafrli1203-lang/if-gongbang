@@ -88,11 +88,10 @@ from engine.application.pipeline_base import (
     checked_facts, fakes_for, trusted_text,
 )
 from engine.application.pipeline_planning import (
-    append_owner_request_resume_note, capture_probe_logs as _capture_probe_logs,
-    probe_log_path as _probe_log_path, probe_logs_text as _probe_logs_text,
+    append_owner_request_resume_note,
     record_plan_reviewed as _record_plan_reviewed, run_facts as _run_facts,
     run_plan_and_review as _run_plan_and_review, run_probe as _run_probe,
-    verified_probe_text as _verified_probe_text, close_early_attempt_then_tasks, facts_then_rest,
+    close_early_attempt_then_tasks, facts_then_rest,
     maybe_rerun_plan_review, probe_plan_design_close, run_full_job,
 )
 from engine.application.pipeline_release import (

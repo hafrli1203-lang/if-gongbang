@@ -17,6 +17,7 @@ from engine.application import acceptance_probe
 from engine.application.acceptance_probe import run_probe_scripts
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
+from tests.probe_target import contacting_py_script, serve_target
 
 
 def _open(workspace: Workspace, job_name: str = "job1") -> str:
@@ -69,10 +70,6 @@ def test_probe_py_script_calls_resolve_system_python_not_sys_executable(
     attempt_id = _open(workspace)
     probe_dir = workspace.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.py").write_text(
-        "print('PROBE OK https://docs.stripe.com/api')\n", encoding="utf-8",
-    )
-
     calls: list[str] = []
     real_resolve = acceptance_probe._resolve_system_python
 
@@ -83,10 +80,12 @@ def test_probe_py_script_calls_resolve_system_python_not_sys_executable(
 
     monkeypatch.setattr(acceptance_probe, "_resolve_system_python", spy)
 
-    results = run_probe_scripts(
-        workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
-        [("stripe", "https://docs.stripe.com/api")],
-    )
+    with serve_target() as url:
+        (probe_dir / "t1.py").write_text(contacting_py_script(url), encoding="utf-8")
+        results = run_probe_scripts(
+            workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
+            [("stripe", url)],
+        )
 
     assert len(calls) == 1
     assert results[0].ok is True

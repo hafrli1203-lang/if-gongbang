@@ -14,9 +14,11 @@ other way."""
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 from engine.application import task_pipeline as orbit
 from engine.config import EngineConfig
+from engine.application.owner_approval import PENDING_KIND_WHITELIST
 from engine.application.pipeline_base import (
     BUILDER_ROLE, FullOutcome, Run, max_fix_rounds, resumed_plan, task_attempt_committed,
     task_for, unblock_internal_crash,
@@ -33,10 +35,41 @@ from engine.application.repair_target import (
 )
 from engine.domain.plan import Plan
 from engine.application.job_state import (
-    JobPosition, hand_off_later_task_requests, outstanding_requests, record_position, stages_from_spec, stages_spec,
-    task_stop_position, widen_stage_owns,
+    JobPosition, current_position_seq, hand_off_later_task_requests, outstanding_requests,
+    record_position, stages_from_spec, stages_spec, task_stop_position, widen_stage_owns,
 )
 from engine.application.steps.open_job import copy_root
+
+
+def sync_installed_manifests(repo: Path, build_copy: Path,
+                             pending_requests: tuple[dict, ...]) -> None:
+    """결함 69: copies each `pending_requests` entry whose kind is owner-
+    approvable (install/scripts_change/test_config_change -- the SAME
+    PENDING_KIND_WHITELIST job_state_requests.request_fulfilled already
+    gates on) from `repo`'s own manifest path into this attempt's
+    builder copy, byte for byte. `repo`'s manifest now carries the
+    owner-approved change AND is committed to HEAD (engine.application.steps.
+    install's own commit_manifest step) by the time a task-owner stop
+    resumes here -- but `build_copy` was archived from an OLDER HEAD at
+    job-open time (engine.application.steps.open_job._make_copies) and is never
+    refreshed on its own. Without this, a builder resumed on the SAME
+    attempt keeps reading its own stale copy of the manifest and
+    reports the identical request again forever (마케팅 채팅 job
+    gb2-change-1793123186). A request not in PENDING_KIND_WHITELIST
+    (e.g. an `edit`/owns-scope report) has no manifest of its own and
+    is skipped here, same as request_fulfilled's own whitelist check."""
+    for request in pending_requests:
+        if not isinstance(request, dict) or request.get("kind") not in PENDING_KIND_WHITELIST:
+            continue
+        manifest = request.get("manifest")
+        if not isinstance(manifest, str) or not manifest:
+            continue
+        source = repo / manifest
+        if not source.exists():
+            continue
+        target = build_copy / manifest
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
 
 
 def advance_past_task(run: Run, pos: JobPosition, plan: Plan,
@@ -190,21 +223,40 @@ def rerun_task_owner_stop(run: Run, pos: JobPosition, plan: Plan, *,
             isinstance(r, dict) and not is_owns_scope_request(r) for r in pos.pending_requests
         ):
             build_copy = copy_root(run_config, attempt_id, BUILDER_ROLE)
+            sync_installed_manifests(run.repo, build_copy, pos.pending_requests)
             run_station_text = install_followup_task_text(run_station_text, build_copy)
     else:
         build_copy = copy_root(run_config, attempt_id, BUILDER_ROLE)
+        sync_installed_manifests(run.repo, build_copy, pos.pending_requests)
         run_station_text = install_followup_task_text(task_text, build_copy)
     merge_retry_n = sum(1 for _seq, event in run.ledger.events(run.project, "merge.recorded")
                         if event.attempt_id == attempt_id)
-    # 결함 61: how many run_station requests this attempt has already
-    # submitted (its first attempt plus every owner-request resume
-    # since) -- busts this resume's own payload hash so it never
-    # collides with an earlier resume's followup text that happened to
-    # come out byte-identical (same unchanged dirty_paths, same
-    # base_task_text -- see stages_from_spec's own docstring).
+    # 결함 61 (and its own follow-up, 결함 F1): how many run_station
+    # requests this attempt had already submitted by the time THIS
+    # stop (the one this resume is answering) was recorded -- busts
+    # this resume's own payload hash so it never collides with an
+    # earlier resume's followup text that happened to come out
+    # byte-identical (same unchanged dirty_paths, same base_task_text --
+    # see stages_from_spec's own docstring).
+    #
+    # 결함 F1: anchored on current_position_seq (this stop's own seq),
+    # not "every run_station submit that exists right now" -- a crash
+    # between this SAME resume's own submission and the next position
+    # being recorded used to make a retry see its own just-submitted
+    # request already counted, bumping resume_n by one and producing a
+    # different payload hash/request_id on every retry (the builder
+    # dispatched again each time). Anything this resume itself submits
+    # lands at a seq AFTER this still-current stop, so it is excluded;
+    # recomputing the count on any number of retries of the SAME stop
+    # therefore always gives back the same resume_n. A genuinely new
+    # stop (recorded only once this resume's own request reaches a
+    # terminal state) raises the anchor for the NEXT resume, so that
+    # one still gets its own distinct resume_n.
+    anchor_seq = current_position_seq(run.ledger, run.project, run.job)
     resume_n = sum(
-        1 for _seq, event in run.ledger.events(run.project, "request.submitted")
+        1 for seq, event in run.ledger.events(run.project, "request.submitted")
         if event.attempt_id == attempt_id and event.payload.get("kind") == "run_station"
+        and (anchor_seq is None or seq <= anchor_seq)
     )
     stages = widen_stage_owns(
         stages_from_spec(spec, run_config, attempt_id, task_text=run_station_text,

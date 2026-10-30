@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from engine.infrastructure import evidence
+from engine.domain.policy import OWNS_SCOPE_REQUEST_RULE
 from engine.domain.records import Event, RequestRow
 
 if TYPE_CHECKING:
@@ -264,6 +265,47 @@ def job_cost_usd(ledger: Ledger, project: str, job_name: str) -> float:
     return round(total, 4)
 
 
+# 결함 66: the real-world incident this exists for -- a fix round's
+# builder kept retrying a write the live gate had already denied
+# (every retry importing one more "outside_allowed_path"
+# gate_log.decision event, worker_gate_log.import_gate_log's own inert
+# kind -- see that function's docstring for why a worker's own log
+# lines can never forge anything else) -- across several fix rounds
+# before `fix()` ever stopped it, at a real cost (one live case: 4
+# rounds, ~$9.8, 34 such denials). `fix()` checks THIS count for the
+# attempt about to be replaced BEFORE composing the next round's task
+# (same "stop before spending another round" shape as
+# review_findings_repeat/fix_rounds_used), rather than waiting for the
+# builder to eventually report itself stuck.
+OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD = 5
+
+
+def outside_allowed_path_denials(ledger: Ledger, project: str,
+                                 attempt_id: str) -> tuple[str, ...]:
+    """Every "path" (repo-copy-relative or absolute, whatever the gate
+    itself logged -- never re-derived or normalized here) a
+    "policy.decided" gate_log.decision event for `attempt_id` denied
+    with reason "outside_allowed_path", oldest first, duplicates kept
+    (the CALLER decides whether it cares about the count or the
+    distinct set -- see its own OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD
+    use, which wants the count, and compose_fix_task-adjacent reporting,
+    which wants the distinct set). Reads gate_log.decision -- the
+    engine's own, forgery-resistant import of gate.log (import_gate_log)
+    -- never the raw worker-writable log file itself."""
+    paths: list[str] = []
+    for _seq, event in ledger.events(project, "gate_log.decision"):
+        if event.attempt_id != attempt_id:
+            continue
+        payload = event.payload
+        if (payload.get("orig_kind") == "policy.decided"
+                and payload.get("allowed") is False
+                and payload.get("reason") == "outside_allowed_path"):
+            path = payload.get("path")
+            if isinstance(path, str) and path:
+                paths.append(path)
+    return tuple(paths)
+
+
 def _carried_findings_and_bench_tail(ledger: Ledger, project: str, job_name: str,
                                      exclude_attempt_id: str,
                                      ) -> tuple[list[object], str | None]:
@@ -486,20 +528,95 @@ def inject_context_into_fix_task(config: "EngineConfig", ledger: "Ledger", proje
     return build_task_gate(config, ledger, project, plan, task).prompt(task)
 
 
+# A fix round's own `original_task` (find_fix_target reads it back from
+# run_station.payload["task"]) can itself be a PREVIOUS round's full
+# compose_fix_task output, since repair.fix() writes that same composed
+# text as the next attempt's run_station task -- so an uncapped
+# original_task nests every earlier round's text inside the new
+# "Continue this task. Original request: ..." wrapper, growing without
+# bound round over round (one live case reached 253,883 chars, burying
+# that round's own `extra` at character 192,346, far past where a
+# worker reading top-to-bottom had already stopped paying attention).
+# Same cap value and shape as the engine's existing truncation note
+# (engine.application.pipeline_planning._FINDINGS_NOTE_CAP): large
+# enough to carry a real round's own content, small enough that
+# round-over-round nesting cannot run away.
+_CARRIED_ORIGINAL_TASK_CHARS = 20_000
+
+
+def _capped_original_task(original_task: str) -> str:
+    """`original_task` unchanged, unless it exceeds
+    _CARRIED_ORIGINAL_TASK_CHARS -- then only its LAST
+    _CARRIED_ORIGINAL_TASK_CHARS characters (a nested chain of earlier
+    fix rounds always ends with the most recent round's own text, which
+    is what a new fix round needs to see) plus a note naming how many
+    leading characters were cut."""
+    if len(original_task) <= _CARRIED_ORIGINAL_TASK_CHARS:
+        return original_task
+    omitted = len(original_task) - _CARRIED_ORIGINAL_TASK_CHARS
+    return (
+        f"(앞 {omitted}자 생략 -- 전체는 ledger의 이전 run_station.payload.task에 "
+        "있음)\n" + original_task[-_CARRIED_ORIGINAL_TASK_CHARS:]
+    )
+
+
+# 결함 66 (same root as 결함 58/65: an instruction built in one place
+# drifting from a boundary enforced in another): the ORIGINAL task
+# text (builder_task_text, stage_prompts.py) carries
+# OWNS_SCOPE_REQUEST_RULE once, but a fix round's own `original_task`
+# can be a previous round's full compose_fix_task output, nested
+# arbitrarily deep and truncated by _capped_original_task -- by the
+# time a round-N builder reads it, that one reminder may already be
+# cut off or buried thousands of characters in. Every fix round gets
+# this SAME rule again, every time, plus the one extra step unique to
+# a fix round: the owner is not "somewhere upstream", they are one
+# `gb2 fix <app> --also-own <path>` call away (add_also_own,
+# repair_target_owns module docstring) -- a builder that hits
+# "outside_allowed_path" must stop and report it via `requests`
+# (exactly as OWNS_SCOPE_REQUEST_RULE already says), never keep
+# retrying the same denied write across several fix rounds at the
+# owner's expense.
+_FIX_OWNS_SCOPE_NOTE = (
+    f"{OWNS_SCOPE_REQUEST_RULE} 이 작업에서 고칠 수 있는 경로는 위 "
+    '"이 작업에서 고칠 수 있는 경로는 다음뿐이다" 줄에 적힌 것뿐이다 -- '
+    "그 밖의 경로가 꼭 필요하면 거기 쓰기를 반복하지 말고 바로 멈춰서 "
+    "requests로 보고한다. 운영자·반장은 `gb2 fix <app> --also-own <그 경로>`로 "
+    "이 작업의 owns를 넓힌 뒤 다시 보낸다."
+)
+
+
 def compose_fix_task(target: FixTarget, extra: str, also_own: tuple[str, ...] = ()) -> str:
-    """"Continue this task. Original request: ... [Review findings to
-    address: ...] [Failing test output: ...] [Paths the owner added to
-    this task: ...] [Extra: ...]" -- the sections for findings/test
-    output/also_own/extra are only included when there is actually
-    something to say (a bench-only failure has no review findings; an
-    owner who ran `gb2 fix <app>` with no extra text has nothing to add
-    there; `also_own` is only non-empty once an owner has run `gb2 fix
-    <app> --also-own <path>` for this task -- see add_also_own).
-    `also_own` never widens anything on its own -- it only tells the
-    builder, in plain text, what the ledger-recorded grant
-    (record_owns_extension) and _fix_spec's own widened run_station/
-    merge "owns" already allow."""
-    parts = [f"Continue this task. Original request: {target.original_task}"]
+    """"## 이번 회차 운영자·반장 지시 (최우선)\n<extra> [then] Continue this
+    task. Original request: ... [Review findings to address: ...]
+    [Failing test output: ...] [Paths the owner added to this task:
+    ...]\n\n<_FIX_OWNS_SCOPE_NOTE>" -- the sections for extra/findings/
+    test output/also_own are only included when there is actually
+    something to say (an owner who ran `gb2 fix <app>` with no extra
+    text has nothing to add there; a bench-only failure has no review
+    findings; `also_own` is only non-empty once an owner has run
+    `gb2 fix <app> --also-own <path>` for this task -- see
+    add_also_own). `also_own` never widens anything on its own -- it
+    only tells the builder, in plain text, what the ledger-recorded
+    grant (record_owns_extension) and _fix_spec's own widened
+    run_station/merge "owns" already allow. `_FIX_OWNS_SCOPE_NOTE`
+    (결함 66), unlike every other section here, is NEVER conditional --
+    every fix round repeats it, since this is exactly the round a
+    builder is most likely to need something outside its own owns and
+    the original task's own copy of the same reminder may be buried or
+    truncated by now (_capped_original_task).
+
+    `extra` (결함 63) is placed FIRST, under its own clearly labeled
+    header, never appended last as a bare "Extra:" line -- a long
+    original_task (itself possibly a nested chain of earlier fix
+    rounds, see _capped_original_task) used to push the owner/
+    foreman's own instruction for THIS round far enough down the text
+    that a builder reading top-to-bottom never reached it."""
+    parts = []
+    if extra:
+        parts.append(f"## 이번 회차 운영자·반장 지시 (최우선)\n{extra}")
+    parts.append(
+        f"Continue this task. Original request: {_capped_original_task(target.original_task)}"
+    )
     if target.review_findings:
         parts.append(
             "Review findings to address: "
@@ -509,8 +626,7 @@ def compose_fix_task(target: FixTarget, extra: str, also_own: tuple[str, ...] = 
         parts.append(f"Failing test output: {target.bench_tail}")
     if also_own:
         parts.append("Paths the owner added to this task: " + ", ".join(also_own))
-    if extra:
-        parts.append(f"Extra: {extra}")
+    parts.append(_FIX_OWNS_SCOPE_NOTE)
     return "\n\n".join(parts)
 
 
@@ -538,4 +654,5 @@ __all__ = [
     "HANDOFF_KIND", "HANDOFF_NOTE_PREFIX", "fix_rounds_used",
     "review_findings_for_attempt", "previous_review_findings", "findings_key",
     "review_findings_repeat", "job_cost_usd",
+    "OUTSIDE_ALLOWED_PATH_STUCK_THRESHOLD", "outside_allowed_path_denials",
 ]

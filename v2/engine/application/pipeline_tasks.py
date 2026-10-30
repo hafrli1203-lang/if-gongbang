@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from engine.application import task_pipeline as orbit
 from engine.config import EngineConfig
+from engine.domain.records import Event
 from engine.application.pipeline_base import (
     BUILDER_ROLE, REVIEWER_ROLE, FullOutcome, ProgressCallback, Run, fakes_for,
 )
@@ -33,7 +34,7 @@ from engine.application.task_stage_runner import HandoffContext, run_task_stages
 from engine.domain.plan import Plan, Task, classify_skill_tools, tools_for_station
 from engine.application.repair_target import handed_off_requests_for_task, handoff_note_text
 from engine.application.job_state import (
-    STAGE_POST_TASKS, STAGE_REQUIREMENTS_REVIEW, STAGE_SECURITY_FIX, STAGE_TASK_OWNER,
+    STAGE_POST_TASKS, STAGE_REQUIREMENTS_REVIEW, STAGE_TASK_OWNER,
     acceptance_fix_rounds_used, record_position, stages_spec, without_release,
 )
 from engine.application.processor import Fakes
@@ -432,16 +433,57 @@ def run_acceptance_and_handoff(config: EngineConfig, ledger: Ledger, fakes: Fake
     commit_job_trail(config, ledger, project, last_attempt_id, job_name,
                       f"gongbang: {job_name} - handoff")
     return finish_after_handoff(config, ledger, project, job_name, plan, last_attempt_id,
-                                 report_path, max_fix_rounds)
+                                 report_path, max_fix_rounds, fakes=fakes,
+                                 on_progress=on_progress, processor_factory=processor_factory)
 
+
+
+def security_fix_rounds_used(ledger: Ledger, project: str, job_name: str) -> int:
+    """Distinct attempts this job already spent on `secfix-{n}` tasks
+    (finish_after_handoff's own security-fix rounds), so the cap holds
+    across resumes -- same reasoning as job_state.acceptance_fix_rounds_used."""
+    from engine.application.job_state import POSITION_KIND
+    attempt_ids: set[str] = set()
+    for _seq, event in ledger.events(project, POSITION_KIND):
+        if (event.payload.get("job") == job_name and isinstance(event.attempt_id, str)
+                and str(event.payload.get("task_id") or "").startswith("secfix-")):
+            attempt_ids.add(event.attempt_id)
+    return len(attempt_ids)
+
+
+def security_fix_task_text(findings: tuple[str, ...], goal: str, job_name: str) -> str:
+    """Builder instructions for one security-fix round: the recorded
+    findings (kind:path:line, never secret values), what passes, and the
+    rule that nothing else may change."""
+    lines = [
+        f"보안 검사 실패 수정 — 작업 {job_name}.",
+        "앱 전체 보안 검사(app_security.check: 비밀값 노출·의존성 취약·보안 요구 미충족)가 아래 항목으로 떨어졌다. "
+        "각 항목을 원인 자리에서 고친다. 비밀값은 코드에서 지우고 환경변수/보관함으로 옮기며, 값 자체는 어디에도 적지 않는다.",
+        "",
+        "## 실패 항목 (종류:경로:줄)",
+    ]
+    lines += [f"- {f}" for f in findings[:30]]
+    lines += ["", f"## 작업 목표(변경 금지, 참고만): {goal}", "",
+              "## 규칙", "- 보안 항목과 무관한 기능·화면은 바꾸지 않는다.",
+              "- 고친 뒤 기존 시험을 돌려 통과를 확인하고, 결과에 무엇을 어떻게 고쳤는지 한 줄씩 적는다."]
+    return "\n".join(lines)
 
 
 def finish_after_handoff(config: EngineConfig, ledger: Ledger, project: str, job_name: str,
                           plan: Plan, attempt_id: str, report_path: Path,
-                          max_fix_rounds: int) -> FullOutcome:
+                          max_fix_rounds: int, *, fakes: "Fakes | None" = None,
+                          on_progress: ProgressCallback | None = None,
+                          processor_factory: "orbit.ProcessorFactory | None" = None) -> FullOutcome:
     """Everything after the handoff report is written and committed:
     the app-wide security check  and, only once that passes, the
-    job's single release request (maybe_release_or_done)."""
+    job's single release request (maybe_release_or_done).
+
+    Security-fix rounds: when
+    `fakes` is given and the check fails, a `secfix-{n}` build task
+    (owning every plan task's paths) is run and the check re-run, up to
+    `max_fix_rounds` -- the same fix-then-recheck shape as acceptance.
+    Only when rounds are exhausted (or no `fakes`) does the
+    "record, do not stop" policy below apply."""
     from engine import app_security  # worker B's module; lazy import
 
     record_event(ledger, project, job_name, STAGE_POST_TASKS, attempt_id,
@@ -450,49 +492,53 @@ def finish_after_handoff(config: EngineConfig, ledger: Ledger, project: str, job
     # The result (findings carry kind:path:line only, never values) is
     # recorded for the release gate and for the person fixing it.
     app_security.record(ledger, project, attempt_id, security)
+    if fakes is not None:
+        rounds = security_fix_rounds_used(ledger, project, job_name)
+        while not security.passed and rounds < max_fix_rounds:
+            all_owns = tuple(sorted({entry for t in plan.tasks for entry in t.owns}))
+            fix_task = Task(id=f"secfix-{rounds + 1}", title="보안 검사 실패 수정", detail="",
+                            owns=all_owns, depends_on=())
+            base_task_text = security_fix_task_text(tuple(security.findings), plan.goal, job_name)
+            fix_gate = build_task_gate(config, ledger, project, plan, base_task_text)
+            if fix_gate.unmet is not None:
+                return stop_build_task_for_unmet_context(
+                    config, ledger, project, job_name, fix_task, base_task_text, base_task_text,
+                    fix_gate.unmet, fixing=True, remaining_task_ids=(), max_fix_rounds=max_fix_rounds,
+                )
+            outcome = run_task_attempt(config, ledger, fakes, project, job_name, fix_task,
+                                        fix_gate.prompt(base_task_text), plan, on_progress,
+                                        processor_factory, base_task_text, fixing=True,
+                                        max_fix_rounds=max_fix_rounds, fix_round=rounds)
+            attempt_id = outcome.attempt_id
+            full = station_outcome_to_full(outcome, "build")
+            if full is not None:
+                return full
+            rounds += 1
+            record_event(ledger, project, job_name, STAGE_POST_TASKS, attempt_id,
+                    next_action="security", max_fix_rounds=max_fix_rounds)
+            security = app_security.check(config, project, attempt_id, plan)
+            app_security.record(ledger, project, attempt_id, security)
+    # Policy (no approval stops; a failed security check is
+    # recorded and the job keeps going): a security.check failure used
+    # to stop the job needs_owner at STAGE_SECURITY_FIX right here,
+    # waiting for the owner to fix the source and `gb2 continue`. The
+    # findings are already recorded above (app_security.record, before
+    # this check even runs) -- that is the "record the result" half, unchanged.
+    # The job now falls straight through to maybe_release_or_done
+    # instead of ever stopping; `security_auto_passed` below is an
+    # audit-only event (confirm_source="auto") so a later reader can
+    # still see that this job's security check actually failed and was
+    # overridden, distinct from one that genuinely passed.
     if not security.passed:
         findings = "; ".join(list(security.findings)[:5])
         reason = f"security_failed:{findings}"[:300] if findings else "security_failed"
-        # The repo's own content fingerprint (engine.infrastructure.evidence.
-        # fingerprint, a tree hash covering the working tree -- tracked
-        # AND dirty paths alike, same value engine.application.acceptance's own
-        # before/after check uses) acceptance/handoff actually
-        # certified -- read back on resume (STAGE_SECURITY_FIX) to tell
-        # a plain security retry from one where the owner's own fix has
-        # since changed the source, which must rerun acceptance/
-        # coverage/handoff against the new source before security runs
-        # again, not just security itself. A plain `git rev-parse HEAD`
-        # (this field's own earlier implementation) missed exactly the
-        # case this exists for: an owner fix that EDITS the source
-        # WITHOUT committing (`gb2 fix` always commits on a fresh
-        # attempt and so moves HEAD, but a direct owner edit to the
-        # working tree does not) left HEAD unchanged, so that comparison
-        # silently skipped rerunning acceptance/coverage/handoff and let
-        # a build-only job report "done" against source acceptance never
-        # actually certified.
-        from engine.infrastructure import evidence  # worker C's module; lazy import
-
-        project_config = config.projects[project]
-        plain_fp = evidence.fingerprint(project_config.repo, project_config.excludes)
-        # a review finding (4), 짝의 나머지 반 (s69-certfp,: this value
-        # is compared on resume (engine.application.pipeline_resume.
-        # resume_security_fix) against a freshly recomputed one, purely
-        # as an opaque "did the source change since" token -- never
-        # built into a git commit/diffed as a real tree (unlike
-        # engine.application.acceptance/app_security's own "fingerprint"
-        # fields), so folding file_dep_targets' own content in here is a
-        # straight swap, not an additive field: a project with none
-        # configured gets back exactly `plain_fp` unchanged
-        # (evidence.with_file_deps's own no-op contract), and a project
-        # WITH some now also catches a shared package's content
-        # changing between this security-fix stop and the resume, which
-        # `plain_fp` alone could never see (the app's own repo tree
-        # never moves when only the dependency's content does).
-        certified_fingerprint = evidence.with_file_deps(plain_fp, project_config.file_dep_targets)
-        record_event(ledger, project, job_name, STAGE_SECURITY_FIX, attempt_id,
-                stop_reason=reason, report_path=str(report_path),
-                max_fix_rounds=max_fix_rounds, certified_fingerprint=certified_fingerprint)
-        return FullOutcome("needs_owner", reason, attempt_id, None)
+        ledger.append(Event(
+            project=project, kind="security.auto_passed", actor_kind="processor",
+            actor_id="processor", attempt_id=attempt_id,
+            payload={"job": job_name, "reason": reason, "confirm_source": "auto"},
+        ))
+        return maybe_release_or_done(config, ledger, project, job_name, attempt_id,
+                                     report_path, max_fix_rounds)
     return maybe_release_or_done(config, ledger, project, job_name, attempt_id,
                                   report_path, max_fix_rounds)
 
@@ -515,6 +561,6 @@ def finish_from_tasks(config: EngineConfig, ledger: Ledger, fakes: Fakes, projec
 
 __all__ = [
     "task_attempt_config", "task_stages", "run_task_attempt", "run_acceptance_and_handoff",
-    "finish_after_handoff", "finish_from_tasks", "review_payload", "install_followup_task_text",
+    "finish_after_handoff", "finish_from_tasks", "security_fix_rounds_used", "security_fix_task_text", "review_payload", "install_followup_task_text",
     "edit_approved_followup_task_text", "declined_followup_note", "build_task_gate",
 ]

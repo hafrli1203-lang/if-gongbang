@@ -18,7 +18,7 @@ from engine.domain.plan_model import (
 from engine.domain.policy import OWNS_SCOPE_REQUEST_RULE
 from engine.domain.stage_checks import (
     FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE, FACTS_PASS_NEEDS_SOURCE_RULE,
-    PROBE_EXIT_AND_OK_LINE_RULE, PROBE_TARGETS_EMPTY_MARKER_RULE,
+    PROBE_EXIT_AND_OK_LINE_RULE, PROBE_PROXY_CONTACT_RULE, PROBE_TARGETS_EMPTY_MARKER_RULE,
     PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE,
     PROBE_TARGETS_INTERNAL_DOC_RULE, PROBE_TARGETS_SECTION_FORMAT_RULE,
     probe_log_format_rule, station_record_rule_sentence,
@@ -78,7 +78,7 @@ def prober_prompt(request: str, job: str, targets: tuple[tuple[str, str], ...]) 
         f"대상마다 .gongbang/{job}/probe/<번호>.py (또는 .sh, .js)에 "
         "10~30줄짜리 실제 호출 스크립트를 쓰고 한 번 실행한다. <번호>는 위 목록 "
         "맨 앞의 t1, t2 같은 값이다. 파일 이름을 대상 이름으로 만들지 않는다. 엔진이 이 스크립트를 다시 "
-        f"실행해 통과를 판정한다. {PROBE_EXIT_AND_OK_LINE_RULE} 그다음 "
+        f"실행해 통과를 판정한다. {PROBE_EXIT_AND_OK_LINE_RULE} {PROBE_PROXY_CONTACT_RULE} 그다음 "
         f"{probe_log_format_rule(job)} "
         "재사용할 어댑터는 만들지 않는다 -- 호출이 되는지 확인하는 "
         "스크립트와 로그만 남긴다. 비밀값은 로그에 남기지 않는다. "

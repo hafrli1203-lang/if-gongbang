@@ -109,7 +109,8 @@ def _probe_target_ids_at_review(repo: Path, job: str) -> list[str]:
 
 
 def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
-                         repo: Path, job: str, *, actor_kind: str = "processor") -> None:
+                         repo: Path, job: str, *, actor_kind: str = "processor",
+                         digest_override: str | None = None) -> None:
     """Appends one plan.reviewed ledger event ({"job": job, "digest":
     plan_digest(...), "scene_digests": scene_file_digests(...),
     "requirement_ids": [...], "task_ids": [...], "probe_target_ids":
@@ -135,7 +136,18 @@ def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
     own frozen inventory for probe evidence -- the same reasoning,
     applied to a target that was declared but never actually probed at
     all, which plan_digest alone cannot catch (facts.md, not
-    plan.json, is what it reads)."""
+    plan.json, is what it reads).
+
+    `digest_override`: when given, this EXACT
+    value is stored as "digest" instead of a freshly recomputed
+    plan_digest(path) -- the caller (record_owner_plan_amend, for an
+    office-approved re-approval) already verified a SIGNED
+    target_version matches the current content just moments ago; this
+    stores THAT verified value verbatim rather than reading the file a
+    further time and trusting a second, independent read to agree
+    with the first. `None` (every other caller -- the ordinary
+    planner-station review, which never had anything signed to begin
+    with) keeps the original behavior exactly."""
     path = plan_path(repo, job)
     try:
         plan = load_plan(repo, job)
@@ -143,10 +155,11 @@ def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
         task_ids = [t.id for t in plan.tasks]
     except PlanError:
         requirement_ids, task_ids = [], []
+    digest = digest_override if digest_override is not None else plan_digest(path)
     ledger.append(Event(
         project=project, kind="plan.reviewed", actor_kind=actor_kind,
         actor_id=actor_kind, attempt_id=attempt_id,
-        payload={"job": job, "digest": plan_digest(path),
+        payload={"job": job, "digest": digest,
                  "scene_digests": scene_file_digests(path),
                  "requirement_ids": requirement_ids, "task_ids": task_ids,
                  "probe_target_ids": _probe_target_ids_at_review(repo, job)},
@@ -154,7 +167,10 @@ def record_plan_reviewed(ledger: Ledger, project: str, attempt_id: str,
 
 
 def record_owner_plan_amend(ledger: Ledger, project: str, attempt_id: str,
-                            repo: Path, job: str, reason: str) -> list[str]:
+                            repo: Path, job: str, reason: str, *,
+                            confirm_source: str = "tty",
+                            expected_current_digest: str | None = None,
+                            allow_first_review: bool = False) -> list[str]:
     """Owner-only re-approval for a job whose plan was already
     reviewed once, used after the OWNER edits a tests/scenes/ file
     (never plan.json itself -- plan.json stays frozen evidence, the
@@ -198,7 +214,26 @@ def record_owner_plan_amend(ledger: Ledger, project: str, attempt_id: str,
       - the CURRENT plan_digest already matches the latest
         plan.reviewed event's digest: ["no_change_since_review"] --
         nothing was actually edited since that review, so there is
-        nothing for the owner to re-approve either."""
+        nothing for the owner to re-approve either.
+      - `expected_current_digest` is given and no longer matches the
+        CURRENT plan_digest: ["plan_changed_after_verification"] -- a
+        caller (tools/gb2 approve-plan-edit --office-token) that
+        verified an office-approval token against a PINNED plan_digest
+        snapshot must refuse here if plan.json (or a scene file it
+        references) moved between that verification and this call,
+        rather than silently re-approving whatever the CURRENT content
+        happens to be (the office token's signature
+        covers one specific target_version, and that is the only
+        content this call may ever bless on its behalf).
+
+    `confirm_source` (default "tty") is recorded verbatim on the
+    "plan.owner_amended" event -- "office" for `tools/gb2 approve-
+    plan-edit --office-token ...` (engine.application.office_approval.
+    verify_office_token already checked that token before this
+    function is ever called), so an audit/report can tell the two
+    paths apart the same way engine.application.owner_approval.
+    approve_pending's own "owner.approved".confirm_source already
+    does for install approvals."""
     if not reason.strip():
         return ["reason_required"]
 
@@ -212,12 +247,26 @@ def record_owner_plan_amend(ledger: Ledger, project: str, attempt_id: str,
         return problems
 
     reviewed = _latest_plan_reviewed(ledger, project, job)
-    if reviewed is None:
+    # `allow_first_review`, 반장 개입 경로): a plan the reviewer
+    # rejected until the round cap -- never once reviewed as passing --
+    # used to be unamendable ("plan_never_reviewed"), so the foreman
+    # could fix plan.json by hand and still have no way to move the job
+    # on. The CALLER (tools/gb2 approve-plan-edit) passes True only when
+    # the job is stopped at awaiting_plan_review; this layer stays
+    # ignorant of job positions. The owner's approval then IS the review
+    # (완성 원칙: 2회 떨어지면 반장 직접), recorded like every other owner
+    # amend, with "first_review": True on the audit event.
+    if reviewed is None and not allow_first_review:
         return ["plan_never_reviewed"]
 
     path = plan_path(repo, job)
-    if reviewed.get("digest") == plan_digest(path):
+    current_digest = plan_digest(path)
+    if expected_current_digest is not None and expected_current_digest != current_digest:
+        return ["plan_changed_after_verification"]
+    if reviewed is not None and reviewed.get("digest") == current_digest:
         return ["no_change_since_review"]
+    if reviewed is None:
+        reviewed = {}
 
     old_scene_digests = reviewed.get("scene_digests")
     if not isinstance(old_scene_digests, dict):
@@ -233,9 +282,21 @@ def record_owner_plan_amend(ledger: Ledger, project: str, attempt_id: str,
     ledger.append(Event(
         project=project, kind="plan.owner_amended", actor_kind="owner",
         actor_id="owner", attempt_id=attempt_id,
-        payload={"job": job, "reason": reason, "changed": changed},
+        payload={"job": job, "reason": reason, "changed": changed,
+                 "confirm_source": confirm_source,
+                 "first_review": not bool(reviewed)},
     ))
-    record_plan_reviewed(ledger, project, attempt_id, repo, job, actor_kind="owner")
+    # digest_override=current_digest (not a fresh recompute inside
+    # record_plan_reviewed): `current_digest` above is the ONE value
+    # this whole function already verified (matched the office token's
+    # signed target_version when one was given, or was simply read
+    # once for the TTY path) -- storing it verbatim, rather than
+    # letting record_plan_reviewed read plan.json a THIRD time, closes
+    # the gap a second review pass found (a later, independent re-read
+    # recording a digest that silently differs from the one just
+    # verified).
+    record_plan_reviewed(ledger, project, attempt_id, repo, job, actor_kind="owner",
+                         digest_override=current_digest)
     return []
 
 

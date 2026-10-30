@@ -52,14 +52,26 @@ import dataclasses
 import json
 import os
 import posixpath
+import subprocess
 from pathlib import Path
 
 from engine.infrastructure import evidence
+from engine.infrastructure.gitutil import git_argv
 from engine.domain import ids
 from engine.infrastructure.installers import InstallFailed
 from engine.domain.records import Event, LedgerError
 from engine.domain.policy import Policy
 from engine.application.processor import StepContext, StepDef, StepFailed, StepUnknown
+
+# Git identity for the ONE commit this step makes (just the manifest
+# path) -- same shape engine.application.steps.commit._GIT_IDENTITY uses for its own
+# (separate, review/bench-gated) commit of a task's full change range.
+# Never the real ambient git config (GIT_CONFIG_GLOBAL="/dev/null"
+# below), same reasoning as that module's own commit call.
+_MANIFEST_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "processor", "GIT_AUTHOR_EMAIL": "processor@local",
+    "GIT_COMMITTER_NAME": "processor", "GIT_COMMITTER_EMAIL": "processor@local",
+}
 
 
 def steps(ctx: StepContext) -> list[StepDef]:
@@ -69,6 +81,7 @@ def steps(ctx: StepContext) -> list[StepDef]:
         StepDef("invalidate_evidence", _invalidate_evidence, _reconcile_false),
         StepDef("run_installer", _run_installer, _reconcile_run_installer),
         StepDef("verify_manifest", _verify_manifest, _reconcile_verify_manifest),
+        StepDef("commit_manifest", _commit_manifest, _reconcile_commit_manifest),
         StepDef("record", _record, _reconcile_record),
     ]
 
@@ -289,6 +302,68 @@ def _manifest_matches(ctx: StepContext) -> bool:
         elif actual != expected:
             return False
     return True
+
+
+# ---- commit_manifest -------------------------------------------------
+#
+# 결함 69 (마케팅 채팅 job gb2-change-1793123186): verify_manifest only
+# checked bytes on disk -- the manifest change an owner just approved
+# sat in the repo's WORKING TREE, uncommitted, forever. Two things read
+# the repo by a different rule than that: job_state_requests._manifest_holds
+# (gb2 approve-install's own "already satisfied" check) and
+# engine.application.steps.open_job._make_copies (every worker copy, made once
+# via `git archive HEAD`) both only ever see what is committed. A
+# builder resumed on the SAME attempt/copy therefore kept re-reporting
+# the identical request forever: its own copy was never refreshed (see
+# engine.application.pipeline_resume_tasks's own manifest-sync fix for that
+# half), and even a FRESH attempt's new copy would still miss it since
+# HEAD itself never moved. Committing just this one path here, right
+# after verify_manifest confirms the write succeeded, closes BOTH --
+# `gb2 approve-install`'s fulfillment check and every future copy now
+# read the exact same state.
+
+def _commit_manifest(ctx: StepContext) -> dict[str, object]:
+    if _manifest_matches_head(ctx):
+        return {"committed": False}
+    repo = ctx.config.projects[ctx.project].repo
+    rel = _normalized_manifest_rel(ctx)
+    env = dict(os.environ)
+    env.update(_MANIFEST_GIT_IDENTITY)
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    message = f"install: {rel}\n\nrequest: {ctx.request.request_id}"
+    try:
+        subprocess.run(git_argv(repo, "add", "--", rel), check=True,
+                       capture_output=True, env=env)
+        subprocess.run(git_argv(repo, "commit", "-q", "-m", message), check=True,
+                       capture_output=True, env=env)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        # A fixed, recognizable reason (never silently left out of sync,
+        # per 결함 69's own "작업 트리만 다른 상태" guard): the owner must
+        # see this as a stop to investigate, not a quiet no-op.
+        raise StepFailed("install_manifest_commit_failed") from exc
+    return {"committed": True}
+
+
+def _reconcile_commit_manifest(ctx: StepContext) -> bool:
+    return _manifest_matches_head(ctx)
+
+
+def _manifest_matches_head(ctx: StepContext) -> bool:
+    """True iff the manifest's current on-disk bytes (already verified by
+    verify_manifest to carry `change`) are exactly what HEAD holds for
+    this same path -- i.e. there is nothing left for this step to
+    commit. Uses the SAME HEAD-read job_state_requests._head_manifest_bytes
+    uses for the owner-approval fulfillment check, so this step's own
+    "already done" judgment and that one can never disagree."""
+    from engine.application.job_state_requests import _head_manifest_bytes
+
+    path = _manifest_path(ctx)
+    if not path.exists():
+        return False
+    repo = ctx.config.projects[ctx.project].repo
+    rel = _normalized_manifest_rel(ctx)
+    head = _head_manifest_bytes(repo, rel)
+    return head is not None and head == path.read_bytes()
 
 
 # ---- invalidate_evidence -----------------------------------------------

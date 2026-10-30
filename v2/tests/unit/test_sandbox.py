@@ -29,9 +29,10 @@ from engine.workers.codex_cli import CodexRunner
 from engine.workers.scripted import ScriptedRunner
 from tests.conftest import Workspace
 from tests.fixtures.sample_app import make_sample
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox.available(), reason="bwrap not available on this host",
 )
 
 
@@ -1692,3 +1693,82 @@ def test_pass_fds_for_is_empty_under_mode_bwrap_with_no_child_env(
 ) -> None:
     bwrap_no_env_argv = sandbox.wrap(["true"], cwd=tmp_path, mode="bwrap")
     assert sandbox.pass_fds_for(bwrap_no_env_argv) == ()
+
+
+# ---- protected_roots ------------------------------
+
+@_needs_bwrap
+def test_protected_roots_refuses_a_readonly_mount_that_overlaps(tmp_path: Path) -> None:
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    with pytest.raises(ValueError, match="protected root"):
+        sandbox.wrap(["true"], cwd=tmp_path, readonly=(secrets,), mode="bwrap",
+                     protected_roots=(secrets,))
+
+
+@_needs_bwrap
+def test_protected_roots_refuses_a_readonly_remap_source_that_overlaps(
+    tmp_path: Path,
+) -> None:
+    """The exact shape a review reproduced: a
+    file_dep_targets-style remap SOURCE spelled with a "../" component
+    that lexically looks like it stays outside the protected root, but
+    resolves (os.path.realpath) straight into it -- the previous
+    config-load-only check never saw this because mount-time argv
+    construction is where the SOURCE is actually resolved."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "office-approval.key").write_bytes(b"k")
+    dest = tmp_path / "apps" / "kit"
+    dest.parent.mkdir(parents=True)
+    sneaky_source = tmp_path / "ordinary" / ".." / "secrets"
+
+    with pytest.raises(ValueError, match="protected root"):
+        sandbox.wrap(["true"], cwd=tmp_path, readonly_remap=((sneaky_source, dest),),
+                     mode="bwrap", protected_roots=(secrets,))
+
+
+@_needs_bwrap
+def test_protected_roots_does_not_object_to_its_own_hidden_mount(tmp_path: Path) -> None:
+    """A root that is BOTH hidden and listed in protected_roots (the
+    ordinary real-world shape -- every sandbox builder hides
+    secrets_dir AND lists it as a protected root) must not raise: the
+    check only looks at "ro"/"rw" mounts, never "hide" ones."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    argv = sandbox.wrap(["true"], cwd=tmp_path, hidden=(secrets,), mode="bwrap",
+                        protected_roots=(secrets,))
+    assert argv
+
+
+@_needs_bwrap
+def test_protected_roots_allows_unrelated_mounts(tmp_path: Path) -> None:
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    argv = sandbox.wrap(["true"], cwd=tmp_path, readonly=(other,), mode="bwrap",
+                        protected_roots=(secrets,))
+    assert argv
+
+
+def test_available_does_not_cache_a_self_test_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """: a loaded host made the 1s self-test expire and the whole
+    engine process stayed 'sandbox_unavailable' although bwrap worked on
+    the next try. A timeout must answer False for THIS call only and
+    leave the cache unset so the next call probes again."""
+    sandbox._reset_available_cache()
+    calls = {"n": 0}
+
+    def timing_out_run(*args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sandbox.subprocess.TimeoutExpired(cmd="bwrap", timeout=0.0)
+        return sandbox.subprocess.CompletedProcess(args=[], returncode=0)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", timing_out_run)
+    assert sandbox.available() is False
+    assert sandbox._available_cache is None
+    assert sandbox.available() is True
+    assert calls["n"] == 2
+    sandbox._reset_available_cache()

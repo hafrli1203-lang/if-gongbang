@@ -227,7 +227,7 @@ def _write_grandchild_spawner(tmp_path: Path, marker: Path) -> Path:
         import subprocess, sys, time
         subprocess.Popen(
             [sys.executable, "-c",
-             "import time; time.sleep(0.3); open({str(marker)!r}, 'w').write('alive')"],
+             "import time; time.sleep(2.0); open({str(marker)!r}, 'w').write('alive')"],
         )
         time.sleep(5)
     """), encoding="utf-8")
@@ -256,10 +256,10 @@ def test_publish_timeout_kills_whole_process_group_not_just_the_leader(
     receipt = publisher.lookup("R-grandchild")
     assert receipt["status"] == "failed"
     # Give the grandchild the time it was scheduled to write the marker
-    # at (0.3s after spawn) -- if it is still alive, it would have
+    # at (2.0s after spawn, far past the 0.1s kill even on a loaded host) -- if it is still alive, it would have
     # written by now; it must not have, because the whole group died.
     import time as _time
-    _time.sleep(0.6)
+    _time.sleep(2.5)
     assert not marker.exists()
 
 

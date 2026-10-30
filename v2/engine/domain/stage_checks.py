@@ -364,12 +364,25 @@ def check_probe_targets(repo: Path, job: str) -> list[tuple[str, str]]:
             # a target written in the wrong shape must never vanish.
             continue
         if not stripped.startswith("-"):
+            # A non-bullet line with no address in it cannot be a target --
+            # it is prose (a wrapped note that does not close its own
+            # parenthesis on the same line stopped a real job twice). A
+            # non-bullet line that does carry an address still raises, so a
+            # target written in the wrong shape never vanishes.
+            if "://" not in stripped:
+                continue
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
         body = stripped[1:].strip()
         name, sep, url = body.partition(":")
         name, url = name.strip(), url.strip()
         if not sep or not name or not url:
             raise ProbeTargetsError(f"malformed_probe_target_line: {line!r}")
+        # A target the facts worker marked as in-house ("(사내)") has no
+        # public address and cannot be reached from the probe sandbox (the
+        # apps root is hidden there); it is checked by the build and
+        # acceptance stages instead of being probed.
+        if url.strip("() ") == "사내":
+            continue
         # 결함 19, 마케팅 채팅 job): a real bullet's doc value
         # was "https://.../cli-reference — probe t1 PROBE OK(단, ...)" --
         # an http(s) URL with a human explanation appended on the SAME
@@ -676,6 +689,20 @@ PROBE_EXIT_AND_OK_LINE_RULE = (
 )
 
 
+# engine.application.acceptance_probe runs every probe script behind its
+# own recording proxy and passes a target only when that proxy saw the
+# target's own address host answer (engine.domain.probe_observation) --
+# the pass condition the line above cannot express on its own.
+PROBE_PROXY_CONTACT_RULE = (
+    "세 번째 조건: 엔진은 스크립트를 다시 실행할 때 HTTP_PROXY·HTTPS_PROXY 환경변수로 엔진의 "
+    "기록 프록시를 지정한다 -- 그 프록시를 거쳐 위 목록의 그 대상 \"문서:\" 주소의 "
+    "호스트로 나간 요청이 실제로 응답을 받아야만 통과다(`PROBE OK` 줄만으로는 "
+    "통과하지 못한다). 그래서 스크립트는 그 문서 주소를 실제로 요청하고, 프록시 "
+    "환경변수를 따르는 방법(curl, Python urllib·requests, 프록시를 따르는 CLI)으로 "
+    "호출한다 -- Node 20의 내장 fetch는 이 환경변수를 따르지 않는다."
+)
+
+
 def probe_log_format_rule(job: str) -> str:
     """check_probe's own log-format expectation (first line names the
     target, then "PROBE OK"/"PROBE FAIL") -- takes `job` since the path
@@ -707,7 +734,7 @@ def prober_rule_sentences(job: str) -> tuple[str, ...]:
     must carry verbatim -- the exact pass condition run_probe_scripts/
     _probe_observed checks against the script's own stdout, plus
     check_probe's own log-format expectation."""
-    return (PROBE_EXIT_AND_OK_LINE_RULE, probe_log_format_rule(job))
+    return (PROBE_EXIT_AND_OK_LINE_RULE, PROBE_PROXY_CONTACT_RULE, probe_log_format_rule(job))
 
 
 __all__ = [
@@ -715,6 +742,7 @@ __all__ = [
     "check_probe_targets", "check_probe", "probe_target_id", "ProbeTargetsError",
     "FACTS_PASS_NEEDS_SOURCE_RULE", "FACTS_CODE_VALUES_NO_NEEDS_CHECK_RULE",
     "PROBE_TARGETS_SECTION_FORMAT_RULE", "PROBE_TARGETS_EMPTY_MARKER_RULE",
+    "PROBE_PROXY_CONTACT_RULE",
     "PROBE_TARGETS_INTERNAL_DOC_RULE", "PROBE_TARGETS_EXCLUDE_EXISTING_TEST_TOOLING_RULE",
     "PROBE_EXIT_AND_OK_LINE_RULE", "probe_log_format_rule",
     "facts_rule_sentences", "prober_rule_sentences",

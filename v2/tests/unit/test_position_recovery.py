@@ -10,7 +10,7 @@ import pytest
 
 from engine import faults, full_orbit, full_orbit_runner, position, small_orbit
 from engine.processor import Processor
-from tests.conftest import Workspace
+from tests.conftest import Workspace, git
 from tests.unit.test_full_orbit import (
     _FakeAcceptanceResult,
     _fakes,
@@ -417,9 +417,14 @@ def _install_recorded(ws: Workspace, attempt_id: str, kind: str = "install") -> 
 
 
 def _write_manifest(ws: Workspace, deps: dict) -> None:
+    """Writes AND commits (결함 69: job_state_requests._manifest_holds now
+    reads HEAD, never the raw working tree -- same as a real approved
+    install's own engine.application.steps.install.commit_manifest step)."""
     import json
 
     (ws.alpha / "package.json").write_text(json.dumps({"dependencies": deps}), encoding="utf-8")
+    git(ws.alpha, "add", "package.json")
+    git(ws.alpha, "commit", "-q", "-m", "test: write manifest")
 
 
 def test_f_an_install_recorded_before_the_proposal_does_not_fulfil_it(

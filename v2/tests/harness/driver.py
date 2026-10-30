@@ -343,16 +343,26 @@ def install_fake_acceptance_and_handoff(
     acceptance_mod.run_acceptance = run_acceptance  # type: ignore[attr-defined]
 
     def run_probe_scripts(config, ledger, project, attempt_id, job_name, targets):
-        from types import SimpleNamespace
+        # Engine-shaped records (recorded on the ledger like the real
+        # run), with pass/fail taken from the scripted log.
+        from engine.application.acceptance_probe import ProbeEvidence, _record_probe_executed
+        from engine.domain.probe_observation import target_host
         repo = config.projects[project].repo
         out = []
         from engine.gates import probe_target_id
-        for i, (name, _url) in enumerate(targets):
+        for i, (name, url) in enumerate(targets):
             log = repo / ".gongbang" / job_name / "probe" / f"{probe_target_id(i)}.log"
             text = log.read_text(encoding="utf-8") if log.exists() else ""
             ok = "PROBE OK" in text and "PROBE FAIL" not in text
-            out.append(SimpleNamespace(name=name, script=str(log), returncode=0 if ok else 1,
-                                       stdout_tail=text[-200:], ok=ok))
+            out.append(ProbeEvidence(
+                id=probe_target_id(i), name=name, script=str(log),
+                returncode=0 if ok else 1,
+                stdout_tail=f"PROBE OK {url}" if ok else "exit 1", ok=ok, url=url,
+                reached=ok,
+                contacts=({"host": target_host(url) or "", "port": 443, "method": "CONNECT",
+                           "connected": True, "bytes_up": 1, "bytes_down": 1,
+                           "response_sha256": "a" * 64},) if ok else ()))
+            _record_probe_executed(ledger, project, attempt_id, out[-1])
         return tuple(out)
 
     acceptance_mod.run_probe_scripts = run_probe_scripts  # type: ignore[attr-defined]

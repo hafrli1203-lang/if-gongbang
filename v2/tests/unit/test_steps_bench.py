@@ -564,6 +564,51 @@ def test_run_tests_cannot_shadow_a_tracked_package_with_a_new_untracked_file(
     assert not (ws.alpha / "src" / "greeter" / "evil.py").exists()
 
 
+def test_run_tests_cannot_write_anywhere_in_the_repo_root_under_bwrap(
+    workspace: Workspace,
+) -> None:
+    """run_tests binds the real repo READ-ONLY as a whole
+    (_bench_sandbox_argv's root_readonly): a test_cmd can no longer
+    plant a root-level config file, a node_modules-style symlink, or a
+    file under a gitignored directory (.deps/, which the fingerprint
+    never covers -- so neither did the old post-run fingerprint
+    re-check). Exit 0 only if every write was refused."""
+    import pytest
+
+    from engine.infrastructure import sandbox as _sandbox
+    if not _sandbox.available():
+        pytest.skip("bwrap not available on this host")
+    ws = _bench_workspace(workspace, variant=1)
+    (ws.alpha / ".deps").mkdir(exist_ok=True)
+    plant_cmd = (
+        sys.executable, "-c",
+        "import os, sys\n"
+        "refused = 0\n"
+        "for action in (lambda: open('vitest.config.js', 'w').write('x'),\n"
+        "               lambda: os.symlink('/usr', 'node_modules'),\n"
+        "               lambda: open('.deps/shadow.py', 'w').write('X = 1')):\n"
+        "    try:\n"
+        "        action()\n"
+        "    except OSError:\n"
+        "        refused += 1\n"
+        "sys.exit(0 if refused == 3 else 1)\n",
+    )
+    project_config = replace(ws.config.projects["alpha"], test_cmd=plant_cmd)
+    ws = Workspace(ws.root, replace(ws.config, sandbox="bwrap",
+                                    projects={**ws.config.projects, "alpha": project_config}),
+                   ws.ledger, ws.alpha, ws.beta)
+    attempt_id, rid = _submit_bench(ws)
+    proc = _processor(ws)
+    proc.run_once("alpha")
+
+    run_tests_row = ws.ledger.steps(rid).get("run_tests")
+    assert run_tests_row is not None
+    assert run_tests_row.payload["returncode"] == 0, run_tests_row.payload["tail"]
+    assert not (ws.alpha / "vitest.config.js").exists()
+    assert not (ws.alpha / "node_modules").exists()
+    assert not (ws.alpha / ".deps" / "shadow.py").exists()
+
+
 def test_run_tests_exit_0_with_zero_tests_executed_is_not_ok(workspace: Workspace) -> None:
     """Reuses bench's own existing no-tests banner
     (looks_like_zero_tests_ran), never a new

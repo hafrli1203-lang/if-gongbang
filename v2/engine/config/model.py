@@ -118,6 +118,43 @@ def _is_ancestor_or_equal(entry: Path, root: Path) -> bool:
         return False
 
 
+def realpath_overlaps(a: Path, b: Path) -> bool:
+    """True iff the REAL (symlink-resolved, "."/".." normalized) paths
+    of `a` and `b` are the same, or either is an ancestor of the
+    other -- checked in BOTH directions, unlike _is_ancestor_or_equal
+    above. The one function both EngineConfig's own __post_init__
+    validation (file_dep_targets/bench_readonly_paths, below) and
+    engine.infrastructure.sandbox.wrap's mount-time guard use, so the
+    two can never silently disagree about what counts as "overlapping
+    a protected root".
+
+    a config-load check that compares
+    UN-normalized path strings/Paths is bypassable by a target spelled
+    with a lexically-safe-looking "../" component that still resolves,
+    once bwrap/the OS actually opens it, straight into the real
+    protected directory (reproduced: "/x/ordinary/../secrets" passed a
+    plain string/Path comparison but os.path.realpath resolves it to
+    the real secrets dir). os.path.realpath never raises for a path
+    that does not exist (or does not exist YET, e.g. a file_dep_
+    targets entry checked before anything is actually written there),
+    so this is safe to call unconditionally at config-load time, not
+    only once a sandbox is about to actually run."""
+    real_a = Path(os.path.realpath(a))
+    real_b = Path(os.path.realpath(b))
+    if real_a == real_b:
+        return True
+    try:
+        real_a.relative_to(real_b)
+        return True
+    except ValueError:
+        pass
+    try:
+        real_b.relative_to(real_a)
+        return True
+    except ValueError:
+        return False
+
+
 def _validate_copy_links_entry(entry: str) -> None:
     if not entry or entry.startswith("/"):
         raise ValueError(f"copy_links entry must be a relative path: {entry!r}")
@@ -298,6 +335,18 @@ class ProjectConfig:
     # runs it inside the same bench sandbox run_tests uses -- never a
     # second, differently-isolated subprocess call.
     arch_check_cmd: tuple[str, ...] = ()
+    # Policy (no approval stops): JobPosition.
+    # max_fix_rounds' own cap (fix/early-station retry rounds before a
+    # job would have stopped needs_owner) -- raised from the old fixed
+    # default 2 to a per-project, config-overridable number, default 5,
+    # so a job on auto-pilot (engine.application.auto_pilot) gets more
+    # headroom to converge on its own before anything forces a pass.
+    # Threaded through exactly where the old literal `= 2` defaults
+    # lived (engine.application.pipeline_planning.run_full_job /
+    # engine.application.quick_pipeline.run_small_job, both called only
+    # from tools/gb2lib with no explicit override before this field
+    # existed) -- never a second, independent cap.
+    max_fix_rounds: int = 5
 
     def __post_init__(self) -> None:
         if self.bench_scope not in _KNOWN_BENCH_SCOPES:
@@ -514,17 +563,54 @@ class EngineConfig:
         # bench_readonly_paths exists to re-expose a TOOLCHAIN cache dir
         # (e.g. ~/.cache/ms-playwright) from under an otherwise-hidden
         # real HOME -- an entry equal to or ABOVE the real HOME itself,
-        # the ledger dir, secrets_dir or config.home would instead
-        # re-expose one of those wholesale (the same shape of mistake
-        # this module's own copy_links/sandbox fixes closed elsewhere).
-        forbidden_roots = [self.home, self.secrets_dir, self.ledger_path.parent]
+        # the ledger dir, or config.home would instead re-expose one of
+        # those wholesale (the same shape of mistake this module's own
+        # copy_links/sandbox fixes closed elsewhere). secrets_dir gets
+        # its OWN, bidirectional rule below (realpath_overlaps): unlike
+        # home/ledger_path.parent, nothing may legitimately re-expose
+        # ANYTHING inside secrets_dir -- there is no "cache dir" use
+        # case for a directory that holds nothing but secrets.
+        #
+        # both checks below compare REAL (realpath)
+        # paths, not the Path objects as spelled -- a lexically
+        # different but same-or-overlapping path ("/x/ordinary/../
+        # secrets") used to pass a plain Path comparison and only
+        # revealed itself once a sandbox actually mounted it.
+        # realpath_overlaps is the ONE function this check and engine.
+        # infrastructure.sandbox.wrap's own mount-time guard both call,
+        # so config-load time and mount time can never disagree.
+        one_directional_roots = [self.home, self.ledger_path.parent]
         real_home = os.environ.get("HOME")
         if real_home:
-            forbidden_roots.append(Path(real_home))
+            one_directional_roots.append(Path(real_home))
+        real_secrets_dir = Path(os.path.realpath(self.secrets_dir))
+
+        def _refuses_as_protected(entry: Path) -> bool:
+            real_entry = Path(os.path.realpath(entry))
+            for root in one_directional_roots:
+                if _is_ancestor_or_equal(real_entry, Path(os.path.realpath(root))):
+                    return True
+            return realpath_overlaps(real_entry, real_secrets_dir)
+
         for entry in self.bench_readonly_paths:
-            for root in forbidden_roots:
-                if _is_ancestor_or_equal(entry, root):
-                    raise ValueError("bench_readonly_path_forbidden")
+            if _refuses_as_protected(entry):
+                raise ValueError("bench_readonly_path_forbidden")
+        # file_dep_targets (ProjectConfig): an operator-configured
+        # absolute host path a sandbox remaps READ-ONLY into a worker/
+        # bench root (engine.application.steps.file_deps.
+        # sandbox_file_dep_pairs) at a DIFFERENT, aliased location --
+        # unlike bench_readonly_paths above, that remap had no overlap
+        # check of its own at all before. Same rule
+        # as bench_readonly_paths: one-directional for home/
+        # ledger_path.parent/real_home (a target BELOW one of those is
+        # ordinary and expected -- e.g. a real deployment's apps all
+        # living under the same root the ledger does, see tests/
+        # acceptance/test_t13_file_dep_real_sandbox.py's own layout),
+        # bidirectional for secrets_dir.
+        for project in self.projects.values():
+            for _relspec, target in project.file_dep_targets:
+                if _refuses_as_protected(Path(target)):
+                    raise ValueError("file_dep_target_forbidden_overlap")
         # reference_paths is deliberately NOT validated here -- see
         # ProjectConfig.reference_paths's own docstring: the real checks
         # (overlap with secrets_dir, home, ledger, repos, hidden_paths, real

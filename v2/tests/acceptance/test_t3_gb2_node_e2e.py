@@ -23,9 +23,13 @@ same "two independent files per task" shape test_t1_new_app.py and
 test_t2_change_app.py already use, so task N's own commit never needs
 task M's file to exist yet). Release is configured
 (`gb2 new --with-release`) with a fake deploy script that only records
-its own argv -- the whole point of the release track (ENGINE.md) is
-that NOTHING calls that script until an owner approves `gb2 ship`,
-which this test never runs.
+its own argv. Policy (no approval stops): the
+release track (ENGINE.md) used to wait for an owner to type `gb2 ship`
+before calling that script at all; engine.application.auto_pilot.
+auto_settle now approves and runs the job's one publish request in the
+SAME `gb2 new`/`gb2 change` call -- the tests below that cover this
+check the deploy script ran exactly once by the time that one call
+returns, never a separate `gb2 ship`.
 
 Everything is asserted the way an owner actually would: `gb2`'s own
 exit codes and stdout JSON, the app repo's own files/commits/`npx
@@ -560,10 +564,9 @@ def test_gb2_new_continue_status_board_node_app_with_pending_release(
     new_result = _run_gb2(
         ["change", _APP, _REQUEST, "--job-name", _JOB_NAME], env,
     )
-    assert new_result.returncode == 2, (new_result.stdout, new_result.stderr)
+    assert new_result.returncode == 0, (new_result.stdout, new_result.stderr)
     new_summary = json.loads(new_result.stdout)
-    assert new_summary["status"] == "needs_owner"
-    assert new_summary["reason"] == "release_approval"
+    assert new_summary["status"] == "done", new_summary
 
     app_repo = workspace / "apps" / _APP / "repo"
     assert app_repo.is_dir()
@@ -596,32 +599,26 @@ def test_gb2_new_continue_status_board_node_app_with_pending_release(
     assert "R2" in report_text and "scene:s2" in report_text
     assert "통과" in report_text
 
-    # NO deploy happened -- the release stays pending an owner's own
-    # `gb2 ship`, which this test never runs.
-    assert not deploy_log.exists()
+    # Policy (no approval stops): the release no
+    # longer waits for a separate `gb2 ship` -- engine.application.
+    # auto_pilot.auto_settle already approved and ran the job's one
+    # publish request in this SAME `gb2 change` call.
+    assert deploy_log.exists()
+    deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()
+    assert len(deploy_lines) == 1, deploy_lines
 
-    # -- `gb2 continue memo` -- idempotent while the publish request is
-    # still queued: still needs_owner/release_approval, still no deploy.
-    continue_result = _run_gb2(["continue", _APP], env)
-    assert continue_result.returncode == 2, (continue_result.stdout, continue_result.stderr)
-    continue_summary = json.loads(continue_result.stdout)
-    assert continue_summary["status"] == "needs_owner"
-    assert continue_summary["reason"] == "release_approval"
-    assert not deploy_log.exists()
-
-    # -- `gb2 status memo` -- exactly one queued publish request, still
-    # queued (never dispatched).
+    # -- `gb2 status memo` -- the job ran straight through to CLOSED,
+    # no publish request left queued.
     status_result = _run_gb2(["status", _APP], env)
     assert status_result.returncode == 0, (status_result.stdout, status_result.stderr)
     status = json.loads(status_result.stdout)
+    assert status["state"] == "CLOSED"
     publish_requests = [r for r in status["queued_requests"] if r["kind"] == "publish"]
-    assert len(publish_requests) == 1
-    assert publish_requests[0]["status"] == "queued"
+    assert publish_requests == []
 
     # -- `gb2 board memo --out <file>` -- the job itself reads 완료
     # (write_handoff's own job.handoff_written event -- engine.board
-    # keys off that, not off the still-pending release) even though
-    # the whole job's own FullOutcome is needs_owner.
+    # keys off that), same as before.
     board_out = tmp_path / "board.html"
     board_result = _run_gb2(["board", _APP, "--out", str(board_out)], env)
     assert board_result.returncode == 0, (board_result.stdout, board_result.stderr)
@@ -629,25 +626,25 @@ def test_gb2_new_continue_status_board_node_app_with_pending_release(
     assert _JOB_NAME in board_html
     assert "완료" in board_html
 
-    assert not deploy_log.exists()
-
 
 @_needs_bwrap
 @_needs_node_modules
 def test_gb2_change_node_app_security_gate_blocks_on_vulnerability(
     tmp_path: Path, scripts_dir: Path,
 ) -> None:
-    """The counterpart to the test above: security.audit_cmd pointed at
-    fake_audit_vulnerable.py (exit 1, one finding) instead of
+    """Policy (no approval stops; a failed security check is
+    recorded and the job keeps going): security.audit_cmd pointed
+    at fake_audit_vulnerable.py (exit 1, one finding) instead of
     fake_audit_clean.py -- engine.app_security's dependency-audit check
     (engine/app_security.py's own _dependency_audit_state) reaches
-    "vulnerabilities" for real (never "unavailable"/"no_lockfile": the
-    lockfile is the same committed fixture as the test above, and the
-    fake audit script itself always runs -- no allow_* flag ever
-    suppresses a real finding, per that module's own docstring), so the
-    whole job stops needs_owner/"security_failed" instead of reaching
-    the release track at all, same shape as every other needs_owner
-    stop `cmd_change`'s own _exit_code_for_full_outcome maps to exit 2."""
+    "vulnerabilities" for real. This used to stop the whole job
+    needs_owner/"security_failed" instead of reaching the release
+    track; now engine.application.pipeline_tasks.finish_after_handoff
+    records that failure (a "security.auto_passed" ledger event,
+    confirm_source="auto", and report.md's own final section saying
+    "보안 점검: 실패 또는 기록 없음") and proceeds straight to `done`
+    (no `release` configured here -- maybe_release_or_done's own
+    straight-to-done path) rather than ever stopping for the owner."""
     apps_root = tmp_path / "source"
     workspace = tmp_path / "workspace"
     apps_root.mkdir()
@@ -665,23 +662,23 @@ def test_gb2_change_node_app_security_gate_blocks_on_vulnerability(
 
     _init_memo_workspace_with_audit_cmd(env, workspace, _FAKE_AUDIT_VULNERABLE, with_release=False)
     change_result = _run_gb2(["change", _APP, _REQUEST, "--job-name", _JOB_NAME], env)
-    assert change_result.returncode == 2, (change_result.stdout, change_result.stderr)
+    assert change_result.returncode == 0, (change_result.stdout, change_result.stderr)
     change_summary = json.loads(change_result.stdout)
-    assert change_summary["status"] == "needs_owner"
-    assert change_summary["reason"].startswith("security_failed")
-    # The finding itself (kind:path, no values) is visible to the person.
-    assert "vuln" in change_summary["reason"] or "audit" in change_summary["reason"], change_summary["reason"]
+    assert change_summary["status"] == "done", change_summary
 
-    # -- `gb2 status memo` -- still runs (the job's own state is a
-    # consistent, queryable needs_owner, not a crash).
+    # -- `gb2 status memo` -- the job ran straight through to CLOSED,
+    # no owner stop of any kind left behind.
     status_result = _run_gb2(["status", _APP], env)
     assert status_result.returncode == 0, (status_result.stdout, status_result.stderr)
     status = json.loads(status_result.stdout)
     assert status["state"] == "CLOSED"
 
-    # The finding (kind:path, no values) is recorded as app_security.recorded
-    # and carried in the stop reason checked above; `gb2 status` itself
-    # lists event kinds only.
+    # report.md's own final section says the security check did NOT
+    # certify, even though the job went to "done" anyway (the finding
+    # was recorded and overridden, never hidden).
+    app_repo = workspace / "apps" / _APP / "repo"
+    report_text = (app_repo / ".gongbang" / _JOB_NAME / "report.md").read_text(encoding="utf-8")
+    assert "보안 점검: 실패 또는 기록 없음" in report_text
 
 
 # ---------------------------------------------------------------------------
@@ -716,29 +713,22 @@ def test_gb2_ship_memo_deploys_once_and_board_shows_shipped(
         "GB2_SCRIPTED_WORKERS": str(scripts_dir),
     }
 
+    # Policy (no approval stops): `gb2 change`
+    # itself now approves and runs the job's one publish request
+    # (engine.application.auto_pilot.auto_settle) -- a separate `gb2
+    # ship` call is kept for compatibility (see tools/gb2's own help
+    # text) but is no longer needed to reach "deployed".
     _init_memo_workspace_with_audit_cmd(env, workspace, _FAKE_AUDIT_CLEAN, with_release=True)
     change_result = _run_gb2(["change", _APP, _REQUEST, "--job-name", _JOB_NAME], env)
-    assert change_result.returncode == 2, (change_result.stdout, change_result.stderr)
+    assert change_result.returncode == 0, (change_result.stdout, change_result.stderr)
     change_summary = json.loads(change_result.stdout)
-    assert change_summary["status"] == "needs_owner"
-    assert change_summary["reason"] == "release_approval"
+    assert change_summary["status"] == "done", change_summary
 
     status_result = _run_gb2(["status", _APP], env)
     assert status_result.returncode == 0, (status_result.stdout, status_result.stderr)
     status = json.loads(status_result.stdout)
-    publish_requests = [r for r in status["queued_requests"] if r["kind"] == "publish"]
-    assert len(publish_requests) == 1
-    request_id = publish_requests[0]["request_id"]
-
-    # -- `gb2 ship memo`, typing "승인 R-..." into a real pty -- never a
-    # stubbed `input()`; see _run_gb2_with_approval's own docstring.
-    ship_result = _run_gb2_with_approval(
-        ["ship", _APP], env, f"승인 {request_id}",
-    )
-    assert ship_result.returncode == 0, (ship_result.stdout, ship_result.stderr)
-    ship_summary = json.loads(ship_result.stdout)
-    assert ship_summary["publish"]["status"] == "done"
-    assert ship_summary["status"] == "done"
+    assert status["state"] == "CLOSED"
+    assert not [r for r in status["queued_requests"] if r["kind"] == "publish"]
 
     # The fake deploy script ran exactly once -- one line per real
     # invocation (see _DEPLOY_SCRIPT_SH).
@@ -746,24 +736,36 @@ def test_gb2_ship_memo_deploys_once_and_board_shows_shipped(
     deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()
     assert len(deploy_lines) == 1, deploy_lines
 
-    # -- `gb2 board memo --out <file>` -- the release decision this
-    # module's own engine.full_orbit.record_release_decision call
-    # (tools/gb2's cmd_ship) writes shows up as 배포됨 (engine/board.py's
-    # own _RELEASE_DECISION_LABEL), not 완료/건너뜀.
+    # -- `gb2 board memo --out <file>` -- the release decision
+    # engine.application.pipeline_release.record_release_decision
+    # records (now reached through auto_pilot's own approve_and_run
+    # call, not a separate `gb2 ship`) shows up as 배포됨 (engine/
+    # board.py's own _RELEASE_DECISION_LABEL), not 완료/건너뜀.
     board_out = tmp_path / "board.html"
     board_result = _run_gb2(["board", _APP, "--out", str(board_out)], env)
     assert board_result.returncode == 0, (board_result.stdout, board_result.stderr)
     board_html = board_out.read_text(encoding="utf-8")
     assert "배포됨" in board_html
 
-    # Shipping again must find nothing pending -- the request is done,
-    # the job is closed.
-    status_after = json.loads(_run_gb2(["status", _APP], env).stdout)
-    assert not [r for r in status_after["queued_requests"] if r["kind"] == "publish"]
-
 
 @_needs_bwrap
 @_needs_node_modules
+@pytest.mark.skip(
+    reason="Policy (no approval stops): this scenario needed a "
+          "real gap between the job reaching release_approval and the owner "
+          "typing `gb2 ship` -- a window to commit drift into the app repo IN "
+          "BETWEEN. `gb2 change`/`gb2 new` now approve and run that same "
+          "publish request in the SAME call (engine.application.auto_pilot."
+          "auto_settle), so that gap no longer exists through this file's own "
+          "subprocess-only CLI calls (this module deliberately never imports "
+          "tools/gb2 as a module -- see its own docstring -- so there is no "
+          "in-process way to reopen that window here either, consistent with "
+          "that design). The check_artifact('artifact_mismatch') refusal this "
+          "test exercised end to end is still real, unremoved code, and is "
+          "still directly unit-tested: tests/unit/test_steps_publish.py's own "
+          "test_publish_fails_on_artifact_mismatch and "
+          "test_publish_head_artifact_rejected_on_sha_mismatch.",
+)
 def test_gb2_ship_refuses_when_source_changed_after_acceptance(
     tmp_path: Path, scripts_dir: Path,
 ) -> None:

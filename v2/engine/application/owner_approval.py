@@ -37,6 +37,7 @@ from engine.domain.policy import SHELL_METACHARS as _SHELL_METACHARS
 from engine.domain.install_request_shape import (
     JSON_INSTALL_SECTIONS as _JSON_INSTALL_SECTIONS,
     PACKAGE_NAME_RE as _PACKAGE_NAME_RE,
+    USE_SCRIPTS_CHANGE_KIND_REASON as _USE_SCRIPTS_CHANGE_KIND_REASON,
     VERSION_SPECIFIER_RE as _VERSION_SPECIFIER_RE,
 )
 from engine.application.processor import submit
@@ -121,12 +122,23 @@ def _validate_json_install_change(change: dict) -> tuple[bool, str]:
     """Only for kind="install" against a .json manifest. Returns
     (True, "ok") or (False, <constant reason code -- never the
     offending section/name/value itself, which could be an attacker's
-    payload or carry a secret>)."""
+    payload or carry a secret>).
+
+    결함 65: a section outside _JSON_INSTALL_SECTIONS used to return the
+    generic "manifest_section_not_allowed" -- true, but it does not say
+    what to do about it, and a worker that legitimately needed to touch
+    e.g. "scripts" had no actionable next step. Returns
+    _USE_SCRIPTS_CHANGE_KIND_REASON instead: still a rejection (an
+    "install" request smuggling a "scripts" backdoor, e.g. postinstall,
+    is rejected exactly as before -- this renames WHY, never weakens
+    WHETHER), but the reason now names the fix (use kind="scripts_change"
+    or "test_config_change" instead) without echoing the offending
+    section name itself."""
     if not change:
         return False, "manifest_change_empty"
     for section, packages in change.items():
         if section not in _JSON_INSTALL_SECTIONS:
-            return False, "manifest_section_not_allowed"
+            return False, _USE_SCRIPTS_CHANGE_KIND_REASON
         if not isinstance(packages, dict) or not packages:
             return False, "manifest_section_not_dict"
         for name, version in packages.items():
@@ -257,6 +269,18 @@ def approve_pending(config: EngineConfig, ledger: Ledger, project: str,
     confirm=True. "install" has no such restriction (its `change` is
     already shape-restricted to dependency sections).
 
+    Owner standing approval: engine.
+    application.standing_approval calls this function with
+    confirm_source="standing" too, but ONLY for kind="install" (its
+    own policy, deliberately never covers
+    "scripts_change"/"test_config_change" -- see that module's own
+    docstring for why a fixed runner-command allowlist was removed
+    after review found it could be defeated). "install" already takes
+    any confirm_source here, same as "tty"/"office" -- no special case
+    needed for "standing" at all; this function makes no distinction
+    between who supplied an install confirmation, only that `confirm`
+    is True and validate_pending passes.
+
     Validates with validate_pending(); on failure raises
     ValueError(reason), appends nothing, submits nothing. On success
     calls processor.submit with actor_id="owner" FIRST, then appends an
@@ -286,7 +310,15 @@ def approve_pending(config: EngineConfig, ledger: Ledger, project: str,
     # make these kinds safe by shape alone. A human must read the
     # actual content on a terminal before confirming, so --yes (a
     # non-interactive confirm_source) is only ever valid for "install".
-    if kind != "install" and confirm_source != "tty":
+    # Policy (no approval stops): confirm_source=
+    # "auto" (engine.application.auto_pilot, gb2's fully automatic
+    # progression) is ALSO accepted here, for every kind -- the owner's
+    # own blanket instruction covers scripts_change/test_config_change
+    # too (deploys and external packages are allowed). "tty" stays the one other
+    # accepted value for a kind outside "install"; nothing else (a
+    # stray "office"/"standing" for one of these two kinds, say) is
+    # weakened.
+    if kind != "install" and confirm_source not in ("tty", "auto"):
         raise ValueError("kind_requires_interactive_confirm")
 
     payload = {key: value for key, value in request.items() if key != "kind"}
@@ -321,4 +353,16 @@ def approve_pending(config: EngineConfig, ledger: Ledger, project: str,
     return request_id
 
 
-__all__ = ["PENDING_KIND_WHITELIST", "validate_pending", "approve_pending"]
+# Public alias for _redacted_change_preview -- engine.application.
+# office_approval (E1, AI office approval tokens) needs the exact same
+# "section/key names only, never a value" preview shape for its own
+# pending-approval listing, and must not reach for another module's
+# leading-underscore name to get it (docs/standards/architecture.md
+# §3's "비공개 이름 교차 import" rule). The function itself stays
+# named/defined once, here; this is just its public door.
+redacted_change_preview = _redacted_change_preview
+
+__all__ = [
+    "PENDING_KIND_WHITELIST", "validate_pending", "approve_pending",
+    "redacted_change_preview",
+]

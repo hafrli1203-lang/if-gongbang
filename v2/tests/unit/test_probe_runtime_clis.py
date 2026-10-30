@@ -20,16 +20,18 @@ from engine.application import acceptance_bench
 from engine.application.steps import worker_sandbox
 from engine.infrastructure import sandbox as sandbox_mod
 from tests.conftest import Workspace
+from tests.probe_target import serve_target
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox_mod.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox_mod.available(), reason="bwrap not available on this host",
 )
 
 
 def _patch_bench_sandbox_argv(monkeypatch, captured: dict[str, object]) -> None:
     def fake_bench_sandbox_argv(ctx, repo, argv, env, *, net=False,
                                extra_readonly=(), extra_symlinks=(),
-                               extra_writable=()):
+                               extra_writable=(), root_readonly=False):
         captured["extra_readonly"] = extra_readonly
         captured["extra_symlinks"] = extra_symlinks
         captured["extra_writable"] = extra_writable
@@ -130,22 +132,28 @@ def test_probe_js_target_spawning_a_real_cli_sees_it_under_bwrap(
                           roles=("builder",))
     probe_dir = workspace.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.js").write_text(
-        "const { spawnSync } = require('child_process');\n"
-        "const r = spawnSync('sh', ['-c', 'echo sh-found']);\n"
-        "if (r.error) {\n"
-        "  console.log('SPAWN_ERROR:' + r.error.code);\n"
-        "} else {\n"
-        "  console.log(r.stdout.toString().trim());\n"
-        "  console.log('PROBE OK https://docs.stripe.com/api');\n"
-        "}\n",
-        encoding="utf-8",
-    )
-
-    results = run_probe_scripts(
-        config, workspace.ledger, "alpha", attempt_id, "job1",
-        [("stripe", "https://docs.stripe.com/api")],
-    )
+    with serve_target() as url:
+        # The script reaches the target through the engine's proxy
+        # (HTTP_PROXY) with node's own http client, after the CLI check.
+        (probe_dir / "t1.js").write_text(
+            "const { spawnSync } = require('child_process');\n"
+            "const http = require('http');\n"
+            "const r = spawnSync('sh', ['-c', 'echo sh-found']);\n"
+            "if (r.error) {\n"
+            "  console.log('SPAWN_ERROR:' + r.error.code);\n"
+            "} else {\n"
+            "  console.log(r.stdout.toString().trim());\n"
+            "  const p = new URL(process.env.HTTP_PROXY);\n"
+            f"  http.get({{host: p.hostname, port: p.port, path: '{url}'}}, (res) => {{\n"
+            "    res.resume();\n"
+            f"    res.on('end', () => console.log('PROBE OK {url}'));\n"
+            "  });\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        results = run_probe_scripts(
+            config, workspace.ledger, "alpha", attempt_id, "job1", [("stripe", url)],
+        )
 
     assert "SPAWN_ERROR" not in results[0].stdout_tail
     assert "sh-found" in results[0].stdout_tail

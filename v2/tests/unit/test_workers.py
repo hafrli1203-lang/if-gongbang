@@ -345,16 +345,22 @@ def test_claude_parse_result_missing_file(tmp_path: Path) -> None:
 
 # ---- CodexRunner -------------------------------------------------------
 
-def test_codex_argv_read_only_and_schema(tmp_path: Path) -> None:
+def test_codex_argv_no_nested_sandbox_and_schema(tmp_path: Path) -> None:
+    """codex must not open a second (nested) bwrap -- refused on this host,
+    which silently killed every reviewer shell command -- but its commands
+    still get a sandbox: read-only through codex's Landlock+seccomp path,
+    which needs no new user namespace."""
     spec = _spec(tmp_path, task="review this diff")
     worker = WorkerConfig(runner="codex", reasoning="low")
     argv = CodexRunner().argv(spec, worker)
 
     assert argv[0:3] == ["codex", "exec", "-s"]
     assert argv[3] == "read-only"
+    assert argv[4:6] == ["-c", "features.use_legacy_landlock=true"]
+    assert "danger-full-access" not in argv
     assert "--skip-git-repo-check" in argv
     assert argv[argv.index("-C") + 1] == str(spec.workdir)
-    assert argv[argv.index("-c") + 1] == 'model_reasoning_effort="low"'
+    assert 'model_reasoning_effort="low"' in argv
     # The prompt reaches codex over stdin, not as an argv element (a
     # real review prompt can exceed Linux's MAX_ARG_STRLEN -- see
     # CodexRunner.prompt_via_stdin's own docstring) -- a bare "-" in

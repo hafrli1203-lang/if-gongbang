@@ -472,27 +472,36 @@ def test_gb2_continue_resumes_a_small_job_after_a_build_install_request(
 def test_gb2_continue_resumes_a_small_job_after_security_failed(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same point as the install-request test above, for the OTHER
-    needs_owner stop engine.small_orbit hands to full_orbit's own
-    machinery for free: engine.app_security failing once, then passing
-    on a plain `gb2 continue` retry (test_full_orbit.py's own
-    test_security_fix_resume_without_a_moved_head_just_reruns_security,
-    driven through small_orbit instead of full_orbit)."""
+    """Policy (no approval stops; a failed security check is
+    recorded and the job keeps going): engine.application.pipeline_
+    tasks.finish_after_handoff no longer stops needs_owner on a failed
+    engine.app_security check at all -- it records the failure
+    ("security.auto_passed", confirm_source="auto") and proceeds straight
+    through to done, same as a small job driven through full_orbit's
+    own machinery.
+
+    Fix-then-recheck: a
+    failed check now first runs ONE security-fix build round (`secfix-1`,
+    owning the plan's paths) and re-checks. Here the second check passes,
+    so the job ends "done" with two checks, two builds and NO
+    security.auto_passed (nothing was overridden)."""
     ws = _full_orbit_workspace(workspace)
     stub = _RunStationStub({
         "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _small_plan_json())],
-        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"},
+                  {"src/greeter/extra1.py": "VALUE_1 = 1  # secret removed\n"}],
     })
     state = _install_fake_acceptance_and_handoff(
         monkeypatch, [_FakeAcceptanceResult(passed=True, scenes=(_FakeSceneResult("s1", True),))],
     )
     security_calls: list[str] = []
-    security_results = [False, True]
 
     def check(config, project, attempt_id, plan):
         security_calls.append(attempt_id)
-        return type("FakeSecurity", (), {"passed": security_results.pop(0),
-                                          "findings": (), "ran": ()})()
+        passed = len(security_calls) >= 2
+        return type("FakeSecurity", (), {"passed": passed,
+                                          "findings": () if passed else ("secret:a.py:1",),
+                                          "ran": ()})()
 
     sys.modules["engine.app_security"].check = check  # type: ignore[attr-defined]
 
@@ -500,16 +509,14 @@ def test_gb2_continue_resumes_a_small_job_after_security_failed(
         ws.config, ws.ledger, _fakes(), "alpha", _JOB, "값 하나만 바꿔줘",
         processor_factory=_processor_factory(stub),
     )
-    assert outcome.status == "needs_owner"
-    assert str(outcome.reason).startswith("security_failed")
-
-    resumed = full_orbit.continue_full_job(
-        ws.config, ws.ledger, _fakes(), "alpha", _JOB,
-        processor_factory=_processor_factory(stub),
-    )
-    assert resumed.status == "done", resumed
+    assert outcome.status == "done", outcome
     assert len(security_calls) == 2
+    assert len(set(security_calls)) == 2  # the re-check ran on the secfix attempt
     assert state.acceptance_calls == 1
+    auto_passed = [e for _seq, e in ws.ledger.events("alpha", "security.auto_passed")]
+    assert auto_passed == []
+    from engine.application.pipeline_tasks import security_fix_rounds_used
+    assert security_fix_rounds_used(ws.ledger, "alpha", _JOB) == 1
 
 
 def test_small_job_crash_leaves_a_small_plan_cursor_resumable_directly(
@@ -1021,3 +1028,33 @@ def test_small_planning_stops_needs_owner_when_a_required_skill_is_missing(
     done = full_orbit.continue_full_job(ws.config, ws.ledger, _fakes(), "alpha", _JOB,
                                         processor_factory=_processor_factory(stub))
     assert done.status == "done", done
+
+
+def test_security_still_failing_after_the_cap_is_recorded_as_auto_passed(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rounds exhausted (max_fix_rounds=1 here): the owner's
+    rule applies -- record security.auto_passed and proceed to done,
+    never stop needs_owner."""
+    ws = _full_orbit_workspace(workspace)
+    stub = _RunStationStub({
+        "plan": [_planning_files(_FACTS_MD_NO_TARGETS, _small_plan_json())],
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"},
+                  {"src/greeter/extra1.py": "VALUE_1 = 2\n"}],
+    })
+    _install_fake_acceptance_and_handoff(
+        monkeypatch, [_FakeAcceptanceResult(passed=True, scenes=(_FakeSceneResult("s1", True),))],
+    )
+    calls: list[str] = []
+    def check(config, project, attempt_id, plan):
+        calls.append(attempt_id)
+        return type("FakeSecurity", (), {"passed": False, "findings": ("secret:a.py:1",), "ran": ()})()
+    sys.modules["engine.app_security"].check = check  # type: ignore[attr-defined]
+    outcome = small_orbit.run_small_job(
+        ws.config, ws.ledger, _fakes(), "alpha", _JOB, "값 하나만 바꿔줘",
+        max_fix_rounds=1, processor_factory=_processor_factory(stub),
+    )
+    assert outcome.status == "done", outcome
+    assert len(calls) == 2
+    auto_passed = [e for _seq, e in ws.ledger.events("alpha", "security.auto_passed")]
+    assert len(auto_passed) == 1 and auto_passed[0].payload["confirm_source"] == "auto"

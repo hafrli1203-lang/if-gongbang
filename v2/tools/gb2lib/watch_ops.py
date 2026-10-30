@@ -46,7 +46,8 @@ from engine.ledger import Event, Ledger
 
 from . import ops, shared
 
-__all__ = ["cmd_watch", "maybe_resume", "run_watch_pass", "judge_one", "post_ops_alert"]
+__all__ = ["cmd_watch", "maybe_resume", "maybe_standing_approve", "run_watch_pass",
+           "judge_one", "post_ops_alert"]
 
 _RESUME_WINDOW_SEC = 3600.0
 _ALERTS_PATH_ENV = "GB2_OPS_ALERTS_PATH"
@@ -161,8 +162,11 @@ def maybe_resume(config: EngineConfig, ledger: Ledger, project: str,
     ))
     from engine.full_orbit import FullOrbitError
 
+    from engine.application.driver_session import driver_session
+
     try:
-        _continue_full_job(config, ledger, fakes_for, project, job_name)
+        with driver_session(ledger, project):
+            _continue_full_job(config, ledger, fakes_for, project, job_name)
     except ProcessorBusy:
         return "resume_raced"
     except FullOrbitError as exc:
@@ -173,6 +177,138 @@ def maybe_resume(config: EngineConfig, ledger: Ledger, project: str,
         ))
         return "resume_failed"
     return "resumed"
+
+
+def maybe_standing_approve(config: EngineConfig, ledger: Ledger, project: str,
+                           fakes_for: Callable, record: dict[str, object], *,
+                           policy_path: Path | None = None) -> str:
+    """Owner standing approval: the ONLY
+    place `record["verdict"] == "waiting_owner"` is ever acted on
+    automatically -- maybe_resume above never touches it, by design
+    (a human decision). Owner-set policy (engine.application.
+    standing_approval.load_policy) may pre-clear a NARROW set of
+    request shapes (a dependency patch bump, or a design approval) for
+    this app; this function checks EVERY genuinely pending stop
+    against that policy and ONLY IF EVERYTHING pending matches does it
+    actually approve+drain the install(s) (via the EXISTING
+    owner_approval.approve_pending gate, confirm_source="standing")
+    and/or append a design.approved event (standing_approval.
+    design_standing_approved), then resumes through the SAME
+    `continue_full_job` path maybe_resume's "resumed" branch uses. One
+    request outside the policy -- or no policy at all -- leaves
+    EVERYTHING untouched and returns "not_all_matched": never a
+    partial approval, the job keeps waiting for the owner exactly as
+    before this feature existed.
+
+    결함: this used to query ONLY
+    office_approval.pending_install_requests, itself filtered to
+    owner_approval.PENDING_KIND_WHITELIST -- a pending request of ANY
+    other kind (an "edit" request, or any kind this codebase does not
+    even define yet) was invisible to the all-or-nothing check, so a
+    batch mixing a covered install with one of those could auto-
+    approve the install alone and leave the OTHER stop unaddressed
+    while looking "handled". Now queries job_state_requests.
+    pending_owner_requests directly -- the SAME unfiltered list
+    job_state's own resume gates read, no kind filter at all -- so
+    standing_approval.request_standing_kind (which already returns
+    None for anything that is not a covered "install") sees every
+    genuinely pending stop, not just the three historically-
+    whitelisted kinds.
+
+    Returns one of: "not_waiting_owner" (record's verdict was not
+    "waiting_owner"), "skipped_no_attempt"/"skipped_no_job" (nothing to
+    resume), "skipped_locked" (another live driver holds the lock --
+    same check maybe_resume makes), "not_all_matched" (no pending stop
+    was covered by the policy, or there was nothing pending at all --
+    nothing changed), "standing_install_failed:<status>" (an approved
+    install itself failed to drain to "done" -- nothing further is
+    attempted), "resume_raced"/"resume_failed" (same meaning as
+    maybe_resume's own), or "standing_approved_resumed" (every pending
+    stop was approved and `continue_full_job` ran)."""
+    # A small-path job stopped on an owner request is judged "idle", not
+    # "waiting_owner"; the pending-request list below still decides.
+    if record.get("verdict") not in ("waiting_owner", "idle"):
+        return "not_waiting_owner"
+
+    project_row = ledger.project(project)
+    attempt_id = project_row.current_attempt_id
+    if attempt_id is None:
+        return "skipped_no_attempt"
+    job_name = _job_name_for_attempt(ledger, project, attempt_id)
+    if job_name is None:
+        return "skipped_no_job"
+    if watch.driver_alive(ledger, project):
+        return "skipped_locked"
+
+    from engine import owner as owner_module
+    from engine.application import office_approval
+    from engine.application.job_state_requests import pending_owner_requests
+    from engine.application.standing_approval import (
+        all_requests_match_standing, design_standing_approved, load_policy, policy_digest,
+    )
+    from engine.cli import _drain
+
+    repo = config.projects[project].repo
+    policy = load_policy(policy_path)
+    approved_something = False
+
+    # the FULL, unfiltered pending-owner-request list --
+    # never office_approval.pending_install_requests' own
+    # PENDING_KIND_WHITELIST-filtered view, which would silently hide
+    # a non-whitelisted (e.g. "edit") request sitting alongside a
+    # covered install and let the install alone through. See this
+    # function's own docstring.
+    pending = pending_owner_requests(ledger, project, job_name, repo=repo)
+    if pending:
+        matched_kinds = all_requests_match_standing(policy, project, pending, repo)
+        if matched_kinds is None:
+            return "not_all_matched"
+        batch = office_approval.pinned_install_batch(ledger, project, job_name, pending)
+        digest = policy_digest(policy)
+        for entry, matched_kind in zip(batch, matched_kinds):
+            request_id = owner_module.approve_pending(
+                config, ledger, project, attempt_id, entry["request"],
+                confirm=True, confirm_source="standing", proposal=entry["proposal"],
+            )
+            ledger.append(Event(
+                project=project, kind="standing.approved", actor_kind="processor",
+                actor_id="watch", attempt_id=attempt_id,
+                payload={"request_id": request_id, "kind": matched_kind,
+                         "policy_digest": digest},
+            ))
+            status = _drain(config, ledger, project, attempt_id, request_id)
+            if status != "done":
+                return f"standing_install_failed:{status}"
+        approved_something = True
+
+    if design_standing_approved(ledger, project, job_name, attempt_id, repo, policy=policy):
+        approved_something = True
+
+    if not approved_something:
+        return "not_all_matched"
+
+    ledger.append(Event(
+        project=project, kind="watch.resumed", actor_kind="processor",
+        actor_id="watch", attempt_id=attempt_id,
+        payload={"reason": "standing_approved", "stage": record.get("stage")},
+    ))
+    from engine.full_orbit import FullOrbitError
+
+    from engine.application.driver_session import driver_session
+
+    try:
+        with driver_session(ledger, project):
+            _continue_full_job(config, ledger, fakes_for, project, job_name)
+    except ProcessorBusy:
+        return "resume_raced"
+    except FullOrbitError as exc:
+        ledger.append(Event(
+            project=project, kind="watch.resume_failed", actor_kind="processor",
+            actor_id="watch", attempt_id=attempt_id,
+            payload={"reason": str(exc), "stage": record.get("stage")},
+        ))
+        return "resume_failed"
+    return "standing_approved_resumed"
 
 
 def _alerts_path(override: Path | None = None) -> Path:
@@ -259,11 +395,47 @@ def run_watch_pass(apps: list[str], *, resume: bool = False,
     own config/ledger is opened and closed within this one call; nothing
     is held across passes. `alerts_path` is for tests ONLY (a real
     caller never passes one -- see `_alerts_path`'s own docstring).
+
+    Also when `resume` is True (owner standing approval): every
+    "waiting_owner" verdict is first offered to `maybe_standing_approve`
+    -- if the owner's policy covers everything that app is stopped on,
+    it is auto-approved and resumed right here, BEFORE the alert above
+    is even considered, and the record is re-judged so the alert (and
+    the ordinary stalled-resume branch right below) see where the job
+    actually stands now. A verdict the policy does not fully cover is
+    untouched and alerts exactly as before. The record carries the
+    added "standing_approve" key whenever this was attempted.
+
     Returns the list of verdict records (each carrying an added "resume"
     key when `resume` was True)."""
     records: list[dict[str, object]] = []
     for app in apps:
         record = judge_one(app)
+        if resume and "error" not in record and record.get("verdict") in ("waiting_owner", "idle"):
+            config_path = shared.app_workspace(app) / "config.json"
+            config = EngineConfig.from_json(config_path)
+            try:
+                config, fakes_for = shared.fakes_builder(config, app)
+            except ValueError:
+                fakes_for = None
+            if fakes_for is not None:
+                ledger = Ledger.open(config.ledger_path)
+                try:
+                    standing_result = maybe_standing_approve(config, ledger, app, fakes_for, record)
+                finally:
+                    ledger.close()
+                record["standing_approve"] = standing_result
+                if standing_result == "standing_approved_resumed":
+                    # Re-judge: the job may have moved on (done, a
+                    # different owner stop, or even "stalled" if the
+                    # resumed run itself crashed) -- every check below
+                    # (the alert, the ordinary stalled-resume branch)
+                    # must see where the job stands NOW, never the
+                    # stale "waiting_owner" verdict standing approval
+                    # just cleared.
+                    refreshed = judge_one(app)
+                    refreshed["standing_approve"] = standing_result
+                    record = refreshed
         if "error" not in record and record.get("verdict") in ("failed", "waiting_owner"):
             config_path = shared.app_workspace(app) / "config.json"
             config = EngineConfig.from_json(config_path)

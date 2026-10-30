@@ -15,6 +15,8 @@ limit `gb2 watch --loop --resume` must never exceed.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import os
 import subprocess
 import sys
@@ -358,6 +360,213 @@ def test_resume_failed_does_not_raise_and_records_an_event(workspace: Workspace,
     failed_events = workspace.ledger.events("alpha", "watch.resume_failed")
     assert len(failed_events) == 1
     assert "no pending stop" in failed_events[0][1].payload["reason"]
+
+
+# ---------------------------------------------------------------------
+# Owner standing approval:
+# tools/gb2lib/watch_ops.maybe_standing_approve
+# ---------------------------------------------------------------------
+
+def _with_manifest(workspace: Workspace, manifest: str) -> Workspace:
+    from dataclasses import replace
+    project = replace(workspace.config.projects["alpha"], manifest=manifest)
+    config = replace(workspace.config,
+                     projects={**workspace.config.projects, "alpha": project})
+    return replace(workspace, config=config)
+
+
+def _stop_with_pending_install(workspace: Workspace, job_name: str,
+                               attempt_id: str, request: dict) -> None:
+    record_position(workspace.ledger, "alpha", JobPosition(
+        job=job_name, stage="awaiting_task_owner", attempt_id=attempt_id,
+        pending_requests=(request,), stop_reason="owner_request",
+    ))
+
+
+def test_standing_approve_ignores_a_non_waiting_owner_verdict(workspace: Workspace) -> None:
+    from tools.gb2lib import watch_ops
+
+    outcome = watch_ops.maybe_standing_approve(
+        workspace.config, workspace.ledger, "alpha", lambda attempt: None,
+        {"verdict": "stalled"},
+    )
+    assert outcome == "not_waiting_owner"
+
+
+def test_standing_approve_leaves_job_waiting_when_no_policy_set(
+        workspace: Workspace, tmp_path, monkeypatch) -> None:
+    """No STANDING_APPROVALS.json at all -> load_policy's EMPTY_POLICY ->
+    nothing matches -> the job keeps waiting for the owner exactly as
+    before this feature existed."""
+    import json
+
+    from tools.gb2lib import watch_ops
+
+    monkeypatch.setattr("engine.application.standing_approval.DEFAULT_POLICY_PATH", Path(str(tmp_path / "missing.json")))
+    ws = _with_manifest(workspace, "package.json")
+    (ws.alpha / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "16.3.6"}}), encoding="utf-8")
+    attempt_id = _open(ws, "J-std1")
+    _stop_with_pending_install(ws, "J-std1", attempt_id, {
+        "kind": "install", "manifest": "package.json",
+        "change": {"dependencies": {"next": "16.4.3"}},
+    })
+
+    calls: list[str] = []
+    monkeypatch.setattr(watch_ops, "_continue_full_job", lambda *a, **k: calls.append("called"))
+
+    record = watch.judge_app(ws.ledger, "alpha").__dict__
+    assert record["verdict"] == "waiting_owner"
+    outcome = watch_ops.maybe_standing_approve(ws.config, ws.ledger, "alpha",
+                                               lambda attempt: None, record)
+    assert outcome == "not_all_matched"
+    assert calls == []
+    assert ws.ledger.events("alpha", "owner.approved") == []
+
+
+def test_standing_approve_auto_approves_a_patch_bump_and_resumes(
+        workspace: Workspace, tmp_path, monkeypatch) -> None:
+    import json
+
+    import engine.interface.cli as cli_mod
+    from tools.gb2lib import watch_ops
+
+    policy_path = tmp_path / "STANDING_APPROVALS.json"
+    policy_path.write_text(json.dumps({"apps": {"alpha": ["dependency_patch_bump"]}}),
+                           encoding="utf-8")
+    monkeypatch.setattr("engine.application.standing_approval.DEFAULT_POLICY_PATH", Path(str(policy_path)))
+
+    ws = _with_manifest(workspace, "package.json")
+    (ws.alpha / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "16.3.6", "zod": "4.6.6"}}), encoding="utf-8")
+    attempt_id = _open(ws, "J-std2")
+    _stop_with_pending_install(ws, "J-std2", attempt_id, {
+        "kind": "install", "manifest": "package.json",
+        "change": {"dependencies": {"next": "16.4.3", "zod": "4.6.7"}},
+    })
+
+    monkeypatch.setattr(cli_mod, "_drain", lambda *a, **k: "done")
+    calls: list[str] = []
+    monkeypatch.setattr(watch_ops, "_continue_full_job", lambda *a, **k: calls.append("called"))
+
+    record = watch.judge_app(ws.ledger, "alpha").__dict__
+    assert record["verdict"] == "waiting_owner"
+    outcome = watch_ops.maybe_standing_approve(ws.config, ws.ledger, "alpha",
+                                               lambda attempt: None, record)
+
+    assert outcome == "standing_approved_resumed"
+    assert calls == ["called"]
+    approved = ws.ledger.events("alpha", "owner.approved")
+    assert len(approved) == 1
+    assert approved[0][1].payload["confirm_source"] == "standing"
+    standing_events = ws.ledger.events("alpha", "standing.approved")
+    assert len(standing_events) == 1
+    assert standing_events[0][1].payload["kind"] == "dependency_patch_bump"
+
+
+def test_standing_approve_rejects_a_new_package_and_leaves_job_waiting(
+        workspace: Workspace, tmp_path, monkeypatch) -> None:
+    """All-or-nothing: a batch mixing a covered patch bump with an
+    uncovered new package must approve NEITHER."""
+    import json
+
+    from tools.gb2lib import watch_ops
+
+    policy_path = tmp_path / "STANDING_APPROVALS.json"
+    policy_path.write_text(json.dumps({"apps": {"alpha": ["dependency_patch_bump"]}}),
+                           encoding="utf-8")
+    monkeypatch.setattr("engine.application.standing_approval.DEFAULT_POLICY_PATH", Path(str(policy_path)))
+
+    ws = _with_manifest(workspace, "package.json")
+    (ws.alpha / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "16.3.6"}}), encoding="utf-8")
+    attempt_id = _open(ws, "J-std3")
+    _stop_with_pending_install(ws, "J-std3", attempt_id, {
+        "kind": "install", "manifest": "package.json",
+        "change": {"dependencies": {"left-pad": "1.0.0"}},
+    })
+
+    calls: list[str] = []
+    monkeypatch.setattr(watch_ops, "_continue_full_job", lambda *a, **k: calls.append("called"))
+
+    record = watch.judge_app(ws.ledger, "alpha").__dict__
+    outcome = watch_ops.maybe_standing_approve(ws.config, ws.ledger, "alpha",
+                                               lambda attempt: None, record)
+    assert outcome == "not_all_matched"
+    assert calls == []
+    assert ws.ledger.events("alpha", "owner.approved") == []
+
+
+def test_standing_approve_rejects_batch_mixed_with_a_non_whitelisted_edit_request(
+        workspace: Workspace, tmp_path, monkeypatch) -> None:
+    """a pending "edit" request (never part of
+    owner_approval.PENDING_KIND_WHITELIST at all) sitting ALONGSIDE a
+    covered install must block the WHOLE batch -- the install must
+    not be approved alone while the edit request is left unaddressed
+    but invisible to this check."""
+    import json
+
+    from tools.gb2lib import watch_ops
+
+    policy_path = tmp_path / "STANDING_APPROVALS.json"
+    policy_path.write_text(json.dumps({"apps": {"alpha": ["dependency_patch_bump"]}}),
+                           encoding="utf-8")
+    monkeypatch.setattr("engine.application.standing_approval.DEFAULT_POLICY_PATH", Path(str(policy_path)))
+
+    ws = _with_manifest(workspace, "package.json")
+    (ws.alpha / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "16.3.6"}}), encoding="utf-8")
+    attempt_id = _open(ws, "J-std5")
+    record_position(ws.ledger, "alpha", JobPosition(
+        job="J-std5", stage="awaiting_task_owner", attempt_id=attempt_id,
+        pending_requests=(
+            {"kind": "install", "manifest": "package.json",
+             "change": {"dependencies": {"next": "16.4.3"}}},
+            {"kind": "edit", "path": "src/x.py", "diff": "..."},
+        ),
+        stop_reason="owner_request",
+    ))
+
+    calls: list[str] = []
+    monkeypatch.setattr(watch_ops, "_continue_full_job", lambda *a, **k: calls.append("called"))
+
+    record = watch.judge_app(ws.ledger, "alpha").__dict__
+    assert record["verdict"] == "waiting_owner"
+    outcome = watch_ops.maybe_standing_approve(ws.config, ws.ledger, "alpha",
+                                               lambda attempt: None, record)
+    assert outcome == "not_all_matched"
+    assert calls == []
+    assert ws.ledger.events("alpha", "owner.approved") == []
+
+
+def test_standing_approve_skipped_when_a_live_driver_holds_the_lock(
+        workspace: Workspace, tmp_path, monkeypatch) -> None:
+    import json
+
+    from tools.gb2lib import watch_ops
+
+    policy_path = tmp_path / "STANDING_APPROVALS.json"
+    policy_path.write_text(json.dumps({"apps": {"alpha": ["dependency_patch_bump"]}}),
+                           encoding="utf-8")
+    monkeypatch.setattr("engine.application.standing_approval.DEFAULT_POLICY_PATH", Path(str(policy_path)))
+
+    ws = _with_manifest(workspace, "package.json")
+    attempt_id = _open(ws, "J-std4")
+    _stop_with_pending_install(ws, "J-std4", attempt_id, {
+        "kind": "install", "manifest": "package.json",
+        "change": {"dependencies": {"next": "16.4.3"}},
+    })
+    # Judge FIRST (no lock held yet -> "waiting_owner"), then a live
+    # driver grabs the lock before this function actually acts on that
+    # verdict -- the same race maybe_resume's own "skipped_locked"
+    # check exists for.
+    record = watch.judge_app(ws.ledger, "alpha").__dict__
+    assert record["verdict"] == "waiting_owner"
+    assert ws.ledger.acquire_lock("alpha", "driver-x", pid=os.getpid())
+
+    outcome = watch_ops.maybe_standing_approve(ws.config, ws.ledger, "alpha",
+                                               lambda attempt: None, record)
+    assert outcome == "skipped_locked"
 
 
 # ---------------------------------------------------------------------

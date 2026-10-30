@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from engine.domain.install_request_shape import install_request_shape_text
+from engine.domain.install_request_shape import (
+    NON_INSTALL_PENDING_KINDS,
+    install_request_shape_text,
+)
 from engine.domain.plan_model import SCENES_PREFIX
 from engine.infrastructure.workers.base import WorkerSpec
 
@@ -89,7 +92,21 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
     request built exactly as instructed here is guaranteed to pass that
     check, by construction -- 결함 58, where this always described
     add_lines even for a .json manifest, whose gate only ever accepts
-    a dependency section and rejected every such request)."""
+    a dependency section and rejected every such request).
+
+    결함 65 (same root as 결함 58): this used to describe ONLY the
+    "install" kind, even though engine.application.owner_approval.
+    PENDING_KIND_WHITELIST also accepts "scripts_change"/
+    "test_config_change" for a manifest edit that is not a dependency
+    bump (e.g. a package.json "scripts" entry) -- a worker with no
+    instructed shape for that filed it as "install" instead, which
+    validate_pending rejects by construction (an "install" kind's
+    `change` may only touch a dependency section). The instruction now
+    also names "scripts_change"/"test_config_change" and their shape
+    (install_request_shape_text(manifest, kind=...) for each of
+    NON_INSTALL_PENDING_KINDS), still from the SAME shared module as
+    the "install" shape, so a worker's choice of kind stays correct by
+    construction too."""
     prefixes_text = ", ".join(allowed_prefixes) if allowed_prefixes else "(none)"
     patterns_text = ", ".join(terminal_patterns) if terminal_patterns else "(none)"
     test_text = (
@@ -97,6 +114,12 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
         f"{' '.join(test_cmd)}\n" if test_cmd else ""
     )
     install_request_shape = install_request_shape_text(manifest)
+    non_install_shapes = "; or ".join(
+        f'kind="{kind}" (for a manifest edit that is NOT a package '
+        f"version bump, e.g. a build/start/test script): "
+        f"{install_request_shape_text(manifest, kind=kind)}"
+        for kind in NON_INSTALL_PENDING_KINDS
+    )
     return (
         f"{spec.task}\n\n"
         f"{test_text}"
@@ -108,6 +131,8 @@ def build_prompt(spec: WorkerSpec, allowed_prefixes: tuple[str, ...],
         "a new dependency added to a manifest file you cannot write), do "
         "not try to edit that file yourself. Instead add an entry to "
         f'"requests" in your final JSON shaped like: {install_request_shape}\n'
+        f"For any OTHER manifest edit you cannot write yourself, use "
+        f"{non_install_shapes}\n"
         f"{_FINAL_JSON_INSTRUCTION}"
     )
 

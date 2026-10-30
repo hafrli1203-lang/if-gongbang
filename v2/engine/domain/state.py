@@ -22,6 +22,19 @@ class TransitionError(Exception):
     """Input not allowed in the current state."""
 
 
+class ProjectOpenError(TransitionError):
+    """Raised by a pre-check BEFORE any ledger write when a caller tries
+    to open a fresh job (`open_with_intent`) while the project is not
+    CLOSED -- a different job is still active. Deliberately a distinct
+    subclass of TransitionError (never raised by `transition`/`open_job`
+    themselves, which keep their own generic TransitionError for the
+    guards they already had) so a caller that wants to turn ONLY this
+    specific, pre-write rejection into a friendly message can catch it
+    without also swallowing `open_job`'s own "project_busy"/queued-
+    requests refusals, which still mean something went wrong mid-write
+    and should surface as-is."""
+
+
 def _has_unknown_request(ledger: Ledger, project: str) -> bool:
     """True iff some request submitted for this project currently has
     status 'unknown'. Walks request.submitted events rather than a direct

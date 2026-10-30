@@ -313,15 +313,17 @@ def test_gb2_new_against_an_empty_folder_installs_for_real_and_ships(
     # dependency install (engine.bootstrap.ensure_installed, no
     # node_modules/marker yet) -> the full orbit (facts -> plan ->
     # build -> review -> bench -> acceptance -> app_security -> report)
-    # -> stops needs_owner/release_approval (a release track is
-    # configured, nothing ships itself).
+    # -> Policy (no approval stops): 운영자
+    # 승인(release_approval)에서 멈추지 않고 engine.application.
+    # auto_pilot.auto_settle이 그 자리에서 바로 "승인 <request_id>"를
+    # 합성해 release.approve_and_run을 불러 실제 배포까지 같은 호출
+    # 안에서 끝낸다 -- 사람 입력 없이 처음부터 배포까지 끝까지 간다.
     new_result = _run_gb2(
         ["new", _APP, _REQUEST, "--with-release", "--job-name", _JOB_NAME], env,
     )
-    assert new_result.returncode == 2, (new_result.stdout, new_result.stderr)
+    assert new_result.returncode == 0, (new_result.stdout, new_result.stderr)
     new_summary = json.loads(new_result.stdout)
-    assert new_summary["status"] == "needs_owner", new_summary
-    assert new_summary["reason"] == "release_approval", new_summary
+    assert new_summary["status"] == "done", new_summary
 
     source_repo = apps_root / _APP
     app_repo = workspace / "apps" / _APP / "repo"
@@ -359,27 +361,20 @@ def test_gb2_new_against_an_empty_folder_installs_for_real_and_ships(
     # requirement tracking end to end, not just a pass/fail string.
     assert "R1" in report_text
 
-    assert not deploy_log.exists()  # release still pending `gb2 ship`
+    # auto_settle already approved and ran the job's one publish
+    # request, in this SAME `gb2 new` call -- no separate `gb2 status`/
+    # `gb2 ship` needed (and `gb2 status` would now show no queued
+    # publish request left at all).
+    assert deploy_log.exists()
+    deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()
+    assert len(deploy_lines) == 1, deploy_lines  # the fake deploy script ran exactly once
 
-    # -- `gb2 status greeter` -- exactly one queued publish request.
     status_result = _run_gb2(["status", _APP], env)
     assert status_result.returncode == 0, (status_result.stdout, status_result.stderr)
     status_json = json.loads(status_result.stdout)
+    assert status_json["state"] == "CLOSED"
     publish_requests = [r for r in status_json["queued_requests"] if r["kind"] == "publish"]
-    assert len(publish_requests) == 1
-    request_id = publish_requests[0]["request_id"]
-
-    # -- a REAL `gb2 ship greeter`, typing "승인 R-..." into a real pty.
-    ship_result = _run_gb2_with_approval(["ship", _APP], env, f"승인 {request_id}")
-    assert ship_result.returncode == 0, (ship_result.stdout, ship_result.stderr)
-    ship_summary = json.loads(ship_result.stdout)
-    assert ship_summary["status"] == "done"
-    assert ship_summary["publish"]["status"] == "done"
-
-    # The fake deploy script ran exactly once.
-    assert deploy_log.exists()
-    deploy_lines = deploy_log.read_text(encoding="utf-8").splitlines()
-    assert len(deploy_lines) == 1, deploy_lines
+    assert publish_requests == []
 
 
 def test_ci_engine_node_e2e_job_runs_t3_t4_and_t5() -> None:

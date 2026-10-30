@@ -457,6 +457,7 @@ def _setup_app_workspace(app: str, with_release: bool) -> EngineConfig:
             sandbox_mode=config.sandbox,
             hidden_paths=(config.home, config.secrets_dir,
                          config.ledger_path.parent),
+            protected_roots=(config.secrets_dir,),
         )
         record_bootstrap(ledger, app, bootstrap_result)
         if not bootstrap_result.ok:
@@ -657,3 +658,38 @@ def cmd_new(args: argparse.Namespace) -> int:
 
     job_name = args.job_name or f"gb2-new-{int(time.time())}"
     return shared.run_full_job_and_report(args, config, job_name, request, new_app_marker=marker)
+
+
+def sync_work_branch_if_behind(app: str) -> dict:
+    """Before a job opens (observed on a live job: the
+    gb2/work worktree sat 6 commits behind master and the builder re-did
+    fixes master already had): when the app worktree is clean and its
+    HEAD is behind the recorded base branch, rebase it onto that base --
+    the same `git rebase <base>` `gb2 sync` runs. Returns a small dict
+    for the caller's summary: {"synced": bool, "behind": int, "reason":
+    str|None}. A dirty worktree or a failed rebase (aborted, nothing
+    changed) is reported, never raised -- the job then still opens on the
+    old base, with the reason printed so the owner sees why."""
+    import subprocess
+
+    repo_dir = shared.app_workspace(app) / "repo"
+    if not repo_dir.exists():
+        return {"synced": False, "behind": 0, "reason": "no_worktree"}
+    base = read_worktree_base(app)
+    try:
+        if shared.git(["status", "--porcelain"], cwd=repo_dir):
+            return {"synced": False, "behind": 0, "reason": "worktree_dirty"}
+        behind = int(shared.git(["rev-list", "--count", f"HEAD..{base}"], cwd=repo_dir) or "0")
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        return {"synced": False, "behind": 0, "reason": f"git_error:{type(exc).__name__}"}
+    if behind == 0:
+        return {"synced": False, "behind": 0, "reason": None}
+    try:
+        shared.git(["rebase", base], cwd=repo_dir)
+    except subprocess.CalledProcessError:
+        try:
+            shared.git(["rebase", "--abort"], cwd=repo_dir)
+        except subprocess.CalledProcessError:
+            pass
+        return {"synced": False, "behind": behind, "reason": "rebase_conflict"}
+    return {"synced": True, "behind": behind, "reason": None}

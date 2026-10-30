@@ -190,9 +190,19 @@ def test_crash_at_plan_review_boundary_then_continue_resumes_and_finishes(
 
 # ---- 3. security fix -------------------------------------------------------
 
-def test_crash_at_security_fix_boundary_then_continue_resumes_and_finishes(
+def test_security_check_failure_no_longer_stops_the_job_at_all(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Policy (no approval stops; a failed security check is
+    recorded and the job keeps going): this used to be a crash-
+    boundary test ("position.record.awaiting_security_fix" -- a crash
+    right as the STAGE_SECURITY_FIX stop was recorded, then resumed).
+    engine.application.pipeline_tasks.finish_after_handoff no longer
+    ever records that position for a new job at all -- a failed
+    security check is recorded ("security.auto_passed", confirm_source
+    ="auto") and bypassed in the SAME call, with nothing left to crash
+    at that boundary or resume from. One `run_full_job` call now goes
+    straight to "done"."""
     ws = _full_orbit_workspace(workspace)
     job_name = "flow-security-fix"
     plan_json = _plan_json(tasks=[
@@ -202,37 +212,33 @@ def test_crash_at_security_fix_boundary_then_continue_resumes_and_finishes(
     stub = _RunStationStub({
         "facts": [{f".gongbang/{job_name}/facts.md": "- 요청 확인: 통과 (출처: request)\n\n## 외부 대상\n(없음)\n"}],
         "plan": [_plan_queue_entry(job_name, plan_json)],
-        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}],
+        # one build for t1, then one per security-fix round (secfix-<n>);
+        # the check below never passes, so every round runs up to the cap.
+        "build": [{"src/greeter/extra1.py": "VALUE_1 = 1\n"}]
+                 + [{"src/greeter/extra1.py": f"VALUE_1 = 1  # fix {n}\n"} for n in range(1, 7)],
     })
     state = _install_fake_acceptance_and_handoff(monkeypatch, [
-        _FakeAcceptanceResult(passed=True), _FakeAcceptanceResult(passed=True),
+        _FakeAcceptanceResult(passed=True),
     ])
-    security_results = [False, True]
 
     def check(config, project, attempt_id, plan):
-        return _FakeSecurityResult(passed=security_results.pop(0))
+        return _FakeSecurityResult(passed=False)
 
     sys.modules["engine.app_security"].check = check  # type: ignore[attr-defined]
     factory = _processor_factory(stub)
 
-    _arm_and_crash(monkeypatch, "position.record.awaiting_security_fix", lambda: full_orbit.run_full_job(
+    done = full_orbit.run_full_job(
         ws.config, ws.ledger, _fakes(), "alpha", job_name, "파일 하나 만들어줘",
         processor_factory=factory,
-    ))
-
-    # Same "crash lands before the stop's own write" reasoning as
-    # probe-retry/plan-review: acceptance+handoff+the first (failing)
-    # security check all already ran before the crash; resume falls
-    # back to the pre-acceptance position and reruns acceptance ->
-    # handoff -> security fresh (STAGE_SECURITY_FIX's own resume always
-    # does, per _resume_acceptance's docstring), consuming this test's
-    # SECOND prepared acceptance result and security_results entry
-    # (True) -- one resume call goes straight to "done".
-    done = position.resume_job(ws.config, ws.ledger, _fakes(), "alpha", job_name,
-                               processor_factory=factory)
+    )
     assert done.status == "done", done
-    assert state.acceptance_calls == 2
-    assert security_results == []  # both prepared results consumed, none left over
+    assert state.acceptance_calls == 1
+    auto_passed = [e for _seq, e in ws.ledger.events("alpha", "security.auto_passed")]
+    assert len(auto_passed) == 1
+    assert auto_passed[0].payload["confirm_source"] == "auto"
+    # the fix-then-recheck rounds ran before the result was recorded and passed
+    from engine.application.pipeline_tasks import security_fix_rounds_used
+    assert security_fix_rounds_used(ws.ledger, "alpha", job_name) >= 1
 
 
 # ---- 4. design approval ----------------------------------------------------

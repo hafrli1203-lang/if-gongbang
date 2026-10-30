@@ -1,20 +1,21 @@
 """Running one scene's cmd (or the project's own full test_cmd) inside
-the bench sandbox against a disposable snapshot, and detecting a
-scene/full-suite stage that left the snapshot's own HEAD-tracked
-content mutated. See engine.application.acceptance's module docstring for why
-every stage gets its own fresh, disposable snapshot rather than
-running against the real repo.
+the bench sandbox against a disposable snapshot whose root is bound
+read-only, and detecting a scene/full-suite stage that left ANY entry
+of that snapshot -- tracked, untracked or ignored -- different from
+what it was right before the run (guarded_stage). See
+engine.application.acceptance's module docstring for why every stage
+gets its own fresh, disposable snapshot rather than running against
+the real repo.
 """
 from __future__ import annotations
 
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 from engine.config import EngineConfig
-from engine.infrastructure.gitutil import git_argv
+from engine.application.steps import suite_tree_guard as _tree_guard
 from engine.application.steps.suite_zero_tests import (
     looks_like_zero_tests_ran as _looks_like_zero_tests_ran,
 )
@@ -116,7 +117,7 @@ def run_scene(config: EngineConfig, project: str, attempt_id: str, repo: Path,
         argv = list(scene.cmd)
     returncode, tail = run_in_bench_sandbox(
         config, project, attempt_id, repo, argv, env, timeout_sec,
-        extra_readonly=extra_readonly)
+        extra_readonly=extra_readonly, root_readonly=True)
     if returncode == 0 and _looks_like_zero_tests_ran(tail):
         # An exit-0 scene
         # that executed zero actual tests/assertions must not pass --
@@ -141,39 +142,65 @@ def run_full_suite(config: EngineConfig, project: str, attempt_id: str,
         return False, -1, "no_test_cmd"
     returncode, tail = run_in_bench_sandbox(
         config, project, attempt_id, repo, list(test_cmd), env, timeout_sec,
-        extra_readonly=extra_readonly)
+        extra_readonly=extra_readonly, root_readonly=True)
     if returncode == 0 and _looks_like_zero_tests_ran(tail):
         return False, -1, "no_tests_executed"
     return returncode == 0, returncode, tail
 
 
-def tracked_mutated_paths(snapshot: Path) -> tuple[str, ...]:
-    """Relative paths in `snapshot`'s own `git status --porcelain -z
-    --untracked-files=all` that are NOT a bare untracked addition
-    (status "??") -- a scene creating a new scratch/output file is not
-    a mutation of the certified tree; a scene that edits, stages,
-    deletes or renames a path HEAD already tracks (bench_snapshot.
-    make_snapshot's own commit) is. Same call/rename-pair handling as
-    engine.application.steps.open_job.dirty_paths, filtered down to tracked
-    changes only."""
-    out = subprocess.run(
-        git_argv(snapshot, "status", "--porcelain", "-z", "--untracked-files=all"),
-        check=True, capture_output=True,
-    ).stdout
-    tokens = out.decode("utf-8", "surrogateescape").split("\0")
-    paths: list[str] = []
-    i = 0
-    while i < len(tokens):
-        entry = tokens[i]
-        i += 1
-        if not entry:
-            continue
-        status, rel = entry[:2], entry[3:]
-        tracked = status != "??"
-        if tracked:
-            paths.append(rel)
-        if status[0] in ("R", "C") and i < len(tokens) and tokens[i]:
-            if tracked:
-                paths.append(tokens[i])
-            i += 1
-    return tuple(paths)
+@dataclass(frozen=True)
+class StageIntegrity:
+    """What one stage's run was checked against, for evidence.
+    `tree` is make_snapshot's own verified HEAD^{tree} of the snapshot
+    the run executed in (equal to the certified fingerprint by
+    construction -- make_snapshot raises otherwise); `manifest_before`/
+    `manifest_after` are suite_tree_guard.manifest_digest of the whole
+    snapshot tree right before and right after the run; `changed`
+    lists every entry that differs (empty iff the run left the tree
+    exactly as it found it)."""
+    stage: str
+    tree: str
+    manifest_before: str
+    manifest_after: str
+    changed: tuple[str, ...]
+
+    @property
+    def mutated(self) -> bool:
+        return bool(self.changed)
+
+    def as_payload(self) -> dict[str, object]:
+        return {"stage": self.stage, "tree": self.tree,
+                "manifest_before": self.manifest_before,
+                "manifest_after": self.manifest_after,
+                "changed": list(self.changed[:_CHANGED_CAP]),
+                "changed_count": len(self.changed)}
+
+
+_CHANGED_CAP = 50
+_T = TypeVar("_T")
+
+
+def guarded_stage(snapshot: Path, stage: str, tree: str,
+                  run: Callable[[], _T]) -> tuple[_T, StageIntegrity]:
+    """Run `run()` (a no-argument callable executing one stage against
+    `snapshot`) between two whole-tree manifests: every directory of
+    the snapshot is made read-only first (suite_tree_guard.
+    lock_tree_dirs -- what blocks new entries under sandbox="none"; the
+    read-only root bind does it under bwrap), the manifest is taken,
+    the stage runs, the manifest is taken again, and the directories
+    are unlocked so the snapshot can later be removed. Returns
+    (run()'s own result, StageIntegrity)."""
+    _tree_guard.lock_tree_dirs(snapshot)
+    try:
+        before = _tree_guard.tree_manifest(snapshot)
+        result = run()
+        after = _tree_guard.tree_manifest(snapshot)
+    finally:
+        _tree_guard.unlock_tree_dirs(snapshot)
+    integrity = StageIntegrity(
+        stage=stage, tree=tree,
+        manifest_before=_tree_guard.manifest_digest(before),
+        manifest_after=_tree_guard.manifest_digest(after),
+        changed=_tree_guard.manifest_changes(before, after),
+    )
+    return result, integrity

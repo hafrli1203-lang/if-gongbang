@@ -149,9 +149,16 @@ OWNER_STOP_TABLE: dict[str, dict[str, object]] = {
                       "test_crash_at_requirements_review_boundary_then_continue_resumes_to_the_same_stop")],
     },
     job_state.STAGE_SECURITY_FIX: {
-        "command": "소스 수정 -> gb2 continue",
+        "command": "Policy (no approval stops): tools/gb2lib "
+                    "레벨(gb2 new/change/continue/fix)에서는 더 이상 이 자리에서 멈추지 "
+                    "않는다 -- engine.application.pipeline_tasks.finish_after_handoff가 "
+                    "실패를 기록하고 바로 진행한다. 이 STAGE/RESUME_TABLE 항목은 그 전에 "
+                    "이미 이 자리에서 멈춘 레거시 원장만을 위해 남아 있다: 소스 수정 -> "
+                    "gb2 continue",
         "evidence": [("tests.acceptance.test_t8_flow_boundary_stops",
-                      "test_crash_at_security_fix_boundary_then_continue_resumes_and_finishes")],
+                      "test_security_check_failure_no_longer_stops_the_job_at_all"),
+                     ("tests.unit.test_full_orbit",
+                      "test_security_fix_resume_without_a_moved_head_just_reruns_security")],
     },
     job_state.STAGE_RELEASE_APPROVAL: {
         "command": "gb2 ship(승인)/gb2 skip-ship(포기); publish가 unknown/중단된 "
@@ -286,7 +293,9 @@ def test_defect_45_and_46_regression_tests_pass_in_this_worktree() -> None:
     ]
     result = subprocess.run(
         [sys.executable, "-P", "-m", "pytest", "-q", *targets],
-        cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=300,
+        # 900s: under the full parallel suite (-n 8) this nested run hit the
+        # old 300s limit although it passes in seconds when run alone.
+        cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=900,
     )
     assert result.returncode == 0, (
         f"결함 45/46 regression test(s) failed:\n{result.stdout}\n{result.stderr}"

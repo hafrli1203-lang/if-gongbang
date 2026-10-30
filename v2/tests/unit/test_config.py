@@ -573,3 +573,114 @@ def test_reference_paths_other_projects_missing_entry_does_not_break_config_load
     }))
     assert config.projects["alpha"].reference_paths == ()
     assert config.projects["beta"].reference_paths == (tmp_path / "unreachable-for-beta",)
+
+
+def test_file_dep_targets_rejects_a_target_inside_secrets_dir(tmp_path: Path) -> None:
+    """a project's file_dep_targets remaps an
+    absolute host path READ-ONLY into a worker/bench sandbox at a
+    DIFFERENT, aliased location (engine.application.steps.file_deps.
+    sandbox_file_dep_pairs) -- unlike bench_readonly_paths, that remap
+    had no overlap check of its own at all, so a target pointing
+    inside secrets_dir (the one place the office-approval HMAC key now
+    always lives) would re-expose it through the alias even though the
+    real secrets_dir path stays hidden everywhere else."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    secrets_dir = (tmp_path / "secrets").resolve()
+    bad = _write_config(tmp_path, {
+        "projects": {"alpha": {
+            "repo": "repo",
+            "file_dep_targets": [["../_shared/kit", str(secrets_dir / "office-approval.key")]],
+        }},
+    })
+    try:
+        EngineConfig.from_json(bad)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "file_dep_target_forbidden_overlap" in str(exc)
+
+
+def test_file_dep_targets_rejects_a_target_above_secrets_dir(tmp_path: Path) -> None:
+    """Same rule, other direction: a target at or ABOVE secrets_dir
+    (e.g. its parent) would remap everything under secrets_dir too,
+    not only a target strictly inside it."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    bad = _write_config(tmp_path, {
+        "projects": {"alpha": {
+            "repo": "repo",
+            "file_dep_targets": [["../_shared/kit", str(tmp_path)]],
+        }},
+    })
+    try:
+        EngineConfig.from_json(bad)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "file_dep_target_forbidden_overlap" in str(exc)
+
+
+def test_file_dep_targets_allows_a_target_under_the_same_root_as_the_ledger(
+    tmp_path: Path,
+) -> None:
+    """A target BELOW ledger_path.parent (not AT/ABOVE it, and not
+    inside secrets_dir) is ordinary and expected -- e.g. a real
+    deployment's apps all living under the same root the ledger does
+    (tests/acceptance/test_t13_file_dep_real_sandbox.py's own layout).
+    Only home/ledger_path.parent/real_home's one-directional rule
+    (bench_readonly_paths') and secrets_dir's stricter bidirectional
+    one apply here -- not "everywhere under the config's own base
+    directory"."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    shared = tmp_path / "shared" / "kit"
+    config = EngineConfig.from_json(_write_config(tmp_path, {
+        "projects": {"alpha": {
+            "repo": "repo",
+            "file_dep_targets": [["../_shared/kit", str(shared)]],
+        }},
+    }))
+    assert config.projects["alpha"].file_dep_targets == (("../_shared/kit", str(shared)),)
+
+
+def test_file_dep_targets_rejects_a_dotdot_path_that_resolves_into_secrets_dir(
+    tmp_path: Path,
+) -> None:
+    """a target spelled with a "../" component
+    that LOOKS like it stays outside secrets_dir, but actually resolves
+    (os.path.realpath) straight into it, must be refused exactly like
+    the direct spelling already is -- a plain, un-normalized Path
+    comparison missed this."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    secrets_dir = (tmp_path / "secrets").resolve()
+    secrets_dir.mkdir()
+    sneaky_target = tmp_path / "shared" / ".." / "secrets" / "office-approval.key"
+    bad = _write_config(tmp_path, {
+        "projects": {"alpha": {
+            "repo": "repo",
+            "file_dep_targets": [["../_shared/kit", str(sneaky_target)]],
+        }},
+    })
+    try:
+        EngineConfig.from_json(bad)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "file_dep_target_forbidden_overlap" in str(exc)
+
+
+def test_bench_readonly_paths_rejects_an_entry_inside_secrets_dir(
+    tmp_path: Path,
+) -> None:
+    """the previous check only forbade an entry
+    AT OR ABOVE secrets_dir -- an entry strictly INSIDE it (e.g. the
+    office-approval key file itself) was allowed through, and
+    suite_run.py's own bench sandbox would then re-expose it read-only
+    despite secrets_dir being hidden."""
+    make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    secrets_dir = (tmp_path / "secrets").resolve()
+    secrets_dir.mkdir()
+    bad = _write_config(tmp_path, {
+        "projects": {"alpha": {"repo": "repo"}},
+        "bench_readonly_paths": [str(secrets_dir / "office-approval.key")],
+    })
+    try:
+        EngineConfig.from_json(bad)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "bench_readonly_path_forbidden" in str(exc)

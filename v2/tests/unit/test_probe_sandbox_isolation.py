@@ -16,9 +16,11 @@ from engine import sandbox
 from engine.acceptance import run_probe_scripts
 from engine.steps.open_job import open_job
 from tests.conftest import Workspace
+from tests.probe_target import contacting_py_script, serve_target
+from tests.security_gate import bwrap_skipif
 
-_needs_bwrap = pytest.mark.skipif(
-    not sandbox.available(), reason="bwrap not available on this host",
+_needs_bwrap = bwrap_skipif(
+    sandbox.available(), reason="bwrap not available on this host",
 )
 
 
@@ -37,17 +39,16 @@ def test_probe_writing_a_relative_path_lands_in_the_snapshot_not_the_repo(
     attempt_id = _open(workspace)
     probe_dir = workspace.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.py").write_text(
-        "from pathlib import Path\n"
-        "Path('pwned.txt').write_text('pwned')\n"
-        "print('PROBE OK https://docs.stripe.com/api')\n",
-        encoding="utf-8",
-    )
-
-    results = run_probe_scripts(
-        workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
-        [("stripe", "https://docs.stripe.com/api")],
-    )
+    with serve_target() as url:
+        (probe_dir / "t1.py").write_text(
+            "from pathlib import Path\n"
+            "Path('pwned.txt').write_text('pwned')\n" + contacting_py_script(url),
+            encoding="utf-8",
+        )
+        results = run_probe_scripts(
+            workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
+            [("stripe", url)],
+        )
 
     assert results[0].ok is True
     assert not (workspace.alpha / "pwned.txt").exists()
@@ -175,20 +176,20 @@ def test_two_targets_each_get_their_own_snapshot_one_cannot_rewrite_the_others(
     attempt_id = _open(workspace)
     probe_dir = workspace.alpha / ".gongbang" / "job1" / "probe"
     probe_dir.mkdir(parents=True)
-    (probe_dir / "t1.py").write_text(
-        "from pathlib import Path\n"
-        "Path('t2.py').write_text(\"print('PROBE OK https://api.slack.com/web')\\n\")\n"
-        "print('PROBE OK https://docs.stripe.com/api')\n",
-        encoding="utf-8",
-    )
     (probe_dir / "t2.py").write_text(
         "print('legit t2 script, never patched by t1')\n", encoding="utf-8",
     )
-
-    results = run_probe_scripts(
-        workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
-        [("stripe", "https://docs.stripe.com/api"), ("slack", "https://api.slack.com/web")],
-    )
+    with serve_target() as url:
+        (probe_dir / "t1.py").write_text(
+            "from pathlib import Path\n"
+            "Path('t2.py').write_text(\"print('PROBE OK https://api.slack.com/web')\\n\")\n"
+            + contacting_py_script(url),
+            encoding="utf-8",
+        )
+        results = run_probe_scripts(
+            workspace.config, workspace.ledger, "alpha", attempt_id, "job1",
+            [("stripe", url), ("slack", "https://api.slack.com/web")],
+        )
 
     assert results[0].ok is True
     # If t1 and t2 shared one snapshot, t1's write would have replaced
