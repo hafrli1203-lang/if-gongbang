@@ -74,6 +74,39 @@ jobs:
         with:
           name: engine-junit-${{ github.sha }}
           path: v2/engine-junit.xml
+  v3:
+    name: V3 worktree tools (syntax + scope-fence + land/retry + public-ready)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pytest pyyaml
+      - name: Shell syntax + Python compile check (no execution)
+        run: |
+          status=0
+          for f in v3/tools/*.sh v3/tools/wt-bin/npm; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || status=1
+          done
+          python3 -m py_compile v3/tools/wt-env.py harness/export_v3_public.py harness/public_ready_scan.py || status=1
+          python3 -c "import yaml, sys; yaml.safe_load(open('.github/workflows/tests.yml')); print('workflow YAML parses')"
+          exit $status
+      - name: Run v3 tests (scope fence negative test, land success/failure-revert/retry, public-ready scan)
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci
+          python -m pytest tests/test_v3_scope.py tests/test_v3_land.py tests/test_public_ready.py -q -rs -p no:cacheprovider --junitxml=v3-junit.xml
+      - name: Summary
+        if: always()
+        run: python .github/scripts/junit_summary.py v3-junit.xml "V3 worktree tools" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v3-junit-${{ github.sha }}
+          path: v3-junit.xml
+
   engine-node-e2e:
     name: V2 real gb2 CLI + Node template (scripted AI)
     runs-on: ubuntu-24.04

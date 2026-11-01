@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Generated from private source at 5b12eebee24334c8a78ac755dc179c5b1c3f0e47; do not edit by hand (see harness/export_v3_public.py).
+# PATH wrapper used inside work copies (wt-run.sh puts _shared/wt-bin first): node_modules is a symlink to the app's
+# own, so installing from a copy would change the running app's packages. Install-type commands are refused (exit 1);
+# everything else goes to the real tool found later on PATH. The same file serves npm, pnpm and yarn (symlinks).
+set -euo pipefail
+tool=$(basename "$0")
+self_dir=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+sub=""
+skip=0
+for a in "$@"; do   # first positional argument; value-taking flags (--prefix x, -C x, -w x) are skipped with their value
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in --prefix|-C|--cwd|-w|--workspace|--dir|--filter|-F) skip=1 ;; -*) ;; *) sub="$a"; break ;; esac
+done
+case "$tool:$sub" in
+  *:install|*:i|*:in|*:ins|*:inst|*:insta|*:instal|*:isnt|*:isnta|*:isntal|*:isntall|*:ci|*:clean-install|*:ic|*:install-clean|*:isntall-clean \
+  |*:install-test|*:it|*:install-ci-test|*:cit|*:clean-install-test|*:sit|*:add|*:remove|*:rm|*:r|*:un|*:uninstall|*:unlink \
+  |*:update|*:up|*:upgrade|*:udpate|*:dedupe|*:ddp|*:prune|*:link|*:ln|yarn:)
+    echo "작업 사본 안에서는 $tool ${sub:-install} 를 쓸 수 없습니다 — node_modules는 앱 폴더와 공유됩니다." >&2
+    echo "패키지가 필요하면 멈추고 반장에게 보고하세요(작업 지시서 「금지」)." >&2
+    exit 1 ;;
+esac
+IFS=: read -r -a dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  [ -n "$d" ] || continue
+  [ "$(cd "$d" 2>/dev/null && pwd)" = "$self_dir" ] && continue
+  if [ -x "$d/$tool" ] && [ ! -d "$d/$tool" ]; then exec "$d/$tool" "$@"; fi
+done
+echo "$tool 실행 파일을 찾지 못했습니다" >&2; exit 127
