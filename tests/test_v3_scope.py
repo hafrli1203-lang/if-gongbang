@@ -24,7 +24,7 @@ def copy(tmp_path):
     wt = tmp_path / "copy"
     wt.mkdir()
     git(str(wt), "init", "-q", "-b", "main")
-    git(str(wt), "config", "user.email", "t@example.com")
+    git(str(wt), "config", "user.email", "ci-test")
     git(str(wt), "config", "user.name", "t")
     (wt / "README.md").write_text("base\n")
     git(str(wt), "add", "README.md")

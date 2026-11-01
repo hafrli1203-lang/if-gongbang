@@ -58,9 +58,10 @@ ALLOWED_FILES = [
     ("review-gate.sh", "review-gate.sh"),
 ]
 # Explicitly excluded (plan 2026-11-01 "공개판 전에 로컬에서 먼저 고칠 것" / item B "제외"):
-#   app_facts.py (internal fact-card generator), work_claim.py (Markdown-line queue, AX OS
-#   does not match it), crew_metrics.py (depends on internal paths), ship.sh (REVIEW_GATE
-#   adapter target - documented in docs/v3-adapters.md as "adapter, stop if absent", not
+#   app_facts.py (internal fact-card generator), work_claim.py (Markdown-line queue, the
+#   private task tracker does not match it), crew_metrics.py (depends on internal paths),
+#   ship.sh (REVIEW_GATE adapter target - documented in docs/v3-adapters.md as "adapter, stop
+#   if absent", not
 #   extracted because it calls back into review-gate.sh's internal Codex/QA wiring that is
 #   itself out of scope here), kit/ (app-side library, not a worktree tool).
 
@@ -103,22 +104,22 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
         (re.compile(r'# Contract: _AGENCY_OS/plans/2026-11-01-wt-interface\.md\.'),
          "# Contract: docs/v3-wt-interface.md."),
         (re.compile(r' \(team-lead 11-01: 6 -> 8\)'), ""),
-        (re.compile(r'\(c-IFCOMPANYTOOL\)'), "(a copy made by hand)"),
-        (re.compile(r'\(drizzle-kit apps: sitefactory, YOUTUBEstudy\)'), "(drizzle-kit apps)"),
+        (re.compile(r'adopted hand-made copies \([^)]+\)'), "adopted hand-made copies"),
+        (re.compile(r'\(drizzle-kit apps: [^)]+\)'), "(drizzle-kit apps)"),
     ],
     "wt-new.sh": [
         (re.compile(r'src="/srv/apps/\$app"'), 'src="$WT_APPS_ROOT/$app"'),
         (re.compile(r'# Contract: _AGENCY_OS/plans/2026-11-01-wt-interface\.md[^\n]*'),
          "# Contract: docs/v3-wt-interface.md §1."),
-        (re.compile(r"sitefactory D-025"), "일부 앱"),
-        (re.compile(r'\(C crew 11-01, blogdesk·search\)'), "(두 앱에서 관찰됨)"),
-        (re.compile(r'\(env file TEST_DATABASE_URL, e\.g\. sitefactory_test: backup/forms\n  # roles\)'),
+        (re.compile(r'\(DATABASE_OWNER_URL, [^)]+\)'), "(DATABASE_OWNER_URL)"),
+        (re.compile(r'# root \([^)]+\)\. Same filesystem:'), "# root (observed on two apps). Same filesystem:"),
+        (re.compile(r'\(env file TEST_DATABASE_URL, e\.g\. [^:]+: backup/forms\n  # roles\)'),
          "(env file TEST_DATABASE_URL: roles granted there)"),
     ],
     "wt-run.sh": [
         (re.compile(r'src="/srv/apps/\$app"'), 'src="$WT_APPS_ROOT/$app"'),
         (re.compile(r'— contract: wt-interface\.md §2\.'), "— contract: docs/v3-wt-interface.md §2."),
-        (re.compile(r'so a copy never reports to the live AX OS, ledger or library\.'),
+        (re.compile(r'so a copy never reports to [^.]*ledger or library\.'),
          "so a copy never reports to a live internal service."),
     ],
     "wt-stop.sh": [
@@ -128,10 +129,11 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
         (re.compile(r'src="/srv/apps/\$app"'), 'src="$WT_APPS_ROOT/$app"'),
         (re.compile(r'ship_lock="/srv/data/_deploy-prev/\$app\.review/ship\.lock"'),
          'ship_lock="$WT_DEPLOY_STATE/$app.review/ship.lock"'),
-        (re.compile(r"opti-blog, ai-office, \.\.\."), "해당 앱 deploy.env에 DEPLOY_CMD가 있을 때"),
-        (re.compile(r"first unit 11-01: \" M next-env\.d\.ts\" stopped naverads"),
+        (re.compile(r"DEPLOY_CMD in deploy\.env: [^)]+\.\.\."), "DEPLOY_CMD in deploy.env"),
+        (re.compile(r'first unit 11-01: " M next-env\.d\.ts" stopped [^)\s]+'),
          'first observed: " M next-env.d.ts" stopped a land unexpectedly'),
-        (re.compile(r"\(perfads, sitefactory\)"), "(e.g. helpers kept under scripts/)"),
+        (re.compile(r"# helpers at the skill root or under scripts/ \([^)]+\)"),
+         "# helpers at the skill root or under scripts/ (app-dependent)"),
         (re.compile(r"— wt-interface\.md §5\."), "— docs/v3-wt-interface.md §5."),
         (re.compile(r'if \[ -z "\$self_deploy" \]; then'), 'if [ -z "$self_deploy" ]; then'),
         # ship.sh is an explicit adapter (REVIEW_GATE=1 apps): fail clearly if missing, not with
@@ -148,11 +150,12 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
         (re.compile(r'mkdir -p "/srv/backups/\$app"'), 'mkdir -p "$WT_BACKUPS/$app"'),
     ],
     "wt-gc.sh": [
-        # AX OS sqlite task-status lookup is an internal adapter. Public version: a configurable
-        # command (WT_TASK_STATUS_CMD <task-id> -> prints a status word on stdout), empty/unset
-        # means "unknown" - which this script already treats as "keep" (see case "$st" below).
+        # The private source's internal task-tracker sqlite lookup is an internal adapter.
+        # Public version: a configurable command (WT_TASK_STATUS_CMD <task-id> -> prints a
+        # status word on stdout), empty/unset means "unknown" - which this script already
+        # treats as "keep" (see case "$st" below).
         (re.compile(
-            r'OFFICE_DB="\$\{WT_OFFICE_DB:-/srv/data/ai-office/office\.sqlite\}"\nSTALE_SEC',
+            r'OFFICE_DB="\$\{WT_OFFICE_DB:-[^}]+\}"\nSTALE_SEC',
             re.S,
         ), 'STALE_SEC'),
         (re.compile(
@@ -164,15 +167,15 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
          '  $WT_TASK_STATUS_CMD "$1" 2>/dev/null || true\n'
          '}\n'),
         (re.compile(r"— wt-interface\.md §6\."), "— docs/v3-wt-interface.md §6."),
-        (re.compile(r"Run at AX OS start and nightly 03:30\."),
+        (re.compile(r"Run at \S+ \S+ start and nightly 03:30\."),
          "Run at session start and on a nightly schedule."),
-        (re.compile(r"its AX OS task \(task_id in \.wt\.json\) ended"), "its WT_TASK_STATUS_CMD task ended"),
-        (re.compile(r"\(landed, or discarded by AX OS\)"), "(landed, or discarded by the caller)"),
+        (re.compile(r"its \S+ \S+ task \(task_id in \.wt\.json\) ended"), "its WT_TASK_STATUS_CMD task ended"),
+        (re.compile(r"\(landed, or discarded by \S+ \S+\)"), "(landed, or discarded by the caller)"),
     ],
     "wt-adopt.sh": [
         (re.compile(r"\(no \.wt\.json\) so the limits, *\n"), "(no .wt.json) so the limits,\n"),
         (re.compile(r"— contract: wt-interface\.md §\?"), "— contract: docs/v3-wt-interface.md"),
-        (re.compile(r"\(c-IFCOMPANYTOOL\)"), "(a copy made by hand)"),
+        (re.compile(r'adopted hand-made copies \([^)]+\)'), "adopted hand-made copies"),
     ],
     "scope-check.sh": [
         (re.compile(r"— wt-interface\.md §4\."), "— docs/v3-wt-interface.md §4."),
@@ -182,7 +185,7 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
             r'INTERNAL_URL_KEYS = \("OS_URL", "LEDGER_URL", "LIBRARY_URL", "SEARCH_URL", "SEARCH_PUBLIC_URL"\)',
         ),
          'INTERNAL_URL_KEYS = tuple(k for k in os.environ.get("WT_INTERNAL_URL_KEYS", "").split(",") if k)'),
-        (re.compile(r"# Internal-app address keys: always pointed at a dead port in a copy \(code defaults like OS_URL=http://127\.0\.0\.1:3260 would\n# otherwise reach the live AX OS / ledger / library\)\. Set even when the env file lacks them; nothing overrides them\."),
+        (re.compile(r"# Internal-app address keys: always pointed at a dead port in a copy \(code defaults like OS_URL=http://127\.0\.0\.1:\d+ would\n# otherwise reach the live \S+ \S+ / ledger / library\)\. Set even when the env file lacks them; nothing overrides them\."),
          "# Internal-app address keys (configured via WT_INTERNAL_URL_KEYS, comma-separated): always pointed at a dead\n"
          "# port in a copy, so a copy's own code defaults never reach a live internal service by accident.\n"
          "# Set even when the env file lacks them; nothing overrides them."),
@@ -191,13 +194,13 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
         (re.compile(r'LIVE_DATA = "/srv/data/"   # the apps\' live data root: a copy gets its own folder under <copy>/\.verify/data/<KEY>'),
          'LIVE_DATA = os.environ.get("WT_LIVE_DATA_ROOT", "")   # the apps\' live data root (adapter, optional): a copy\n'
          "# gets its own folder under <copy>/.verify/data/<KEY> for any value under it; unset disables this relocation."),
-        (re.compile(r"an AX OS or foreman session"), "a calling session"),
-        (re.compile(r"\(AX OS, a shell\)"), "(a calling session, a shell)"),
+        (re.compile(r"an \S+ \S+ or foreman session"), "a calling session"),
+        (re.compile(r"\(\S+ \S+, a shell\)"), "(a calling session, a shell)"),
         (re.compile(r" \(11-01: /srv/data/<app> defaults\)"), ""),
     ],
     "deploy.sh": [
         (re.compile(r'dir="/srv/apps/\$app"'), 'dir="$WT_APPS_ROOT/$app"'),
-        (re.compile(r'HEAVY=/srv/apps/opti-blog/scripts/heavy\.sh.*\n'),
+        (re.compile(r'HEAVY=/srv/apps/[^/\s]+/scripts/heavy\.sh.*\n'),
          '# Memory-capped build wrapper (adapter, optional): WT_HEAVY_CMD "--mem <cap> --name <n> -- <cmd...>".\n'
          '# Unset: the build command below runs directly, without a memory cap (warning printed).\n'
          'HEAVY="${WT_HEAVY_CMD:-}"\n'),
@@ -213,22 +216,22 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
          '  IF_BUILD_DIR=.next-build NODE_OPTIONS="--max-old-space-size=$NODE_HEAP" npm run -s build || build_failed=1\n'
          'fi\n'
          'if [ "$build_failed" = 1 ]; then'),
-        (re.compile(r'# Common deploy for one Next\.js app \(G2 A2\), based on opti-blog scripts/deploy\.sh \(74 lines, incidents 09-18/09-24/10-14\)\.'),
+        (re.compile(r'# Common deploy for one Next\.js app \([^)]*\), based on [^(]*\([^)]*\)\.'),
          "# Common deploy for one Next.js app."),
         (re.compile(r' \(G2 A4, 2026-10-16\)'), ""),
-        (re.compile(r'HEALTH_HOST="100\.69\.210\.5:3225"'), 'HEALTH_HOST="<tailnet-host>:3225"'),
+        (re.compile(r'HEALTH_HOST="\d{1,3}(?:\.\d{1,3}){3}:3225"'), 'HEALTH_HOST="<tailnet-host>:3225"'),
         (re.compile(r'APP_DIR=/srv/apps/<app>/web \(Next project in a subfolder\)'),
          "APP_DIR=<path> (Next project in a subfolder)"),
-        (re.compile(r' \(lensoder: web/\)'), ""),
-        (re.compile(r'\(IFCOMPANYTOOL 0→152 errors shipped unnoticed\)'),
+        (re.compile(r' \([a-z0-9_-]+: web/\)'), ""),
+        (re.compile(r'\([A-Za-z0-9_-]+ 0→152 errors shipped unnoticed\)'),
          "(an app once shipped hundreds of new type errors unnoticed)"),
-        (re.compile(r'\(opti-blog 2026-10-17, owner "넣어라"\)'), "(observed once)"),
-        (re.compile(r'DEPLOY_CMD_DEPLOY/_CHECK/_ROLLBACK \(opti-blog\)\.'), "DEPLOY_CMD_DEPLOY/_CHECK/_ROLLBACK."),
+        (re.compile(r'\([a-z0-9_-]+ 2026-10-17, owner "넣어라"\)'), "(observed once)"),
+        (re.compile(r'DEPLOY_CMD_DEPLOY/_CHECK/_ROLLBACK \([a-z0-9_-]+\)\.'), "DEPLOY_CMD_DEPLOY/_CHECK/_ROLLBACK."),
     ],
     "review-gate.sh": [
         (re.compile(r'dir="/srv/apps/\$app"'), 'dir="$WT_APPS_ROOT/$app"'),
         (re.compile(r'state="/srv/data/_deploy-prev/\$app\.review"'), 'state="$WT_DEPLOY_STATE/$app.review"'),
-        (re.compile(r"\(perfads first; other apps later\)"), "(enable per app, incrementally)"),
+        (re.compile(r"\([a-z0-9_-]+ first; other apps later\)"), "(enable per app, incrementally)"),
     ],
     "wt-bin/npm": [],
 }

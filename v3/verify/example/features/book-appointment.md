@@ -31,5 +31,4 @@ Preconditions:
 ## Gotchas
 
 - TODO: note any duplicate labels on the same screen that need scoping to a specific form, the
-  way a real feature file would (see naverplace's store-add.md for the pattern this template
-  is based on).
+  way a real app's own verify-<app> feature file should.

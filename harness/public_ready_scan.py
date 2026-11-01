@@ -30,7 +30,15 @@ GENERIC = [
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
 ]
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
-SKIP_FILES = {"test_public_ready.py", "public_ready.local.txt", "public_ready.local.example.txt"}
+# export_v3_public.py's whole job is to encode the EXACT "before" text of a private source
+# commit (file paths, example app names, a comment's internal nickname) so it can find and
+# replace it with a public, parameterized equivalent - the same reason a redaction tool's own
+# source legitimately contains the shape of what it redacts. Its *output* (v3/tools/) is what
+# this scanner (and the "leftover identifiers" check in that script itself) verifies instead.
+SKIP_FILES = {
+    "test_public_ready.py", "public_ready.local.txt", "public_ready.local.example.txt",
+    "export_v3_public.py",
+}
 
 
 def load_list(root: str) -> list[str]:

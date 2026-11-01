@@ -49,7 +49,7 @@ def harness(tmp_path):
     src = apps_root / app
     src.mkdir()
     git(str(src), "init", "-q", "-b", "main")
-    git(str(src), "config", "user.email", "t@example.com")
+    git(str(src), "config", "user.email", "ci-test")
     git(str(src), "config", "user.name", "t")
     (src / "README.md").write_text("hello\n")
     git(str(src), "add", "README.md")

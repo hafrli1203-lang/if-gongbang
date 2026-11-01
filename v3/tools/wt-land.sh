@@ -64,7 +64,7 @@ run() {  # mutating step: printed under --dry, executed otherwise
   if [ "$dry" = 1 ]; then say "(dry) 실행할 것: $*"; return 0; fi
   say "\$ $*"; "$@"
 }
-# Apps with their own deploy (DEPLOY_CMD in deploy.env: 해당 앱 deploy.env에 DEPLOY_CMD가 있을 때) have their own exit codes and rollback
+# Apps with their own deploy (DEPLOY_CMD in deploy.env) have their own exit codes and rollback
 # meanings, so a failed land could not be undone reliably (Codex review 11-01, twice). They are refused before anything moves.
 self_deploy=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${DEPLOY_CMD:-}${DEPLOY_CMD_DEPLOY:-}"' _ "$src/deploy.env" 2>/dev/null || true)
 [ -z "$self_deploy" ] || WT_EXIT=2 wt_die "자체 배포 앱(DEPLOY_CMD)은 wt-land가 합치지 않습니다 — 반장이 앱 자체 배포로 합치고 배포합니다: $app"
@@ -213,7 +213,7 @@ restart_workers() {  # every enabled ${WT_UNIT_PREFIX:-ifapp}-<app>-*.service ex
 post_verify_run() {
   local skill="$wt/.claude/skills/verify-$app" h journey ev out
   post_verify=skipped; post_evidence=""
-  h="$skill"; [ -f "$h/launch.sh" ] || h="$skill/scripts"   # helpers at the skill root or under scripts/ (e.g. helpers kept under scripts/)
+  h="$skill"; [ -f "$h/launch.sh" ] || h="$skill/scripts"   # helpers at the skill root or under scripts/ (app-dependent)
   if [ ! -d "${WT_APPS_ROOT}/$app/.claude/skills/verify-$app" ] || [ ! -f "$h/launch.sh" ] || [ ! -f "$h/doctor.sh" ] || [ ! -f "$h/drive.mjs" ]; then
     say "6b) 배포 뒤 확인 — verify-$app 스킬 없음: deploy.sh 응답 확인만"; return 0
   fi

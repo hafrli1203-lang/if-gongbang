@@ -86,7 +86,7 @@ for p in '.next-wt*/' '.verify/' '.wt.json' '.wt.json.tmp' '.wt.scope' '.wt.done
 done
 flock -u 6; exec 6>&-
 # node_modules: hard-link copy, not a symlink — Next 16/Turbopack refuses a node_modules symlink pointing out of the project
-# root (두 앱에서 관찰됨). Same filesystem: almost no disk, seconds. Other filesystem: rsync --link-dest.
+# root (observed on two apps). Same filesystem: almost no disk, seconds. Other filesystem: rsync --link-dest.
 if [ -d "$src/node_modules" ]; then
   cp -al "$src/node_modules" "$wt/node_modules" 2>/dev/null \
     || { rm -rf -- "$wt/node_modules"; rsync -a --link-dest="$src/node_modules/" "$src/node_modules/" "$wt/node_modules/"; } \
@@ -111,7 +111,7 @@ if [ -n "$envf" ] && python3 "$WT_ENVPY" has --env-file "$envf"; then
   db="${app}_wt${slot}_test"
   exists=$(wt_pg_admin postgres psql -XtAqc "select 1 from pg_database where datname = '$db'")
   [ "$exists" = 1 ] || wt_die "시험 DB가 없습니다: $db (풀 생성 필요)"
-  # apps with a separate migration role (DATABASE_OWNER_URL, 일부 앱): public belongs to that role, and its
+  # apps with a separate migration role (DATABASE_OWNER_URL): public belongs to that role, and its
   # migrate command connects with it (wt-env.py maps DATABASE_OWNER_URL to the slot DB with the owner's credentials)
   if python3 "$WT_ENVPY" has --env-file "$envf" --key DATABASE_OWNER_URL; then
     owner=$(python3 "$WT_ENVPY" user --env-file "$envf" --key DATABASE_OWNER_URL)

@@ -18,7 +18,7 @@ wt_check_name() {  # $1 kind, $2 value
   case "$1" in
     app) [[ "$2" =~ ^[A-Za-z0-9._-]+$ ]] && [ -d "$WT_APPS_ROOT/$2/.git" ] || wt_die "앱 이름이 이상하거나 git 저장소가 아닙니다: $2" ;;
     name) [[ "$2" =~ ^[a-z0-9-]+$ ]] || wt_die "사본 이름은 [a-z0-9-]+ 만: $2" ;;
-    existing) [[ "$2" =~ ^[A-Za-z0-9._-]+$ ]] || wt_die "사본 이름이 이상합니다: $2" ;;   # adopted hand-made copies (a copy made by hand)
+    existing) [[ "$2" =~ ^[A-Za-z0-9._-]+$ ]] || wt_die "사본 이름이 이상합니다: $2" ;;   # adopted hand-made copies
   esac
 }
 
