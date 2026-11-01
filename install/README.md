@@ -34,6 +34,9 @@ cp -n gongbang.config.example.json gongbang.config.json
 - `extra_protected_hook_names`: 이 저장소 밖에 추가로 보호하고 싶은 자체 hook 파일 이름 목록
   (선택).
 - `work_queue_path`, `alerts_path`, `lessons_dir`, `library_root`: 각자 환경의 실제 경로.
+- `protected_paths`, `protected_exceptions`: `protect_sensitive_files.py`가 Read·Edit·Write·
+  MultiEdit·NotebookEdit·Bash 전체에서 차단할 파일 glob 패턴과 그 예외(예: `.env.example`은
+  항상 허용). 비밀값·키 파일 이름 규칙이 환경마다 다르면 이 두 목록만 고치면 된다.
 
 ## 2. hook 파일 배치
 
@@ -53,10 +56,11 @@ lesson_capture.py   (library_nudge.py가 이 파일의 clean_prompt/MAX_PROMPT_C
 library_nudge.py
 lesson_start.py
 approve_gate.py
-scope_guard.py       (block_dangerous.py가 이 파일의 파서 함수를 가져다 쓴다)
+scope_guard.py       (block_dangerous.py·protect_sensitive_files.py가 이 파일의 파서 함수를 가져다 쓴다)
 verify_claims.py
 preflight_gate.py
 block_dangerous.py
+protect_sensitive_files.py
 next_task.sh
 ```
 

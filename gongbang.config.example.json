@@ -12,5 +12,7 @@
   "transcripts_root": "~/.claude/projects",
   "log_dir": "~/.gongbang/logs",
   "preflight_mode": "warn",
-  "library_tool_name": "library_search"
+  "library_tool_name": "library_search",
+  "protected_paths": [".env", ".env.*", "*.pem", "*.key", "id_rsa*"],
+  "protected_exceptions": [".env.example", "*.sample"]
 }

@@ -92,6 +92,16 @@ DEFAULTS = {
         r"\bnpm\s+run\s+build\b", r"\b(pnpm|yarn)\s+build\b",
         r"\btsc\b", r"\bcargo\s+build\b", r"\bgo\s+build\b", r"\bgradle(w)?\s+build\b",
     ],
+    # fnmatch glob patterns protect_sensitive_files.py denies Read/Edit/Write/MultiEdit/
+    # NotebookEdit/Bash access to (checked against the raw path, its ~/$VAR-expanded form, and
+    # its basename - see that hook's module docstring). Not a hardcoded list in the hook itself,
+    # so a local install can widen it (an extra key-file extension, a site-specific secrets
+    # filename, ...) without a code change.
+    "protected_paths": [".env", ".env.*", "*.pem", "*.key", "id_rsa*"],
+    # Patterns that override protected_paths for the SAME path - an exception match always
+    # wins, so ".env.example" (which also matches the ".env.*" protected pattern) stays
+    # readable/writable.
+    "protected_exceptions": [".env.example", "*.sample"],
 }
 
 # Keys whose value must be a non-empty absolute path. A malformed or type-mismatched override
