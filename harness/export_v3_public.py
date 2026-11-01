@@ -56,6 +56,7 @@ ALLOWED_FILES = [
     ("wt-bin/npm", "wt-bin/npm"),
     ("deploy.sh", "deploy.sh"),
     ("review-gate.sh", "review-gate.sh"),
+    ("deploy-check.sh", "deploy-check.sh"),
 ]
 # Explicitly excluded (plan 2026-11-01 "공개판 전에 로컬에서 먼저 고칠 것" / item B "제외"):
 #   app_facts.py (internal fact-card generator), work_claim.py (Markdown-line queue, the
@@ -232,6 +233,13 @@ _RULES: dict[str, list[tuple[re.Pattern, str]]] = {
         (re.compile(r'dir="/srv/apps/\$app"'), 'dir="$WT_APPS_ROOT/$app"'),
         (re.compile(r'state="/srv/data/_deploy-prev/\$app\.review"'), 'state="$WT_DEPLOY_STATE/$app.review"'),
         (re.compile(r"\([a-z0-9_-]+ first; other apps later\)"), "(enable per app, incrementally)"),
+    ],
+    "deploy-check.sh": [
+        (re.compile(r'envf="/srv/apps/\$app/deploy\.env"'), 'envf="$WT_APPS_ROOT/$app/deploy.env"'),
+        (re.compile(r'# Reads /srv/apps/<app>/deploy\.env:'), "# Reads $WT_APPS_ROOT/<app>/deploy.env:"),
+        (re.compile(r'; e\.g\. "200 403" for apps that refuse loopback by design \([a-z0-9_-]+\)'),
+         '; e.g. "200 403" for an app that refuses a loopback request by design'),
+        (re.compile(r' \([a-z0-9_-]+: \d{1,3}(?:\.\d{1,3}){3}:PORT\)'), " (e.g. a specific tailnet address:PORT)"),
     ],
     "wt-bin/npm": [],
 }

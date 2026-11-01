@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 5b12eebee24334c8a78ac755dc179c5b1c3f0e47; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
 # Common deploy for one Next.js app.
 # Order is forced: busy check -> memory check -> quality gate -> build in a separate folder -> swap only on success
 # -> restart -> deploy-check -> automatic rollback if the check fails.

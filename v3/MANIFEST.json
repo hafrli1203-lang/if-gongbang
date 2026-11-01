@@ -1,19 +1,20 @@
 {
   "files": {
+    "deploy-check.sh": "89176c2d1a3145691f31b33cb5c723e176442664edda3c7a3540f1b7fd19b444",
     "deploy.sh": "6258de0e1f550a567a02bb7488b5cba956b2766614a670077fd614b7a2930e18",
     "review-gate.sh": "66b3aeb6050e0e8fe42040fca6bcc77d171772d54daaf97e22a1cda32a40bc76",
-    "scope-check.sh": "204a7a13d8b01770a18aa9e06507a30cc2a26d969cf819a973cacb013527ba70",
-    "wt-adopt.sh": "a1f4903431035513321ea14b943c7a6086b3f69991bffa733e3083f6d9ec2bb1",
+    "scope-check.sh": "557b1b08c3e745799eac27f12af4be0a5fec75a01b5491e2d2875dab25d2e3cc",
+    "wt-adopt.sh": "45e025905e4204c92d8f9627b88393e8812bc197c5a5d0edec2faecad01c05ff",
     "wt-bin/npm": "82306e1f0dd42c8940d178076450e26f418c906914a72bf6e18ac8bc08722af3",
     "wt-env.py": "22248080ecebd6a140a4930ce6f349f4f9f096047ceab45fdf3ea8e2f6faf4d5",
-    "wt-gc.sh": "6b2f8d6ec2279571bed1608dc296b8c52c03a887aa06d0baf029da320060d74f",
-    "wt-land.sh": "682608afef6ce66c0781b7bc972f240df77bc82c3b15d386e9c7120fc63590e9",
+    "wt-gc.sh": "244eeb38867aada5474cf23bab1cc3100a08bf4ff55633d005048cb70b298099",
+    "wt-land.sh": "24b9d950175064a927a90225dacae9d7eb2a461f3eec2e7e2730565471118ed0",
     "wt-lib.sh": "b17431b52ab8a3d420ca43ef63b3775ee91e1c0be0163ab9e9130204e944a1b0",
-    "wt-migrate.sh": "05a2359692aa575c59992cde785c8f8c1c3ed3fa149c348a9d676e1866f5b751",
-    "wt-new.sh": "34513d76a8344dc2dc167e099cec0ced77e4b04502e20c3eeaf25352ab2fa0d6",
-    "wt-run.sh": "a3482b8a622e7a945bc9725051e8286cde156d6a9154d83a3d29160842c44173",
-    "wt-stop.sh": "13436acaf633b466f2b02baa980b381a3e88aa4cb745396e602f9235604297dd"
+    "wt-migrate.sh": "80083e61347da327f8f3c79246955cd7b83adea4481cb16294c820a561cafcbd",
+    "wt-new.sh": "566184fdfc6c9c0fc19a6a14d292d5f608b58fb6394aff1ac822e70c25240cc7",
+    "wt-run.sh": "cb8bfa8ac6f16dab6ee3a47661d1ddcbd67fcf45f8767cde2f90a6b6b6cc0209",
+    "wt-stop.sh": "29b63b9e1ac7b09ba4e228c94c324b36fdf205184934a0bfb31c6d8f755fe995"
   },
   "rules_version": "1",
-  "source_commit": "5b12eebee24334c8a78ac755dc179c5b1c3f0e47"
+  "source_commit": "d72495d955c050e98c98a283b5521f31f3eff43a"
 }

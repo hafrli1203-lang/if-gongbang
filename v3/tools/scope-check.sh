@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 5b12eebee24334c8a78ac755dc179c5b1c3f0e47; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
 # scope-check.sh <copy> [--range <a>..<b>]
 # --range: check the files changed between two commits of the app repository instead of the copy (wt-land --retry).
 # Compares what the copy changed with its allowed paths (<copy>/.wt.scope, one glob per line, # comments) — docs/v3-wt-interface.md §4.
@@ -13,10 +13,13 @@
 # Run from a private copy (11-01 23:14: this file was edited while a live wt-land ran; bash reads a script as it goes and
 # died on the half-new text after the deploy, before push). The copy under $WT_DATA/.run is what executes.
 if [ -z "${WT_SELF:-}" ]; then
-  _run="${WT_DATA:?WT_DATA 환경변수가 필요합니다}/.run"; mkdir -p "$_run"
+  _run="${WT_DATA:?WT_DATA 환경변수가 필요합니다}/.run"; _orig="$(readlink -f "$0")"
+  mkdir -p "$_run" || { echo "실행 복사본 폴더를 만들 수 없습니다: $_run" >&2; exit 1; }
   find "$_run" -name '*.sh' -mmin +1440 -delete 2>/dev/null || true
-  _copy="$_run/$(basename "$0" .sh)-$$.sh"; cp "$(readlink -f "$0")" "$_copy"
-  WT_SELF="$(readlink -f "$0")" exec bash "$_copy" "$@"
+  _copy="$_run/$(basename "$0" .sh)-$$.sh"
+  # a failed or short copy would run an empty script and exit 0 (Codex 11-01): stop instead
+  { cp "$_orig" "$_copy" && cmp -s "$_orig" "$_copy"; } || { echo "실행 복사본을 만들 수 없습니다: $_copy" >&2; exit 1; }
+  WT_SELF="$_orig" exec bash "$_copy" "$@"
 fi
 _wt_self="$WT_SELF"; unset WT_SELF   # children (scope-check, wt-stop, ...) make their own copies
 set -euo pipefail

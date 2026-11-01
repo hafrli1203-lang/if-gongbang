@@ -4,11 +4,11 @@ no migrations/ files are touched, REVIEW_GATE stays unset (deploy.sh path, not s
 app ever registers a verify-<app> skill or a remote, so wt-land.sh's own code takes the
 "nothing to do" branch at each of those optional steps rather than skipping the test.
 
-Known gap (see docs/v3-adapters.md): the failure path also calls tools/deploy-check.sh, which
-is not part of this bundle (not in the private source's allow-listed file set either). Its
-absence here surfaces exactly as it would for anyone using this bundle without that script: a
-caught "bash: tools/deploy-check.sh: No such file or directory", the revert step still
-succeeds, and wt-land.sh still exits 5 - asserted below, not hidden.
+The failure path also calls the bundled tools/deploy-check.sh at the end, to confirm the
+rolled-back state answers again. This test's fake app has no deploy.env, so deploy-check.sh
+itself reports "FAIL no <path>/deploy.env" (its own, documented refusal) rather than actually
+probing a health path - the revert step still succeeds and wt-land.sh still exits 5 either way,
+asserted below.
 """
 import glob
 import json
@@ -127,8 +127,10 @@ def test_land_failure_reverts_source(harness):
     assert rec["deploy_rc"] == 1
     # the file the land added is gone again after the revert - the source is back to "init"
     assert not (harness["src"] / "allowed" / "a.txt").exists()
-    # known gap (see module docstring / docs/v3-adapters.md): deploy-check.sh is not bundled
-    assert "deploy-check.sh" in r.stdout or "응답 확인 실패" in r.stdout
+    # deploy-check.sh is bundled and runs for real; this fake app has no deploy.env, so it
+    # reports its own documented refusal rather than a probe result - either way the land
+    # script reports the outcome instead of crashing.
+    assert "응답 확인" in r.stdout
 
 
 def test_land_retry_after_failure_then_success(harness):

@@ -1,4 +1,4 @@
-# Generated from private source at 5b12eebee24334c8a78ac755dc179c5b1c3f0e47; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
 # shellcheck shell=bash
 # Shared helpers for the worktree tools (wt-new/run/stop/land/gc/migrate, scope-check). Sourced, never run.
 # Contract: docs/v3-wt-interface.md. Database URLs and env values are never printed:
