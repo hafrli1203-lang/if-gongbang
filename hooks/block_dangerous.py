@@ -11,8 +11,19 @@ not (the literal substring never appears). structural_block() below reuses scope
 own shell tokenizer/segment-splitter/first-command finder (one parser shared by both hooks -
 see scope_guard.py's module docstring) to walk git/rm's actual option grammar, so option order
 and splitting cannot change the answer. The plain regex list stays as a second, independent
-layer for everything else (DB commands, mkfs, dd, chmod, curl|sh, secret echo, process kills),
-where option-reordering is not a realistic concern.
+layer for everything else (DB commands, mkfs, dd, chmod, curl|sh, secret echo), where
+option-reordering is not a realistic concern.
+
+pkill/killall are hard-blocked the SAME structural way (see _pkill_killall_hit below), not by
+a plain regex: scope_guard.py's SIMPLE_PROGRAM_GATES already treats a bare "pkill"/"killall" as
+approval-gated (reversible with "승인 <TASK>"), but this hook's local operating rule is that
+process kills are never approvable at all, so structural_block() recognizes pkill/killall as
+the actual command being run - including behind any command-runner prefix chain (sudo, env,
+nice, ...), after a pipe/`;`/`&&` segment separator, and regardless of option order/splitting -
+and blocks it outright. A bare mention of the word "pkill"/"killall" inside another command's
+own argument (a quoted echo string, a grep pattern, a comment) is never flagged, because only
+the segment's ACTUAL first command is checked, the same convention scope_guard.py already uses
+everywhere else in this codebase.
 """
 import json
 import os
@@ -166,11 +177,29 @@ def _positional_args(tokens: list[str]) -> list[str]:
     return out
 
 
+def _pkill_killall_hit(segment: list[str]) -> str | None:
+    """pkill/killall, run directly OR behind any command-runner prefix chain (including sudo -
+    reuses scope_guard's own _skip_prefix_chain so option order/splitting in the prefix cannot
+    hide it), are hard-blocked outright - not merely approval-gated (scope_guard.py's
+    SIMPLE_PROGRAM_GATES already gates them behind "승인 <TASK>" as a reversible action; this is
+    the separate, never-approvable layer PSTACK_KO.md's "모든 pkill·killall 금지" requires).
+    A bare mention inside a quoted string ("echo 'do not pkill this'") is never flagged, because
+    _skip_prefix_chain only recognizes pkill/killall as the actual command being run (the first
+    token of the segment after assignments/prefixes), not a word appearing anywhere in the text."""
+    name, _, prefixes = _sg._skip_prefix_chain(segment)
+    if name in ("pkill", "killall"):
+        return f"{name}: 프로세스 강제 종료는 항상 금지(승인으로도 허용하지 않음)"
+    return None
+
+
 def structural_block(command: str) -> str | None:
     tokens = _sg._tokenize(command)
     if tokens is None:
         return None  # malformed quoting: BLOCKED_PATTERNS below is the fallback layer
     for segment in _sg._split_segments(tokens):
+        pk = _pkill_killall_hit(segment)
+        if pk:
+            return pk
         git = _git_subcommand_and_rest(segment)
         if git:
             subcmd, rest = git

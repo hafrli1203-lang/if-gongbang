@@ -161,3 +161,62 @@ def test_main_fails_closed_on_internal_error(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hi"}})))
     code = bd.main()
     assert code == 2
+
+
+# --- pkill/killall: hard-blocked outright (never approval-gated), via the shared command-token
+# parser - option order/splitting, a sudo/prefix chain, and pipe/&&-chained position must not
+# hide it; a bare mention inside a quoted argument must NOT be flagged. ----------------------
+
+def test_plain_pkill_is_blocked():
+    reason, _ = bd.check("pkill node")
+    assert reason is not None
+
+
+def test_plain_killall_is_blocked():
+    reason, _ = bd.check("killall python3")
+    assert reason is not None
+
+
+def test_pkill_with_option_before_target_is_blocked():
+    reason, _ = bd.check("pkill -f server.py")
+    assert reason is not None
+
+
+def test_pkill_behind_sudo_is_blocked():
+    reason, _ = bd.check("sudo pkill node")
+    assert reason is not None
+
+
+def test_killall_behind_sudo_with_option_is_blocked():
+    reason, _ = bd.check("sudo -u root killall -9 python3")
+    assert reason is not None
+
+
+def test_killall_reordered_options_is_blocked():
+    reason, _ = bd.check("killall -v -9 myproc")
+    assert reason is not None
+
+
+def test_pkill_behind_nice_prefix_is_blocked():
+    reason, _ = bd.check("nice -n 5 pkill node")
+    assert reason is not None
+
+
+def test_pkill_after_pipe_segment_is_blocked():
+    reason, _ = bd.check("ps aux | pkill -f foo")
+    assert reason is not None
+
+
+def test_killall_after_and_chain_is_blocked():
+    reason, _ = bd.check("echo hi && killall node")
+    assert reason is not None
+
+
+def test_pkill_mentioned_inside_quoted_echo_is_not_blocked():
+    reason, warn = bd.check("echo 'do not pkill this process'")
+    assert reason is None
+
+
+def test_killall_mentioned_as_grep_argument_is_not_blocked():
+    reason, warn = bd.check("grep -r killall scripts/")
+    assert reason is None
