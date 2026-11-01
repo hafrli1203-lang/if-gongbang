@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy this file to export_v3_private.json (gitignored - never commit it) and fill in the REAL paths for the machine export_v3_public.py is run on. Every value below is a placeholder, safe to commit.",
+  "src_apps_root": "<path to the folder that holds every app's own git checkout>",
+  "src_data_root": "<path to the folder used for work-copy logs, locks and test-DB slot bookkeeping>",
+  "src_backups_root": "<path to the folder used for pre-migration pg_dump backups>",
+  "src_deploy_state_root": "<path to the folder used for deploy locks and review-gate state>",
+  "src_admin_env": "<path to an env file whose DATABASE_URL is a postgres role allowed to create/drop test databases>",
+  "src_unit_prefix": "<systemd service-name prefix this host's apps use, e.g. myapp>"
+}

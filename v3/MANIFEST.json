@@ -15,6 +15,6 @@
     "wt-run.sh": "cb8bfa8ac6f16dab6ee3a47661d1ddcbd67fcf45f8767cde2f90a6b6b6cc0209",
     "wt-stop.sh": "29b63b9e1ac7b09ba4e228c94c324b36fdf205184934a0bfb31c6d8f755fe995"
   },
-  "rules_version": "1",
+  "rules_version": "2",
   "source_commit": "d72495d955c050e98c98a283b5521f31f3eff43a"
 }

@@ -1,6 +1,7 @@
 gongbang.config.json
 tests/public_ready.local.txt
 .gongbang/
+harness/export_v3_private.json
 *.log
 *.jsonl
 __pycache__/
