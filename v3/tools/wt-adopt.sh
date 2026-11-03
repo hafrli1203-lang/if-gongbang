@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
 # wt-adopt.sh <copy path>
 # Registers a work copy made by hand (git worktree under ${WT_ROOT}/<app>/<name> without .wt.json) so the limits,
 # wt-stop, wt-land and wt-gc see it. Writes .wt.json {app, name, branch, base, path, db: null, port: null, units: [],
@@ -29,10 +29,10 @@ rel="${wt#"$WT_ROOT"/}"; app="${rel%%/*}"; name="${rel#*/}"
 WT_EXIT=2 wt_check_name app "$app"; WT_EXIT=2 wt_check_name existing "$name"
 [ -f "$wt/.wt.json" ] && { echo "이미 등록된 사본입니다: $wt"; exit 0; }
 # must be a worktree of the app's own repository
-common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-[ "$common" = "$(git -C "${WT_APPS_ROOT}/$app" rev-parse --path-format=absolute --git-common-dir)" ] \
+common=$(wt_git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+[ "$common" = "$(wt_git -C "$WT_APPS/$app" rev-parse --path-format=absolute --git-common-dir)" ] \
   || WT_EXIT=2 wt_die "$app 저장소의 작업 사본이 아닙니다: $wt"
-branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD)
+branch=$(wt_git -C "$wt" rev-parse --abbrev-ref HEAD)
 [ "$branch" != HEAD ] || WT_EXIT=2 wt_die "가지가 없는(detached) 사본은 등록하지 않습니다: $wt"
 # wt-land and wt-gc work on branch wt/<name>: a copy on any other branch could merge or delete the wrong branch (Codex 11-01)
 [ "$branch" = "wt/$name" ] || WT_EXIT=2 wt_die "사본 가지가 wt/$name 이 아니라 $branch 입니다 — 등록하지 않습니다: $wt"

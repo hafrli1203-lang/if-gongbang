@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
 # wt-migrate.sh <app> <land-id>
 # PRE_SWAP_CMD of a land that brings migrations (wt-land.sh -> deploy.sh, after a good build, before the swap).
 # 1) pg_dump -Fc of the app's production DB -> ${WT_BACKUPS}/<app>/pre-land-<land-id>.dump; any failure exits 1
@@ -26,7 +26,7 @@ set -euo pipefail
 app="${1:-}"; id="${2:-}"
 wt_check_name app "$app"
 [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || wt_die "land-id가 이상합니다: $id"
-src="$WT_APPS_ROOT/$app"
+src="$WT_APPS/$app"
 envf=$(wt_app_env "$app")
 [ -n "$envf" ] && python3 "$WT_ENVPY" has --env-file "$envf" || wt_die "운영 DB 주소(DATABASE_URL)를 찾지 못했습니다 — 백업 없이 마이그레이션하지 않습니다."
 

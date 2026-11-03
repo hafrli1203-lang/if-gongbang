@@ -108,15 +108,33 @@ read as "no changes").
    still written, so "dry" means "no repository or deploy change", not "no filesystem change at
    all".
 
-An app whose own `deploy.env` sets `DEPLOY_CMD` (it deploys itself, outside this contract) is
-refused up front, exit **2** — its own rollback semantics cannot be relied on from here.
+An app whose own `deploy.env` sets `DEPLOY_CMD` (it deploys itself, outside this contract) goes
+through the same land steps above, not a separate path: the deploy adapter call forwards to
+that command, then (step 5a, step 7 below) an independent `deploy-check.sh` confirmation runs
+since the exec hides the common receipt/fingerprint checks. A failure past that point runs the
+app's own command again against the reverted source as recovery; if that second run also
+cannot be confirmed, the land stops in the "unknown" state (exit **10**) rather than guessing.
+
+### `wt-scope.sh <app> <name> --file <scope-file> | --add <glob>...`
+
+Sets or extends a copy's `.wt.scope` after creation — the only sanctioned way besides
+`wt-new.sh --scope-file`, since `protect_sensitive_files` refuses hand edits of `.wt.*` files.
+Refuses a bare `**`/`/`/`.` line (that would mean "everything," not a scope).
 
 ### `wt-gc.sh [--dry] [--only <copy>]`
 
-A copy is removed when `.wt.done` exists, **or** it has no live unit, has been untouched for
-48h, and an external task-status adapter (docs/v3-adapters.md) confirms its job ended
-failed/cancelled/discarded with no uncommitted change. Everything else — including every copy
-when no task-status adapter is configured — is kept.
+A copy is removed when: (a) `.wt.done` exists; (b) no live unit, no `task_id` at all (a
+hand-made test copy) and untouched for `WT_GC_TASKLESS_SEC` (default 2h) or more; (b2) has a
+`task_id`, no live unit, untouched 48h or more, and an external task-status adapter
+(docs/v3-adapters.md) confirms its job ended failed/cancelled/discarded; or (c) its branch is
+merged into the app's base and clean (ignoring the next-regenerated-file exception) even with
+no `.wt.done` — a hand `--ff-only` merge outside `wt-land.sh`, gated by a freshness floor
+(`WT_GC_FRESH_SEC`, default 30m) so a copy someone just resumed is not pulled out from under
+them. A stray folder with neither `.wt.json` nor `.git` (died mid `wt-new.sh`) is archived
+after `WT_GC_TASKLESS_SEC`'s longer sibling, never deleted outright. Every copy of an app
+currently being landed (`land.lock` held) is skipped entirely. A dirty, untouched-48h+
+hand-made copy is moved whole to `$WT_ARCHIVE_ROOT` (never deleted); everything else not
+matched above is kept — including every copy when no task-status adapter is configured.
 
 ### `wt-adopt.sh <copy path>`
 
@@ -124,13 +142,39 @@ Registers a work copy made by hand (a `git worktree` under `$WT_ROOT/<app>/<name
 `.wt.json` yet) so it counts toward the limits and the other commands can see it. No port or
 test-DB slot is assigned.
 
+### `new-app.sh <app> [--template <dir>]`
+
+Scaffolds `$WT_APPS_ROOT/<app>` as a fresh git repo with one commit: either copies `--template
+<dir>` (or `$WT_OPS_HARNESS_DIR/../templates/$WT_TEMPLATE`, when set and present) as-is, or
+generates a minimal Next.js app whose dependency versions are copied from
+`$WT_SCAFFOLD_VERSIONS_FROM/package.json` (required when no template applies — see
+docs/v3-adapters.md). Installs nothing; exit 0 = created, 2 = usage/already exists/no version
+source.
+
+### `wt-sandbox.py` (used by `wt-run.sh`'s foreground commands via `WT_SANDBOX_BWRAP`)
+
+Wraps a foreground command in `bubblewrap`: the copy, its own data folder and `/tmp` stay
+writable; the rest of the filesystem is read-only or hidden (other apps, other copies, the
+app's own untracked files, `/srv` backups/archives/logs, runtime sockets). Test-shaped commands
+get no network except a loopback DB relay restricted to the environment's own slot database.
+`WT_SANDBOX_BWRAP=0` disables it outright for a host without `bwrap`.
+
+### `sec-gate.sh` / `suite-check.py` / `receipts.py` (used internally by `deploy.sh` and `wt-land.sh`)
+
+Not meant to be called directly: `sec-gate.sh` audits a Node project's dependency changes from
+the commits being landed (never a working folder); `suite-check.py` picks the test runner and
+judges a run's output (0 tests, a count drop, a facts/probe file still unresolved) for
+`deploy.sh`'s quality gate; `receipts.py` records and judges a deploy's outcome (survived vs.
+reverted vs. unknown) from boot/start timestamps, read back by `wt-land.sh` and `wt-gc.sh`.
+
 ## Exit codes (land)
 
 | Code | Meaning |
 |---|---|
-| 2 | Refused up front (bad argument, self-deploying app, missing adapter) or scope violation |
+| 2 | Refused up front (bad argument, missing adapter) or scope violation |
 | 3 | Nothing to land (0 commits ahead of base) |
 | 4 | App folder or copy not clean |
 | 5 | Deploy failed — reverted automatically |
 | 6 | Rebase conflict, or another land already running |
 | 7 | Deployed, but the push afterward failed |
+| 10 | Self-deploy recovery could not be confirmed either — a person must look, then re-run with `--ack-unknown` |

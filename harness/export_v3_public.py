@@ -49,7 +49,7 @@ RULES_VERSION = "2"
 # src_deploy_state_root, src_admin_env, src_unit_prefix.
 REQUIRED_CFG_KEYS = (
     "src_apps_root", "src_data_root", "src_backups_root", "src_deploy_state_root",
-    "src_admin_env", "src_unit_prefix",
+    "src_admin_env", "src_unit_prefix", "src_ops_dirname", "src_archive_root",
 )
 
 
@@ -87,6 +87,12 @@ ALLOWED_FILES = [
     ("deploy.sh", "deploy.sh"),
     ("review-gate.sh", "review-gate.sh"),
     ("deploy-check.sh", "deploy-check.sh"),
+    ("wt-scope.sh", "wt-scope.sh"),
+    ("wt-sandbox.py", "wt-sandbox.py"),
+    ("receipts.py", "receipts.py"),
+    ("sec-gate.sh", "sec-gate.sh"),
+    ("suite-check.py", "suite-check.py"),
+    ("new-app.sh", "new-app.sh"),
 ]
 # Explicitly excluded (plan 2026-11-01 "공개판 전에 로컬에서 먼저 고칠 것" / item B "제외"):
 #   app_facts.py (internal fact-card generator), work_claim.py (Markdown-line queue, the
@@ -113,6 +119,7 @@ def build_global(cfg: dict) -> list[tuple[re.Pattern, str]]:
     backups_root = re.escape(cfg["src_backups_root"])
     deploy_state_root = re.escape(cfg["src_deploy_state_root"])
     unit_prefix = re.escape(cfg["src_unit_prefix"])
+    ops_dirname = re.escape(cfg["src_ops_dirname"])
     return [
         # the self-copy-and-exec header (private source, 2026-11-01) carries its own inline
         # default before wt-lib.sh is sourced - identical text in 8 of the 13 wt-*.sh files.
@@ -122,7 +129,15 @@ def build_global(cfg: dict) -> list[tuple[re.Pattern, str]]:
         (re.compile(data_root + r'\b'), "${WT_DATA}"),
         (re.compile(apps_root + r'/_shared\b'), "${WT_SHARED}"),
         (re.compile(apps_root + r'/_wt\b'), "${WT_ROOT}"),
+        # the private workspace's own ops/harness folder name (plans, a daily review tool, test-
+        # trust checks) is an internal workspace name, not a generic convention - rename it like
+        # any other internal identifier before the generic apps_root/ rule below touches the rest
+        # of the path around it.
+        (re.compile(r'\b' + ops_dirname + r'\b'), "_ops"),
         (re.compile(apps_root + r'/'), "${WT_APPS_ROOT}/"),
+        # anything left bare (not followed by a path separator - end of string, a shell `}`/`)`/
+        # quote, etc.) after the rules above have consumed every apps_root+'/...' occurrence.
+        (re.compile(apps_root + r'\b'), "${WT_APPS_ROOT}"),
         (re.compile(backups_root + r'\b'), "${WT_BACKUPS}"),
         # any remaining reference to the private plan doc this contract was generated from,
         # by whatever relative path it was written with - the suffix (e.g. " §1.") is left
@@ -141,6 +156,8 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
     backups_root = re.escape(cfg["src_backups_root"])
     deploy_state_root = re.escape(cfg["src_deploy_state_root"])
     admin_env = re.escape(cfg["src_admin_env"])
+    archive_root = re.escape(cfg["src_archive_root"])
+    ops_dirname = re.escape(cfg["src_ops_dirname"])
     # LIVE_DATA in wt-env.py is a prefix check against the data root's own PARENT (anything
     # under it, not only the _wt subtree) - derived from src_data_root (e.g. ".../_wt" ->
     # ".../"), not a separate required key, since every observed layout nests _wt under it.
@@ -162,6 +179,7 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
             (re.compile(r' \(team-lead 11-01: 6 -> 8\)'), ""),
             (re.compile(r'adopted hand-made copies \([^)]+\)'), "adopted hand-made copies"),
             (re.compile(r'\(drizzle-kit apps: [^)]+\)'), "(drizzle-kit apps)"),
+            (re.compile(r'[A-Za-z][A-Za-z0-9_.-]*/c-[A-Za-z][A-Za-z0-9_.-]*'), "an app's work copy"),
         ],
         "wt-new.sh": [
             (re.compile(r'src="' + apps_root + r'/\$app"'), 'src="$WT_APPS_ROOT/$app"'),
@@ -177,10 +195,20 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
         ],
         "wt-stop.sh": [],
         "wt-land.sh": [
+            (re.compile(r'#  Apps with their own deploy \(DEPLOY_CMD\) are refused up front \(exit 2\): their rollback cannot be relied on\. Then workers'),
+             "#  Apps with their own deploy (DEPLOY_CMD) go through the same land, with one extra independent confirmation step (5a) and their own recovery path on failure (self_deploy branch below). Workers"),
             (re.compile(r'src="' + apps_root + r'/\$app"'), 'src="$WT_APPS_ROOT/$app"'),
             (re.compile(r'ship_lock="' + deploy_state_root + r'/\$app\.review/ship\.lock"'),
              'ship_lock="$WT_DEPLOY_STATE/$app.review/ship.lock"'),
             (re.compile(r"DEPLOY_CMD in deploy\.env: [^)]+\.\.\."), "DEPLOY_CMD in deploy.env"),
+            (re.compile(r'[a-z][a-z0-9_-]*, [a-z][a-z0-9_-]*, [a-z][a-z0-9_-]*, \.\.\.\)'), "example apps)"),
+            (re.compile(r'[a-z][a-z0-9_-]*/[a-z][a-z0-9_-]* keep a pre-build copy and swap only after a good build; [a-z][a-z0-9_-]*\'s own comment'),
+             "some apps keep a pre-build copy and swap only after a good build; one app's own comment"),
+            (re.compile(r'실측: [A-Za-z][A-Za-z0-9_-]* wiring copy'), "실측: an app's wiring copy"),
+            (re.compile(r'\([a-z][a-z0-9_-]*/[a-z][a-z0-9_-]*: pre-build kept, swap only on success, so a'),
+             "(some apps: pre-build kept, swap only on success, so a"),
+            (re.compile(r"of theirs; [a-z][a-z0-9_-]*'s own comment says the same:"),
+             "of theirs; one app's own comment says the same:"),
             (re.compile(r'first unit 11-01: " M next-env\.d\.ts" stopped [^)\s]+'),
              'first observed: " M next-env.d.ts" stopped a land unexpectedly'),
             (re.compile(r"# helpers at the skill root or under scripts/ \([^)]+\)"),
@@ -214,6 +242,19 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
              "Run at session start and on a nightly schedule."),
             (re.compile(r"its \S+ \S+ task \(task_id in \.wt\.json\) ended"), "its WT_TASK_STATUS_CMD task ended"),
             (re.compile(r"\(landed, or discarded by \S+ \S+\)"), "(landed, or discarded by the caller)"),
+            (re.compile(r'moved whole to ' + archive_root + r'/<날짜>/wt-stale/<app>-<name>'),
+             "moved whole to $WT_ARCHIVE_ROOT/<날짜>/wt-stale/<app>-<name>"),
+            (re.compile(r'gc removed an [A-Za-z][A-Za-z0-9_-]* wiring copy'), "gc removed a work copy"),
+            (re.compile(r'실측: [A-Za-z][A-Za-z0-9_-]*/[A-Za-z][A-Za-z0-9_-]*, 11-01 23:32'), "실측: one app's copy"),
+            (re.compile(r'실측: [A-Za-z][A-Za-z0-9_-]*/[A-Za-z][A-Za-z0-9_-]*'), "실측: one app's copy"),
+            (re.compile(r'WITHOUT an [A-Z][A-Za-z ]* task'), "without a tracked task"),
+            (re.compile(r'실측: [A-Za-z][A-Za-z0-9_-]* [a-z0-9]+/[a-z0-9]+/[a-z0-9]+가 가지는 master에'),
+             "실측: 한 앱의 여러 사본이 가지는 master에"),
+            (re.compile(r'task_status\(""\) is always "모름", so the \(b\)'), "task_status(\"\") is always \"모름\", so the (b)"),
+            (re.compile(r'WT_ARCHIVE_ROOT="\$\{WT_ARCHIVE_ROOT:-' + archive_root + r'\}"   # test seam — tests must never write the real ' + archive_root),
+             'WT_ARCHIVE_ROOT="${WT_ARCHIVE_ROOT:?WT_ARCHIVE_ROOT 환경변수가 필요합니다 (오래된 사본을 보관할 폴더)}"'),
+            (re.compile(r'wt-land removed an [A-Za-z][A-Za-z0-9_-]* wiring copy'), "wt-land removed a work copy"),
+            (re.compile(r'실측: [A-Za-z][A-Za-z0-9_-]*/[A-Za-z][A-Za-z0-9_-]*'), "실측: one app's copy"),
         ],
         "wt-adopt.sh": [
             (re.compile(r"\(no \.wt\.json\) so the limits, *\n"), "(no .wt.json) so the limits,\n"),
@@ -221,6 +262,17 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
         ],
         "scope-check.sh": [],
         "wt-env.py": [
+            (re.compile(r'# code-default sqlite paths \([A-Za-z][A-Za-z0-9_-]* class\): the app has no \.env key at all for [A-Z_]+ — only a zod\n'
+                        r'# default in source \(`export const DEFAULT_DB_PATH = "' + live_data_root + r'[A-Za-z][A-Za-z0-9_-]*/office\.sqlite"`, then\n'
+                        r'# `[A-Z_]+: z\.string\(\)\.min\(1\)\.default\(DEFAULT_DB_PATH\)`\)\. wt-sandbox hiding ' + live_data_root + r'<app> was the only\n'),
+             '# code-default sqlite paths (observed on one app class): the app has no .env key at all for its sqlite\n'
+             '# path - only a code-level default (e.g. `const DEFAULT_DB_PATH = "<data-root>/<app>/app.sqlite"`, then\n'
+             '# a zod schema defaulting to it). wt-sandbox hiding <data-root>/<app> was the only\n'),
+            (re.compile(r'\([A-Za-z][A-Za-z0-9_-]* class: no \.env, only'), "(observed on one app class: no .env, only"),
+            (re.compile(r'even a relative path or one outside ' + live_data_root.rstrip('/') + r'\), is moved into the copy \(11-01: ' + live_data_root + r'<app> defaults;'),
+             "even a relative path or one outside the live data root), is moved into the copy (11-01: <data-root>/<app> defaults;"),
+            (re.compile(r'\*_DB_PATH/SQLITE keys protected even when the value is not already under ' + live_data_root + r'\)'),
+             "*_DB_PATH/SQLITE keys protected even when the value is not already under the live data root)"),
             (re.compile(r'INTERNAL_URL_KEYS = \("OS_URL", "LEDGER_URL", "LIBRARY_URL", "SEARCH_URL", "SEARCH_PUBLIC_URL"\)'),
              'INTERNAL_URL_KEYS = tuple(k for k in os.environ.get("WT_INTERNAL_URL_KEYS", "").split(",") if k)'),
             (re.compile(r"# Internal-app address keys: always pointed at a dead port in a copy \(code defaults like OS_URL=http://127\.0\.0\.1:\d+ would\n# otherwise reach the live \S+ \S+ / ledger / library\)\. Set even when the env file lacks them; nothing overrides them\."),
@@ -237,11 +289,16 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
             (re.compile(r" \(11-01: " + live_data_root + r'<app> defaults\)'), ""),
         ],
         "deploy.sh": [
+            (re.compile(r'dependency such as @[A-Za-z][A-Za-z0-9_-]*/kit\)'), "a shared internal package)"),
             (re.compile(r'dir="' + apps_root + r'/\$app"'), 'dir="$WT_APPS_ROOT/$app"'),
-            (re.compile(r'HEAVY=' + apps_root + r'/[^/\s]+/scripts/heavy\.sh.*\n'),
+            (re.compile(r'HEAVY="\$\{DEPLOY_HEAVY:-' + apps_root + r'/[^/\s]+/scripts/heavy\.sh\}".*\n'),
              '# Memory-capped build wrapper (adapter, optional): WT_HEAVY_CMD "--mem <cap> --name <n> -- <cmd...>".\n'
              '# Unset: the build command below runs directly, without a memory cap (warning printed).\n'
              'HEAVY="${WT_HEAVY_CMD:-}"\n'),
+            (re.compile(r'untracked \([A-Za-z][A-Za-z0-9_-]* ignores'), "untracked (one app ignores"),
+            (re.compile(r"lists them \([A-Za-z][A-Za-z0-9_-]*: next-env\.d\.ts\)"), "lists them (observed once)"),
+            (re.compile(r'\([A-Za-z0-9_-]+ 0→152 errors shipped unnoticed\)'),
+             "(an app once shipped hundreds of new type errors unnoticed)"),
             (re.compile(r'PREV="' + deploy_state_root + r'/\$app"'), 'PREV="$WT_DEPLOY_STATE/$app"'),
             (re.compile(r'if ! IF_BUILD_DIR=\.next-build NODE_OPTIONS="--max-old-space-size=\$NODE_HEAP" bash "\$HEAVY" --mem "\$BUILD_MEM" --name "\$app" -- npm run -s build; then'),
              'build_failed=0\n'
@@ -277,6 +334,49 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
             (re.compile(r' \([a-z0-9_-]+: \d{1,3}(?:\.\d{1,3}){3}:PORT\)'), " (e.g. a specific tailnet address:PORT)"),
         ],
         "wt-bin/npm": [],
+        "wt-scope.sh": [
+            (re.compile(r'wt="' + apps_root + r'/_wt/\$app/\$name"'), 'wt="$WT_ROOT/$app/$name"'),
+            (re.compile(r' — 2026-11-02, L1-0\d+ wiring audit:\n'), ":\n"),
+        ],
+        "wt-sandbox.py": [
+            (re.compile(r'breaking every git command run inside the sandbox \(gap: [a-z][a-z0-9_-]*\n'
+                        r'             scripts/backup\.sh\'s `git bundle`/`git log` died "not a git repository"\)'),
+             'breaking every git command run inside the sandbox (observed once: an app\'s own\n'
+             '             backup script\'s `git bundle`/`git log` died "not a git repository")'),
+            (re.compile(r'e\.g\. [a-z][a-z0-9_-]* web/data/admin-credential\.json; the copy holds all tracked code\)'),
+             "e.g. a credential file an app keeps untracked in its own data folder; the copy holds all tracked code)"),
+            (re.compile(r'# team-lead 2026-11-02 \(실측: [a-z][a-z0-9_-]* scripts/backup\.sh, git bundle/log inside a copy died "not a git\n'
+                        r'    # repository"\) — a `git worktree add` copy'),
+             "# team-lead 2026-11-02 (실측: an app's own backup script, git bundle/log inside a copy died \"not a git\n"
+             "    # repository\") — a `git worktree add` copy"),
+            (re.compile(r'harness_dir = os\.path\.join\(APPS, "[A-Za-z_]+", "harness"\)'),
+             'harness_dir = os.environ.get("WT_OPS_HARNESS_DIR", "")'),
+            (re.compile(r'    # [A-Za-z_]+/harness \(read-only\): an app\'s own test suite may call its suite_trust\.py \(gap: [a-z][a-z0-9_-]*\n'
+                        r'    # server-dev-path\'s "시험 0개" sandbox check got ModuleNotFoundError — [A-Za-z_]+ was hidden with the rest of /srv\n'
+                        r'    # and never brought back\)\. Only this one subfolder, never the rest of [A-Za-z_]+ \(plans, app-facts, WORK_QUEUE\.md\)\.\n'),
+             '    # The ops/harness folder (read-only, adapter path WT_OPS_HARNESS_DIR): an app\'s own test suite may\n'
+             '    # import a test-trust check module from there. Only that one subfolder is ever exposed, never the\n'
+             '    # rest of the ops workspace (plans, task queue, etc.) - unset means nothing is exposed.\n'),
+        ],
+        "receipts.py": [],
+        "sec-gate.sh": [
+            (re.compile(r'\([a-z][a-z0-9_-]* keeps it in web/\)'), "(an app may keep it in a subfolder such as web/)"),
+        ],
+        "suite-check.py": [
+            (re.compile(r'harness modules in ' + apps_root + r'/[A-Za-z_]+/harness \(HARNESS_DIR overrides\)\.'),
+             "harness modules at a configurable path (HARNESS_DIR)."),
+            (re.compile(r'HARNESS = os\.environ\.get\("HARNESS_DIR", "' + apps_root + r'/[A-Za-z_]+/harness"\)'),
+             'HARNESS = os.environ.get("HARNESS_DIR", "")'),
+        ],
+        "new-app.sh": [
+            (re.compile(r'\(WT_SCAFFOLD_VERSIONS_FROM, default [a-z][a-z0-9_-]*\)'), "(WT_SCAFFOLD_VERSIONS_FROM, required)"),
+            (re.compile(r'from="\$\{WT_SCAFFOLD_VERSIONS_FROM:-\$apps/[a-z][a-z0-9_-]*\}/package\.json"'),
+             'from="${WT_SCAFFOLD_VERSIONS_FROM:?WT_SCAFFOLD_VERSIONS_FROM 환경변수가 필요합니다 (버전을 베낄 기존 앱의 경로)}/package.json"'),
+            (re.compile(r'    "docs/ai/CURRENT_DECISIONS\.md": f"# \{app\} — 결정 기록\\n\\n대표 결정은 원문 그대로, 날짜와 함께 적는다\.\\n",\n'),
+             '    "docs/ai/CURRENT_DECISIONS.md": f"# {app} — 결정 기록\\n\\n결정은 원문 그대로, 날짜와 함께 적는다.\\n",\n'),
+            (re.compile(r'    "README\.md": f"# \{app\}\\n\\n구조: ' + apps_root + r'/' + ops_dirname + r'/COMMON_ARCHITECTURE_STANDARD\.md\\n",\n'),
+             '    "README.md": f"# {app}\\n\\n구조 표준 문서가 있다면 그것을 참고하세요.\\n",\n'),
+        ],
     }
 
 HEADER = {

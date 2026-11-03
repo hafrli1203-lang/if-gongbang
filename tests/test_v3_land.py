@@ -152,10 +152,26 @@ def test_land_retry_after_failure_then_success(harness):
     assert not glob.glob(str(harness["data"] / harness["app"] / "land-fail-*.json"))
 
 
-def test_land_refuses_self_deploying_app(harness):
+def test_land_self_deploying_app(harness):
     make_copy(harness, "selfdeploy1")
+    # DEPLOY_CMD apps (their own deploy.env names a self-deploy command) go through the same
+    # land path as any other app - committed like any other tracked file, not left dangling -
+    # and the one extra step (5a) is an independent deploy-check.sh confirmation after their own
+    # script returns 0 (gap: DEPLOY_CMD is an exec, so the common receipt/fingerprint checks
+    # never run for them on their own).
     (harness["src"] / "deploy.env").write_text('DEPLOY_CMD="bash scripts/deploy.sh"\n')
+    git(str(harness["src"]), "add", "deploy.env")
+    git(str(harness["src"]), "commit", "-q", "-m", "chore: self-deploy")
+    fake_deploy(harness["tools"], 0)
 
     r = run_land(harness, "selfdeploy1")
-    assert r.returncode == 2, r.stdout + r.stderr
-    assert "자체 배포" in (r.stdout + r.stderr)
+    out = r.stdout + r.stderr
+    assert "자체 배포" in out, out
+    # deploy-check.sh (bundled, run for real - gap: an exec hides the common receipt checks) has
+    # no real unit/health path to confirm here, so even though the fake deploy and the self-
+    # deploy recovery both return 0, the land cannot call it a verified success and must not
+    # silently mark the copy done without an independent check - it ends in the documented
+    # "unknown, a person must look" state (exit 10, --ack-unknown), not a plain pass or fail.
+    assert r.returncode == 10, out
+    assert "ack-unknown" in out, out
+    assert not (harness["root"] / harness["app"] / "selfdeploy1" / ".wt.done").exists()

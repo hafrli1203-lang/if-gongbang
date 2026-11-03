@@ -114,6 +114,37 @@ Default `ifapp` — change only if the host's own convention for an app's system
 differs (`wt-land.sh`'s worker-restart step and `deploy.sh`'s rollback step look for
 `<prefix>-<app>-*.service`).
 
+### Owner-alert adapter — `notify-owner.mjs` (not included in this bundle)
+
+`wt-new.sh` (a limit/slot/port wait) and `wt-land.sh` (self-deploy recovery exhausted) both call
+`node "$WT_SHARED/notify-owner.mjs" "<one line>" "<link>" "<channel>"` to page a person. Like
+`ship.sh`, this is intentionally **not extracted**: the private source's version reaches into an
+internal chat-bot/notification service that has no public equivalent. Both call sites already
+treat it as optional and best-effort (`|| true` / a logged warning on failure, never a hard
+stop) — unset or missing, a copy just waits/stops at the same point with the condition printed
+to its own log instead of paged to a person. Drop in your own script at that path with the same
+three-argument CLI to wire up a real alert channel.
+
+### Garbage-collection archive root — `WT_ARCHIVE_ROOT`
+
+`wt-gc.sh` moves a stale-but-uncommitted hand-made copy under here instead of deleting it
+(`<root>/<date>/wt-stale/<app>-<name>`) — required, no default, so a host that has not set one
+gets a clear refusal rather than silently writing nowhere or to a guessed path.
+
+### Ops/harness read-only mount — `WT_OPS_HARNESS_DIR`
+
+`wt-sandbox.py` exposes this one folder read-only inside the bwrap sandbox (nothing else from
+the host's own ops workspace — plans, a task queue, etc.) so that an app's own test suite can
+import a test-trust check module from it. **Unset (default): nothing is exposed** — an app
+whose tests import from there will fail inside the sandbox exactly as if the module did not
+exist, which is the safe default for a host with no such module to share.
+
+### Scaffold version source — `WT_SCAFFOLD_VERSIONS_FROM`
+
+`new-app.sh` (no `--template`) copies its `next`/`react`/`typescript` versions from an existing
+app's `package.json` rather than inventing numbers — required, no default, since there is no
+safe app to assume exists on every host. Point it at any existing Next.js app's folder.
+
 ## 사본 환경 (what a work copy's own environment looks like)
 
 Built by `wt-env.py app` (never prints a value — everything stays inside the child process's

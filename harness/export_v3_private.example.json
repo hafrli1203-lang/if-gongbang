@@ -5,5 +5,7 @@
   "src_backups_root": "<path to the folder used for pre-migration pg_dump backups>",
   "src_deploy_state_root": "<path to the folder used for deploy locks and review-gate state>",
   "src_admin_env": "<path to an env file whose DATABASE_URL is a postgres role allowed to create/drop test databases>",
-  "src_unit_prefix": "<systemd service-name prefix this host's apps use, e.g. myapp>"
+  "src_unit_prefix": "<systemd service-name prefix this host's apps use, e.g. myapp>",
+  "src_ops_dirname": "<folder name under src_apps_root that holds this workspace's own ops/harness files - plans, a daily-review tool, test-trust checks; e.g. _ops>",
+  "src_archive_root": "<path to the folder stale/garbage-collected work copies are moved to instead of deleted>"
 }

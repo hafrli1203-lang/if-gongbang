@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
 # scope-check.sh <copy> [--range <a>..<b>]
 # --range: check the files changed between two commits of the app repository instead of the copy (wt-land --retry).
 # Compares what the copy changed with its allowed paths (<copy>/.wt.scope, one glob per line, # comments) — docs/v3-wt-interface.md §4.
@@ -39,14 +39,14 @@ range=""
 # state files, .pids and the node_modules copy. Committed or staged, they count like any other path.
 ARTIFACTS='^(node_modules(/.*)?|\.wt\.(json|scope|done)(\.tmp)?|\.next-wt[^/]*(/.*)?|\.verify(/.*)?|\.pids(/.*)?)$'
 # every git query must succeed: a failed one would otherwise read as "no changes" and pass (Codex 11-01)
-g() { git -C "$wt" "$@" || { echo "범위 검사 불가 — git ${*:1:2} 실패" >&2; exit 1; }; }
+g() { wt_git -C "$wt" "$@" || { echo "범위 검사 불가 — git ${*:1:2} 실패" >&2; exit 1; }; }
 filt() { grep -vE "$1" || [ $? = 1 ]; }   # grep exit 1 = nothing left after filtering, not an error
 if [ -n "$range" ]; then
   [[ "$range" =~ ^[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}$ ]] || wt_die "범위 형식: <커밋>..<커밋>"
-  app_dir="${WT_APPS_ROOT}/$(wt_json_get "$wt/.wt.json" app)"
-  changed=$(git -C "$app_dir" diff --name-only "${range%%..*}" "${range##*..}") || wt_die "범위 검사 불가 — git diff $range 실패"
+  app_dir="$WT_APPS/$(wt_json_get "$wt/.wt.json" app)"
+  changed=$(wt_git -C "$app_dir" diff --name-only "${range%%..*}" "${range##*..}") || wt_die "범위 검사 불가 — git diff $range 실패"
 else
-fork=$(git -C "$wt" merge-base "$base" HEAD) || wt_die "기본 가지($base)와의 갈림점을 찾지 못했습니다"
+fork=$(wt_git -C "$wt" merge-base "$base" HEAD) || wt_die "기본 가지($base)와의 갈림점을 찾지 못했습니다"
 committed=$(g diff --name-only "$fork" HEAD)
 staged=$(g diff --cached --name-only HEAD)   # staged changes are never "next-generated": always checked
 unstaged=$(g diff --name-only)

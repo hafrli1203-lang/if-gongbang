@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Generated from private source at d72495d955c050e98c98a283b5521f31f3eff43a; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
 # Post-deploy check for one app (G2 A2 / A0 table): unit active, each health path answers 200, memory printed.
-# Reads $WT_APPS_ROOT/<app>/deploy.env: UNIT, PORT, HEALTH_PATHS (space separated, default "/"), WORKER_UNIT (optional).
+# Reads <DEPLOY_APPS_ROOT>/<app>/deploy.env: UNIT, PORT, HEALTH_PATHS (space separated, default "/"), WORKER_UNIT (optional).
 # usage: deploy-check.sh <app>      exit 0 = all good, 1 = something failed (prints what)
+# Test seams (same names as deploy.sh): DEPLOY_APPS_ROOT (default ${WT_APPS_ROOT}), DEPLOY_SYSTEMCTL (default systemctl).
 set -uo pipefail
 app="${1:?app}"
-envf="$WT_APPS_ROOT/$app/deploy.env"
+APPS_ROOT="${DEPLOY_APPS_ROOT:-${WT_APPS_ROOT}}"
+SYSTEMCTL="${DEPLOY_SYSTEMCTL:-systemctl}"
+envf="$APPS_ROOT/$app/deploy.env"
 [ -f "$envf" ] || { echo "FAIL no $envf" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$envf"
@@ -13,10 +16,17 @@ UNIT="${UNIT:-${WT_UNIT_PREFIX:-ifapp}-$app}"; PORT="${PORT:?PORT in deploy.env}
 HEALTH_CODES="${HEALTH_CODES:-200}"   # codes that prove the app answers; e.g. "200 403" for an app that refuses a loopback request by design
 HEALTH_HOST="${HEALTH_HOST:-}"   # Host header to send, for apps that only trust their tailscale host (e.g. a specific tailnet address:PORT)
 fail=0
-state=$(systemctl --user is-active "$UNIT" 2>/dev/null || true)
-if [ "$state" = active ]; then echo "OK unit $UNIT active (NRestarts=$(systemctl --user show "$UNIT" -p NRestarts --value), mem=$(( $(systemctl --user show "$UNIT" -p MemoryCurrent --value) / 1048576 ))MB)"; else echo "FAIL unit $UNIT $state"; fail=1; fi
+state=$($SYSTEMCTL --user is-active "$UNIT" 2>/dev/null || true)
+if [ "$state" = active ]; then
+  nrestarts=$($SYSTEMCTL --user show "$UNIT" -p NRestarts --value 2>/dev/null); nrestarts="${nrestarts:-0}"
+  memcur=$($SYSTEMCTL --user show "$UNIT" -p MemoryCurrent --value 2>/dev/null); memcur="${memcur:-0}"
+  case "$memcur" in ''|*[!0-9]*) memcur=0 ;; esac   # a fake or odd systemctl may answer [not set] / empty
+  echo "OK unit $UNIT active (NRestarts=$nrestarts, mem=$(( memcur / 1048576 ))MB)"
+else
+  echo "FAIL unit $UNIT $state"; fail=1
+fi
 if [ -n "${WORKER_UNIT:-}" ]; then
-  ws=$(systemctl --user is-active "$WORKER_UNIT" 2>/dev/null || true)
+  ws=$($SYSTEMCTL --user is-active "$WORKER_UNIT" 2>/dev/null || true)
   if [ "$ws" = active ]; then echo "OK worker $WORKER_UNIT active"; else echo "FAIL worker $WORKER_UNIT $ws"; fail=1; fi
 fi
 for p in $HEALTH_PATHS; do
