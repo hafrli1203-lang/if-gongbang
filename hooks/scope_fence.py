@@ -7,14 +7,14 @@ session into its own `.wt.scope` allow-list in real time, instead of only catchi
 after the fact via scope-check.sh.
 
 Owner directives G19 ("개발 툴부터 정립하는게 우선이다 자꾸 개발부터 급하게 할려고 하지마라") /
-G25 ("다른 앱은 이프 공방 개발 끝나고 보기로 했잖아") were, per the 2026-10-27 전수조사, "글로만
+G25 ("다른 앱은 이프 공방 개발 끝나고 보기로 했잖아") were, per an internal review, "글로만
 있음(막는 장치 없음)" -- this hook is that device. It is additive to, not a replacement for,
 scope-guard.py (infra paths: settings.json/systemd/.env/...) and preflight-gate.py (pre-change
 report) -- all three run independently. scope-check.sh (run at wt-land) remains the authoritative
 post-hoc check; this hook is the realtime half, so a violation is refused before it ever lands in
 a commit, not just caught afterwards.
 
-=== Part 1: CURRENT_SCOPE.json app allow-list (unchanged from the 2026-10-27 revision) ===
+=== Part 1: CURRENT_SCOPE.json app allow-list (unchanged from an earlier revision) ===
 Scope is a plain allow-list the owner sets with `set_scope.py`, run by the owner's own typed `!`
 command (never a model tool call -- this hook denies every model-side write to CURRENT_SCOPE.json
 itself, unconditionally, the same "no gate, ever" posture scope-guard.py gives its own hook files).
@@ -28,7 +28,7 @@ Blocked once a scope exists:
   - a Bash command that WRITES into an out-of-scope /apps/<app>/ path.
   - an Agent tool_use whose prompt/description/name names another real /apps/<app> directory
     that is not in scope.
-See the 2026-10-27 revision's comments (kept below, unit tests pin them) for exact edge cases.
+See an earlier revision's comments (kept below, unit tests pin them) for exact edge cases.
 
 === Part 2: work-copy session fence (new) ===
 A "work-copy session" is a Claude Code session operating inside one wt-new.sh copy

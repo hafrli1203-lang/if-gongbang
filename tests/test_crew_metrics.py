@@ -27,7 +27,7 @@ def test_db_write_real_migrate_execution_is_risk():
 
 
 def test_db_write_real_seed_execution_is_risk():
-    assert cm.is_db_write_command('npm run seed -- a@example.com pass "x" "y"') is True
+    assert cm.is_db_write_command('npm run seed -- user1 pass "x" "y"') is True
 
 
 def test_db_write_psql_update_is_risk():
@@ -76,7 +76,7 @@ def test_heredoc_body_commit_message_mentioning_migrate_is_not_risk():
     "npm run migrate/seed 실행"이라는 말이 들어 있어도 실행한 것이 아니다."""
     cmd = (
         "git commit -m \"$(cat <<'EOF'\n"
-        "fix: ... stageA-1(/apps/IFCOMPANYTOOL에서 직접 npm run migrate/seed 실행, 진짜 사고)\n"
+        "fix: ... stageA-1(/apps/exampleapp에서 직접 npm run migrate/seed 실행, 진짜 사고)\n"
         "EOF\n"
         ")\" -- tools/crew_metrics.py"
     )
@@ -93,7 +93,7 @@ def test_app_path_matches_worktree_copy():
     assert cm.APP_PATH.search("/apps/_wt/exampleapp/fence-probe/src/x.ts")
 
 
-def test_app_path_excludes_agency_os():
+def test_app_path_excludes_ops_dir():
     assert not cm.APP_PATH.search("/apps/_ops/metrics/dev_units.py")
 
 
@@ -137,7 +137,7 @@ def test_scan_flags_app_file_edit_on_git_commit_in_bash(tmp_path):
 
 def test_scan_prod_db_risk_excludes_test_db_hint(tmp_path):
     p = tmp_path / "agent-fix3-abc.jsonl"
-    write_transcript(str(p), [{"name": "Bash", "input": {"command": "DATABASE_URL=naverads_test npm run migrate"}}])
+    write_transcript(str(p), [{"name": "Bash", "input": {"command": "DATABASE_URL=exampleapp_test npm run migrate"}}])
     m = cm.scan(str(p))
     assert m["prod_db_risk"] == 0
 

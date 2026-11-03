@@ -43,7 +43,7 @@ def test_fresh_log_with_evidence_passes() -> None:
 
 def test_stale_log_rejected_by_default_24h() -> None:
     now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
-    text = "2026-10-20 PROBE OK https://api.example.com\nreturncode: 0\n"
+    text = "2026-09-01 PROBE OK https://api.example.com\nreturncode: 0\n"
     result = check_probe_log(text, now=now)
     assert result.ok is False
     assert result.reasons == ["stale"]
@@ -51,7 +51,7 @@ def test_stale_log_rejected_by_default_24h() -> None:
 
 def test_stale_log_accepted_with_wider_max_age() -> None:
     now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
-    text = "2026-10-20 PROBE OK https://api.example.com\nreturncode: 0\n"
+    text = "2026-09-01 PROBE OK https://api.example.com\nreturncode: 0\n"
     result = check_probe_log(text, now=now, max_age_hours=999999)
     assert result.ok is True
 

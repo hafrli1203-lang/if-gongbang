@@ -10,7 +10,7 @@
 # FILE CONTENT so the 2026-11-02 exclude-list change below actually reaches the running copy).
 #
 # lessons-start.py / "no-cap" decision superseded (owner decision 2026-11-02 01:10, team-lead
-# recommendation, no objection): the 2026-10-15 "no cap, just measure it" decision produced a
+# recommendation, no objection): an earlier "no cap, just measure it" decision produced a
 # 74-entry/~70KB workspace lessons injection, most of it either already enforced by a real device
 # (graduated) or a near-duplicate of another entry. Replaced with an EXCLUDE-LIST approach instead
 # of a hard cap: `_ops/lessons_exclude.json` names the specific L1 numbers to skip (with a

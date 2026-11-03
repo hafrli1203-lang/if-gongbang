@@ -223,7 +223,7 @@ def host_check(app_dir: Path) -> str:
 
 
 # 2026-11-01 team-lead 지시: 오늘 search 빌드가 tmp/ 519MB(.gitignore 안 됨)를 Turbopack이
-# 스캔하다 6G에서 OOM(exampleapp·IFCOMPANYTOOL과 같은 원인). git이 이미 추적도 무시도 안 하는
+# 스캔하다 6G에서 OOM(exampleapp·exampleapp과 같은 원인). git이 이미 추적도 무시도 안 하는
 # 디렉터리(기본 `git status --porcelain`이 untracked dir를 묶어서 보여주는 것)만 보고 크기를 잰다
 # — 지어낸 기준 없음, 50MB는 team-lead 지시값.
 BUILD_SCAN_RISK_MB = 50
