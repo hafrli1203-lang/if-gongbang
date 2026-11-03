@@ -8,7 +8,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOKS_DIR = os.path.join(ROOT, "hooks")
-for sub in ("hooks", "metrics", "ops"):
+for sub in ("hooks", "metrics", "ops", "tools", "harness"):
     path = os.path.join(ROOT, sub)
     if path not in sys.path:
         sys.path.insert(0, path)

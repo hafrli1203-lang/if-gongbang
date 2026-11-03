@@ -176,7 +176,7 @@ def bwrap_args(copy: str, data: str, app: str, net_off: bool) -> list:
             a += ["--tmpfs", d]
     if os.path.isdir("/run/systemd/resolve"):   # resolv.conf points here
         a += ["--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve"]
-    # _shared (file: packages such as @ifcompany/kit) and this script's own folder, read-only
+    # _shared (file: a shared internal package) and this script's own folder, read-only
     for d in shared_dirs:
         if os.path.isdir(d):
             a += ["--ro-bind", d, d]

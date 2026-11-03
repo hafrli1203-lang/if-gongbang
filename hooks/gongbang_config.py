@@ -97,11 +97,23 @@ DEFAULTS = {
     # its basename - see that hook's module docstring). Not a hardcoded list in the hook itself,
     # so a local install can widen it (an extra key-file extension, a site-specific secrets
     # filename, ...) without a code change.
-    "protected_paths": [".env", ".env.*", "*.pem", "*.key", "id_rsa*"],
+    "protected_paths": [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*"],
     # Patterns that override protected_paths for the SAME path - an exception match always
     # wins, so ".env.example" (which also matches the ".env.*" protected pattern) stays
     # readable/writable.
     "protected_exceptions": [".env.example", "*.sample"],
+    # Regex patterns (matched against a path with ~/$VAR expanded and normpath'd) that are
+    # ALWAYS write-denied, regardless of approval: systemd unit files and a reverse-proxy
+    # config, if this install uses either. settings.json/settings.local.json/
+    # gongbang.config.json and the live hooks/gate directory itself are protected separately in
+    # protect_sensitive_files.py via its own real, hardcoded paths, never from this
+    # (overridable) config value - a config file that could change what protects the config
+    # loader itself would be a hole in itself (see that file's module docstring).
+    "hard_protected_patterns": [
+        r"/\.config/systemd/user/",
+        r"^/etc/systemd/",
+        r"Caddyfile$",
+    ],
 }
 
 # Keys whose value must be a non-empty absolute path. A malformed or type-mismatched override

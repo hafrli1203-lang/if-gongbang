@@ -134,6 +134,7 @@ def build_global(cfg: dict) -> list[tuple[re.Pattern, str]]:
         # any other internal identifier before the generic apps_root/ rule below touches the rest
         # of the path around it.
         (re.compile(r'\b' + ops_dirname + r'\b'), "_ops"),
+        (re.compile(r'packages such as @[A-Za-z][A-Za-z0-9_-]*/kit\)'), "a shared internal package)"),
         (re.compile(apps_root + r'/'), "${WT_APPS_ROOT}/"),
         # anything left bare (not followed by a path separator - end of string, a shell `}`/`)`/
         # quote, etc.) after the rules above have consumed every apps_root+'/...' occurrence.

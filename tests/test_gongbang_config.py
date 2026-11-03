@@ -1,3 +1,4 @@
+# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
 import json
 import os
 
@@ -6,7 +7,7 @@ import gongbang_config as gc
 
 def test_load_defaults_are_absolute_paths(tmp_path, monkeypatch):
     monkeypatch.delenv("GONGBANG_CONFIG", raising=False)
-    cfg = gc.load(start_dir=str(tmp_path))  # no gongbang.config.json anywhere above tmp_path
+    cfg = gc.load(start_dir=str(tmp_path))
     for key in gc.PATH_KEYS:
         assert os.path.isabs(cfg[key]), key
 
@@ -24,7 +25,7 @@ def test_null_installed_hooks_dir_override_falls_back_to_default(tmp_path, monke
     cfg_path.write_text(json.dumps({"installed_hooks_dir": None}), encoding="utf-8")
     monkeypatch.setenv("GONGBANG_CONFIG", str(cfg_path))
     cfg = gc.load()
-    assert cfg["installed_hooks_dir"]  # non-empty, did not crash
+    assert cfg["installed_hooks_dir"]
     assert os.path.isabs(cfg["installed_hooks_dir"])
 
 
@@ -72,6 +73,14 @@ def test_type_mismatched_override_is_ignored(tmp_path, monkeypatch):
     monkeypatch.setenv("GONGBANG_CONFIG", str(cfg_path))
     cfg = gc.load()
     assert cfg["preflight_mode"] == "warn"
+
+
+def test_hard_protected_patterns_default_covers_caddyfile():
+    # settings.json/settings.local.json/gongbang.config.json are protected via HARDCODED real
+    # paths in protect_sensitive_files.py instead (see that file's module docstring) - this
+    # config-driven list covers only systemd/Caddyfile.
+    cfg = gc.load(start_dir="/nonexistent-path-for-test")
+    assert any("Caddyfile" in p for p in cfg["hard_protected_patterns"])
 
 
 def test_extra_protected_hook_names_defaults_empty():
