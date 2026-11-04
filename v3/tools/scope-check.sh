@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # scope-check.sh <copy> [--range <a>..<b>]
 # --range: check the files changed between two commits of the app repository instead of the copy (wt-land --retry).
 # Compares what the copy changed with its allowed paths (<copy>/.wt.scope, one glob per line, # comments) — docs/v3-wt-interface.md §4.
@@ -52,7 +52,7 @@ staged=$(g diff --cached --name-only HEAD)   # staged changes are never "next-ge
 unstaged=$(g diff --name-only)
 untracked=$(g ls-files --others --exclude-standard)
 changed=$(printf '%s\n%s\n%s\n%s\n' "$committed" "$staged" \
-  "$(printf '%s\n' "$unstaged" | filt '^(tsconfig\.json|next-env\.d\.ts|CLAUDE\.md|AGENTS\.md)$')" \
+  "$(printf '%s\n' "$unstaged" | filt '^((.*/)?(tsconfig\.json|next-env\.d\.ts)|CLAUDE\.md|AGENTS\.md)$')" \
   "$(printf '%s\n' "$untracked" | filt "$ARTIFACTS")" | sed '/^$/d' | sort -u)
 fi
 

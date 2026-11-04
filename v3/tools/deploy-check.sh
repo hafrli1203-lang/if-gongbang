@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # Post-deploy check for one app (G2 A2 / A0 table): unit active, each health path answers 200, memory printed.
 # Reads <DEPLOY_APPS_ROOT>/<app>/deploy.env: UNIT, PORT, HEALTH_PATHS (space separated, default "/"), WORKER_UNIT (optional).
 # usage: deploy-check.sh <app>      exit 0 = all good, 1 = something failed (prints what)

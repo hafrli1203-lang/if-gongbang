@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # sec-gate.sh <repo> <from> <to> [--baseline <dir>]
 # Security check of one land, before it is merged (gap 34; v2 engine app_security.py rewritten without the engine).
 #  1) secrets in what the land ADDS (git diff <from> <to>, added lines only — every app already carries old literals in

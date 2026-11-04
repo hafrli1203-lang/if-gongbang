@@ -1,4 +1,4 @@
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """Probe-log trust checks (묶음 6 — 실측 신뢰성).
 
 실측자(probe agent) writes probe/<name>.log by hand after an actual CLI/API

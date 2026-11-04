@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-land.sh <app> <name> [--retry <land-id>] [--dry] [--ack-unknown | --resolve kept|reverted]
 # "Open a PR" for a work copy = land it on the app's default branch and deploy — docs/v3-wt-interface.md §5.
 #  1) land.lock (${WT_DATA}/<app>/land.lock, separate from deploy.sh's own lock; waits WT_LAND_WAIT s, default 600)
@@ -85,6 +85,11 @@ run() {  # mutating step: printed under --dry, executed otherwise
 # says the same by hand: "이전 커밋으로 checkout 뒤 다시 deploy"). If that second run also fails, nothing more is
 # guessed at: the land stops, a person is paged (notify-owner), and the copy is kept — see the self_deploy branch below.
 self_deploy=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${DEPLOY_CMD:-}${DEPLOY_CMD_DEPLOY:-}"' _ "$src/deploy.env" 2>/dev/null || true)
+# The Next project may live in a subfolder (deploy.env APP_DIR, someapp: web/): next's own rewrites of tsconfig.json /
+# next-env.d.ts land there, not at the repo root, and a land stopped on them twice (someapp session, 11-04).
+app_sub=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${APP_DIR:-}"' _ "$src/deploy.env" 2>/dev/null || true); app_sub="${app_sub%/}"
+case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute (someapp) -> relative; outside the app -> ignored
+next_files() { local f; for f in tsconfig.json next-env.d.ts; do printf '%s\n' "$f"; [ -n "$app_sub" ] && [ "$app_sub" != . ] && printf '%s\n' "$app_sub/$f"; done; return 0; }
 say "합치기 시작 — $app/$name (기본 가지 $base, land-id $id${retry:+, 재시도}${dry:+$( [ "$dry" = 1 ] && echo ', dry')}${self_deploy:+, 자체 배포 앱})"
 
 # Evidence files a range brings (gaps 115/117, harness probe_trust): a facts.md still saying 확인 필요, or a probe/*.log
@@ -148,7 +153,7 @@ if [ "$ack" = 1 ]; then
     # anything staged is a person's: never restored or committed here (Codex 11-02)
     wt_git -C "$src" diff --cached --quiet || WT_EXIT=4 wt_die "앱 폴더에 스테이징된 변경이 있습니다 — 되돌리지 않습니다."
     # a deploy that died mid-build leaves next's own rewrites behind: put those two back first (tracked ones only)
-    for f in tsconfig.json next-env.d.ts; do
+    for f in $(next_files); do
       if wt_git -C "$src" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && ! wt_git -C "$src" diff --quiet -- "$f"; then
         wt_git -C "$src" checkout HEAD -- "$f"; say "next 자동 변경 복원: $f"
       fi
@@ -217,7 +222,8 @@ norm = lambda t: block.sub("\n", t).rstrip("\n")
 sys.exit(0 if norm(head) == norm(work) else 1)
 PY
 }
-AUTO_RE='^ M (tsconfig\.json|next-env\.d\.ts)$'
+# root or any subfolder (someapp web/): these two names are only ever next's own rewrites, restored from HEAD, never committed
+AUTO_RE='^ M ((.*/)?tsconfig\.json|(.*/)?next-env\.d\.ts)$'
 dirty=$(wt_git -C "$src" status --porcelain)
 auto=$(printf '%s\n' "$dirty" | grep -E "$AUTO_RE" | cut -c4- || true)
 rest=$(printf '%s\n' "$dirty" | grep -vE "$AUTO_RE" | sed '/^$/d' || true)
@@ -259,7 +265,7 @@ if [ -z "$retry" ]; then
   [ -z "$staged" ] || { say "사본에 스테이징된 변경:"; printf '%s\n' "$staged" | tee -a "$log"; stop 4 "사본에 스테이징된 변경이 있습니다 — 커밋하거나 되돌린 뒤 다시."; }
   # next's own rewrites: tsconfig.json / next-env.d.ts always; CLAUDE.md / AGENTS.md only when the change is nothing but
   # Next's agent-rules block — any other edit there is a person's and stops the land (Codex 11-02)
-  copy_auto="tsconfig.json next-env.d.ts"
+  copy_auto="$(next_files | tr '\n' ' ')"; copy_auto="${copy_auto% }"
   for f in CLAUDE.md AGENTS.md; do
     wt_git -C "$wt" diff --quiet -- "$f" 2>/dev/null || { next_block_only "$wt" "$f" && copy_auto="$copy_auto $f"; } || true
   done
@@ -574,7 +580,7 @@ PY
     # WT_NOTIFY=0: test seam (same as ship.sh's SHIP_NOTIFY) — the self-deploy test (sdstuck/w1) paged the owner
     # 22 times on 2026-11-02 through this line.
     if [ "${WT_NOTIFY:-1}" = 0 ]; then say "(WT_NOTIFY=0) 알림 생략"; else
-    timeout 20 node "$WT_SHARED/notify-owner.mjs" "#경보 $app/$name 자체 배포 복구 실패 — 운영 상태를 직접 확인해 주세요 (최초 코드 $rc, 복구 코드 $rc2, 기록 $log)" "/" "시스템" >>"$log" 2>&1 \
+    timeout 20 node "$WT_SHARED/notify-owner.mjs" "$app 앱 배포가 실패했고 되돌리기도 실패했습니다(작업 '$name'). 지금 운영 사이트가 옛 버전인지 새 버전인지 알 수 없는 상태입니다. 대표가 할 일: 사이트가 정상으로 보이는지 한 번 열어 보시고 이상하면 반장에게 알려 주세요. 반장이 운영을 확인한 뒤 정리합니다." "/" "시스템" >>"$log" 2>&1 \
       || say "notify-owner 알림 실패 — 그래도 $log 를 사람이 봐야 합니다"
     fi
     say "운영을 확인한 뒤: wt-land.sh $app $name --ack-unknown"

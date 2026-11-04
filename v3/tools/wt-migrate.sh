@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-migrate.sh <app> <land-id>
 # PRE_SWAP_CMD of a land that brings migrations (wt-land.sh -> deploy.sh, after a good build, before the swap).
 # 1) pg_dump -Fc of the app's production DB -> ${WT_BACKUPS}/<app>/pre-land-<land-id>.dump; any failure exits 1

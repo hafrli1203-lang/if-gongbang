@@ -1,4 +1,4 @@
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """stall_watch.py 판정 시험 — 가짜 사본 3개(활발·30분 멈춤·완료)로 돌린다. 실제 git·systemd·office.sqlite는 쓰지 않는다."""
 from __future__ import annotations
 
@@ -93,3 +93,24 @@ def test_main_end_to_end_no_notify(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "멈춤 사본 1개" in out
     assert "stuck" in out and "active" in out and "done" in out
+
+
+def test_hold_marked_copy_is_waiting_not_stalled(tmp_path, monkeypatch):
+    """A copy with .wt.hold (wt-hold.sh) is waiting on a person: never stalled, never paged ."""
+    import json, subprocess, time
+    copy = tmp_path / "wt" / "demo" / "waiting"
+    copy.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(copy), "init", "-q", "-b", "main"], check=True)
+    (copy / "a.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(copy), "-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt"], check=True)
+    subprocess.run(["git", "-C", str(copy), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a"], check=True)
+    (copy / "b.txt").write_text("pending", encoding="utf-8")   # uncommitted work -> would be "pending"
+    old = time.time() - 5 * 3600
+    import os
+    os.utime(copy / "b.txt", (old, old))
+    (copy / ".wt.json").write_text(json.dumps({"app": "demo", "name": "waiting", "path": str(copy), "base": "main",
+                                               "created_at": "2020-01-01T00:00:00+09:00"}), encoding="utf-8")
+    (copy / ".wt.hold").write_text("운영자 QR 스캔 대기\n", encoding="utf-8")
+    row = stall_watch.scan_one(copy / ".wt.json", tmp_path / "none.sqlite", time.time())
+    assert row is not None and row["hold"] == "운영자 QR 스캔 대기"
+    assert stall_watch.is_stalled(row, threshold_min=30) is False

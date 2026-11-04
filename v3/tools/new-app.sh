@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # new-app.sh <app> [--template <dir>]
 # Scaffolds a new app folder <apps root>/<app> as a git repository with one first commit (gap 28; v2 `gb2 new`
 # rewritten without the engine). Called by `wt-new.sh <app> <name> --new` when the folder does not exist yet.

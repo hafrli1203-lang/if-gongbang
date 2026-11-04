@@ -1,4 +1,4 @@
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """app_facts.py 시험 (자가 점검 2026-11-03):
 ① 지난 실수가 카드에 "번호: 다음부터 규칙" 한 줄씩 들어가고, 조회 실패면 직접 부르라고 적는지
 ② sqlite 앱·파일 저장 앱·손으로 DATABASE_URL을 넣는 시험이 있는 앱을 "시험 DB 단서 없음"과 구분하는지.
@@ -74,3 +74,5 @@ def test_named_test_db_still_wins(tmp_path):
     d = _app(tmp_path, {"pg": "1"}, {"vitest.config.ts": "TEST_DATABASE_URL", "tests/setup.ts": "checkTestDbUrl()"})
     hint = af.test_db_hint(d)
     assert hint.startswith("시험 DB 단서") and "가드 있음" in hint
+
+

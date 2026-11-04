@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 """Environment helper for the worktree tools (wt-*.sh). Never prints a URL, password or env value.
 
 Reads an app's env file (.env.local, else .env) and runs a command with a derived environment, so database

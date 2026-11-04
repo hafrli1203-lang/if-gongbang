@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # Common deploy for one Next.js app.
 # Order is forced: busy check -> memory check -> quality gate -> build in a separate folder -> swap only on success
 # -> restart -> deploy-check -> automatic rollback if the check fails.
@@ -31,7 +31,7 @@ dir="$APPS_ROOT/$app"; envf="$dir/deploy.env"
 [ -f "$envf" ] || { echo "배포 중단 — $envf 없음 (UNIT·PORT·HEALTH_PATHS 필요)"; exit 2; }
 # shellcheck disable=SC1090
 . "$envf"
-dir="${APP_DIR:-$dir}"   # the Next project may live in a subfolder
+case "${APP_DIR:-}" in "") ;; /*) dir="$APP_DIR" ;; *) dir="$dir/${APP_DIR%/}" ;; esac   # the Next project may live in a subfolder (someapp: web/, absolute or relative)
 # Apps with their own release-based deploy (apt: isolated release dirs + health gate + rollback) set DEPLOY_CMD in deploy.env;
 # this script then only forwards to it so every app still has one entry point and one settings file.
 if [ -n "${DEPLOY_CMD:-}${DEPLOY_CMD_DEPLOY:-}" ]; then

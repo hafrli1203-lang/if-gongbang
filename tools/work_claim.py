@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """Work-queue self-claim (2026-11-01, team-lead: "작업판 일을 작업조가 스스로 맡기" — Agentic Mesh 글 요지,
 중앙 배정자 없이 작업조가 WORK_QUEUE.md 의 「(자율)」 표시 줄을 스스로 보고 맡는다).
 
@@ -12,6 +12,10 @@
   python3 work_claim.py claim  --line N --by <작업조 이름> [--file ...]
   python3 work_claim.py done   --line N --by <작업조 이름> --evidence "<커밋/증거 한 줄>" [--file ...]
   python3 work_claim.py release --line N --by <작업조 이름> [--file ...]
+  python3 work_claim.py restore --from <백업 파일> --by <이름> [--file ...]
+      디스크 판이 비었거나(0바이트) 백업보다 줄이 짧을 때만 백업으로 되돌린다(2026-11-04,
+      밤 자가 점검이 쓰기 오류로 작업판을 0바이트로 만든 사고). 그 외(디스크 판이 백업과
+      같거나 더 길면) 거부 — 진행 중인 내용을 덮어쓰지 않는다.
   python3 work_claim.py selftest   # 임시 사본으로 동시 claim 2개 → 하나만 성공하는지 자체 확인
 """
 from __future__ import annotations
@@ -173,6 +177,44 @@ def release(queue_file: Path, line_no: int, by: str) -> str:
     return _with_flock(queue_file, work)
 
 
+def restore(queue_file: Path, from_file: Path, by: str) -> str:
+    """디스크 판이 비었거나(0바이트) 백업보다 줄 수가 적을 때만 백업 전체 내용으로 되돌린다.
+    디스크 판이 백업과 같거나 더 길면(이미 정상이거나 그 뒤로 더 쌓였으면) 거부한다 —
+    실수로 새로 쌓인 내용을 백업으로 덮어쓰는 사고를 막는다."""
+
+    def work() -> str:
+        if not from_file.is_file():
+            raise ClaimError(f"백업 파일이 없습니다: {from_file}")
+        backup_text = from_file.read_text(encoding="utf-8")
+        if not backup_text.strip():
+            raise ClaimError(f"백업 파일이 비어 있습니다: {from_file}")
+        backup_lines = backup_text.count("\n") + (0 if backup_text.endswith("\n") else 1)
+        current_text = queue_file.read_text(encoding="utf-8") if queue_file.exists() else ""
+        current_lines = current_text.count("\n") + (0 if (current_text and not current_text.endswith("\n")) else 0)
+        if current_text.strip() and current_lines >= backup_lines:
+            raise ClaimError(
+                f"디스크 판({current_lines}줄)이 백업({backup_lines}줄)보다 짧지 않습니다 — "
+                "되돌리지 않습니다(진행 중인 내용을 덮어쓸 위험)."
+            )
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(queue_file.parent), prefix=f".{queue_file.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(backup_text)
+            os.replace(tmp_path, queue_file)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"복원 완료: {queue_file} ← {from_file} ({backup_lines}줄, by {by} {ts})"
+
+    return _with_flock(queue_file, work)
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     for line_no, text in list_unclaimed(Path(args.file)):
         print(f"{line_no}\t{text}")
@@ -199,6 +241,16 @@ def _cmd_done(args: argparse.Namespace) -> int:
         print(f"끝내기 실패: {e}", file=sys.stderr)
         return 1
     print(new_text)
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    try:
+        msg = restore(Path(args.file), Path(args.from_file), args.by)
+    except ClaimError as e:
+        print(f"복원 실패: {e}", file=sys.stderr)
+        return 1
+    print(msg)
     return 0
 
 
@@ -332,6 +384,12 @@ def main() -> int:
     p_release.add_argument("--by", required=True)
     p_release.add_argument("--file", default=str(DEFAULT_QUEUE))
     p_release.set_defaults(func=_cmd_release)
+
+    p_restore = sub.add_parser("restore", help="디스크 판이 비었거나 더 짧을 때만 백업으로 되돌린다")
+    p_restore.add_argument("--from", dest="from_file", required=True)
+    p_restore.add_argument("--by", required=True)
+    p_restore.add_argument("--file", default=str(DEFAULT_QUEUE))
+    p_restore.set_defaults(func=_cmd_restore)
 
     sub.add_parser("selftest", help="임시 사본으로 동시 claim 등 자체 확인")
 

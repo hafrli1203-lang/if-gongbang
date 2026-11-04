@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-stop.sh <copy>
 # Stops only the scope units recorded in <copy>/.wt.json "units" (systemctl --user stop), then empties the list.
 # Never kills by process name or pattern — contract: docs/v3-wt-interface.md §3.

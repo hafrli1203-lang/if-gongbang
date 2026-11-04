@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """App fact cards (2026-11-01, owner: "개발 구조를 모든 앱이 알아서 자동으로 보고 거기에 맞게 하게 해라").
 
 Writes /apps/_ops/app-facts/<app>.md for every app with a deploy.env: the facts a fresh agent must know before
@@ -23,7 +23,7 @@ DEPLOY = "/apps/_shared/deploy.sh"
 
 METHOD = """## 일하는 법 (모든 앱 공통 — 이것만 지키면 된다)
 0. 먼저 `/apps/_ops/PSTACK_KO.md`와 poteto-mode SKILL.md(실제 경로: `~/.claude/skills-library/03-에이전트·하네스·오케스트레이션/pstack/skills/poteto-mode/SKILL.md`)를 읽는다(2026-11-01 pstack 도입).
-1. 시작: 이 카드(맨 아래 「지난 실수」 포함 — 이번 일에 걸리는 번호를 첫 보고에 적는다) → 그 앱 `docs/ai/CURRENT_DECISIONS.md`의 해당 절을 읽는다. 더 오래된 실수는 `lessons_for(app)`. 운영자 말은 원문 그대로 옮긴다.
+1. 시작: 이 카드(위 「지난 실수」 포함 — 첫 보고 첫 줄을 `지난 실수: L1-xxxx` 또는 `지난 실수: 걸리는 것 없음`으로 쓴다) → 그 앱 `docs/ai/CURRENT_DECISIONS.md`의 해당 절을 읽는다. 더 오래된 실수는 `lessons_for(app)`. 운영자 말은 원문 그대로 옮긴다.
 2. 통과 장면부터: "사람이 하는 일 → 앱이 보여 주는 결과 → 화면 위치"를 먼저 적고 만든다. 입력 칸만 만든 것은 구현이 아니다.
 3. 운영 DB에 쓰지 않는다: 시험·dev 서버·seed는 아래 「시험 DB」만. 운영 마이그레이션은 백업 뒤 배포 때 한 번. dev 서버·임시 빌드 폴더(distDir)는 앱 폴더가 아니라 자기 scratchpad 아래에 둔다(앱 폴더에 남은 .next-* 가 린트·Tailwind 검사를 3만 건 넘게 오염시킴, 2026-11-01).
 4. 완료는 증거로: 화면이면 실제로 눌러 본 캡처(1440·390), 데이터면 조회 결과, 코드면 이 앱 CI 범위 전체 실패 0. 증거가 없으면 "미검증: 무엇"이라고 쓴다 — 그건 완료가 아니다. 설치·연결·입구 일(스킬·자료·직원 매뉴얼·지시 판별)은 운영자가 실제로 쓰는 자리(카톡 지시 한 줄·the office app 화면)에 1건 넣어 그 자산이 읽히고 결과가 돌아온 출력까지가 완료다 — 없으면 "만듦(통과 장면 미검증)"(L1-0253·0254·0258·0259).
@@ -332,7 +332,10 @@ def summarize_lessons(text: str) -> list[str]:
 
 
 def lessons_section(app: str, lessons: dict[str, list[str]] | None) -> list[str]:
-    head = f"## 지난 실수 (자동, `lessons_for({app})` 최근 {LESSONS_PER_APP}건 — 이번 일에 걸리는 번호를 첫 보고에 적는다)"
+    # Placed right under the app facts (11-04: crews that read only the first 15 lines missed it at the bottom; 3/17 app-edit
+    # crews wrote the number). The fixed first-line form is what crew_metrics can count.
+    head = (f"## 지난 실수 (자동, `lessons_for({app})` 최근 {LESSONS_PER_APP}건) — 첫 보고 첫 줄: "
+            "`지난 실수: L1-xxxx`(걸리는 번호) 또는 `지난 실수: 걸리는 것 없음`")
     if lessons is None or app not in lessons:
         return [head, "- 자동 조회 실패 — 시작할 때 `lessons_for(app)`를 직접 부른다."]
     return [head, *(lessons[app] or ["- 기록된 지난 실수 없음."])]
@@ -368,6 +371,8 @@ def card(app: str, lessons: dict[str, list[str]] | None = None) -> str:
         *deploy_state(app, d),
         *build_scan_risk(d),
         "",
+        *lessons_section(app, lessons),
+        "",
         "## 사본 실행 (`_shared/wt-new.sh`·`wt-run.sh`가 쓰는 값, 2026-11-01)",
         f"- DEV_CMD: `{dev_cmd(app_dir, env)}`",
         f"- MIGRATE_CMD: `{migrate_cmd(app_dir, env)}`",
@@ -379,7 +384,6 @@ def card(app: str, lessons: dict[str, list[str]] | None = None) -> str:
         ] if review else []),
         "",
         METHOD,
-        *lessons_section(app, lessons),
     ]
     return "\n".join(lines) + "\n"
 

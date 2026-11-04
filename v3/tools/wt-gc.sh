@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-gc.sh [--dry] [--only <copy>]
 # Removes only work copies whose job is finished for good — docs/v3-wt-interface.md §6. Run at session start and on a nightly schedule.
 # A copy is removed when

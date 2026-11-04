@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-new.sh <app> <name> [--task <id>] [--scope-file <file>] [--new]
 # --new: the app folder does not exist yet — new-app.sh scaffolds it (template or minimal Next app) and commits, then the
 #   copy is made from it as usual.
@@ -61,14 +61,14 @@ exec 6>"$WT_DATA/global.mutex"; flock 6
 # 상한(또는 빈 포트/DB 슬롯 없음)에 걸리면 "대기"로 끝내되 — 원본을 직접 고치는 대신 반장에게 바로 알린다
 # (반장 2026-11-03 08:40, WORK_QUEUE 32번: 작업조가 상한에 막히자 기다리지 않고 앱 원본을 직접 고친 사고).
 wt_notify_wait() {
-  timeout 20 node "$WT_SHARED/notify-owner.mjs" "[사본 대기] $app/$name — $1" "/" "시스템" >>"$WT_DATA/notify.log" 2>&1 || true
+  timeout 20 node "$WT_SHARED/notify-owner.mjs" "$app 앱의 새 작업('$name')이 순서를 기다리고 있습니다. 이유: $1. 고장이 아니라 정상 대기이고, 앞의 작업이 끝나면 반장이 이어서 시작합니다. 대표가 할 일: 없음." "/" "시스템" >>"$WT_DATA/notify.log" 2>&1 || true
 }
 app_n=$(wt_active_dirs "$app" | wc -l); all_n=$(wt_active_dirs "" | wc -l)
-[ "$app_n" -lt "$WT_APP_MAX" ] || { echo "대기 — $app 사본 ${app_n}개(상한 $WT_APP_MAX) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "사본 상한 ${app_n}/${WT_APP_MAX}"; exit 3; }
-[ "$all_n" -lt "$WT_GLOBAL_MAX" ] || { echo "대기 — 전체 사본 ${all_n}개(상한 $WT_GLOBAL_MAX) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "전체 사본 상한 ${all_n}/${WT_GLOBAL_MAX}"; exit 3; }
+[ "$app_n" -lt "$WT_APP_MAX" ] || { echo "대기 — $app 사본 ${app_n}개(상한 $WT_APP_MAX) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "이 앱에서 동시에 할 수 있는 작업 ${WT_APP_MAX}개가 모두 돌고 있습니다"; exit 3; }
+[ "$all_n" -lt "$WT_GLOBAL_MAX" ] || { echo "대기 — 전체 사본 ${all_n}개(상한 $WT_GLOBAL_MAX) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "서버 전체에서 동시에 할 수 있는 작업 ${WT_GLOBAL_MAX}개가 모두 돌고 있습니다"; exit 3; }
 if [ -n "$scope_file" ] && wt_scope_has_migrations "$scope_file"; then
   for d in $(wt_active_dirs "$app"); do
-    wt_scope_has_migrations "$d/.wt.scope" && { echo "대기 — $app 에 DB 변경 사본이 이미 있습니다($d) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "DB 변경 사본 중복($d)"; exit 3; }
+    wt_scope_has_migrations "$d/.wt.scope" && { echo "대기 — $app 에 DB 변경 사본이 이미 있습니다($d) — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "같은 앱에서 데이터 구조를 바꾸는 작업이 이미 돌고 있어 겹치지 않게 기다립니다"; exit 3; }
   done
 fi
 used_ports=" "
@@ -79,7 +79,7 @@ for p in $(seq 4000 4999); do
   case "$used_ports$listening" in *" $p "*) continue ;; esac
   port="$p"; break
 done
-[ -n "$port" ] || { echo "대기 — 빈 포트(4000~4999)가 없습니다 — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "빈 포트 없음(4000~4999)"; exit 3; }
+[ -n "$port" ] || { echo "대기 — 빈 포트(4000~4999)가 없습니다 — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "시험용 화면을 띄울 빈자리가 없습니다"; exit 3; }
 
 base=$(wt_base_branch "$app")
 created=0; slot=""
@@ -120,27 +120,35 @@ done
 flock -u 6; exec 6>&-
 # node_modules: hard-link copy, not a symlink — Next 16/Turbopack refuses a node_modules symlink pointing out of the project
 # root (observed on two apps). Same filesystem: almost no disk, seconds. Other filesystem: rsync --link-dest.
-if [ -d "$src/node_modules" ]; then
-  cp -al "$src/node_modules" "$wt/node_modules" 2>/dev/null \
-    || { rm -rf -- "$wt/node_modules"; rsync -a --link-dest="$src/node_modules/" "$src/node_modules/" "$wt/node_modules/"; } \
-    || wt_die "node_modules 복사 실패"
+copy_node_modules() {  # $1 folder relative to the app root ('' = root): hard-link copy of its node_modules into the copy
+  local rel="$1" from="$src${1:+/$1}" to="$wt${1:+/$1}" relinked=0 l t
+  [ -d "$from/node_modules" ] || return 0
+  mkdir -p "$to"
+  cp -al "$from/node_modules" "$to/node_modules" 2>/dev/null \
+    || { rm -rf -- "$to/node_modules"; rsync -a --link-dest="$from/node_modules/" "$from/node_modules/" "$to/node_modules/"; } \
+    || wt_die "node_modules 복사 실패${rel:+ ($rel)}"
   # relative symlinks that leave node_modules (file:../_shared/kit -> ../../../_shared/kit) break one level deeper in
   # the copy: re-point each broken one at what the app folder's same link resolves to, as an absolute path. ln -sfn
   # replaces only the copy's directory entry; the app folder's link (same inode under cp -al) is left as it was.
-  relinked=0
   while IFS= read -r -d '' l; do
     t=$(readlink -f "$src/${l#"$wt/"}" 2>/dev/null || true)
     [ -n "$t" ] && [ -e "$t" ] || { echo "끊긴 링크(앱 폴더에서도 대상 없음): ${l#"$wt/"}" >&2; continue; }
     ln -sfn "$t" "$l"; relinked=$((relinked + 1))
-  done < <(find "$wt/node_modules" -maxdepth 3 -xtype l -print0)
-  [ "$relinked" = 0 ] || echo "node_modules 링크 재연결 ${relinked}개" >&2
-fi
+  done < <(find "$to/node_modules" -maxdepth 3 -xtype l -print0)
+  [ "$relinked" = 0 ] || echo "node_modules 링크 재연결 ${relinked}개${rel:+ ($rel)}" >&2
+}
+copy_node_modules ""
+# The Next project may live in a subfolder (deploy.env APP_DIR, someapp: web/): its own node_modules is needed there too
+# (someapp session 11-04 had to cp -al it by hand).
+app_sub=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${APP_DIR:-}"' _ "$src/deploy.env" 2>/dev/null || true); app_sub="${app_sub%/}"
+case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute (someapp) -> relative; outside the app -> ignored
+[ -z "$app_sub" ] || [ "$app_sub" = . ] || copy_node_modules "$app_sub"
 
 # 2) test DB slot
 envf=$(wt_app_env "$app")
 db=""
 if [ -n "$envf" ] && python3 "$WT_ENVPY" has --env-file "$envf"; then
-  slot=$(wt_slot_claim "$app" "$wt") || { echo "대기 — $app 시험 DB 슬롯 $WT_SLOTS개가 모두 사용 중 — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "시험 DB 슬롯 모두 사용 중($WT_SLOTS개)"; exit 3; }
+  slot=$(wt_slot_claim "$app" "$wt") || { echo "대기 — $app 시험 DB 슬롯 $WT_SLOTS개가 모두 사용 중 — 반장에게 알리기: notify-owner.mjs로 알림 보냄, 기다린다"; wt_notify_wait "시험용 데이터베이스 ${WT_SLOTS}개가 모두 쓰이고 있습니다"; exit 3; }
   db="${app}_wt${slot}_test"
   exists=$(wt_pg_admin postgres psql -XtAqc "select 1 from pg_database where datname = '$db'")
   [ "$exists" = 1 ] || wt_die "시험 DB가 없습니다: $db (풀 생성 필요)"

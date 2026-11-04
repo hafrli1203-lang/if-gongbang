@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """IF 공방 작업 사본(wt) 환경 사전 점검 -- 묶음 8 #29.
 
 Checks every external dependency the wt-*.sh tool chain (plans/2026-11-01-wt-interface.md)

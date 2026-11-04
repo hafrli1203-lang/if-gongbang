@@ -131,6 +131,14 @@ DROP_FUNCTIONS: dict[str, list[str]] = {
     # portable to any other machine (including this extraction's own clone). The rest of
     # test_probe_trust.py (synthetic-string cases) stays and is the real regression coverage.
     "harness/tests/test_probe_trust.py": ["test_real_probe_logs_on_this_host_pass_with_wide_max_age"],
+    # Calls app_facts.card() against a real app name with no tmp_path fixture - card() reads
+    # that app's actual deploy.env etc. from disk, so after the dynamic app-name substitution
+    # above turns the real name into the placeholder "exampleapp" (no such directory on any
+    # other machine, including this extraction's own clone) the call raises FileNotFoundError
+    # regardless of anything this script's transforms could do to the test's own text. The
+    # other test_app_facts.py functions already use tmp_path + a synthetic app dir (see _app())
+    # and are the portable coverage for this module.
+    "tools/tests/test_app_facts.py": ["test_lessons_sit_right_under_app_facts_with_fixed_first_line"],
 }
 
 
@@ -182,6 +190,27 @@ STRUCTURAL_FIXES: dict[str, list[tuple[re.Pattern, str]]] = {
     ],
     "tools/tests/test_wt_doctor.py": [
         (re.compile(r'TOOLS = HERE\.parent\n'), 'TOOLS = HERE.parent / "tools"\n'),
+    ],
+    "tools/tests/test_daily_review.py": [
+        # This test's own point is that TWO DIFFERENT app names are told apart in the
+        # finding text. The dynamic app-name pass below maps every real app name to the
+        # same placeholder ("exampleapp"), which would collapse both names together and
+        # make the distinguishing assertion impossible regardless of the real code's
+        # behavior - so the second name is pinned to a distinct literal first, here,
+        # before that pass runs.
+        # NOT "exampleapp2": the real substitution target is literally "exampleapp" (see
+        # build_app_name_rx below), and "exampleapp" is itself a SUBSTRING of "exampleapp2" -
+        # this test's own assertion is `"exampleapp" not in p`, which a numbered variant of
+        # the same placeholder can never satisfy. A disjoint word is required instead.
+        (re.compile(r'(?<![A-Za-z0-9_])' + re.escape("site" + "factory") + r'(?![A-Za-z0-9_])'), "otherapp"),
+    ],
+    "tools/stall_watch.py": [
+        # trailing owner-quote comment on an otherwise functional constant-definition line -
+        # not caught by scrub_comment_only_lines (that pass only drops/edits PURE comment
+        # lines; this line's content before the "#" is real code, so it is kept, only the
+        # trailing citation is removed).
+        (re.compile(r'   # owner 2026-11-05: the same copy paged 20\+ times at 30 min = noise; first page, then once per 6 h\n'),
+         "   # the same copy paged repeatedly at a short interval once; first page, then once per renotify window\n"),
     ],
 }
 

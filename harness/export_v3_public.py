@@ -93,6 +93,8 @@ ALLOWED_FILES = [
     ("sec-gate.sh", "sec-gate.sh"),
     ("suite-check.py", "suite-check.py"),
     ("new-app.sh", "new-app.sh"),
+    ("notify-text.mjs", "notify-text.mjs"),
+    ("wt-hold.sh", "wt-hold.sh"),
 ]
 # Explicitly excluded (plan 2026-11-01 "공개판 전에 로컬에서 먼저 고칠 것" / item B "제외"):
 #   app_facts.py (internal fact-card generator), work_claim.py (Markdown-line queue, the
@@ -135,6 +137,11 @@ def build_global(cfg: dict) -> list[tuple[re.Pattern, str]]:
         # of the path around it.
         (re.compile(r'\b' + ops_dirname + r'\b'), "_ops"),
         (re.compile(r'packages such as @[A-Za-z][A-Za-z0-9_-]*/kit\)'), "a shared internal package)"),
+        # the real app name used as the private source's own worked example for the
+        # subfolder-app feature (2026-11-05) - comment-only occurrences, swapped for a
+        # generic placeholder (name read from cfg, never written here as a literal).
+        (re.compile(r'\b' + re.escape(cfg.get("src_example_subfolder_app", "")) + r'\b')
+         if cfg.get("src_example_subfolder_app") else re.compile(r'(?!)'), "someapp"),
         (re.compile(apps_root + r'/'), "${WT_APPS_ROOT}/"),
         # anything left bare (not followed by a path separator - end of string, a shell `}`/`)`/
         # quote, etc.) after the rules above have consumed every apps_root+'/...' occurrence.
@@ -383,11 +390,16 @@ def build_rules(cfg: dict) -> dict[str, list[tuple[re.Pattern, str]]]:
 HEADER = {
     "sh": "# Generated from private source at {commit}; do not edit by hand (see harness/export_v3_public.py).\n",
     "py": "# Generated from private source at {commit}; do not edit by hand (see harness/export_v3_public.py).\n",
+    "mjs": "// Generated from private source at {commit}; do not edit by hand (see harness/export_v3_public.py).\n",
 }
 
 
 def file_kind(relpath: str) -> str:
-    return "py" if relpath.endswith(".py") else "sh"
+    if relpath.endswith(".py"):
+        return "py"
+    if relpath.endswith(".mjs"):
+        return "mjs"
+    return "sh"
 
 
 def insert_header(text: str, commit: str, kind: str) -> str:

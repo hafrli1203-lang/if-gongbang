@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit|Bash|Agent): block work aimed at an app
 outside the owner's current scope (CURRENT_SCOPE.json) -- AND, new in this revision (team-lead
 2026-11-02, v2 gap bundle 4, items 105/110/111/158/159/167/214), fence a work-copy (wt-new.sh)

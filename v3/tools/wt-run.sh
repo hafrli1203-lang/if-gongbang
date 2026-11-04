@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-run.sh <copy> [--bg] [--mem 4G] [--dev | --tests | --tests-full | -- <command...>]
 # Runs inside bubblewrap by default (wt-sandbox.py: copy writable, rest read-only, env files hidden). Foreground
 # commands run without network (only loopback DB ports relayed, slot DBs only); --bg / --dev servers keep it.

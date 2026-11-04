@@ -1,4 +1,4 @@
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """crew_metrics.py 시험 (2026-11-02 team-lead 지시, 03:30 자가 점검 지적 보정):
 ① 분모가 "앱 파일을 실제로 고친 작업조"인지 ② DB 쓰기 정규식이 문자열 언급(cat으로 파일
 읽기, created_at/updated_at 같은 컬럼명)을 "쓰기"로 잡지 않고 실행 명령만 잡는지.

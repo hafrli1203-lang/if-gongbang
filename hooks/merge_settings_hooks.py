@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """Merges this bundle's hook registrations into ~/.claude/settings.json's "hooks" section,
 preserving every existing entry (never truncates or replaces the whole file) - the merge half of
 `apply_hooks_v3.sh`.

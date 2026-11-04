@@ -1,4 +1,4 @@
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """daily_review.py 시험 — 가짜 office.sqlite·notify-log.jsonl·ALERTS.md로 집계·정렬·중복 제외를 확인한다."""
 from __future__ import annotations
 
@@ -137,3 +137,43 @@ def test_render_report_md_marks_empty_bucket(tmp_path):
     md = daily_review.render_report_md(result, "2026-11-03")
     assert "건수 0" in md
     assert "근거 있는 항목 없음" in md
+
+
+def test_discord_table_is_plain_words():
+    """#밤점검 표는 쉬운 말만: 꼬리표 코드·파일 이름 없이, 끝에 운영자가 할 일 (운영자 2026-11-05)."""
+    result = {"top10": [
+        {"bucket": "고장", "score": 63, "count": 1, "title": "서비스 failed: ifapp-exampleapp.service",
+         "plain": f"멈춰 있음: {daily_review.app_label('ifapp-exampleapp.service')}"},
+        {"bucket": "불편", "score": 20, "count": 3, "title": "the office app 완료 증거 없음(evidence_ok=0)",
+         "plain": "끝났다고 하면서 증거를 붙이지 않은 작업"},
+    ]}
+    out = daily_review.render_discord_table(result, "2026-11-05")
+    assert "멈춰 있음: exampleapp 앱 서비스 (1건)" in out
+    assert ".service" not in out and "evidence_ok" not in out and "·63]" not in out
+    assert out.rstrip().endswith("운영자가 할 일: 없음 — 반장이 위에서부터 작업판에 올려 고칩니다.")
+
+
+def test_app_label():
+    assert daily_review.app_label("ifapp-exampleapp-asr.service") == "exampleapp 앱의 asr 작업"
+    assert daily_review.app_label("ifapp-exampleapp.service") == "exampleapp 앱 서비스"
+
+
+def test_wired_app_without_skill_use_is_a_finding(tmp_path, monkeypatch):
+    usage = tmp_path / "usage.jsonl"
+    now = datetime.now(timezone.utc).isoformat()
+    usage.write_text(json.dumps({"at": now, "app": "exampleapp", "task": "blog_post", "used": ["a"], "missing": []}) + "\n"
+                     + json.dumps({"at": now, "app": "exampleapp", "task": "blog_post", "used": [], "missing": ["seo-최적화"]}) + "\n",
+                     encoding="utf-8")
+    wired = tmp_path / "wired.json"
+    wired.write_text(json.dumps({"apps": ["exampleapp", "otherapp"]}), encoding="utf-8")
+    monkeypatch.setattr(daily_review, "SKILL_USAGE", usage)
+    monkeypatch.setattr(daily_review, "SKILL_WIRED", wired)
+    monkeypatch.setattr(daily_review, "OFFICE_DB", tmp_path / "none.sqlite")
+    monkeypatch.setattr(daily_review, "NOTIFY_LOG", tmp_path / "none.jsonl")
+    monkeypatch.setattr(daily_review, "ALERTS_MD", tmp_path / "none.md")
+    monkeypatch.setattr(daily_review, "read_failed_units", lambda: [])
+    res = daily_review.build_findings(24)
+    plains = [f.get("plain", "") for f in res["findings"]]
+    assert any("otherapp" in p and "exampleapp" not in p for p in plains)
+    assert any("seo-최적화" in p for p in plains)
+    assert res["skill_use"] == {"exampleapp": 2}

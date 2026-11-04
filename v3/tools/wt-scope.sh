@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-scope.sh <app> <name> --file <scope-file> | --add <glob>...
 # Sets or extends a work copy's .wt.scope (the only sanctioned way besides wt-new.sh --scope-file:
 # the protect_sensitive_files hook refuses hand edits of ${WT_ROOT}/**/.wt.*:

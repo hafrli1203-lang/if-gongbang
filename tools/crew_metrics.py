@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """Crew behaviour metrics (2026-11-01, Agent Experience idea: measure what agents actually do before adding more rules —
 Microsoft "Best practices are hypotheses until you measure them"; owner: "똑같은 실수를 반복하고 자꾸 누락하고").
 2026-11-02 보정 (03:30 자가 점검 지적, reports/self-improve-2026-11-02.md): 어제치 84개 중 55개(general-purpose 42·

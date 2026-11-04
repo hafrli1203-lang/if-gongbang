@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at a8eb56b1bac538511499bb39b350117e5eead6e1; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
 # wt-adopt.sh <copy path>
 # Registers a work copy made by hand (git worktree under ${WT_ROOT}/<app>/<name> without .wt.json) so the limits,
 # wt-stop, wt-land and wt-gc see it. Writes .wt.json {app, name, branch, base, path, db: null, port: null, units: [],

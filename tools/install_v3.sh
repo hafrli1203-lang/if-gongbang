@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 # IF 공방 작업 사본(wt) 환경 멱등 설치 -- 묶음 8 #30.
 # 있으면 건너뛰고, 없으면 만든다. 두 번 돌려도 같은 결과(멱등). .env*는 열지 않는다.
 # (2026-11-02 배선 수정: "승인 관문" 문구 제거 -- 승인 관문은 11-02 폐지됐다, MASTER_RULES §7.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """멈춘 작업 사본 감시 (2026-11-03, team-lead 지시 — 운영자 "왜 작업을 안했는지 확인해.
 지금 이것도 심각한 오류다"(L1-0261): 반장이 작업조 보고만 기다려 00:30~07:46 멈춘 사고 재발 방지).
 
@@ -37,7 +37,7 @@ OFFICE_DB = Path(os.environ.get("STALL_WATCH_DB", "/data/exampleapp/office.sqlit
 STATE_FILE = Path(os.environ.get("STALL_WATCH_STATE", "/apps/_ops/metrics/stall-watch-state.json"))
 NO_NOTIFY = os.environ.get("STALL_WATCH_NO_NOTIFY") == "1"
 NOTIFY_MJS = "/apps/_shared/notify-owner.mjs"
-RENOTIFY_SEC = 30 * 60
+RENOTIFY_SEC = 6 * 60 * 60   # the same copy paged repeatedly at a short interval once; first page, then once per renotify window
 
 # 빌드 산출물·캐시 폴더 — MASTER_RULES §7 "제외 폴더"와 같다. 여기 mtime은 "작업했다"는 신호가 아니다.
 EXCLUDE_DIRS = {
@@ -163,6 +163,7 @@ def scan_one(json_path: Path, db_path: Path, now: float) -> dict | None:
     copy_path = Path(info.get("path") or json_path.parent)
     if not copy_path.is_dir():
         return None
+    hold = read_hold(copy_path)
     finished = (copy_path / ".wt.done").exists() or not work_pending(copy_path, info.get("base") or "")
     commit_epoch = last_commit_epoch(copy_path) if not finished else None
     mtime_epoch = max_file_mtime(copy_path) if not finished else None
@@ -181,6 +182,7 @@ def scan_one(json_path: Path, db_path: Path, now: float) -> dict | None:
         "name": info.get("name"),
         "path": str(copy_path),
         "finished": finished,
+        "hold": hold,
         "task_id": task_id,
         "task_status": task.get("status") if task else None,
         "commit_epoch": commit_epoch,
@@ -193,8 +195,18 @@ def scan_one(json_path: Path, db_path: Path, now: float) -> dict | None:
     }
 
 
+def read_hold(copy_path: Path) -> str | None:
+    """`.wt.hold` (written by _shared/wt-hold.sh) = this copy is waiting on a person (owner answer, QR scan, decision):
+    not stalled, not paged. The file holds the reason."""
+    f = copy_path / ".wt.hold"
+    try:
+        return f.read_text(encoding="utf-8").strip() or "대기" if f.exists() else None
+    except OSError:
+        return None
+
+
 def is_stalled(row: dict, threshold_min: float) -> bool:
-    if row["finished"]:
+    if row["finished"] or row.get("hold"):
         return False
     return row["age_min"] > threshold_min
 
@@ -224,9 +236,11 @@ def _save_state(state: dict) -> None:
 
 
 def notify(row: dict, threshold_min: float) -> None:
+    # owner should do. One line because notify-owner sends one line.
     text = (
-        f"[멈춤 감시] {row['app']}/{row['name']} {_fmt_age(row['age_min'])} 동안 "
-        f"커밋·변경·보고 없음(기준 {threshold_min:.0f}분)"
+        f"작업이 멈춘 것 같습니다: {row['app']} 앱의 '{row['name']}' 작업 사본이 {_fmt_age(row['age_min'])} 동안 아무 변화가 없습니다. "
+        f"작업조가 끝내지 못하고 멈췄거나 잊힌 사본일 수 있습니다. "
+        f"운영자가 할 일: 없음 — 반장이 확인해서 이어서 하거나 정리합니다. (같은 알림은 6시간에 한 번만 옵니다)"
     )
     try:
         subprocess.run(
@@ -251,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'사본':40} {'상태':8} {'나이':10} {'작업상태':10} {'살아있는 유닛'}")
     stalled_rows = []
     for row in rows:
-        state = "완료" if row["finished"] else ("멈춤" if is_stalled(row, threshold_min) else "진행중")
+        state = "완료" if row["finished"] else ("대기" if row.get("hold") else ("멈춤" if is_stalled(row, threshold_min) else "진행중"))
         alive = ", ".join(f"{u}:{s}" for u, s in row["units"]) or "-"
         label = f"{row['app']}/{row['name']}"
         print(f"{label:40} {state:8} {_fmt_age(row['age_min']):10} {row['task_status'] or '-':10} {alive}")

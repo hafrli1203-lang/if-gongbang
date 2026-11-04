@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from the private ops workspace at b94af62b97af64e2e58e8c102fa2538f066ae366; do not edit by hand (see harness/export_ops_public.py).
+# Generated from the private ops workspace at 24c1bb68758c8a552514d06d8280463876278f76; do not edit by hand (see harness/export_ops_public.py).
 """밤 점검 24시간 분석 (2026-11-03, team-lead 지시 — 운영자 "매일 발전하는 프롬프트 두 줄": 둘째 줄은
 "지난 24시간 로그를 분석해 고장·불편·비효율을 효과 순으로 제안, 매일"). `tools/self_improve.sh` 뒤에 붙여 돈다.
 
@@ -37,6 +37,10 @@ from pathlib import Path
 ROOT = Path("/apps/_ops")
 OFFICE_DB = Path(os.environ.get("DAILY_REVIEW_DB", "/data/exampleapp/office.sqlite"))
 NOTIFY_LOG = Path(os.environ.get("DAILY_REVIEW_NOTIFY_LOG", "/data/exampleapp/notify-log.jsonl"))
+# 2026-11-05 (owner "앱들이 알아서 돌아가게 했는지가 중요하다"): apps record every skill load in usage.jsonl
+# (_shared/app-skills); wired.json lists the apps whose AI calls were wired. A wired app with no skill load in 24h is a finding.
+SKILL_USAGE = Path(os.environ.get("DAILY_REVIEW_SKILL_USAGE", "/data/app-skills/usage.jsonl"))
+SKILL_WIRED = Path(os.environ.get("DAILY_REVIEW_SKILL_WIRED", "/apps/_shared/app-skills/wired.json"))
 ALERTS_MD = Path(os.environ.get("DAILY_REVIEW_ALERTS", str(ROOT / "ops" / "ALERTS.md")))
 WORK_QUEUE = Path(os.environ.get("DAILY_REVIEW_WORK_QUEUE", str(ROOT / "WORK_QUEUE.md")))
 REPORTS = Path(os.environ.get("DAILY_REVIEW_REPORTS", str(ROOT / "reports")))
@@ -171,6 +175,7 @@ def build_findings(hours: float) -> dict:
     for key, count in sorted(repeated_alerts, key=lambda kv: -kv[1]):
         findings.append({
             "bucket": "고장", "title": key[:140], "count": count,
+            "plain": f"같은 알림이 {count}번 반복됨 — 원인이 아직 안 고쳐졌다는 뜻: {key[:50]}",
             "evidence": f"notify-log.jsonl 지난 {hours:g}시간 같은 문구 {count}회",
         })
 
@@ -183,6 +188,7 @@ def build_findings(hours: float) -> dict:
     for key, count in alert_units.items():
         findings.append({
             "bucket": "고장", "title": f"ALERTS.md 미확인: {key}", "count": count,
+            "plain": f"아무도 확인하지 않은 경보: {app_label(key)}",
             "evidence": f"ops/ALERTS.md `- [ ]` {count}건",
         })
 
@@ -190,7 +196,16 @@ def build_findings(hours: float) -> dict:
     for unit in failed_units:
         findings.append({
             "bucket": "고장", "title": f"서비스 failed: {unit}", "count": 1,
+            "plain": f"멈춰 있음: {app_label(unit)}",
             "evidence": "systemctl --user list-units --state=failed",
+        })
+
+    unplain = [r for r in notify_rows if r.get("plain")]
+    if unplain:
+        findings.append({
+            "bucket": "불편", "title": f"쉬운 말 아닌 알림 {len(unplain)}건(notify-log plain)", "count": len(unplain),
+            "plain": "운영자님이 알아듣기 어려운 말로 나간 알림",
+            "evidence": f"notify-log.jsonl plain 표시 {len(unplain)}건, 예: {unplain[-1].get('text', '')[:40]}",
         })
 
     # the office app 작업 기반 불편·비효율
@@ -198,24 +213,28 @@ def build_findings(hours: float) -> dict:
     if owner_followup_n:
         findings.append({
             "bucket": "불편", "title": "the office app 작업 중 운영자 재지시(owner_followup)", "count": owner_followup_n,
+            "plain": "운영자님이 같은 일을 다시 지시해야 했던 작업",
             "evidence": f"office.sqlite tasks owner_followup=1 지난 {hours:g}시간 {owner_followup_n}건",
         })
     format_bad_n = sum(1 for t in tasks if t["report_format_ok"] == 0)
     if format_bad_n:
         findings.append({
             "bucket": "불편", "title": "the office app 보고 형식 미비(report_format_ok=0)", "count": format_bad_n,
+            "plain": "보고가 정해진 순서(결론·한 것·주의·운영자가 할 일)를 안 지킨 작업",
             "evidence": f"office.sqlite tasks report_format_ok=0 지난 {hours:g}시간 {format_bad_n}건",
         })
     evidence_bad_n = sum(1 for t in tasks if t["evidence_ok"] == 0)
     if evidence_bad_n:
         findings.append({
             "bucket": "불편", "title": "the office app 완료 증거 없음(evidence_ok=0)", "count": evidence_bad_n,
+            "plain": "끝났다고 하면서 증거를 붙이지 않은 작업",
             "evidence": f"office.sqlite tasks evidence_ok=0 지난 {hours:g}시간 {evidence_bad_n}건",
         })
     resume_n = sum(1 for t in tasks if t["resume_count"] > 0)
     if resume_n:
         findings.append({
             "bucket": "비효율", "title": "the office app 작업 재시도(resume_count>0)", "count": resume_n,
+            "plain": "한 번에 못 끝내고 다시 이어서 한 작업",
             "evidence": f"office.sqlite tasks resume_count>0 지난 {hours:g}시간 {resume_n}건",
         })
 
@@ -230,8 +249,33 @@ def build_findings(hours: float) -> dict:
         if over:
             findings.append({
                 "bucket": "비효율", "title": "the office app 작업 소요 시간이 중앙값의 2배 넘음", "count": len(over),
+            "plain": "평소보다 2배 넘게 오래 걸린 작업",
                 "evidence": f"중앙값 {median:.0f}초, 초과 {len(over)}/{len(durations)}건",
             })
+
+    usage_rows = read_notify_log(SKILL_USAGE, since)   # same jsonl shape ({"at": ...})
+    skill_use: dict[str, int] = {}
+    for r in usage_rows:
+        skill_use[r.get("app", "?")] = skill_use.get(r.get("app", "?"), 0) + 1
+    missing_skill_rows = [r for r in usage_rows if r.get("missing")]
+    try:
+        wired = json.loads(SKILL_WIRED.read_text(encoding="utf-8")).get("apps", [])
+    except (OSError, json.JSONDecodeError):
+        wired = []
+    silent = [a for a in wired if skill_use.get(a, 0) == 0]
+    if silent:
+        findings.append({
+            "bucket": "불편", "title": f"스킬 연결된 앱이 24h 스킬 0회: {', '.join(silent)}", "count": len(silent),
+            "plain": f"우리 기준(스킬)을 안 쓰고 일했거나 일을 안 한 앱: {', '.join(silent)}",
+            "evidence": f"usage.jsonl 지난 {hours:g}시간, wired.json {len(wired)}개 중 0회 {len(silent)}개",
+        })
+    if missing_skill_rows:
+        names = sorted({m for r in missing_skill_rows for m in r.get("missing", [])})
+        findings.append({
+            "bucket": "고장", "title": f"앱이 찾지 못한 스킬: {', '.join(names)[:80]}", "count": len(missing_skill_rows),
+            "plain": f"앱이 쓰려던 스킬을 찾지 못함: {', '.join(names)[:60]}",
+            "evidence": f"usage.jsonl missing {len(missing_skill_rows)}건",
+        })
 
     for f in findings:
         f["score"] = f["count"] * WEIGHT[f["bucket"]]
@@ -240,7 +284,7 @@ def build_findings(hours: float) -> dict:
     return {
         "since_hours": hours, "tasks_seen": len(tasks), "notify_rows_seen": len(notify_rows),
         "open_alerts_seen": len(open_alerts), "failed_units_seen": len(failed_units),
-        "findings": findings, "top10": top10,
+        "findings": findings, "top10": top10, "skill_use": skill_use,
     }
 
 
@@ -267,12 +311,23 @@ def render_report_md(result: dict, day: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def app_label(unit_or_key: str) -> str:
+    """'ifapp-exampleapp.service' -> 'exampleapp 앱 서비스' (owner-facing; no unit file names)."""
+    m = re.match(r"(?:ifapp|ifsvc|ifops)-([\w.-]+?)(?:-(worker|asr|search|backup|collect))?\.(service|timer)$", unit_or_key)
+    if not m:
+        return unit_or_key[:40]
+    name, part = m.group(1), m.group(2)
+    return f"{name} 앱" + (f"의 {part} 작업" if part else " 서비스")
+
+
 def render_discord_table(result: dict, day: str) -> str:
-    lines = [f"밤 점검 {day} — 효과 순 상위 10"]
+    """Owner-facing (#밤점검): plain words only — what / how many / what the owner does (2026-11-05)."""
+    lines = [f"밤 점검 결과({day}) — 지난 하루 동안 고칠 가치가 큰 순서입니다."]
     if not result["top10"]:
-        lines.append("근거 있는 항목 없음")
+        lines.append("고칠 것이 없었습니다.")
     for i, it in enumerate(result["top10"], 1):
-        lines.append(f"{i:2}. [{it['bucket']}·{it['score']:2}] {it['title'][:60]}")
+        lines.append(f"{i:2}. {it['bucket']} · {it.get('plain') or it['title'][:60]} ({it['count']}건)")
+    lines.append("운영자가 할 일: 없음 — 반장이 위에서부터 작업판에 올려 고칩니다.")
     return "\n".join(lines)
 
 
