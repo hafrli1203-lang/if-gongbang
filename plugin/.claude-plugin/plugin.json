@@ -1,7 +1,7 @@
 {
   "name": "gongbang",
   "version": "1.0.0",
-  "description": "IF 공방 v3 skills and crew-agent bundle: a work-copy-first development workflow (fact-check -> probe -> plan -> implement -> external review for risky work only -> land/deploy -> evidence report) plus an optional automatic skill router.",
+  "description": "AX OS build kit (gongbang v3): skills and crew-agent bundle for a chat-entry (KakaoTalk/Discord/terminal) task pipeline that goes work-copy -> scope check -> land/deploy -> evidence report hands-off, plus an optional automatic skill router.",
   "author": {
     "name": "IF"
   },
