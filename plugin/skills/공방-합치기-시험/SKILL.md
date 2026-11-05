@@ -1,58 +1,43 @@
 ---
 name: 공방-합치기-시험
-description: Merge several crews' work copies for one job into one, run the full test suite once, and record the result before landing. Use on "merge these", "combine and test", "bring the crews together".
+description: IF 공방 v3 작업 사본을 wt-land.sh로 합치고 배포까지 끝낸다 — 영수증(receipts.py)로 배포 성공 확인, 결과 모름(unknown)은 --ack-unknown/--resolve로 사람이 정리, 실패 시 자동 되돌림. "합쳐", "머지하고 배포해", "wt-land 돌려" 같은 말에 쓴다.
 ---
 
-# Merge crews' work and test once
+# 공방 합치기·시험 (v3, wt-land.sh)
 
-Only needed when several crews from `공방-작업조-붙이기` worked on separate copies of the same
-job and must become one change before `wt-land.sh` runs. A single crew's single copy skips
-this - go straight to landing.
+## 합치기 전
+- `scope-check.sh <사본 경로>`로 범위 검사가 통과하는지 미리 본다.
+- 사본이 뒤처졌으면 사본 안에서 `git rebase <기본 가지>`(그 사본 **자기 자신** 안에서만 — 다른 사본을
+  겨냥한 rebase/reset/checkout/stash는 설치된 훅이 막는다).
 
-## Before merging
-- Look at each copy's real diff (`git -C <copy> log --oneline <base>..HEAD`, `git diff <base>
-  <branch> --stat`) - know exactly what each one actually changed.
-- If a copy has a commit that was meant to be thrown away (e.g. a revert that should not come
-  back), `git cherry-pick` only the commits that should survive rather than a plain merge - a
-  three-way merge can silently keep a stale version of a file only one side touched.
-
-## Merging
+## 합치기·배포 — 한 명령
 ```bash
-git -C <one copy> merge --no-edit <other copy's branch>
+bash wt-land.sh <앱> <작업조 이름>
 ```
-On conflict:
-- Two sides added different things to the same list (an exports list, a config-key list) -
-  keep both.
-- Two crews independently wrote the same function - keep whichever version's own tests cover
-  more, delete the other.
-- Resolve, then run only the directly affected test files first, and the full suite after.
+순서대로 다 한다: 범위 검사 → 보안 검사(추가된 줄에 비밀값 없음, Node 프로젝트면 의존성 변경 검사) →
+land 커밋 → 병합 → 배포(앱 자체 배포 명령이 있으면 그걸로) → 배포 영수증 확인. 성공하면 push·사본
+정리까지, 실패하면 이전 트리·워커로 자동 되돌림까지 한 번에 돈다.
+- 이 명령은 timeout으로 감싸지 않는다(배포 마무리를 끊으면 영수증이 "모름"으로 남는다). 긴 명령은
+  전경에서 충분히 긴 제한 시간으로 돌리고 출력을 읽는다.
+- `--dry`로 먼저 돌리면 실제로 바꾸지 않고 무엇을 할지만 본다.
 
-## Testing
-Run the project's own full test command once, in the foreground. Record the exact pass/fail
-count from that run - do not round it or describe it from memory. A failure after a merge may
-be the merge itself or a pre-existing defect; say which, with evidence, before reporting.
-
-## After
-Land the merged result the normal way:
+## 배포 결과가 "모름"일 때 (영수증 unknown)
+배포 프로세스가 신호로 죽었거나 영수증이 멈추면 되돌리지도 다시 하지도 않고 멈춘다. **사람이 운영을
+직접 확인한 뒤**:
 ```bash
-bash tools/wt-land.sh <app> <job-name>
+bash wt-land.sh <앱> <작업조 이름> --resolve kept      # 새 빌드가 돌고 있으면
+bash wt-land.sh <앱> <작업조 이름> --resolve reverted  # 이전 빌드로 되돌렸으면
+bash wt-land.sh <앱> <작업조 이름> --ack-unknown       # 확인만 하고 표시를 지울 때
 ```
-This one call does the scope check, a secrets check, the land commit, the fast-forward merge,
-the deploy, and the deploy receipt check, in order - success pushes and cleans up the copy,
-failure reverts and restores the previous running state automatically.
+운영을 보지 않고 추측으로 `--resolve`를 쓰지 않는다.
 
-If the receipt comes back "unknown" (the deploy process died or never confirmed), `wt-land.sh`
-stops without reverting or retrying - check production yourself first, then settle it
-explicitly:
-```bash
-bash tools/wt-land.sh <app> <job-name> --resolve kept       # the new build is actually running
-bash tools/wt-land.sh <app> <job-name> --resolve reverted    # it's actually back on the old build
-bash tools/wt-land.sh <app> <job-name> --ack-unknown          # just clear the mark after checking
-```
-Never guess a `--resolve` value without having looked at production.
+## 실패했을 때
+- 범위 밖 변경이면 `--retry <land-id>`로 다시 붙이기 전에 범위를 넓히거나(`wt-scope.sh --add`) 범위 밖
+  파일을 되돌린다.
+- 배포 실패(자동 되돌림까지 끝난 경우)는 로그에서 원인(빌드 에러·시험 실패·워커 재시작 실패)을 가른
+  뒤 그 자리만 고쳐 다시 `wt-land.sh`를 돈다. 같은 지적을 다시 돌리지 말고 고친다.
 
-A finished copy whose branch is already merged and has no uncommitted changes is removed by
-`wt-gc.sh` on its own - do not force-remove one that still has uncommitted work.
-
-Report: which copies were merged, the exact test numbers, the deploy receipt's outcome, and
-anything left unmerged.
+## 정리
+- 성공한 사본은 `wt-land.sh`가 자동으로 지운다. 실패해 미커밋 파일이 남은 사본은 지우지 않는다 —
+  `공방-실행결과-조회` 스킬로 상태를 다시 본 뒤 판단.
+- 보고: 합친 작업조·커밋, 영수증 상태(배포 성공/모름/되돌림), 시험 숫자, 남은 사본 목록.

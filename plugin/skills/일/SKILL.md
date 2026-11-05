@@ -1,92 +1,66 @@
 ---
 name: 일
-description: A user says "/일" or "build an app like this" or "change this app to do X", or a chat-style task-dispatch front door receives the same kind of request. Starts the v3 work-copy orbit (read facts → pass scenario → disposable work copy → implement/test → a second read-only opinion for risky work only → land/deploy → evidence report → lesson). Saying this is the instruction to actually run it.
+description: 새 작업이 들어왔을 때(사람이 직접 시켰든, 채팅 앞문을 거쳐 들어왔든) IF 공방 v3 궤도 — 사실 확인 → 통과 장면 → 작업 사본 → 구현·시험 → 위험한 일만 다른 모델 1회 점검 → 합치기·배포 → 증거 보고 — 를 시작한다. "이 앱 이렇게 바꿔줘", "/일" 같은 말에 쓴다.
 ---
 
-# 일 — start the v3 work-copy orbit
+# 일 — IF 공방 v3 궤도 시작
 
-Being asked this (by command or by an equivalent chat request) means: actually do this job on
-this app now. Do not widen it to another app or another job. The entry point (a terminal, or a
-chat-style dispatcher) never changes the procedure below — the same work copy, scope check,
-land and deploy run either way (see `docs/v3.md`).
+이 스킬이 불렸다 = 이 앱·이 일을 실제로 진행하라는 지시다. 입구(터미널인지 채팅 앱인지)가 다르다고
+절차를 바꾸지 않는다 — 사본·범위 검사·합치기·배포는 항상 아래와 같다.
 
-## 0. One line before starting
-Write "doing this / not doing this / expected result" in one line, quoting the request as
-given. If no app is named, ask only that.
+## 0. 무엇을 할지 한 줄로 확인
+「이번에 하는 것 / 안 하는 것 / 기대 수준」 한 줄을 쓴다. 지시 원문을 그대로 인용한다. 앱 이름이
+없으면 그것만 먼저 묻는다.
 
-## 1. Facts first
-Read this app's own current documentation (its README, a decisions log such as
-`docs/CURRENT_DECISIONS.md` if it has one, its `deploy.env`) before touching anything. If this
-project keeps a lessons/issue log, check it for this app before starting.
+## 1. 사실부터
+그 앱의 운영 DB·시험 DB·배포 명령·알려진 함정을 적어 둔 곳(있다면 그 앱 자체 문서, 없다면 README·
+`.env.example`·`deploy.env`)을 끝까지 읽는다. 기준·숫자·외부 API 형식을 지어내지 않는다 — 확인
+필요한 것은 "확인 필요"로 남긴다.
 
-## 2. Write the pass scenario first
-One paragraph, before writing code: "what the person does → what the app shows → where on the
-screen." A form with nothing wired behind it is not an implementation. For anything touching
-auth, payments, deletion, or an external integration, verify the exact behavior against real
-evidence before coding it in.
+## 2. 통과 장면부터 적는다
+"사람이 하는 일 → 앱이 보여 주는 결과 → 화면 위치"를 코드를 짜기 전에 한 문단으로 적는다. 입력
+칸만 만든 것은 구현이 아니다.
 
-## 3. Work copy — scope decided up front
-Never edit the app's own checkout directly. Before creating the copy, list every file you
-expect to touch and put all of them in a scope file from the start (adding one path at a time
-afterward is not supported the same way — if scope legitimately grows mid-job, extend it with
-`wt-scope.sh --add` and say why in the report):
+## 3. 작업 사본 — 범위는 처음부터 전부
+앱 폴더를 직접 고치지 않는다. 바꿀 파일을 처음부터 전부 범위 파일에 적는다(나중에 하나씩 추가하지
+않는다 — 늘려야 하면 `wt-scope.sh --add`로 정식으로 넓히고 왜 늘었는지 보고에 적는다):
 
 ```bash
-printf '%s\n' "<file to change 1>" "<file to change 2>" > /tmp/<job-name>.scope
-bash tools/wt-new.sh <app> <job-name> --scope-file /tmp/<job-name>.scope
+printf '%s\n' \
+  "<바꿀 파일 1>" "<바꿀 파일 2>" \
+  > /tmp/<일 이름>.scope
+bash wt-new.sh <앱> <일 이름> --scope-file /tmp/<일 이름>.scope
 ```
 
-`package.json`, a lock file, or any `migrations/`/`drizzle/` path only counts as in-scope when
-the scope file names it literally — a broad `**` does not cover those four. Hitting the
-per-app or global copy limit prints "waiting ..." — wait, or flag it to whoever is coordinating.
+`package.json`·lock 파일·`migrations/`·`drizzle/` 경로는 실제로 건드릴 때만 범위 파일에 그 이름을
+그대로 적는다(넓은 `**`는 이 네 가지를 덮지 않는다).
 
-## 4. Implement and test (inside the copy only)
-- Change code only inside the copy (`$WT_ROOT/<app>/<job-name>`).
-- Tests run against the copy's own test-database slot, never the production database.
-- Run the dev server or a command with `bash tools/wt-run.sh <copy> --dev` or `-- <command>`.
-- When something fails, fix the exact spot rather than re-running the same check unchanged. If
-  the same finding repeats twice, change the approach.
+## 4. 구현·시험 (사본 안에서만)
+- 코드는 사본 안에서만 고친다. 시험은 사본이 받은 시험 DB 슬롯만 쓴다 — 운영 DB에 절대 쓰지 않는다.
+- dev 서버·명령은 `wt-run.sh <사본 경로> --dev` 또는 `-- <명령>`으로만 띄우고 끈다(메모리 상한·네트워크
+  격리 안에서, 사본만의 포트·DB로).
+- 떨어지면 같은 점검을 다시 돌리지 말고 지적 자리를 고친다. 같은 지적이 두 번이면 방법을 바꾼다.
 
-## 5. A second read-only opinion — risky work only
-Only for work touching auth, permissions, payments, deletion, an external integration,
-deployment, or configuration:
+## 5. 위험한 일만 다른 모델 읽기 전용 1회
+인증·권한·결제·삭제·외부 연동·배포·설정을 건드린 일만 둘째 눈을 더한다(자세한 절차는 `공방-외부점검`
+스킬). 그 밖의 일반 코드 일은 건너뛴다 — 새 검토 단계를 더 만들지 않는다.
 
+## 6. 합치기·배포
 ```bash
-codex exec -s read-only -c model_reasoning_effort="high" --skip-git-repo-check \
-  "<one line: what to look at>" < /dev/null
+bash wt-land.sh <앱> <일 이름>
 ```
+범위 검사 → 보안 검사(추가된 줄에 비밀값 없음) → land 커밋 → 병합 → 배포까지 한 번에 돈다. 실패하면
+자동으로 되돌린다. 자세한 처리는 `공방-합치기-시험` 스킬.
 
-Omitting `< /dev/null` hangs the call. Ordinary code changes skip this step — do not add a new
-review stage beyond what is already here.
+## 7. 증거 보고
+결과 맨 앞에 쉬운 말 4줄을 먼저 쓴다:
+1. 무엇을 고쳐 무엇이 됐나
+2. 확인한 숫자(시험 통과 수·커밋·배포 여부)
+3. 미검증(실행 못 해 본 것, 없으면 "없음")
+4. 발견한 문제(범위 밖에서 본 다른 결함, 없으면 "없음")
 
-## 6. Land and deploy — `wt-land.sh`
-```bash
-bash tools/wt-land.sh <app> <job-name>
-```
-Runs the scope check, a secret-leak check on the added lines, a land commit, a fast-forward
-merge, and the deploy adapter, in one call — success pushes and cleans up the copy; failure
-reverts and restores the previous running state automatically. Do not stop to ask for
-permission before this step. On failure, either retry with `--retry <land-id>` or fix the root
-cause and run the whole step again.
+실행 출력 없이 "완료·통과"라고 쓰지 않는다. 실패는 실패대로 보고한다.
 
-## 7. Evidence report (lead with these four lines)
-Before any technical detail (hashes, paths), write four plain lines:
-1. What was fixed and what works now
-2. The numbers that back it up (tests passed, commit, deployed or not)
-3. What was not verified (or "none")
-4. Any other problem noticed outside this job's scope (or "none")
-
-Never write "done" or "passing" without the command output that proves it. Report a failure as
-a failure.
-
-## 8. Lesson
-If this project keeps a lessons log, record anything a reviewer corrected, so the next job on
-this app starts knowing it.
-
-## Keep to
-- No artificial cost or retry caps — if blocked, fix it directly rather than giving up at a
-  limit.
-- Never hardcode an industry or brand not present in the actual request.
-- Do not wrap `wt-new.sh`/`wt-land.sh`/`wt-scope.sh` in a short timeout — let a long test or
-  deploy run to completion in the foreground.
-- Never hand-edit a `.wt.*` state file — extend scope only through `wt-scope.sh --add`.
+## 함께 쓰는 스킬
+`공방-작업조-붙이기`(병렬 작업), `공방-외부점검`(위험한 일 점검), `공방-합치기-시험`(wt-land.sh),
+`공방-실행결과-조회`(진행 상태 조회), `공방-공개올리기`(이 엔진 자체를 공개 저장소에 반영할 때).

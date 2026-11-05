@@ -1,52 +1,34 @@
 ---
 name: 공방-외부점검
-description: Get a read-only second opinion from a different model family (Codex) on a change, and split its findings by root cause rather than by individual finding. Use on "get an outside review", "have Codex check this", "get a cross-check".
+description: IF 공방 v3에서 인증·권한·결제·삭제·외부 연동·배포·설정이 걸린 위험한 일만 다른 모델 계열에게 읽기 전용으로 1회 점검받는다. "외부 점검", "교차 점검 받아" 같은 말에 쓴다.
 ---
 
-# A second, read-only opinion (Codex)
+# 공방 외부 점검 (v3)
 
-## When
-At the end of a change that already passed its own tests and review - after `wt-land.sh`
-would otherwise run, not instead of it. Re-checking the same scope more than twice is a sign
-the fix, not the check, is wrong.
+## 언제 — 위험한 일만
+`일` 스킬 궤도의 5단계: 인증·권한·결제·삭제·외부 연동·배포·설정을 건드린 일만. 일반 기능 변경은
+건너뛴다(새 검토 단계를 더 만들지 않는다).
 
-## Two passes (both matter - a diff-only check misses whether the feature actually works end
-to end)
-1. **Whole-goal check** (can run earlier, even mid-job): read the whole repository against the
-   actual user-facing goal - does the real entry point the user actually calls complete the
-   job safely end to end. Ask about: the real command path, when deployment actually happens
-   (once, after full verification - never mid-job), every pause point's resume path, evidence
-   that each requirement is actually met (not just "a test exists"), security of anything the
-   job produces, and what the tests prove versus what they skip.
-2. **Diff check**: the actual command below, against the specific commits just made.
-
-## Review depth
-- Security, permissions, deployment, configuration, or an external integration: the highest
-  reasoning effort available.
-- An ordinary feature or bug-fix change: a medium effort is usually enough and much faster.
-
-## Running it
+## 실행
+읽기 전용·stdin을 닫고 돌릴 수 있는 다른 모델 계열 CLI(예: `codex exec -s read-only`)가 있다면:
 ```bash
-codex exec -s read-only -c model_reasoning_effort="medium" --skip-git-repo-check \
-  "$(cat <instructions-file>)" < /dev/null > <log-file> 2>&1
+codex exec -s read-only -c model_reasoning_effort="high" --skip-git-repo-check \
+  "<무엇을 볼지 한 줄 — 범위(커밋 두 개), 걸리는 위험 지점, 출력 형식>" < /dev/null
 ```
-`< /dev/null` is required - without it the call hangs waiting on stdin. The instructions file
-should give: the exact commit range, what to read first, the specific questions to answer, a
-fixed output format (severity | file:line | finding | how it fails | suggested fix), and "do
-not change any code." If a previous review's findings exist, include them and ask for a
-FIXED/PARTIAL/NOT FIXED table against each one.
+stdin을 반드시 닫는다(빼면 입력 대기로 멈춘다). 같은 범위의 재점검은 최대 2회.
 
-## Handling the findings
-- Verify every finding directly against the code before accepting it - fix only the ones that
-  are actually true.
-- **Group findings by root cause before fixing anything.** The same underlying cause often
-  produces several findings across different files; fixing them one at a time, file by file,
-  tends to miss a sibling occurrence of the same cause elsewhere and it resurfaces on the next
-  review.
-- One crew per root cause, not one crew per individual finding.
-- Fix every finding at the highest severity levels; judge and either fix or record a reason for
-  the next tier; record only for the lowest.
+## 점검 수준
+- 인증·권한·결제·삭제·외부 연동·배포·설정: 가장 깊은 추론 수준.
+- 그 밖의 정상 경로 변경은 이 스킬을 쓰지 않는다(해당 없음).
 
-Report: time spent, counts by severity, the root-cause groups and each one's fixed/partial/not-
-started status, and how many of the previous review's findings are now actually fixed - never
-just repeat the tool's own output as the verdict.
+## 결과 처리
+- 각 지적을 코드에서 직접 확인한 뒤 맞음/틀림을 판단한다. 맞는 것만 고친다.
+- **같은 원인끼리 묶은 표를 먼저 만든다**(지적 번호·파일:줄 전부 / 고칠 원칙 하나) — 지적 하나하나를
+  따로 고치면 같은 원인이 다른 파일에서 또 터진다.
+- P0·P1은 고치고, P2는 판단해서 고치거나 이유를 남기고, P3은 기록만 한다.
+- 고칠 것을 원인별로 작업조 파일 소유 범위에 맞춰 나눠 지시한다(`공방-작업조-붙이기`).
+- 보고: 걸린 시간, P0/P1/P2 개수, 원인 묶음 수와 각 묶음의 처리 여부, 반영 계획.
+
+## 금지
+- 점검은 읽기 전용이다 — 점검하는 쪽에게 코드 변경을 맡기지 않는다.
+- 점검 결과를 그대로 믿지 않는다. 확인한 것과 못 한 것을 나눠 적는다.

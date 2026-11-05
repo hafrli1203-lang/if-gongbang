@@ -1,52 +1,30 @@
 ---
 name: 공방-공개올리기
-description: Re-extract this toolset's own private-source changes into its public repository, check it is clean of internal paths/names, run its tests, and push. Use on "push the public update", "sync the public repo", "publish the latest tool changes".
+description: IF 공방 v3 엔진(작업 사본 도구 + 하네스 + 스킬·작업조 묶음) 자체를 고친 뒤 공개 저장소로 반영한다 — 공개 적합성 검사 통과, CI와 같은 범위 시험, 커밋·push, 자동 시험 확인. "공개 저장소에 올려", "엔진 업데이트 올려" 같은 말에 쓴다. 이 엔진을 쓰는 보통의 앱 작업에는 쓰지 않는다 — 그건 `일` 스킬.
 ---
 
-# Publish an update to the public repository
+# 공방 공개 올리기 (v3)
 
-## When
-The private source the public repository's `harness/export_v3_public.py` /
-`harness/export_ops_public.py` read from has new commits that should reach the public copy.
+## 언제
+이 저장소(`tools/`·`hooks/`·`harness/`·`skills/`·`agents/`) 자체를 고쳤을 때만. 이 엔진으로 어떤 앱을
+개발하는 평소 작업은 `일` 스킬이 맞다.
 
-## Steps
-1. Get the exact commit hash of each private source this install extracts from
-   (`git -C <private source> rev-parse HEAD`). Extraction always reads a named commit, never
-   "whatever the working tree looks like right now" - that keeps the public bundle
-   reproducible from a fixed point in history.
-2. Run the extractor(s) against the public repository checkout:
-   ```bash
-   python3 harness/export_v3_public.py <private _shared dir> <commit> <public repo>/v3
-   python3 harness/export_ops_public.py <private ops dir> <commit> <public repo>
-   ```
-   Each one scrubs internal paths/names via its own substitution rules and refuses (exit 1,
-   with a list) if anything still looks like it leaked through - fix the extractor's rule
-   table or the private source, never hand-patch the generated output.
-3. Update `README.md`/`docs/*.md` to describe **only the current, implemented design** -
-   no internal dates, no quoted internal directives, no internal file paths, no "the owner"
-   or an equivalent phrase naming who runs this install.
-4. Run the full test suite in the public repository, and the public-readiness scan with no
-   local extra-identifier file active (so the result matches what CI, which has no such local
-   file, will actually see):
-   ```bash
-   python3 -m pytest tests -q -p no:cacheprovider
-   GONGBANG_PUBLIC_READY_EXTRA=/nonexistent python3 harness/public_ready_scan.py .
-   ```
-   A hit found only with a local extra-identifier file active and not present in the files you
-   changed is a pre-existing, local-only condition - note it, do not try to "fix" something you
-   did not touch unless it is actually blocking the push (see step 5).
-5. Commit (English, conventional-commit style) and push. If a push hook runs the same
-   public-readiness scan and blocks on something real, fix that exact line - never bypass the
-   hook.
-6. Check the repository's own CI result for the pushed commit before reporting it as done.
+## 순서
+1. 바꾼 파일을 경로로 지정해 커밋한다(`git add <경로>`, `add -A` 금지).
+2. 공개 적합성 검사를 돌린다 — 이 저장소의 `harness/public_ready_scan.py`(또는 그 역할을 하는 스캐너)로
+   홈 디렉터리 경로·서버 경로·이메일·IP 같은 구조적 식별자가 남지 않았는지 확인한다. 걸리면 그 줄을
+   고치고 다시 돌린다.
+3. 이 저장소의 테스트 전체를 돌린다(`pytest` 등 그 저장소가 쓰는 시험 명령). 실패가 있으면 올리지
+   않는다.
+4. 커밋 메시지는 conventional commit, 영어, 끝줄에 작업한 모델의 공동 작성자 줄.
+5. **push는 작업 범위 안이면 바로 한다.** push 전 보안 검사가 막으면 우회하지 않고 해당 줄을 고친다.
+6. 원격 CI(예: `gh run list -R <owner>/<repo> -L 1`)로 자동 시험 결과를 확인하고 보고한다. 실패면
+   원인을 고쳐 다시 커밋·push한다.
 
-## Report
-The pushed commit hash, the test suite's exact pass/fail numbers, the CI run's result, and a
-list of what moved from the private source to which public file.
+## 보고
+올린 커밋 해시, 돌린 시험 범위와 숫자, 자동 시험 결과(성공/실패, 실패면 원인). 실행 출력 없이
+"완료·통과"라고 쓰지 않는다.
 
-## Watch for
-- A worked-example comment that happens to name a real, private app/account/project can leak
-  through even when the surrounding code is already generic - the extractor's own leftover
-  scan exists specifically to catch this, run it, do not skip it because "it's just a comment."
-- Never push a different local branch of the public repository by mistake - confirm the
-  branch before pushing.
+## 주의
+- 이 저장소의 기본 가지(main)만 push한다.
+- 민감한 설정 파일·로컬 금지 목록은 절대 커밋하지 않는다(`.gitignore` 처리돼 있는지 매번 확인).

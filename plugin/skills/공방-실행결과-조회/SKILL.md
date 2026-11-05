@@ -1,46 +1,36 @@
 ---
 name: 공방-실행결과-조회
-description: Look up a work copy's current status read-only - what it has changed, whether it landed, and whether anything is still running. Use on "where did that job get to", "check on that app's work copy", "is anything still pending". Read-only; never changes state.
+description: IF 공방 v3가 돌리고 있거나 돌린 작업 사본의 지금 상태를 조회해 보고한다 — `.wt.json`(사본 자기 정보)·stall_watch.py(멈춘 사본 전체 감시)·receipts.py(배포 결과)·daily_review.py(최근 흐름)·wt_doctor.py(환경 자체가 멀쩡한지). "지금 어디까지 했어", "그 작업 사본 상태 봐줘", "멈춘 일 있어?" 같은 말에 쓴다. 조회만, 아무것도 고치지 않는다.
 ---
 
-# Check a work copy's status (read-only)
+# 공방 실행 결과 조회 (v3)
 
-Works for any app this install's work-copy tools manage - no app name is hardcoded here.
+## 언제
+업종·앱과 무관하게 공통. v3는 중앙 상태 조회 명령이 없다 — 사본 자신이 들고 있는 상태 파일과, 모든
+사본을 한 번에 훑는 도구(`stall_watch.py`·`daily_review.py`)를 조합해서 본다.
 
-## What to read (all read-only)
-1. `python3 tools/wt_doctor.py [<app>]` - every live work copy, its scope file, commit count,
-   uncommitted files, and whether its dev-server unit is actually up.
-2. `cat $WT_ROOT/<app>/<job-name>/.wt.json` - state since creation: `port`, `db`, `units`
-   (live systemd scopes, if any), `land_id`/`land_commit`/`landed_at` (present once it has
-   landed), `post_verify`.
-3. `[ -f $WT_ROOT/<app>/<job-name>/.wt.hold ]` and its contents - whether it is deliberately
-   waiting on a person (not stalled - see `wt-hold.sh`); `tools/stall_watch.py`'s table
-   reports these two cases differently and does not chase a "waiting on a person" copy.
-4. `python3 v3/tools/receipts.py list <app's receipts folder>` (or `blocking <folder>` for
-   only the unresolved ones) - the most recent deploy's outcome (success / unknown / reverted),
-   its test count, and the deployed tree.
-5. `git -C $WT_ROOT/<app>/<job-name> log --oneline <base>..HEAD` and `git status --short` -
-   its actual commits and any uncommitted change.
-6. `bash tools/scope-check.sh $WT_ROOT/<app>/<job-name>` - whether what it changed is still
-   inside its own declared scope (exit 0 clean, 2 lists violations, 1 means it could not check
-   - never read a failed check as "clean").
-7. If this install runs `tools/daily_review.py`, its latest report shows the shape of recent
-   trouble across every job, not one job's own detail.
-8. `bash tools/wt-land.sh <app> <job-name> --dry` shows what landing would do right now,
-   without changing anything, if that is specifically what's being asked.
+## 조회 순서 (읽기만)
+1. **그 사본 자신의 상태**: `<사본 경로>/.wt.json`을 읽는다 — 범위 파일 경로, 띄운 서비스, task_id,
+   끝났으면 `.wt.done` 존재 여부. `.wt.hold`가 있으면 사람 대기 중이라는 뜻(재촉하지 않는다).
+2. **멈춘 사본 전체 감시**: `python3 tools/stall_watch.py [분=30]` — 작업 사본 루트 전부를 훑어 마지막
+   커밋 시각·파일 변경 시각·서비스 생존을 보고, 일정 시간 아무 활동 없는 사본을 표로 낸다.
+3. **배포 결과**: `python3 tools/receipts.py blocking <영수증 폴더>` — 아직 확인 안 된 영수증만 나온다.
+   특정 영수증 파일을 직접 읽으려면 `cat <영수증 파일>`(JSON — status·tests_count·tree 등).
+4. **환경 자체가 멀쩡한지**: `python3 tools/wt_doctor.py` — 작업 사본 도구 체인이 쓰는 외부 의존을
+   OK/FAIL로. 인자 없음, 특정 앱을 보는 도구가 아니다.
+5. **최근 흐름**(선택): `python3 tools/daily_review.py` — 최근 일들 중 방향을 바꿔야 했던 것, 보고
+   형식이 어긋난 것, 비정상적으로 오래 걸린 것을 짧은 순위표로.
+6. `wt-land.sh <app> <name> --dry`로 "지금 합치면 어떻게 되는지"가 필요하면 추가로 돌릴 수 있다(상태를
+   바꾸지 않는다).
 
-## Report format
-- App / job name
-- Status: `wt_doctor.py`'s verdict + landed (with commit) / in progress (last commit time) /
-  waiting on a person (hold reason) / done and cleaned up
-- Deploy receipt: success / unknown / reverted, test count, last deploy time
-- Changed files: from the `git log`/`git status` above, or "none yet"
-- Scope check: clean / violations (listed) / could not check
-- **Never fill in a field without having actually run the command above for it.** A field you
-  could not check is "not checked: <what>", not a guess.
+## 보고 형식
+- 앱·작업조 이름
+- 상태: `.wt.json`/`.wt.done`/`.wt.hold` 확인 결과 + `stall_watch.py` 표에 떴는지(멈춤 여부)
+- 배포 영수증: 상태(성공/모름/되돌림), 시험 개수, 최근 배포 시각
+- 멈춘 사본: `stall_watch.py` 표 요약 또는 "없음"
+- 실행 출력 없이 위 항목을 채우지 않는다. 명령을 못 돌렸으면 "미확인: <무엇>"으로 적는다.
 
-## Out of scope
-This is read-only. Resuming, retrying a failed land, settling an "unknown" deploy outcome
-(`wt-land.sh ... --resolve kept|reverted` / `--ack-unknown`), or releasing a hold
-(`wt-hold.sh --release`) is a separate, deliberate action - not something this lookup does on
-its own, and never guessed at from outside what production actually shows.
+## 금지
+- 상태를 바꾸는 명령(`wt-land.sh`의 `--resolve`/`--ack-unknown`, `wt-hold.sh --release`, `wt-gc.sh`)은
+  이 스킬 범위 밖 — 사람이 별도로 지시.
+- 장부·설정 파일을 쓰지 않는다(조회 명령만).

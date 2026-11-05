@@ -1,40 +1,38 @@
 ---
 name: 공방-작업조-붙이기
-description: Attach several implementation sub-agents to one job at once, each with its own work copy and a fixed file-ownership split. Use on "attach a crew", "split this and run it in parallel", "work on these at the same time".
+description: IF 공방 v3에서 구현 작업조(서브 에이전트)를 여러 명 동시에 붙인다 — 작업자별 작업 사본(wt-new.sh --scope-file), 범위 파일 처음부터 전부, 계약서. "작업조 붙여", "병렬로 나눠서 해", "동시에 진행해" 같은 말에 쓴다.
 ---
 
-# Attach a crew (parallel work copies)
+# 공방 작업조 붙이기 (v3)
 
-## Decide before splitting (do not change after)
-1. **One contract**: fix the function names, arguments, file paths and config keys the crews
-   hand to each other in one short doc before anyone starts. If it must change mid-job, tell
-   every crew the same message and update the contract too.
-2. **A file-ownership table**: one row per crew, the files it may change, and every other
-   crew's files marked "do not touch". Never give the same file to two crews, and never
-   re-split a job partway through — a late instruction landing twice on the same file is how
-   this goes wrong.
+## 먼저 정할 것 (나눈 뒤에는 바꾸지 않는다)
+1. **계약서 한 장**: 작업조끼리 주고받는 함수 이름·인자·파일 경로·설정 키를 한 문서에 고정한다. 도중에
+   바꿔야 하면 모든 작업조에 같은 메시지로 알리고 계약서도 고친다.
+2. **파일 소유표**: 작업조마다 고칠 파일을 적고, 다른 작업조 파일은 "편집 금지"로 적는다. 같은 파일을
+   두 작업조에 주지 않는다. 일을 도중에 다시 나누지 않는다.
 
-## Work copies
+## 작업 사본 — 범위는 처음부터 전부
 ```bash
-bash tools/wt-new.sh <app> <crew-name-1> --scope-file /tmp/<crew-name-1>.scope
-bash tools/wt-new.sh <app> <crew-name-2> --scope-file /tmp/<crew-name-2>.scope
+printf '%s\n' \
+  "<작업조 1이 고칠 파일 1>" "<작업조 1이 고칠 파일 2>" \
+  > /tmp/<작업조 이름>.scope
+bash wt-new.sh <앱> <작업조 이름> --scope-file /tmp/<작업조 이름>.scope
 ```
-Each crew gets its own copy under `$WT_ROOT/<app>/<crew-name>` - never a shared checkout.
+`package.json`·lock 파일·`migrations/`·`drizzle/` 경로는 실제로 건드릴 때만 범위 파일에 그 이름을
+그대로 적는다. 앱당 사본 상한·전체 상한에 걸리면 "대기 ..."가 뜬다 — 기다리거나 늘려야 하는 이유를
+보고에 적는다.
 
-## Required lines in every crew's briefing
-- Its work-copy path, its scope file's contents, the contract's location, and its own
-  owned/forbidden files.
-- Git: `git add <path>` + `git commit -m "..." -- <path>` only. No stash, reset, checkout, or
-  `add -A`.
-- Run the full test suite once, in the foreground, at the end - not repeatedly, not in the
-  background.
-- No real deployment, no access to another app's repository, unless the coordinator explicitly
-  said so for this job.
-- Report format: commit hash, the test suite's final line, what was not finished.
+## 지시서에 반드시 넣을 줄
+- 작업 사본 경로, 범위 파일 경로, 계약서 경로, 소유 파일과 금지 파일
+- Git: `git add <경로>` + `git commit -m "..." -- <경로>`만. stash·reset --hard·checkout(다른 사본 겨냥
+  포함)·`add -A` 금지 — 설치된 훅이 사본 안에서 이를 실시간으로 막는다.
+- 시험은 사본이 받은 시험 DB 슬롯만. dev 서버·명령은 `wt-run.sh <사본 경로> --dev` 또는 `-- <명령>`으로만
+  띄우고 끈다. `pkill`·`killall` 이름 패턴 금지.
+- 전체 시험은 끝에 한 번, 전경에서 돌리고 출력을 읽는다 — 백그라운드로 보내고 기다리지 않는다.
+- 커밋 전 `scope-check.sh <사본>`으로 범위 밖 변경이 없는지 확인한다(합치기 때 다시 검사된다).
+- 보고: 커밋 해시, 시험 마지막 줄, 하지 못한 것(「미검증」).
 
-## While it runs
-- If a report is late, check the copy's own commit count and uncommitted-file count rather
-  than waiting blind; if a backgrounded test run stalled, tell that crew to re-run it in the
-  foreground.
-- When every crew is done, land through `wt-land.sh` per copy, or merge the copies into one
-  before landing - see the companion merge skill.
+## 돌리는 동안
+- 작업조 이름을 붙여 메시지로 이어 지시한다.
+- 보고가 늦으면 사본의 커밋 수·미커밋 파일 수로 확인한다(`공방-실행결과-조회` 스킬).
+- 끝나면 `공방-합치기-시험` 스킬로 합친다.

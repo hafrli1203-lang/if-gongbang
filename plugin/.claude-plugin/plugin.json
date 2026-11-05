@@ -1,12 +1,10 @@
 {
   "name": "gongbang",
   "version": "1.0.0",
-  "description": "IF Gongbang (공방) v3 work-copy orbit: a skill that starts the orbit (/일), five supporting skills for crew work, review and publishing, and six crew sub-agents for each stage.",
+  "description": "IF 공방 v3 skills and crew-agent bundle: a work-copy-first development workflow (fact-check -> probe -> plan -> implement -> external review for risky work only -> land/deploy -> evidence report) plus an optional automatic skill router.",
   "author": {
-    "name": "if-gongbang contributors"
+    "name": "IF"
   },
   "license": "MIT",
-  "keywords": ["workflow", "agents", "skills", "worktree", "git", "automation"],
-  "category": "workflow",
-  "strict": false
+  "keywords": ["workflow", "worktree", "deploy", "code-review", "agent-crew", "skill-router"]
 }
