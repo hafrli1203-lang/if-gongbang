@@ -1,7 +1,7 @@
 {
   "files": {
     "deploy-check.sh": "42661fd292891fc789a9aefb5068dfe90fdfcbfe16dcbd676b9fa4c4dca8612c",
-    "deploy.sh": "c2a7269c2dc0e95e24d362de34526998ad9179abae9fbe4634fcf5afcc0d4bea",
+    "deploy.sh": "7778829d002f55ab39dc8680c2bfc39aeab2125da74e560f8ab700b4721a51b4",
     "new-app.sh": "681392b614640f30fc425228891ef047e1cbf7af4a7f23ea8aa6472adf253c12",
     "notify-text.mjs": "e9bd811967eb9ae3ed504d3bf4767fd42164db3f6dcd9668c0ab8714a50cc1fa",
     "receipts.py": "d433e9c4bd4ff521ed9caf84685f7828f7dd54b68348fc78c731ee250e60263e",
@@ -11,18 +11,18 @@
     "suite-check.py": "0e01b5852d90c30f9031045986792c1075895e747d514648917a465d69e346a2",
     "wt-adopt.sh": "58c7deba691446b0a8de13a5ad35bc1716e2b6512e9c42fd32354d5f3d2223ec",
     "wt-bin/npm": "82306e1f0dd42c8940d178076450e26f418c906914a72bf6e18ac8bc08722af3",
-    "wt-env.py": "1338a5aa358fe23329784a1f47970e32b7a680c24680df99b591a71d8c2b7cfc",
-    "wt-gc.sh": "2e4011f91e556ad61fecd98d856358ce640a313210a3bbb9140ad8485eb05b65",
+    "wt-env.py": "ff8f5c169b3cb0fddf9d26efddda4a49521c4aeb2360cb30fc8bdbdb6926b065",
+    "wt-gc.sh": "e55be68e09312d3cd78dae77dd9bdd6018bb678a7a7b40cb70fcd5738cbc6282",
     "wt-hold.sh": "ad969d9283836f1c9c88228e0dccb3a8fb93c71d392f3f70d6673d0de7d7ded9",
-    "wt-land.sh": "bb28b9f6bfd8f0166ee282bdb0da51fe6b4e6b11846ae4262431dc58079bb37b",
-    "wt-lib.sh": "be456d53dfb9b05fd9932f2f96f297d6bbac536a96226ba6e4a802eb74aed8f1",
+    "wt-land.sh": "0cf41c707eae03636134956f4530b9294677dbc6655a1d18c85fea842157cfeb",
+    "wt-lib.sh": "92fb18e67b03a2056ae59e325c53ca804a8e54c99f36db875f14e5d02351cf0b",
     "wt-migrate.sh": "fa46a7b4e4505e806b3644ad028c243d0d9513ecfc060e9de307dafed7f4f20e",
-    "wt-new.sh": "03f3da251e0d35c5effe863983caf02bd5b9b51f81f0e1ee2e9947c054d89f75",
+    "wt-new.sh": "2ca159279be608764e387e6ca1fc869f15664fac6b4ed14da37319ccd57654ef",
     "wt-run.sh": "a530c48b00a1098ffab8eca31c9a36d98b824f79da9cf2013411e3419b7202f4",
     "wt-sandbox.py": "78d78a4daeb314d1a273d79d6e044fcea577634883e3a07c3ad4036739dcce1b",
     "wt-scope.sh": "4237912056f7bd7db285cdcbf196a2e80555fe92cb50e64f181d9d694629787e",
     "wt-stop.sh": "29b63b9e1ac7b09ba4e228c94c324b36fdf205184934a0bfb31c6d8f755fe995"
   },
   "rules_version": "2",
-  "source_commit": "495481ceddef11d8ccd4438d8948d5cc71c484d2"
+  "source_commit": "494f80a1335ecba422757332f15d6b4100b0afaf"
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 """Deploy receipts (gaps 190/183): one JSON file per deploy under <state>/<app>.receipts/, shared by deploy.sh and
 wt-land.sh so both judge a receipt the same way.
 

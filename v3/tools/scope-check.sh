@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # scope-check.sh <copy> [--range <a>..<b>]
 # --range: check the files changed between two commits of the app repository instead of the copy (wt-land --retry).
 # Compares what the copy changed with its allowed paths (<copy>/.wt.scope, one glob per line, # comments) — docs/v3-wt-interface.md §4.

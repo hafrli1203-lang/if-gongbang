@@ -1,4 +1,4 @@
-// Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+// Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 // Owner-alert text helpers (2026-11-05, owner "모든 디스코드 알림과 카톡 알림을 쉬운말로 바꿔라"). Alerts are three plain
 // parts — what happened / why it matters / "대표가 할 일: …". Imported by notify-owner.mjs and its tests.
 

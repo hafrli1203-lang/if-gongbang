@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
+{ # Whole body is one brace group: bash parses it all before running, so an edit while a run is in progress cannot change what that run executes (2026-11-05: an in-place edit broke a live app deploy with a syntax error).
 # Common deploy for one Next.js app.
 # Order is forced: busy check -> memory check -> quality gate -> build in a separate folder -> swap only on success
 # -> restart -> deploy-check -> automatic rollback if the check fails.
@@ -31,7 +32,7 @@ dir="$APPS_ROOT/$app"; envf="$dir/deploy.env"
 [ -f "$envf" ] || { echo "배포 중단 — $envf 없음 (UNIT·PORT·HEALTH_PATHS 필요)"; exit 2; }
 # shellcheck disable=SC1090
 . "$envf"
-case "${APP_DIR:-}" in "") ;; /*) dir="$APP_DIR" ;; *) dir="$dir/${APP_DIR%/}" ;; esac   # the Next project may live in a subfolder (someapp: web/, absolute or relative)
+case "${APP_DIR:-}" in "") ;; /*) dir="$APP_DIR" ;; *) dir="$dir/${APP_DIR%/}" ;; esac   # the Next project may live in a subfolder (e.g. web/, absolute or relative)
 # Apps with their own release-based deploy (apt: isolated release dirs + health gate + rollback) set DEPLOY_CMD in deploy.env;
 # this script then only forwards to it so every app still has one entry point and one settings file.
 if [ -n "${DEPLOY_CMD:-}${DEPLOY_CMD_DEPLOY:-}" ]; then
@@ -240,6 +241,11 @@ suite_trust_check() {  # $1 = the test output file
 # person's first question is "why does this one file flip", not "what did I break". A runner this cannot
 # re-run meaningfully (jest; failed-files finds nothing) falls straight back to the ordinary failure path.
 ALERTS_FILE="${DEPLOY_ALERTS_FILE:-$APPS_ROOT/_ops/ops/ALERTS.md}"
+# The gate runs in the real app folder, not a sandboxed copy: without this a test that calls reportToOs/ledger
+# reached the live AX OS with the real token (one app: 175 fake "approval pending" alerts in 7 days, 2026-11-05).
+# Every app resolves its token as OS_TOKEN_FILE/LEDGER_TOKEN_FILE ?? <live path>, so pointing them at a missing
+# file turns reporting off for the gate only. A test that needs a token sets its own.
+TEST_SAFE_ENV=(OS_TOKEN= OS_TOKEN_FILE=/nonexistent/deploy-gate-no-os-token LEDGER_TOKEN_FILE=/nonexistent/deploy-gate-no-ledger-token)
 handle_test_failure() {  # $1 = runner, $2 = first attempt's log file
   local runner="$1" log="$2" files rerun_rc2 rerun_rc3 retrylog2 retrylog3
   files=$(python3 "$SHARED/suite-check.py" failed-files "$runner" "$log" 2>/dev/null) || files=""
@@ -257,8 +263,8 @@ handle_test_failure() {  # $1 = runner, $2 = first attempt's log file
   # the whole script runs under `set -e` — a bare "cmd; rc=$?" would abort right here on the first
   # failing retry, before rc is ever read; the && / || form is what keeps the exit code without
   # tripping set -e (Codex-class bug, caught by tests/v2-gaps.sh's own "all 3 fail"/"mixed" cases).
-  "${rerun_cmd[@]}" >"$retrylog2" 2>&1 && rerun_rc2=0 || rerun_rc2=$?
-  "${rerun_cmd[@]}" >"$retrylog3" 2>&1 && rerun_rc3=0 || rerun_rc3=$?
+  env "${TEST_SAFE_ENV[@]}" "${rerun_cmd[@]}" >"$retrylog2" 2>&1 && rerun_rc2=0 || rerun_rc2=$?
+  env "${TEST_SAFE_ENV[@]}" "${rerun_cmd[@]}" >"$retrylog3" 2>&1 && rerun_rc3=0 || rerun_rc3=$?
   if [ "$rerun_rc2" = 0 ] && [ "$rerun_rc3" = 0 ]; then
     # 1회 실패, 2·3회 성공: 결과가 일치하지 않음 — 불안정
     :
@@ -280,6 +286,35 @@ with open(sys.argv[5], 'a', encoding='utf-8') as f:
   exit 4
 }
 
+# 2b) dependencies: a land that adds a package (2026-11-05, an app adding the shared kit package) changed package-lock.json but
+# nothing installed it into the app folder, so the gate failed with "Cannot find module". Install only when the lock
+# is newer than what npm last installed (node_modules/.package-lock.json); `npm install` adds in place (no `npm ci`,
+# which would wipe node_modules under the running server). DEPLOY_SKIP_INSTALL=1 skips (tests).
+if [ "${DEPLOY_SKIP_INSTALL:-0}" != 1 ] && [ -f package-lock.json ] && [ -d node_modules ] && \
+   { [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ] || \
+     node -e '
+       // a local file: package (../_shared/kit) installed as a COPY (.npmrc install-links=true — Turbopack cannot follow
+       // a link outside the app) goes stale when the shared source moves on: reinstall when its version differs, or
+       // when it sits as a link although the app asks for copies (2026-11-05: two app builds failed).
+       const fs = require("fs"), path = require("path");
+       const copies = /install-links\s*=\s*true/.test(fs.existsSync(".npmrc") ? fs.readFileSync(".npmrc", "utf8") : "");
+       const deps = Object.assign({}, require("./package.json").dependencies, require("./package.json").devDependencies);
+       const bad = Object.entries(deps).some(([name, spec]) => {
+         if (typeof spec !== "string" || !spec.startsWith("file:")) return false;
+         const nm = path.join("node_modules", name); if (!fs.existsSync(nm)) return true;
+         if (fs.lstatSync(nm).isSymbolicLink()) return copies;
+         try { return require(path.resolve(spec.slice(5), "package.json")).version !== require(path.resolve(nm, "package.json")).version; } catch { return false; }
+       });
+       process.exit(bad ? 0 : 1);' 2>/dev/null; }; then
+  echo "의존성 설치 — package-lock.json이 바뀌었거나 공용 부품이 옛 판"
+  # --no-save: install into node_modules but never rewrite package-lock.json (a rewritten lock changed the tree
+  # between the check and the build, exit 9, and left the app folder dirty — one app, 2026-11-05)
+  if ! npm install --no-save --no-audit --no-fund --prefer-offline >/tmp/deploy-$app-install.log 2>&1; then
+    tail -20 "/tmp/deploy-$app-install.log"; echo "배포 중단 — 의존성 설치 실패. 도는 앱은 그대로입니다."; exit 4
+  fi
+  receipt deps_installed=1
+fi
+
 # 3) quality gate: typecheck / test when the app defines them (an app once shipped hundreds of new type errors unnoticed)
 if [ "$QUALITY_GATE" = 1 ]; then
 # The running build's generated route-type file lists routes that may no longer exist; the type check would fail on it
@@ -288,7 +323,7 @@ rm -f "$dir/.next/types/validator.ts"
   for s in ${GATE_SCRIPTS:-typecheck test}; do   # GATE_SCRIPTS="typecheck" for apps without tests (vitest exits 1 when it finds none)
     if node -e "process.exit(require('./package.json').scripts?.['$s'] ? 0 : 1)"; then
       echo "검사 $s …"
-      if NODE_OPTIONS="--max-old-space-size=$NODE_HEAP" npm run -s "$s" >/tmp/deploy-$app-$s.log 2>&1; then
+      if env "${TEST_SAFE_ENV[@]}" NODE_OPTIONS="--max-old-space-size=$NODE_HEAP" npm run -s "$s" >/tmp/deploy-$app-$s.log 2>&1; then
         [ "$s" = test ] && suite_trust_check "/tmp/deploy-$app-$s.log"
       elif [ "$s" = test ]; then
         handle_test_failure "$(python3 "$SHARED/suite-check.py" runner .)" "/tmp/deploy-$app-$s.log"
@@ -390,6 +425,12 @@ if [ "${ON_DEMAND:-0}" = 1 ] && [ "$was_active" != active ]; then
 fi
 if ! $SYSTEMCTL --user restart "$UNIT"; then echo "재시작 실패 — 되돌립니다."; swap_back || swapback_failed=1; exit 5; fi   # Codex P1: set -e must not skip the rollback
 if [ -n "${WORKER_UNIT:-}" ]; then $SYSTEMCTL --user restart "$WORKER_UNIT" || echo "경고 — 워커 재시작 실패($WORKER_UNIT); 웹은 새 빌드로 올라감"; fi
+# Every other running ${WT_UNIT_PREFIX:-ifapp}-<app>-*.service runs the same checkout (one app's worker/asr/search units were never restarted
+# after 11-03, so a day of deploys never reached the worker, 2026-11-05). Only units that are running now; listed by name.
+for u in $($SYSTEMCTL --user list-units --type=service --state=active --no-legend --plain "${WT_UNIT_PREFIX:-ifapp}-$app-*.service" 2>/dev/null | awk '{print $1}'); do
+  { [ "$u" = "$UNIT.service" ] || [ "$u" = "${WORKER_UNIT:-none}.service" ] || [ "$u" = "${WORKER_UNIT:-none}" ]; } && continue
+  $SYSTEMCTL --user restart "$u" && echo "보조 서비스 재시작 — $u" || echo "경고 — 보조 서비스 재시작 실패($u)"
+done
 step_done swap
 for _ in $(seq 1 "${DEPLOY_WAIT_TRIES:-30}"); do
   pid=$($SYSTEMCTL --user show "$UNIT" -p MainPID --value)
@@ -407,3 +448,5 @@ if bash "$CHECK" "$app"; then
   fi
   echo "배포 완료 — $app"
 else echo "배포 확인 실패 — 되돌립니다."; swap_back || swapback_failed=1; exit 5; fi
+exit "$?"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 """Runs one work-copy command inside bubblewrap (gap 23). Called by wt-run.sh after wt-env.py built the environment
 (so the app's env file is read outside the sandbox and never inside it). WT_SANDBOX_BWRAP=0 in wt-run.sh skips this.
 

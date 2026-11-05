@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 """Environment helper for the worktree tools (wt-*.sh). Never prints a URL, password or env value.
 
 Reads an app's env file (.env.local, else .env) and runs a command with a derived environment, so database
@@ -311,7 +311,11 @@ def fake_for(key: str, val: str, copy_port: str) -> str:
         return "false"
     if re.match(r"https?://", v, re.IGNORECASE):
         return DEAD_URL
-    return f"x-{key}"
+    # keep at least the real value's length (and 32 chars minimum): apps validate secrets by length
+    # (one app: SESSION_SECRET min 32 — every copy build failed on "x-SESSION_SECRET", wire2-web 2026-11-05)
+    fake = f"x-{key}"
+    want = max(len(v), 32)
+    return fake + "-" * (want - len(fake)) if len(fake) < want else fake
 
 
 def split_cmd(argv: list) -> tuple:

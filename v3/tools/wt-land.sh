@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
+{ # Whole body is one brace group: bash parses it all before running, so an edit while a run is in progress cannot change what that run executes (2026-11-05: an in-place edit broke a live app deploy with a syntax error).
 # wt-land.sh <app> <name> [--retry <land-id>] [--dry] [--ack-unknown | --resolve kept|reverted]
 # "Open a PR" for a work copy = land it on the app's default branch and deploy — docs/v3-wt-interface.md §5.
 #  1) land.lock (${WT_DATA}/<app>/land.lock, separate from deploy.sh's own lock; waits WT_LAND_WAIT s, default 600)
@@ -85,10 +86,10 @@ run() {  # mutating step: printed under --dry, executed otherwise
 # says the same by hand: "이전 커밋으로 checkout 뒤 다시 deploy"). If that second run also fails, nothing more is
 # guessed at: the land stops, a person is paged (notify-owner), and the copy is kept — see the self_deploy branch below.
 self_deploy=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${DEPLOY_CMD:-}${DEPLOY_CMD_DEPLOY:-}"' _ "$src/deploy.env" 2>/dev/null || true)
-# The Next project may live in a subfolder (deploy.env APP_DIR, someapp: web/): next's own rewrites of tsconfig.json /
-# next-env.d.ts land there, not at the repo root, and a land stopped on them twice (someapp session, 11-04).
+# The Next project may live in a subfolder (deploy.env APP_DIR, e.g. web/): next's own rewrites of tsconfig.json /
+# next-env.d.ts land there, not at the repo root, and a land stopped on them twice (one app's session, 11-04).
 app_sub=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${APP_DIR:-}"' _ "$src/deploy.env" 2>/dev/null || true); app_sub="${app_sub%/}"
-case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute (someapp) -> relative; outside the app -> ignored
+case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute -> relative; outside the app -> ignored
 next_files() { local f; for f in tsconfig.json next-env.d.ts; do printf '%s\n' "$f"; [ -n "$app_sub" ] && [ "$app_sub" != . ] && printf '%s\n' "$app_sub/$f"; done; return 0; }
 say "합치기 시작 — $app/$name (기본 가지 $base, land-id $id${retry:+, 재시도}${dry:+$( [ "$dry" = 1 ] && echo ', dry')}${self_deploy:+, 자체 배포 앱})"
 
@@ -222,7 +223,7 @@ norm = lambda t: block.sub("\n", t).rstrip("\n")
 sys.exit(0 if norm(head) == norm(work) else 1)
 PY
 }
-# root or any subfolder (someapp web/): these two names are only ever next's own rewrites, restored from HEAD, never committed
+# root or any subfolder (e.g. web/): these two names are only ever next's own rewrites, restored from HEAD, never committed
 AUTO_RE='^ M ((.*/)?tsconfig\.json|(.*/)?next-env\.d\.ts)$'
 dirty=$(wt_git -C "$src" status --porcelain)
 auto=$(printf '%s\n' "$dirty" | grep -E "$AUTO_RE" | cut -c4- || true)
@@ -598,3 +599,5 @@ else
 fi
 say "재시도: wt-land.sh $app $name --retry $id"
 exit 5
+exit "$?"
+}

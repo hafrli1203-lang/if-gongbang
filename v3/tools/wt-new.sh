@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # wt-new.sh <app> <name> [--task <id>] [--scope-file <file>] [--new]
 # --new: the app folder does not exist yet — new-app.sh scaffolds it (template or minimal Next app) and commits, then the
 #   copy is made from it as usual.
@@ -61,6 +61,10 @@ exec 6>"$WT_DATA/global.mutex"; flock 6
 # 상한(또는 빈 포트/DB 슬롯 없음)에 걸리면 "대기"로 끝내되 — 원본을 직접 고치는 대신 반장에게 바로 알린다
 # (반장 2026-11-03 08:40, WORK_QUEUE 32번: 작업조가 상한에 막히자 기다리지 않고 앱 원본을 직접 고친 사고).
 wt_notify_wait() {
+  # once per app+task per 6 h: a worker retrying every minute must not ring the owner's phone each time (2026-11-05)
+  local mark="$WT_DATA/notify-wait.$(printf '%s' "$app/$name" | sha256sum | cut -c1-16)"
+  if [ -f "$mark" ] && [ $(( $(date +%s) - $(stat -c %Y "$mark") )) -lt 21600 ]; then return 0; fi
+  mkdir -p "$WT_DATA" && touch "$mark"
   timeout 20 node "$WT_SHARED/notify-owner.mjs" "$app 앱의 새 작업('$name')이 순서를 기다리고 있습니다. 이유: $1. 고장이 아니라 정상 대기이고, 앞의 작업이 끝나면 반장이 이어서 시작합니다. 대표가 할 일: 없음." "/" "시스템" >>"$WT_DATA/notify.log" 2>&1 || true
 }
 app_n=$(wt_active_dirs "$app" | wc -l); all_n=$(wt_active_dirs "" | wc -l)
@@ -138,10 +142,10 @@ copy_node_modules() {  # $1 folder relative to the app root ('' = root): hard-li
   [ "$relinked" = 0 ] || echo "node_modules 링크 재연결 ${relinked}개${rel:+ ($rel)}" >&2
 }
 copy_node_modules ""
-# The Next project may live in a subfolder (deploy.env APP_DIR, someapp: web/): its own node_modules is needed there too
-# (someapp session 11-04 had to cp -al it by hand).
+# The Next project may live in a subfolder (deploy.env APP_DIR, e.g. web/): its own node_modules is needed there too
+# (one app's session 11-04 had to cp -al it by hand).
 app_sub=$(bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${APP_DIR:-}"' _ "$src/deploy.env" 2>/dev/null || true); app_sub="${app_sub%/}"
-case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute (someapp) -> relative; outside the app -> ignored
+case "$app_sub" in "$src"/*) app_sub="${app_sub#"$src"/}" ;; /*) app_sub="" ;; esac   # absolute -> relative; outside the app -> ignored
 [ -z "$app_sub" ] || [ "$app_sub" = . ] || copy_node_modules "$app_sub"
 
 # 2) test DB slot

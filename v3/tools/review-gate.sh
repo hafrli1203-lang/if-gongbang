@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # Review gate (2026-11-01, owner "왜 이렇게 빠트리는일이 많지? 이런일 없게 쫌 할수 없나?" → "추천대로"): the two pre-deploy
 # checks that used to depend on memory — a live run of the changed code on real data, and the Codex read-only review — are
 # enforced here. Opt-in per app with REVIEW_GATE=1 in deploy.env (enable per app, incrementally).

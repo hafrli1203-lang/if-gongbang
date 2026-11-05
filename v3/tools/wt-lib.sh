@@ -1,4 +1,4 @@
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # shellcheck shell=bash
 # Shared helpers for the worktree tools (wt-new/run/stop/land/gc/migrate, scope-check). Sourced, never run.
 # Contract: docs/v3-wt-interface.md. Database URLs and env values are never printed:
@@ -9,7 +9,7 @@ WT_APPS="${WT_APPS:-${WT_APPS_ROOT}}"   # app folders (tests point this at a scr
 WT_ROOT="${WT_ROOT:-$WT_APPS/_wt}"
 WT_DATA="${WT_DATA:?WT_DATA 환경변수가 필요합니다 (작업 DB 슬롯·로그 루트)}"
 WT_ADMIN_ENV="${WT_ADMIN_ENV:?WT_ADMIN_ENV 필요 — 시험 DB 생성 권한이 있는 postgres 역할의 env 파일 경로}"   # postgres role that creates/resets test DBs
-WT_APP_MAX="${WT_APP_MAX:-3}"; WT_GLOBAL_MAX="${WT_GLOBAL_MAX:-8}"; WT_SLOTS="${WT_SLOTS:-3}"   # copies without .wt.done; test-DB slots per app
+WT_APP_MAX="${WT_APP_MAX:-3}"; WT_GLOBAL_MAX="${WT_GLOBAL_MAX:-12}"; WT_SLOTS="${WT_SLOTS:-3}"   # copies without .wt.done (team-lead 11-01: 6 -> 8; 11-05: 8 -> 12 — 23 GB free, builds are still one at a time with a 4 GB check in deploy.sh); test-DB slots per app
 WT_ENVPY="$WT_SHARED/wt-env.py"
 
 wt_die() { echo "$*" >&2; exit "${WT_EXIT:-1}"; }

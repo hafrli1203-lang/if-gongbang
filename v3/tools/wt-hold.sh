@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # wt-hold.sh <app> <name> "<reason>"   |   wt-hold.sh <app> <name> --release
 # Marks a work copy as WAITING ON A PERSON (owner answer, QR scan, decision) by writing <copy>/.wt.hold with the reason.
 # stall_watch.py then shows it as "대기" and never pages about it; wt-gc keeps it (uncommitted/ahead work is untouched).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated from private source at 495481ceddef11d8ccd4438d8948d5cc71c484d2; do not edit by hand (see harness/export_v3_public.py).
+# Generated from private source at 494f80a1335ecba422757332f15d6b4100b0afaf; do not edit by hand (see harness/export_v3_public.py).
 # wt-gc.sh [--dry] [--only <copy>]
 # Removes only work copies whose job is finished for good — docs/v3-wt-interface.md §6. Run at session start and on a nightly schedule.
 # A copy is removed when
@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
     *) echo "모르는 인자: $1" >&2; exit 2 ;;
   esac
 done
-STALE_SEC=$((48 * 3600))
+STALE_SEC=${WT_GC_STALE_SEC:-$((48 * 3600))}   # env override for one-off runs (team-lead 2026-11-05: free slots held by verified-empty copies)
 # team-lead 2026-11-02: condition (c) below (merged + clean + no unit) must not delete a copy another crew just
 # started reusing right after the merge (실측: one app's copy) — a short freshness floor, not the 48h one.
 WT_GC_FRESH_SEC="${WT_GC_FRESH_SEC:-$((30 * 60))}"
