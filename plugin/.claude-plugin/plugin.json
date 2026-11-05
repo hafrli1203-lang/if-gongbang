@@ -1,0 +1,12 @@
+{
+  "name": "gongbang",
+  "version": "1.0.0",
+  "description": "IF Gongbang (공방) v3 work-copy orbit: a skill that starts the orbit (/일), five supporting skills for crew work, review and publishing, and six crew sub-agents for each stage.",
+  "author": {
+    "name": "if-gongbang contributors"
+  },
+  "license": "MIT",
+  "keywords": ["workflow", "agents", "skills", "worktree", "git", "automation"],
+  "category": "workflow",
+  "strict": false
+}

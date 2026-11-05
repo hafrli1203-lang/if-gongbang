@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "if-gongbang",
+  "description": "The gongbang (공방) v3 work-copy orbit as a Claude Code plugin: start a disposable work copy, implement and test inside it, land and deploy, with six crew sub-agents for each stage.",
+  "owner": {
+    "name": "if-gongbang contributors"
+  },
+  "metadata": {
+    "description": "A disposable-work-copy development orbit (facts -> pass scenario -> work copy -> implement/test -> risk-only second opinion -> land/deploy -> evidence report) packaged as a Claude Code plugin."
+  },
+  "plugins": [
+    {
+      "name": "gongbang",
+      "source": "./plugin",
+      "description": "Starts the v3 work-copy orbit (/일 skill), five supporting skills for crew work/review/publishing, and six crew sub-agents for each stage.",
+      "version": "1.0.0",
+      "author": {
+        "name": "if-gongbang contributors"
+      },
+      "license": "MIT",
+      "keywords": ["workflow", "agents", "skills", "worktree", "git", "automation"],
+      "category": "workflow",
+      "tags": ["workflow", "agents", "skills"],
+      "strict": false
+    }
+  ]
+}
