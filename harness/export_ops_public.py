@@ -113,6 +113,10 @@ ALLOWED_FILES = [
     ("harness/arch_check.py", "harness/arch_check.py"),
     ("harness/tests/test_suite_trust.py", "tests/test_suite_trust.py"),
     ("harness/tests/test_probe_trust.py", "tests/test_probe_trust.py"),
+    # --- reserved slot: the automatic skill-selection router is being built separately
+    # (private source: skill-router/) and is not extracted yet. Once it ships, its files are
+    # added as rows here (source-relative-path, dest-relative-path) the same way every other
+    # row in this table was - this comment marks where, not a placeholder file. ---
 ]
 
 # Mechanical, non-privacy fixes for the handful of test files whose own "where is the module
