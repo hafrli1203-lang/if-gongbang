@@ -23,6 +23,21 @@ door fits in").
 다르다**(v2는 실행 관문·샌드박스로 변경 자체를 막는 실행 시점 검사, v3는 변경이 끝난 뒤 경로를 보는
 사후 검사) — 같은 사례의 재시험 전에는 v3가 v2와 동등한 보호를 제공한다고 주장하지 않는다.
 
+## 설치 (Claude Code 플러그인)
+
+공방 v3의 스킬 6개(`일`, `공방-공개올리기`, `공방-작업조-붙이기`, `공방-합치기-시험`, `공방-외부점검`, `공방-실행결과-조회`)와
+작업조 6명(사실확정자·실측자·계획자·시안자·구현자·검토자)은 Claude Code 플러그인으로 설치한다.
+
+```
+claude plugin marketplace add <이 저장소의 GitHub 주소: 소유자/저장소>
+claude plugin install gongbang@if-gongbang
+```
+
+- 일을 시킬 때 스킬 이름을 외워 부를 필요가 없다. 자동 스킬 선택기(`plugin/skill-router/`, 설치 방법은 그 폴더의 README)가 입력마다 맞는 스킬 본문을 골라 넣는다.
+- 다른 공개 스킬 묶음은 `install/install-skills.sh`가 원본 저장소에서 다시 설치한다(`install/skills-manifest.json`).
+- 같은 이름의 스킬을 이미 `~/.claude/skills/`에 두고 있다면 그쪽이 먼저 쓰인다. 이 플러그인은 그런 내부판이 없는 새 설치를 위한 일반판이다.
+- 작업 사본·합치기 도구(`v3/tools`)와 훅(`hooks/`)은 플러그인과 별도로 `tools/install_v3.sh`·`hooks/apply_hooks_v3.sh`로 설치한다.
+
 ## 공방의 부품 10개
 
 | 이름 | 하는 일 |
